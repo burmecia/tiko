@@ -3,6 +3,7 @@
 //! This crate provides safe FFI bindings for PostgreSQL C APIs
 //! used by S3 storage manager and S3 worker extensions.
 
+pub mod aio;
 pub mod bgworker;
 pub mod common;
 pub mod condition_variable;

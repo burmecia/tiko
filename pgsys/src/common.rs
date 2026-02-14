@@ -12,6 +12,8 @@ pub const INDEX_MAX_KEYS: c_int = 32;
 pub const NAMEDATALEN: c_int = 64;
 pub const FLOAT8PASSBYVAL: c_int = 1;
 
+pub const BLCKSZ: usize = 8192;
+
 /// Maximum number of I/O worker processes (proc.h: MAX_IO_WORKERS).
 /// Compile-time upper bound; actual count is controlled by the `io_workers` GUC.
 pub const MAX_IO_WORKERS: c_int = 32;

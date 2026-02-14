@@ -90,6 +90,68 @@ Once md is fully replaced, the md fallback path won't exist. Instead, `s3_writev
 
 This handles initdb, shutdown checkpoint, and s3worker crash without depending on md. Pages land in the local cache (persistent), WAL guarantees recoverability, and on next startup s3worker reconciles cache-dirty pages with S3.
 
+### PG18 AIO Integration
+
+PG18 introduces an asynchronous I/O subsystem built around `PgAioHandle` — a shared-memory object tracking each I/O operation through a state machine: `IDLE → HANDED_OUT → DEFINED → STAGED → SUBMITTED → COMPLETED_IO → COMPLETED_SHARED → COMPLETED_LOCAL → IDLE`. The smgr interface adds `startreadv` alongside the existing synchronous `readv`.
+
+**Design: Custom `PgAioOp` for S3 reads**
+
+Add `PGAIO_OP_S3_READV` to the `PgAioOp` enum and handle it in `pgaio_io_perform_synchronously()`. This plugs into PG18 AIO with a small, contained patch — no I/O method replacement, no custom callbacks needed.
+
+**Data flow:**
+
+```
+Backend              PG IO Worker              s3worker (Tokio)          S3
+═══════              ════════════              ════════════════          ══
+s3_startreadv()
+  set up iovec
+  pgaio_io_stage(PGAIO_OP_S3_READV)
+  submit to IO worker queue
+  return immediately ✓
+                     wakes up
+(doing other work)   pgaio_io_perform_synchronously()
+                       case PGAIO_OP_S3_READV:
+                       submit_and_wait() ────→  claim slot, fill, publish
+                       WaitLatch                dispatch to Tokio
+                                                  cache hit → pread
+                                                  cache miss ──────→ GET
+                                                              ◄───── data
+                                                              write cache
+                                                memcpy to buffer_ptr
+                                                mark_completed + SetLatch
+                     WaitLatch returns ◄────────┘
+                     result = nblocks * BLCKSZ
+                     pgaio_io_process_completion()
+                       callbacks (md_readv_complete, buffer_readv_complete)
+                       ConditionVariableBroadcast
+wref_wait returns ◄──┘
+```
+
+**Key design decisions:**
+
+- **No `PGAIO_HF_SYNCHRONOUS` flag**: Without this flag, `pgaio_io_stage` submits the handle to PG's IO worker pool (not the backend). The IO worker calls `pgaio_io_perform_synchronously()` which hits our `PGAIO_OP_S3_READV` switch case. The backend remains non-blocking — true async from its perspective.
+- **IO worker reuses `submit_and_wait()`**: The IO worker is a regular PG process with a valid `MyProcNumber` and `MyLatch`, counted in `MaxBackends`. It gets its own `BackendSlotPool` in `S3IoControl`. From Pico's perspective, it's just another backend — claims slots, publishes requests, waits on latch. No Tokio runtime needed in the IO worker.
+- **s3worker handles all S3 I/O**: The IO worker never touches S3 directly. It submits to the Pico shared-memory pipeline; s3worker's Tokio runtime handles cache checks, S3 fetches, and writes data to the shared-memory buffer pages.
+- **Bufmgr callbacks work unmodified**: `pgaio_io_process_completion` runs the normal callback chain (md byte validation, bufmgr `BM_VALID` flag setting, checksum checks) — no custom AIO callbacks needed.
+
+**PG patch scope** (~6 switch cases + 1 function + enum update):
+
+| File | Change |
+|------|--------|
+| `include/storage/aio.h` | Add `PGAIO_OP_S3_READV` to `PgAioOp`, update `PGAIO_OP_COUNT` |
+| `aio_io.c` `pgaio_io_perform_synchronously` | Add case calling `s3_io_perform_read()` |
+| `aio_io.c` `pgaio_io_get_op_name` | Add `"s3_readv"` |
+| `aio_io.c` `pgaio_io_uses_fd` | Return `false` (no fd to track) |
+| `aio_io.c` `pgaio_io_get_iovec_length` | Return from `op_data.read.iov_length` |
+| `aio_io.c` | Add `pgaio_io_start_s3_readv()` (sets up op_data, calls `pgaio_io_stage`) |
+| `aio_funcs.c` `pg_get_aios` | Display offset/length for debug view |
+| `method_io_uring.c` | Not needed — IO worker path handles it via `pgaio_io_perform_synchronously` |
+
+**Rust side** (`s3smgr`):
+
+- `s3_startreadv`: Set up iovec from buffers, register md callbacks, set smgr target, call `pgaio_io_start_s3_readv()`
+- `s3_io_perform_read` (`extern "C"`): Decode relation info from `target_data`, call `submit_and_wait()` with iov buffer addresses, return `nblocks * BLCKSZ` or `-errno`
+
 ### Future Improvements
 
 - **Local cache hit short-circuit**: Cache hits bypass the shared memory queue entirely — `s3_readv` checks the cache index and does a direct `pread()`. Only cache misses go through the async pipeline.
