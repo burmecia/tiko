@@ -1,3 +1,4 @@
+mod pipeline;
 mod smgr;
 
 /// Wait event identifiers for S3 I/O operations, initialized in s3_init()

@@ -42,7 +42,7 @@ if [ -f "${TARGET_DIR}/release/libs3worker.dylib" ]; then
 fi
 
 echo "Running tests..."
-if ! (cd postgres/src/test/modules/test_pico && make check PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libs3worker') >/dev/null; then
+if ! (cd postgres/src/test/modules/test_pico && make check PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libs3worker -c shared_buffers=256kB') >/dev/null; then
   echo "Test Pico failed" >&2
   exit 1
 fi

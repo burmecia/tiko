@@ -646,13 +646,6 @@ impl S3IoControl {
         // Update tail
         self.submit_queue.tail.store(tail, Ordering::Release);
 
-        if dispatched_count > 0 {
-            pg_log_debug1(&format!(
-                "s3worker: dispatched {} requests",
-                dispatched_count
-            ));
-        }
-
         Ok(dispatched_count)
     }
 }

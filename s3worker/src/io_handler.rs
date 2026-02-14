@@ -92,7 +92,7 @@ async fn process_io_request(request: IoWorkRequest) {
         }
         S3IoOpKind::Write => {
             // TODO: Write to local cache and schedule S3 upload
-            (0u32, 42)
+            (0u32, 43)
         }
         _ => {
             // Unsupported operation
