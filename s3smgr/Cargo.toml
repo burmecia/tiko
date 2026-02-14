@@ -1,0 +1,17 @@
+[package]
+name = "s3smgr"
+description = "S3 storage manager, implements the PostgreSQL `smgr` interface"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+pgsys = { path = "../pgsys" }
+s3worker = { path = "../s3worker" }
+tracing = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "pgsys"
+description = "PostgreSQL FFI bindings for S3smgr and S3 Worker"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+

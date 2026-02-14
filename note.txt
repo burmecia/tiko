@@ -1,0 +1,36 @@
+
+./configure --prefix $(realpath ../)/target/pg-install \
+    --enable-debug \
+    --enable-cassert \
+    --without-openssl \
+    --without-systemd \
+    --without-libxml \
+    --without-libxslt \
+    --without-llvm \
+    --without-selinux
+
+# minimal build of PostgreSQL with only essential components
+./configure --prefix $(realpath ../)/target/pg-install \
+    --enable-debug \
+    --enable-cassert \
+    --without-readline \
+    --without-zlib \
+    --without-icu \
+    --without-ldap \
+    --without-pam \
+    --without-bonjour \
+    --without-selinux \
+    --without-systemd \
+    --without-gssapi \
+    --disable-nls \
+    --without-openssl \
+    --without-libxml \
+    --without-libxslt \
+    --without-libcurl \
+    --without-lz4 \
+    --without-zstd \
+    --without-llvm \
+    --disable-dtrace \
+    --disable-tap-tests \
+    --disable-profiling \
+    --disable-coverage

@@ -1,0 +1,18 @@
+[package]
+name = "s3worker"
+description = "S3 background worker"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pgsys = { path = "../pgsys" }
+libc = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
