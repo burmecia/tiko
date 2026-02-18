@@ -44,7 +44,12 @@ s3smgr ──→ s3worker ──→ pgsys
 Raw `extern "C"` declarations for PG internals: smgr (md* functions), background workers, shared memory, LWLocks, latches, condition variables, logging. No build.rs/bindgen — bindings are hand-written `#[repr(C)]` structs matching PG's C layout. Symbols resolve at load time against the running postgres process.
 
 ### `s3smgr` — Storage manager interface (staticlib)
-Implements the PG `smgr` interface with `s3_*` functions (`s3_readv`, `s3_writev`, `s3_open`, etc.) that are registered as the storage manager. Currently most functions delegate to `md*` (magnetic disk) as a passthrough while the S3 path is being built. `s3_readv` and `s3_writev` have the full async I/O path: claim slot from per-backend pool → fill → publish → push to submit queue → SetLatch s3worker → WaitLatch for completion → release. Both guard against non-normal modes (initdb, shutdown) via `is_under_postmaster()` with md fallback.
+Implements the PG `smgr` interface with `s3_*` functions (`s3_readv`, `s3_writev`, `s3_open`, etc.) that are registered as the storage manager. Two I/O paths:
+
+- **Sync path** (all smgr functions except `s3_startreadv` and `s3_prefetch`): Calls `s3_ops` directly in the backend process (`pread`/`pwrite` on local cache files). This is correct because sync smgr callers may pass backend-local memory pointers (`PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local `PGIOAlignedBlock`) that s3worker cannot access cross-process.
+- **Async path** (`s3_startreadv` → `s3_io_perform_read`/`s3_io_perform_write`): Uses the shared-memory pipeline to s3worker. Buffers are always in shared memory (`BufferBlocks`), so cross-process access is safe. Also used by `s3_prefetch` for local cache warming (no `buffer_ptr`).
+
+The `use_pipeline()` helper (combines `is_under_postmaster()` + `is_s3worker_alive()`) guards the async path in `aio.rs` and `prefetch.rs`, falling back to direct `s3_ops` when unavailable (initdb, shutdown checkpoint, s3worker crash).
 
 ### `s3worker` — Background worker process (cdylib)
 Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker that calls `s3worker_main`. Internal structure:
@@ -53,6 +58,7 @@ Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker 
 - **`dispatcher`** — bounded `sync_channel` for work requests from main thread to Tokio (no completion channel — Tokio notifies backends directly via SetLatch)
 - **`io_handler`** — async S3 GET/PUT and local cache read/write with SetLatch completion path
 - **`io_queue`** (pub) — the shared memory data structures, also used by `s3smgr`
+- **`s3_ops`** (pub) — synchronous block-level file I/O (`read_blocks`, `write_blocks`, `create_file`, etc.). Called directly by s3smgr sync functions and by s3worker's `io_handler`. Uses S3-style path layout: `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
 - **`shmem`** — hooks into `shmem_request_hook`/`shmem_startup_hook` for PG shared memory init
 
 ### Shared Memory IPC
@@ -79,16 +85,12 @@ Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker 
 
 PostgreSQL kills all `B_BG_WORKER` processes (including s3worker) in `PM_STOP_BACKENDS`, **before** the checkpointer performs the shutdown checkpoint in `PM_WAIT_XLOG_SHUTDOWN`. There is no `bgw_flags` value to keep a bgworker alive past this phase.
 
-**Current guards** (`s3_readv`/`s3_writev`):
-- `is_under_postmaster()` — false during initdb (both `--boot` and `--single` phases), falls back to md. Checked via PG's `IsUnderPostmaster` global (process-local, no shared memory).
-- `is_s3worker_alive()` — checked at slot claim, submit queue push, and completion wait. Falls back to md if s3worker is dead (shutdown, crash). Uses `kill(pid, 0)` on PID stored in shared memory.
+**`use_pipeline()` guard** (used in `aio.rs` and `prefetch.rs`):
+- `is_under_postmaster()` — false during initdb (both `--boot` and `--single` phases). Checked via PG's `IsUnderPostmaster` global (process-local, no shared memory).
+- `is_s3worker_alive()` — uses `kill(pid, 0)` on PID stored in shared memory. Returns false if s3worker is dead (shutdown, crash).
+- When `use_pipeline()` returns false, the AIO path falls back to direct `s3_ops` calls (same as the sync smgr functions).
 
-**Long-term solution — synchronous local cache write fallback**:
-Once md is fully replaced, the md fallback path won't exist. Instead, `s3_writev`/`s3_readv` should have two paths:
-1. **Async path** (s3worker alive): submit queue → Tokio → S3 + local cache (current implementation)
-2. **Sync path** (s3worker dead): direct `pwrite()`/`pread()` to local cache files inline, no submit queue or Tokio needed
-
-This handles initdb, shutdown checkpoint, and s3worker crash without depending on md. Pages land in the local cache (persistent), WAL guarantees recoverability, and on next startup s3worker reconciles cache-dirty pages with S3.
+All sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, `s3_create`, etc.) always call `s3_ops` directly — no pipeline, no fallback needed. This handles initdb, shutdown checkpoint, and s3worker crash. Pages land in the local cache (persistent), WAL guarantees recoverability, and on next startup s3worker reconciles cache-dirty pages with S3.
 
 ### PG18 AIO Integration
 
