@@ -1,4 +1,7 @@
-use pgsys::smgr::*;
+use pgsys::{logging::pg_log_error, smgr::*};
+use s3worker::s3_ops;
+
+const INVALID_BLOCK_NUMBER: BlockNumber = 0xFFFFFFFF;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_extend(
@@ -6,9 +9,30 @@ pub extern "C-unwind" fn s3_extend(
     forknum: ForkNumber,
     blocknum: BlockNumber,
     buffer: *const std::ffi::c_void,
-    skip_fsync: bool,
+    _skip_fsync: bool,
 ) {
-    unsafe {
-        mdextend(reln, forknum, blocknum, buffer, skip_fsync);
+    let loc = unsafe { &(*reln).smgr_rlocator.locator };
+
+    if blocknum == INVALID_BLOCK_NUMBER {
+        pg_log_error(&format!(
+            "s3_extend: cannot extend rel {}/{}/{} fork {} beyond {} blocks",
+            loc.spc_oid, loc.db_oid, loc.rel_number, forknum, INVALID_BLOCK_NUMBER
+        ));
+        return;
+    }
+
+    if let Err(errno) = s3_ops::write_blocks(
+        loc.spc_oid,
+        loc.db_oid,
+        loc.rel_number,
+        forknum,
+        blocknum,
+        1,
+        buffer as *const u8,
+    ) {
+        pg_log_error(&format!(
+            "s3_extend: write failed for rel {}/{}/{} fork {} block {}: errno {}",
+            loc.spc_oid, loc.db_oid, loc.rel_number, forknum, blocknum, errno
+        ));
     }
 }

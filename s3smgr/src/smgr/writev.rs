@@ -1,10 +1,10 @@
-use pgsys::{
-    common::{get_my_proc_number, is_under_postmaster},
-    smgr::*,
-};
-use s3worker::io_queue::S3IoOpKind;
+use pgsys::{common::in_recovery, logging::pg_log_error, smgr::*};
+use s3worker::s3_ops;
 
-use crate::pipeline;
+use crate::buffers;
+
+/// POSIX ENOENT (No such file or directory)
+const ENOENT: i32 = 2;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_writev(
@@ -13,24 +13,44 @@ pub extern "C-unwind" fn s3_writev(
     blocknum: BlockNumber,
     buffers: *const *const std::ffi::c_void,
     nblocks: BlockNumber,
-    skip_fsync: bool,
+    _skip_fsync: bool,
 ) {
-    unsafe {
-        if is_under_postmaster() {
-            let _result = pipeline::submit_and_wait(
-                S3IoOpKind::Write,
-                reln,
-                forknum,
-                blocknum,
-                nblocks,
-                *buffers as u64,
-                crate::WAIT_EVENT_S3_IO_WRITE,
-                get_my_proc_number(),
-                "s3_writev",
-            );
+    // Guard against invalid nblocks
+    if nblocks == 0 {
+        return;
+    }
+
+    let loc = unsafe { &(*reln).smgr_rlocator.locator };
+    let iov = unsafe { buffers::buffers_to_iov(buffers, nblocks) };
+
+    let mut block_offset: u32 = 0;
+    for entry in &iov {
+        let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
+
+        if let Err(errno) = s3_ops::write_blocks(
+            loc.spc_oid,
+            loc.db_oid,
+            loc.rel_number,
+            forknum,
+            blocknum + block_offset,
+            run_nblocks,
+            entry.iov_base as *const u8,
+        ) {
+            // During recovery, silently tolerate ENOENT (no-op is correct)
+            if !(in_recovery() && errno == ENOENT) {
+                pg_log_error(&format!(
+                    "s3_writev: write failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
+                    loc.spc_oid,
+                    loc.db_oid,
+                    loc.rel_number,
+                    forknum,
+                    blocknum + block_offset,
+                    run_nblocks,
+                    errno
+                ));
+            }
         }
 
-        // TODO: remove once io_handler does real I/O
-        mdwritev(reln, forknum, blocknum, buffers, nblocks, skip_fsync);
+        block_offset += run_nblocks;
     }
 }

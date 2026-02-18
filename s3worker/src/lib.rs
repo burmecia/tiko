@@ -1,5 +1,6 @@
 // Module declarations
 pub mod io_queue;
+pub mod s3_ops;
 
 mod dispatcher;
 mod io_handler;

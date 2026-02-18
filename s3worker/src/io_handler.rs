@@ -1,23 +1,17 @@
-#![allow(dead_code)]
-//! S3 and local cache I/O operations
+//! I/O request processing for s3worker's Tokio runtime.
 //!
-//! This module performs the actual I/O work in Tokio worker threads.
-//! It handles:
-//! - S3 GET/PUT operations (async)
-//! - Local file cache I/O (async)
-//! - Direct memory writes to shared buffer pages via memcpy
-//! - Completion notification via SetLatch (wakes backend directly)
+//! This module receives dispatched I/O requests and performs the actual
+//! block-level I/O via `s3_ops::read_blocks` / `s3_ops::write_blocks`.
 //!
 //! # Completion Path
 //!
-//! After async I/O completes on a Tokio thread:
+//! After I/O completes on a Tokio thread:
 //! 1. Write result fields to the slot (`result_status`, `result_nblocks`)
 //! 2. Mark slot completed (`mark_completed()` — Release fence)
 //! 3. Call `SetLatch(owner_latch)` to wake the backend directly
 //!
 //! This eliminates the harvest step — Tokio notifies backends directly.
 
-use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use pgsys::latch::SetLatch;
@@ -25,42 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::dispatcher::IoWorkRequest;
 use crate::io_queue::{S3IoControl, S3IoOpKind};
-
-/// Perform an S3 GET operation (read block from S3)
-pub async fn s3_get(_bucket: &str, _key: &str, _buffer_ptr: *mut c_void, _size: usize) -> i32 {
-    // TODO: Perform async S3 GET request
-    // TODO: Write data to buffer_ptr via memcpy
-    -1 // Placeholder
-}
-
-/// Perform an S3 PUT operation (write block to S3)
-pub async fn s3_put(_bucket: &str, _key: &str, _buffer_ptr: *const c_void, _size: usize) -> i32 {
-    // TODO: Read data from buffer_ptr (safe read from shared memory)
-    // TODO: Perform async S3 PUT request
-    -1 // Placeholder
-}
-
-/// Read from local file cache
-pub async fn read_cache(
-    _file_path: &str,
-    _offset: u64,
-    _buffer_ptr: *mut c_void,
-    _size: usize,
-) -> i32 {
-    // TODO: Open file async, seek, read into buffer_ptr
-    -1 // Placeholder
-}
-
-/// Write to local file cache
-pub async fn write_cache(
-    _file_path: &str,
-    _offset: u64,
-    _buffer_ptr: *const c_void,
-    _size: usize,
-) -> i32 {
-    // TODO: Open file async, seek, write from buffer_ptr
-    -1 // Placeholder
-}
+use crate::s3_ops;
 
 /// Main I/O worker loop — receives requests from the dispatcher channel
 /// and spawns a Tokio task for each request.
@@ -75,7 +34,7 @@ pub async fn io_worker_loop(mut rx: mpsc::Receiver<IoWorkRequest>) {
 
 /// Process a single I/O request.
 ///
-/// Looks up the slot in shared memory, performs the I/O operation (currently stubbed),
+/// Looks up the slot in shared memory, performs the I/O operation,
 /// writes results to the slot, marks it completed, and wakes the backend via SetLatch.
 async fn process_io_request(request: IoWorkRequest) {
     let control = S3IoControl::get();
@@ -85,14 +44,97 @@ async fn process_io_request(request: IoWorkRequest) {
     // Perform I/O based on operation type
     let (status, nblocks) = match slot.op {
         S3IoOpKind::Read => {
-            // TODO: Build S3 key from spc_oid/db_oid/rel_number/fork/block
-            // TODO: Try local cache first, then S3
-            // For now, stub: report success with 0 blocks
-            (0u32, 42)
+            let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *mut u8;
+            match s3_ops::read_blocks(
+                slot.spc_oid,
+                slot.db_oid,
+                slot.rel_number,
+                slot.fork_number,
+                slot.block_number,
+                slot.nblocks,
+                buffer_ptr,
+            ) {
+                Ok(n) => (0u32, n),
+                Err(errno) => (errno as u32, 0u32),
+            }
         }
         S3IoOpKind::Write => {
-            // TODO: Write to local cache and schedule S3 upload
-            (0u32, 43)
+            let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *const u8;
+            match s3_ops::write_blocks(
+                slot.spc_oid,
+                slot.db_oid,
+                slot.rel_number,
+                slot.fork_number,
+                slot.block_number,
+                slot.nblocks,
+                buffer_ptr,
+            ) {
+                Ok(n) => (0u32, n),
+                Err(errno) => (errno as u32, 0u32),
+            }
+        }
+        S3IoOpKind::Exists => {
+            if s3_ops::file_exists(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number) {
+                (0u32, 1)
+            } else {
+                // file doesn't exist — not an error, just report 0 nblocks
+                (0u32, 0)
+            }
+        }
+        S3IoOpKind::Create => {
+            match s3_ops::create_file(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number)
+            {
+                Ok(created) => (0u32, if created { 1 } else { 0 }),
+                Err(errno) => (errno as u32, 0u32),
+            }
+        }
+        S3IoOpKind::Nblocks => {
+            match s3_ops::file_nblocks(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number)
+            {
+                Ok(n) => (0u32, n),
+                Err(errno) => (errno as u32, 0u32),
+            }
+        }
+        S3IoOpKind::Prefetch => {
+            // TODO: warm the local cache by fetching blocks from S3.
+            // On cache miss: issue S3 GET for the requested block range,
+            // write the fetched data into the local cache file. On cache
+            // hit: no-op. This allows subsequent s3_readv calls to hit
+            // the cache instead of going to S3.
+            (0u32, 0u32)
+        }
+        S3IoOpKind::Truncate => {
+            // Target nblocks is stored in block_number
+            match s3_ops::truncate_file(
+                slot.spc_oid,
+                slot.db_oid,
+                slot.rel_number,
+                slot.fork_number,
+                slot.block_number,
+            ) {
+                Ok(()) => (0u32, 0u32),
+                Err(errno) => (errno as u32, 0u32),
+            }
+        }
+        S3IoOpKind::Unlink => {
+            match s3_ops::delete_file(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number)
+            {
+                Ok(()) => (0u32, 0u32),
+                Err(errno) => (errno as u32, 0u32),
+            }
+        }
+        S3IoOpKind::ZeroExtend => {
+            match s3_ops::zeroextend_file(
+                slot.spc_oid,
+                slot.db_oid,
+                slot.rel_number,
+                slot.fork_number,
+                slot.block_number,
+                slot.nblocks,
+            ) {
+                Ok(()) => (0u32, 0u32),
+                Err(errno) => (errno as u32, 0u32),
+            }
         }
         _ => {
             // Unsupported operation

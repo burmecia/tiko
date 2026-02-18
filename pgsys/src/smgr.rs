@@ -1,15 +1,7 @@
 // pgsys/src/smgr.rs
 //! PostgreSQL Storage Manager (SMgr) FFI types and bindings
 
-// Define the types that match PostgreSQL's C types
-pub type BlockNumber = u32;
-pub type ForkNumber = u32;
-pub type RelFileNumber = u32; // typedef Oid RelFileNumber in PostgreSQL
-pub type Oid = u32; // typedef unsigned int Oid
-pub type ProcNumber = i32; // typedef int ProcNumber
-
-// MAX_FORKNUM is INIT_FORKNUM which is 3
-const MAX_FORKNUM: usize = 3;
+pub use crate::common::*;
 
 // Corresponds to PostgreSQL's RelFileLocator struct
 #[repr(C)]
@@ -32,7 +24,7 @@ pub struct RelFileLocatorBackend {
 pub struct SMgrRelationData {
     pub smgr_rlocator: RelFileLocatorBackend,
     pub smgr_targblock: BlockNumber,
-    pub smgr_cached_nblocks: [BlockNumber; MAX_FORKNUM + 1],
+    pub smgr_cached_nblocks: [BlockNumber; (MAX_FORKNUM + 1) as usize],
     // We don't need to define the private fields (smgr_which, md_num_open_segs, etc.)
     // since we only access the public fields above
 }

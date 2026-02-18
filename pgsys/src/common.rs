@@ -5,6 +5,20 @@ pub type Pid = i32;
 
 pub type Datum = u64;
 
+// Define the types that match PostgreSQL's C types
+pub type BlockNumber = u32;
+pub type ForkNumber = i32;
+pub type RelFileNumber = u32; // typedef Oid RelFileNumber in PostgreSQL
+pub type Oid = u32; // typedef unsigned int Oid
+
+pub const INVALID_BLOCK_NUMBER: BlockNumber = 0xFFFFFFFF;
+pub const MAX_BLOCK_NUMBER: BlockNumber = 0xFFFFFFFE;
+
+// Fork number constants (relpath.h)
+pub const INVALID_FORK_NUMBER: ForkNumber = -1;
+pub const MAIN_FORKNUM: ForkNumber = 0;
+pub const MAX_FORKNUM: ForkNumber = 3; // INIT_FORKNUM
+
 pub const PG_VERSION_NUM: c_int = 180001; // in src/include/pg_config.h
 pub const MAXPGPATH: usize = 1024;
 pub const FUNC_MAX_ARGS: c_int = 100;
@@ -67,6 +81,10 @@ unsafe extern "C" {
     /// False during initdb (both --boot and --single phases).
     /// This is the authoritative check for whether background workers can exist.
     pub static IsUnderPostmaster: bool;
+
+    /// True during WAL replay (crash recovery or standby).
+    /// Set by the startup process; other processes see false (xlogutils.h).
+    pub static InRecovery: bool;
 }
 
 #[inline(always)]
@@ -80,6 +98,12 @@ pub fn is_normal_processing() -> bool {
 #[inline(always)]
 pub fn is_under_postmaster() -> bool {
     unsafe { IsUnderPostmaster }
+}
+
+/// True during WAL replay (crash recovery or standby).
+#[inline(always)]
+pub fn in_recovery() -> bool {
+    unsafe { InRecovery }
 }
 
 /// Return the current backend's ProcNumber.

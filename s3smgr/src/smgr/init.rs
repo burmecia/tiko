@@ -1,7 +1,6 @@
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number},
     logging::*,
-    smgr::mdinit,
     wait_events::new_wait_event,
 };
 use s3worker::io_queue::S3IoControl;
@@ -9,12 +8,9 @@ use s3worker::io_queue::S3IoControl;
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_init() {
     unsafe {
-        mdinit();
-
         // Initialize wait event identifiers for S3 I/O operations
         crate::WAIT_EVENT_S3_IO_READ = new_wait_event(c"S3IORead".as_ptr());
         crate::WAIT_EVENT_S3_IO_WRITE = new_wait_event(c"S3IOWrite".as_ptr());
-
         // Explicitly attach to shared memory in this backend process.
         // ShmemInitStruct looks up the existing block (found=true), no reinitialization.
         let total_procs = (MaxBackends + NUM_AUXILIARY_PROCS) as usize;

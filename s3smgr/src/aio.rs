@@ -1,5 +1,5 @@
-use pgsys::common::{BLCKSZ, get_my_proc_number};
-use s3worker::io_queue::S3IoOpKind;
+use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
+use s3worker::{io_queue::S3IoOpKind, s3_ops};
 
 use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline};
 
@@ -8,45 +8,74 @@ use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline};
 /// Called from `pgaio_io_perform_synchronously()` inside `START_CRIT_SECTION()`.
 /// **MUST NOT** call `elog(ERROR)` / `pg_log_error` — that would PANIC.
 ///
-/// Walks the iovec entries (each a contiguous buffer range), submitting one
-/// request per entry through the s3worker async pipeline via `submit_and_wait_raw`.
+/// Walks the iovec entries (each a contiguous buffer range). Under the
+/// postmaster with s3worker alive, submits each entry through the s3worker
+/// async pipeline via `submit_and_wait_raw`. When the pipeline is unavailable
+/// (initdb, shutdown checkpoint, s3worker crash), performs direct
+/// `s3_ops::read_blocks` / `write_blocks` calls instead.
 ///
 /// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
 unsafe fn s3_io_perform(
     op: S3IoOpKind,
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
-    spc_oid: u32,
-    db_oid: u32,
-    rel_number: u32,
-    fork_number: u32,
-    block_number: u32,
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_number: BlockNumber,
     nblocks: i32,
     wait_event: u32,
     label: &str,
 ) -> isize {
     unsafe {
-        let proc_num = get_my_proc_number();
         let mut current_block = block_number;
 
         for i in 0..iov_length as usize {
             let entry = &*iov.add(i);
             let entry_nblocks = (entry.iov_len / BLCKSZ) as u32;
 
-            // Submit this iovec entry as a separate request to the pipeline, and wait for completion.
-            let result = pipeline::submit_and_wait_raw(
-                op,
-                spc_oid,
-                db_oid,
-                rel_number,
-                fork_number,
-                current_block,
-                entry_nblocks,
-                entry.iov_base as u64,
-                wait_event,
-                proc_num,
-                label,
-            );
+            let result = if crate::use_pipeline() {
+                // Normal: submit to s3worker pipeline
+                pipeline::submit_and_wait_raw(
+                    op,
+                    spc_oid,
+                    db_oid,
+                    rel_number,
+                    fork_number,
+                    current_block,
+                    entry_nblocks,
+                    entry.iov_base as u64,
+                    wait_event,
+                    label,
+                )
+                .map(|_| ())
+            } else {
+                // No pipeline (initdb / shutdown / s3worker dead): direct s3_ops call
+                match op {
+                    S3IoOpKind::Read => s3_ops::read_blocks(
+                        spc_oid,
+                        db_oid,
+                        rel_number,
+                        fork_number,
+                        current_block,
+                        entry_nblocks,
+                        entry.iov_base as *mut u8,
+                    )
+                    .map(|_| ()),
+                    S3IoOpKind::Write => s3_ops::write_blocks(
+                        spc_oid,
+                        db_oid,
+                        rel_number,
+                        fork_number,
+                        current_block,
+                        entry_nblocks,
+                        entry.iov_base as *const u8,
+                    )
+                    .map(|_| ()),
+                    _ => Err(45), // ENOTSUP
+                }
+            };
 
             match result {
                 Ok(_) => {
@@ -70,11 +99,11 @@ unsafe fn s3_io_perform(
 pub extern "C-unwind" fn s3_io_perform_read(
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
-    spc_oid: u32,
-    db_oid: u32,
-    rel_number: u32,
-    fork_number: u32,
-    block_number: u32,
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_number: BlockNumber,
     nblocks: i32,
 ) -> isize {
     unsafe {
@@ -98,11 +127,11 @@ pub extern "C-unwind" fn s3_io_perform_read(
 pub extern "C-unwind" fn s3_io_perform_write(
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
-    spc_oid: u32,
-    db_oid: u32,
-    rel_number: u32,
-    fork_number: u32,
-    block_number: u32,
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_number: BlockNumber,
     nblocks: i32,
 ) -> isize {
     unsafe {

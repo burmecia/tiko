@@ -1,10 +1,10 @@
-use pgsys::{
-    common::{get_my_proc_number, is_under_postmaster},
-    smgr::*,
-};
-use s3worker::io_queue::S3IoOpKind;
+use pgsys::{common::in_recovery, logging::pg_log_error, smgr::*};
+use s3worker::s3_ops;
 
-use crate::pipeline;
+use crate::buffers;
+
+/// POSIX ENOENT (No such file or directory)
+const ENOENT: i32 = 2;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_readv(
@@ -14,22 +14,47 @@ pub extern "C-unwind" fn s3_readv(
     buffers: *mut *mut std::ffi::c_void,
     nblocks: BlockNumber,
 ) {
-    unsafe {
-        if is_under_postmaster() {
-            let _result = pipeline::submit_and_wait(
-                S3IoOpKind::Read,
-                reln,
-                forknum,
-                blocknum,
-                nblocks,
-                *buffers as u64,
-                crate::WAIT_EVENT_S3_IO_READ,
-                get_my_proc_number(),
-                "s3_readv",
-            );
+    // Guard against invalid nblocks
+    if nblocks == 0 {
+        return;
+    }
+
+    let loc = unsafe { &(*reln).smgr_rlocator.locator };
+    let iov = unsafe { buffers::buffers_to_iov(buffers as *const *const _, nblocks) };
+
+    let mut block_offset: u32 = 0;
+    for entry in &iov {
+        let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
+
+        if let Err(errno) = s3_ops::read_blocks(
+            loc.spc_oid,
+            loc.db_oid,
+            loc.rel_number,
+            forknum,
+            blocknum + block_offset,
+            run_nblocks,
+            entry.iov_base as *mut u8,
+        ) {
+            // During recovery, silently tolerate ENOENT
+            if in_recovery() && errno == ENOENT {
+                let buffer_ptr = entry.iov_base as *mut u8;
+                unsafe {
+                    std::ptr::write_bytes(buffer_ptr, 0, entry.iov_len);
+                }
+            } else {
+                pg_log_error(&format!(
+                    "s3_readv: read failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
+                    loc.spc_oid,
+                    loc.db_oid,
+                    loc.rel_number,
+                    forknum,
+                    blocknum + block_offset,
+                    run_nblocks,
+                    errno
+                ));
+            }
         }
 
-        // TODO: remove once io_handler does real I/O
-        mdreadv(reln, forknum, blocknum, buffers, nblocks);
+        block_offset += run_nblocks;
     }
 }

@@ -46,6 +46,7 @@
 //! ```
 
 use pgsys::{
+    common::{BlockNumber, ForkNumber, Oid, RelFileNumber},
     latch::{Latch, SetLatch},
     logging::*,
     lwlock::*,
@@ -95,16 +96,36 @@ impl From<u8> for SlotState {
     }
 }
 
+// ── I/O operation types ──
+
+/// S3 I/O operation kinds.
+///
+/// Used in two contexts:
+/// - **AIO path** (`s3_io_perform`): `Read` and `Write` are submitted through
+///   the shared-memory pipeline to s3worker. Buffers are always in shared memory
+///   (`BufferBlocks`), so cross-process pointer access is safe.
+/// - **Prefetch** (`s3_prefetch`): Submitted through the pipeline to warm the
+///   local cache from S3. No `buffer_ptr` needed (s3worker manages its own buffers).
+///
+/// All other sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, etc.)
+/// call `s3_ops` directly in the backend process — they do **not** use the
+/// pipeline, because their buffers may be in backend-local memory (e.g.
+/// `PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local
+/// `PGIOAlignedBlock`) which s3worker cannot access.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum S3IoOpKind {
     Invalid = 0,
-    Read = 1,
-    Write = 2,
-    Extend = 3,
-    Fsync = 4,
-    Nblocks = 5,
-    Prefetch = 6,
+    Read = 1,        // AIO pipeline + direct s3_ops
+    Write = 2,       // AIO pipeline + direct s3_ops
+    Exists = 3,      // direct s3_ops only
+    Create = 4,      // direct s3_ops only
+    Fsync = 5,       // direct s3_ops only
+    Nblocks = 6,     // direct s3_ops only
+    Prefetch = 7,    // pipeline only (cache warming, no buffer_ptr)
+    Truncate = 8,    // direct s3_ops only
+    Unlink = 9,      // direct s3_ops only
+    ZeroExtend = 10, // direct s3_ops only
 }
 
 // ── S3IoSlot ──
@@ -121,12 +142,12 @@ pub struct S3IoSlot {
     pub op: S3IoOpKind,
 
     // ── Request identity ──
-    pub spc_oid: u32,
-    pub db_oid: u32,
-    pub rel_number: u32,
-    pub fork_number: u32,
-    pub block_number: u32,
-    pub nblocks: u32,
+    pub spc_oid: Oid,
+    pub db_oid: Oid,
+    pub rel_number: RelFileNumber,
+    pub fork_number: ForkNumber,
+    pub block_number: BlockNumber,
+    pub nblocks: BlockNumber,
 
     // ── Ownership ──
     /// Backend's MyProcNumber (for debugging/validation)
@@ -210,13 +231,25 @@ impl S3IoSlot {
         if self.op == S3IoOpKind::Invalid {
             return Err(libc::EINVAL as u32);
         }
-        let buffer_ptr = self.buffer_ptr.load(Ordering::Acquire);
-        if buffer_ptr == 0 {
-            return Err(libc::EFAULT as u32);
+
+        // Only Read and Write operations require a buffer
+        let needs_buffer = matches!(self.op, S3IoOpKind::Read | S3IoOpKind::Write);
+        if needs_buffer {
+            let buffer_ptr = self.buffer_ptr.load(Ordering::Acquire);
+            if buffer_ptr == 0 {
+                return Err(libc::EFAULT as u32);
+            }
         }
-        if self.nblocks == 0 || self.nblocks > 1024 {
+
+        // Only operations that transfer blocks need nblocks validation
+        let needs_nblocks = matches!(
+            self.op,
+            S3IoOpKind::Read | S3IoOpKind::Write | S3IoOpKind::ZeroExtend | S3IoOpKind::Prefetch
+        );
+        if needs_nblocks && (self.nblocks == 0 || self.nblocks > 1024) {
             return Err(libc::EINVAL as u32);
         }
+
         Ok(())
     }
 
@@ -588,7 +621,7 @@ impl S3IoControl {
 
             // Validate slot data
             if let Err(error_code) = slot.validate() {
-                pg_log_debug1(&format!(
+                pg_log_warning(&format!(
                     "s3worker: invalid slot data at backend={} slot={} (error={})",
                     backend_id, slot_idx, error_code
                 ));

@@ -7,7 +7,7 @@
 
 use std::sync::atomic::Ordering;
 
-use pgsys::{latch::*, logging::*, smgr::*};
+use pgsys::{common::get_my_proc_number, latch::*, logging::*, smgr::*};
 use s3worker::io_queue::*;
 
 /// POSIX ENOENT (No such file or directory) — constant to avoid libc dependency.
@@ -37,7 +37,6 @@ pub unsafe fn submit_and_wait(
     nblocks: BlockNumber,
     buffer_ptr: u64,
     wait_event: u32,
-    proc_num: i32,
     label: &str,
 ) -> Option<IoResult> {
     unsafe {
@@ -52,7 +51,6 @@ pub unsafe fn submit_and_wait(
             nblocks,
             buffer_ptr,
             wait_event,
-            proc_num,
             label,
         );
         match result {
@@ -60,7 +58,12 @@ pub unsafe fn submit_and_wait(
             Err(_errno) => {
                 pg_log_error(&format!(
                     "{}({}): I/O failed for rel {} fork {} block {}: errno {}",
-                    label, proc_num, loc.rel_number, forknum, blocknum, _errno
+                    label,
+                    get_my_proc_number(),
+                    loc.rel_number,
+                    forknum,
+                    blocknum,
+                    _errno
                 ));
                 None
             }
@@ -77,19 +80,19 @@ pub unsafe fn submit_and_wait(
 /// escalates to PANIC. Uses `pg_log_warning` for diagnostics instead.
 pub unsafe fn submit_and_wait_raw(
     op: S3IoOpKind,
-    spc_oid: u32,
-    db_oid: u32,
-    rel_number: u32,
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
     forknum: ForkNumber,
     blocknum: BlockNumber,
     nblocks: BlockNumber,
     buffer_ptr: u64,
     wait_event: u32,
-    proc_num: i32,
     label: &str,
 ) -> Result<IoResult, i32> {
     unsafe {
         let control = S3IoControl::get();
+        let proc_num = get_my_proc_number();
         let pool = control.backend_pool(proc_num);
 
         // 1. Claim a slot from our own pool (zero contention).

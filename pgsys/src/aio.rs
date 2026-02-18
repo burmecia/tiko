@@ -1,7 +1,8 @@
 // pgsys/src/aio.rs
 //! PostgreSQL AIO (Async I/O) FFI bindings
 
-use crate::smgr::{BlockNumber, ForkNumber, PgAioHandle, SMgrRelationData};
+use crate::common::{BlockNumber, ForkNumber};
+use crate::smgr::{PgAioHandle, SMgrRelationData};
 use std::ffi::c_int;
 
 /// POSIX iovec — matches `struct iovec` from <sys/uio.h>.
