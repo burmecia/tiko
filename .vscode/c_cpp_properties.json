@@ -1,0 +1,28 @@
+{
+    "configurations": [
+        {
+            "name": "macOS",
+            "includePath": [
+                "${workspaceFolder}/postgres/src/include",
+                "${workspaceFolder}/postgres/src/interfaces/libpq",
+                "${workspaceFolder}/postgres/src/bin/psql",
+                "${workspaceFolder}/pgsys/src",
+                "${workspaceFolder}/s3smgr/src",
+                "${workspaceFolder}/s3worker/src",
+                "/usr/local/include",
+                "/usr/include"
+            ],
+            "defines": [
+                "USE_LIBURING"
+            ],
+            "macFrameworkPath": [
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+            ],
+            "compilerPath": "/usr/bin/clang",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "macos-clang-arm64"
+        }
+    ],
+    "version": 4
+}
