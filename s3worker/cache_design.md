@@ -1,7 +1,8 @@
 # Local Cache Design
 
 The s3worker uses local files as a cache in front of S3 (the source of truth).
-The total cache size is configurable. PostgreSQL's WAL provides crash recovery.
+The total cache size is configurable via a GUC (`pico.cache_size`) set at
+server startup. PostgreSQL's WAL provides crash recovery.
 
 ## Position in the I/O Stack
 
@@ -11,10 +12,10 @@ PostgreSQL shared buffers  (hot pages, managed by PG buffer manager)
     smgr interface  (s3_readv / s3_writev)
          |
    +-----------+
-   | Local Cache |  <-- this design
+   | Local Cache |  <-- this design (write-back, chunk-level)
    +-----------+
          |
-        S3       (source of truth)
+   S3-sim files    (source of truth, future: real S3)
 ```
 
 The local cache sits **below** PostgreSQL's shared buffers. Access patterns are
@@ -22,49 +23,74 @@ already filtered by PG's buffer manager:
 - **Reads** happen on buffer cache misses
 - **Writes** happen during checkpoints / bgwriter flushes
 
-## 1. Cache Layout — Fixed-Slot Block Array
+## 1. Cache Layout — Chunk-Slot Array
 
-A single pre-allocated file divided into fixed 8 KB slots:
-
-```
-cache_file:  [slot 0][slot 1][slot 2]...[slot N-1]
-              8 KB    8 KB    8 KB       8 KB
-
-N = cache_size_bytes / 8192
-```
-
-**Why not a directory tree** (one file per relation like `md.c`):
-eviction becomes complex — tracking per-block recency across thousands of files
-and deleting individual blocks from the middle of a file is expensive.
-A flat slot array gives clean O(1) eviction.
-
-## 2. Index — Fixed-Size Hash Table in Shared Memory
+A single pre-allocated file divided into fixed 256 KB chunk slots. Each chunk
+holds 32 contiguous 8 KB blocks, matching the S3 object size:
 
 ```
-BlockTag { spc_oid, db_oid, rel_oid, fork, blkno }  -->  slot_index
+cache_file:  [chunk_0 (256KB)][chunk_1 (256KB)]...[chunk_1023 (256KB)]
+
+Block B within chunk slot S is at byte offset:
+  S * CHUNK_SIZE + (B % BLOCKS_PER_CHUNK) * BLCKSZ
+
+N = 1024 chunk slots = 256 MB default cache
 ```
 
-- **Fixed-size open-addressing hash table** allocated in PG shared memory at
-  startup via `shmem_request_hook`. Sized to `2 * N` entries (2x cache slots)
-  for low collision rates. Same approach PG uses internally for its buffer
-  mapping table (`BufMappingPartition`).
-- Shared memory is fixed at startup — the table cannot grow dynamically.
-  If the cache size is changed, the hash table must be resized at next restart.
+**Why chunk-level instead of block-level**: S3 latency per GET/PUT is ~50-100 ms
+regardless of size. One 8 KB block per S3 object is wasteful. 256 KB chunks
+(32 blocks) amortize S3 request overhead. Read misses prefetch entire chunks,
+and dirty evictions flush only modified blocks within the chunk.
+
+## 2. Index — Hash Table in PG Shared Memory
+
+```
+ChunkTag { spc_oid, db_oid, rel_number, fork_number, chunk_id }  -->  slot_index
+```
+
+Where `chunk_id = blkno / 32`.
+
+- **Fixed-size open-addressing hash table** in PG shared memory (trailing
+  arrays after `S3IoControl`). Sized to `2 * N` entries (2048 for 1024 slots)
+  for low collision rates.
+- All processes access the same shared memory region — writes from one
+  process are immediately visible to others.
 - O(1) lookup for cache hits on the read path (short-circuit, no s3worker).
-- **Partitioned locking**: the table is divided into partitions (e.g., 128),
-  each protected by a lightweight lock. Lookups only hold a shared lock on one
-  partition. Insertions/evictions take an exclusive lock on the affected
-  partition. This minimizes contention across concurrent backends.
+- **Partitioned locking**: the table is divided into 128 partitions,
+  each protected by a spin-based `AtomicRWLock` in shared memory.
+  Lookups hold a shared (read) lock. Insertions/evictions take an exclusive
+  (write) lock.
+
+### Per-block tracking via bitmasks
+
+Each `CacheSlotMeta` has two `AtomicU32` bitmasks:
+- `valid_blocks`: bit N set = block N is populated in this chunk slot
+- `dirty_blocks`: bit N set = block N has been modified (needs flush on eviction)
+
+Slot is "occupied" when `valid_blocks != 0`. Slot is "dirty" when `dirty_blocks != 0`.
+
+### Shared memory layout (trailing arrays)
+
+```
+S3IoControl { header, submit_queue, stats, cache: CacheControl }
+[align 64] BackendSlotPool[0..max_backends]
+[align 4]  AtomicRWLock[0..128]          partition locks (512 bytes)
+[align 4]  CacheSlotMeta[0..1024]        chunk slot metadata (~36 KB)
+[align 4]  CacheHashEntry[0..2048]       hash table (~52 KB)
+```
+
+Total cache metadata: ~88 KB.
 
 ## 3. Eviction — Clock-Sweep
 
 Same algorithm PostgreSQL uses for its own buffer manager — proven for database
 workloads:
 
-- Each slot has: `usage_count` (0–5), `dirty` bit, `pin_count`
+- Each slot has: `usage_count` (0–5), `valid_blocks` / `dirty_blocks` bitmasks, `pin_count`
 - Clock hand sweeps the array; decrements `usage_count` on each pass
 - Evicts first unpinned slot with `usage_count == 0`
-- Dirty pages flushed to S3 **before** eviction (write-back)
+- **Dirty chunks flushed before eviction**: iterates `dirty_blocks` bitmask,
+  writes each dirty block to the S3-sim file via `s3_ops::write_blocks()`
 
 **Why clock-sweep over LRU**: no per-access linked-list manipulation. A single
 atomic increment on `usage_count` per access is all that's needed.
@@ -73,61 +99,33 @@ decays quickly.
 
 ### Concurrency protocol
 
-- **Clock hand**: single `AtomicU32`, advanced via `fetch_add`. Multiple
-  backends can sweep concurrently — each atomically claims the next slot index
-  to inspect, avoiding duplicate work.
-- **Slot pinning**: `pin_count` is an `AtomicU32`. Backends increment before
-  use, decrement after. A pinned slot (`pin_count > 0`) is skipped during
-  eviction — the sweeper moves to the next slot.
-- **Eviction sequence**: to evict slot `i`, a backend must:
-  1. CAS `pin_count` from 0 → 1 (claim exclusive eviction access)
-  2. If dirty: submit async S3 flush, wait for completion, clear dirty bit
-  3. Remove old `BlockTag → i` mapping from hash table (exclusive partition lock)
-  4. Insert new `BlockTag → i` mapping (exclusive partition lock)
-  5. Perform the I/O (read from S3 into slot)
-  6. Set new tag, set `usage_count = 1`, unpin
+- **Clock hand**: single `AtomicU32`, advanced via `fetch_add`.
+- **Slot pinning**: `pin_count` is an `AtomicU32`. Pinned slots (`pin_count > 0`)
+  are skipped during eviction.
+- **Eviction sequence**: CAS `pin_count` 0 → 1, flush dirty blocks if any,
+  remove from hash table, clear metadata, return slot.
 
-  If the CAS fails (another backend pinned it), skip and advance the clock hand.
-
-## 4. Write Policy — Write-Back with Async S3 Flush
+## 4. Write Policy — Write-Back
 
 ```
-PG write  -->  local cache slot (immediate)  -->  S3 (async background)
+PG write  -->  local cache slot (immediate, set dirty bit)
+                                                |
+                            eviction trigger  -->  flush dirty blocks to S3-sim
 ```
 
-- Writes to local cache are fast (local SSD I/O)
-- Background flusher in Tokio runtime uploads dirty pages to S3
-- **Crash safety**: WAL replay handles any pages not yet flushed to S3
-- **Batching**: group dirty pages by relation for multi-block S3 PUTs
-  (S3 charges per request, not per byte)
+- Writes go to cache only — **no write-through** to backing files
+- Dirty blocks are flushed to S3-sim files on eviction
+- **Crash safety**: WAL replay handles any pages not yet flushed
+- Per-block dirty tracking via `dirty_blocks` bitmask means only modified
+  blocks within a chunk are written back on eviction
 
 ## 5. S3 Object Granularity
 
-One 8 KB block per S3 object is wasteful — S3 latency per GET/PUT is ~50–100 ms
-regardless of size.
+One cache chunk = one S3 object = 256 KB (32 blocks):
 
-- **Chunk size: 1 MB** (128 blocks per S3 object)
-- S3 key: `s3://{bucket}/{spc_oid}/{db_oid}/{rel_oid}.{fork}/{chunk_id}`
-- **Read miss**: fetch entire 1 MB chunk, populate up to 128 cache slots (prefetch)
-- **Write flush**: upload dirty blocks as a full chunk
-
-### Chunk merge strategy for writes
-
-S3 objects are immutable — no partial updates. To flush dirty blocks within
-a 1 MB chunk, the full chunk must be uploaded. Two approaches:
-
-1. **Local-only merge (preferred)**: the cache file already holds all blocks
-   for a given chunk (clean + dirty). To flush, read the full chunk's worth of
-   slots from the local cache file, assemble into a 1 MB buffer, and PUT to S3.
-   No S3 read needed — the merge is entirely local I/O.
-
-2. **S3 read-modify-write (fallback)**: if the cache doesn't hold all 128
-   blocks for the chunk (partial population), GET the existing chunk from S3,
-   overlay dirty blocks, PUT back. Adds one S3 round trip.
-
-In practice, approach (1) dominates because the read-miss path prefetches the
-entire chunk, so all blocks are typically resident. Approach (2) is only needed
-for chunks that were never fully fetched.
+- S3 key: `s3://{bucket}/{spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}`
+- **Read miss**: fetch entire 256 KB chunk, populate cache slot (prefetch)
+- **Dirty eviction**: flush only dirty blocks to S3-sim file
 
 ## 6. Crash Recovery — Volatile Cache
 
@@ -135,119 +133,77 @@ The cache is a **performance optimization, not a durability layer**. S3 + WAL
 handle durability.
 
 **On crash:**
-- Shared memory (hash index, slot metadata) is **lost**
-- Cache file survives on disk but blocks are **unidentifiable** (raw 8 KB
-  pages with no embedded metadata indicating which relation/block they belong to)
+- PG shared memory (all cache metadata) is **lost**
+- Cache data file survives but blocks are **unidentifiable** without the
+  in-memory hash table
 
 **Recovery strategy: discard and rebuild**
-1. On startup, **discard the entire cache file** (or truncate to zero)
+1. On startup, PG shared memory is re-initialized (all cache metadata starts
+   fresh — empty hash table, zeroed slot metadata)
 2. WAL replay reconstructs all committed data from the last checkpoint
 3. Cache warms up organically through normal read misses
 
-**Why not persist cache metadata:**
-- Adds complexity (sync metadata file on every eviction/dirty-mark)
-- Marginal benefit — cold cache penalty is temporary and WAL replay is fast
-- Avoids metadata-vs-data consistency bugs entirely
+## 7. Read-Miss Flow (Chunk-Level)
 
-**Alternative (future optimization)**: persist a lightweight metadata file
-alongside the cache (slot → BlockTag mapping), synced at checkpoint boundaries.
-On startup, validate each slot against S3 checksums and repopulate the hash
-index. Only worth doing if cold-start latency becomes a production concern.
-
-## 7. Read-Miss Flow
-
-Full path for a cache miss, including eviction cascade:
+Full path for a cache miss:
 
 ```
 s3_readv(block B)
   │
-  ├─ hash index lookup(B)
-  │   ├─ HIT  → pread() from cache slot, bump usage_count, return
-  │   └─ MISS ↓
-  │
-  ├─ find a free slot:
-  │   ├─ free slot available → claim it
-  │   └─ no free slot → clock-sweep eviction:
-  │       ├─ found clean slot (usage_count=0, !dirty) → evict immediately
-  │       └─ found dirty slot (usage_count=0, dirty):
-  │           └─ flush to S3 first (async) → wait → clear dirty → evict
-  │
-  ├─ fetch 1 MB chunk from S3 (contains block B + up to 127 neighbors)
-  │   └─ populate multiple cache slots (prefetch)
-  │
-  └─ pread() block B from cache slot, return
+  ├─ compute chunk_id = B / 32, block_offset = B % 32
+  ├─ hash index lookup(ChunkTag)
+  │   ├─ CHUNK HIT:
+  │   │   ├─ block valid   → pread() from cache slot, return
+  │   │   └─ block invalid → read single block from S3-sim, populate, return
+  │   │
+  │   └─ CHUNK MISS:
+  │       ├─ insert(chunk_tag) → evicts old chunk (flush if dirty)
+  │       ├─ pread full chunk from S3-sim file (up to 32 blocks)
+  │       ├─ write all fetched blocks to cache slot, set valid_blocks
+  │       └─ read block from cache slot, return
 ```
 
-**Worst case**: evict dirty + fetch from S3 = two S3 round trips (~100–200 ms).
-The prefetch amortizes this — subsequent reads within the same chunk hit the
-cache.
+## 8. Write Flow (Write-Back)
 
-## 8. Shutdown & Fallback Path
+```
+s3_writev(block B)
+  │
+  ├─ compute chunk_id = B / 32, block_offset = B % 32
+  ├─ hash index lookup(ChunkTag)
+  │   ├─ CHUNK HIT  → pin
+  │   └─ CHUNK MISS → insert empty chunk (no S3-sim fetch)
+  │
+  ├─ pwrite block to cache slot
+  ├─ set valid_blocks bit
+  ├─ set dirty_blocks bit
+  └─ unpin
+
+  // NO write-through — dirty blocks flushed on eviction
+```
+
+## 9. Shutdown & Fallback Path
 
 PostgreSQL kills all `B_BG_WORKER` processes (including s3worker) in
 `PM_STOP_BACKENDS`, **before** the checkpointer performs its shutdown
-checkpoint in `PM_WAIT_XLOG_SHUTDOWN`. No `bgw_flags` value can change this
-ordering.
-
-This means `s3_writev`/`s3_readv` must handle three scenarios where
-s3worker is unavailable:
+checkpoint in `PM_WAIT_XLOG_SHUTDOWN`.
 
 | Scenario | Detection | Fallback |
 |---|---|---|
-| initdb (bootstrap + single-user) | `!IsUnderPostmaster` | Sync path |
-| Shutdown checkpoint | `is_s3worker_alive() == false` | Sync path |
-| s3worker crash | `is_s3worker_alive() == false` | Sync path |
+| initdb (bootstrap + single-user) | `!IsUnderPostmaster` | Direct `s3_ops` |
+| Shutdown checkpoint | `is_s3worker_alive() == false` | Direct `s3_ops` |
+| s3worker crash | `is_s3worker_alive() == false` | Direct `s3_ops` |
 
-### Synchronous local cache fallback (long-term)
+When cache is not initialized (initdb), reads/writes fall back to raw
+`read_blocks`/`write_blocks` directly on S3-sim files.
 
-When the async pipeline is unavailable, `s3_writev`/`s3_readv` perform
-**direct synchronous I/O** to the local cache file:
+## 10. Component Summary
 
-```
-s3worker alive?
-  ├── YES → async pipeline (submit queue → Tokio → S3 + local cache)
-  └── NO  → sync pwrite()/pread() to local cache file inline
-```
-
-The sync path:
-1. Looks up the slot via the shared memory hash index
-2. On write: `pwrite()` the page into the cache slot, mark dirty
-3. On read (cache hit): `pread()` from the cache slot
-4. On read (cache miss): zero-fill or error (S3 not reachable without Tokio)
-
-**No data loss** because:
-- Pages land in the local cache (persistent on local SSD)
-- WAL guarantees crash recoverability
-- On next startup, s3worker reconciles cache-dirty pages with S3
-
-**Note**: During initdb, the cache file and shared memory index may not
-exist yet. In this case the sync path falls back further to `md*` functions
-(which will eventually be removed once the cache is initialized before
-first use in all code paths).
-
-## 9. Component Summary
-
-| Component      | Location        | Structure                                        |
-|----------------|-----------------|--------------------------------------------------|
-| Slot data      | Local file      | `N x 8 KB` pre-allocated                        |
-| Slot metadata  | Shared memory   | `[tag, usage_count, dirty, pin_count]` per slot  |
-| Hash index     | Shared memory   | Fixed-size open-addressing, `2*N` entries, partitioned locks |
-| Clock hand     | Shared memory   | Single `AtomicU32`, CAS-advanced                 |
-| Dirty queue    | s3worker        | List of slots pending S3 upload                  |
-| S3 objects     | S3              | 1 MB chunks (128 blocks each)                    |
-
-## 10. Open Questions
-
-1. **Cache file: pre-allocated vs sparse?**
-   Pre-allocated avoids fragmentation but takes full space upfront.
-
-2. **S3 chunk size**: 1 MB is a reasonable default — should it be configurable?
-
-3. **Dirty flush trigger**: time-based (every N seconds), count-based
-   (every N dirty pages), or piggyback on PG checkpoints?
-
-4. **Hash table partition count**: 128 partitions is a reasonable default
-   for up to ~100 concurrent backends. Should scale with `MaxBackends`?
-
-5. **Prefetch strategy on read miss**: always fetch full 1 MB chunk, or
-   adaptive (fetch only requested block for random access patterns)?
+| Component      | Location              | Structure                                        |
+|----------------|-----------------------|--------------------------------------------------|
+| Control        | PG shared memory      | `CacheControl` (~16 bytes): num_slots, clock_hand |
+| Chunk data     | Local file            | `1024 x 256 KB` pre-allocated (`{DataDir}/pico/cache`, 256 MB) |
+| Slot metadata  | PG shared memory      | `[ChunkTag, valid_blocks, dirty_blocks, usage_count, pin_count]` per slot (~36 KB) |
+| Hash index     | PG shared memory      | Fixed-size open-addressing, 2048 entries (~52 KB) |
+| Partition locks| PG shared memory      | `AtomicRWLock[128]` (512 bytes)                   |
+| Clock hand     | PG shared memory      | Single `AtomicU32` in `CacheControl`              |
+| S3-sim files   | Local filesystem      | Per-relation files (`{DataDir}/pico/{spc}/{db}/{rel}.{fork}`) |

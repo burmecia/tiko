@@ -26,7 +26,7 @@ pub extern "C-unwind" fn s3_readv(
     for entry in &iov {
         let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
 
-        if let Err(errno) = s3_ops::read_blocks(
+        if let Err(errno) = s3_ops::cached_read_blocks(
             loc.spc_oid,
             loc.db_oid,
             loc.rel_number,

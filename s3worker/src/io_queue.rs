@@ -38,11 +38,15 @@
 //! S3IoControl (fixed size)
 //! ├── num_backend_pools, s3worker_pid, s3worker_latch
 //! ├── submit_queue (SubmitQueue)
-//! └── stats (S3IoStats)
+//! ├── stats (S3IoStats)
+//! └── cache (CacheControl)
 //! BackendSlotPool[0]  ← immediately after S3IoControl (aligned)
 //! BackendSlotPool[1]
 //! ...
 //! BackendSlotPool[MaxBackends-1]
+//! CacheSlotMeta[0..1024]      ← cache chunk slot metadata (~36 KB)
+//! CacheHashEntry[0..2048]     ← cache hash table (~52 KB)
+//! AtomicRWLock[0..128]        ← cache partition locks (512 bytes)
 //! ```
 
 use pgsys::{
@@ -56,6 +60,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc::error::TrySendError;
 
+use crate::cache::{
+    AtomicRWLock, CACHE_NUM_HASH_ENTRIES, CACHE_NUM_PARTITIONS, CACHE_NUM_SLOTS, CacheControl,
+    CacheHashEntry, CacheSlotMeta,
+};
 use crate::dispatcher::{Dispatcher, IoWorkRequest};
 
 // ── Constants ──
@@ -449,6 +457,8 @@ pub struct S3IoStats {
     pub total_writes: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
+    pub evictions: AtomicU64,
+    pub dirty_evictions: AtomicU64,
     pub s3_gets: AtomicU64,
     pub s3_puts: AtomicU64,
     pub queue_full_waits: AtomicU64,
@@ -460,9 +470,34 @@ impl S3IoStats {
         self.total_writes.store(0, Ordering::Relaxed);
         self.cache_hits.store(0, Ordering::Relaxed);
         self.cache_misses.store(0, Ordering::Relaxed);
+        self.evictions.store(0, Ordering::Relaxed);
+        self.dirty_evictions.store(0, Ordering::Relaxed);
         self.s3_gets.store(0, Ordering::Relaxed);
         self.s3_puts.store(0, Ordering::Relaxed);
         self.queue_full_waits.store(0, Ordering::Relaxed);
+    }
+
+    /// Log a summary of cache performance stats.
+    pub fn log_summary(&self) {
+        let hits = self.cache_hits.load(Ordering::Relaxed);
+        let misses = self.cache_misses.load(Ordering::Relaxed);
+        let total_lookups = hits + misses;
+        let hit_rate = if total_lookups > 0 {
+            hits as f64 / total_lookups as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        pgsys::logging::pg_log_info(&format!(
+            "s3worker cache stats: reads={} writes={} hits={} misses={} hit_rate={:.1}% evictions={} dirty_evictions={}",
+            self.total_reads.load(Ordering::Relaxed),
+            self.total_writes.load(Ordering::Relaxed),
+            hits,
+            misses,
+            hit_rate,
+            self.evictions.load(Ordering::Relaxed),
+            self.dirty_evictions.load(Ordering::Relaxed),
+        ));
     }
 }
 
@@ -486,6 +521,9 @@ pub struct S3IoControl {
     /// MPSC submission queue
     pub submit_queue: SubmitQueue,
 
+    /// Local cache control (slot count, clock hand for eviction)
+    pub cache: CacheControl,
+
     /// I/O statistics
     pub stats: S3IoStats,
 }
@@ -496,17 +534,25 @@ impl S3IoControl {
         self.s3worker_pid.store(0, Ordering::Relaxed);
         self.s3worker_latch.store(0, Ordering::Relaxed);
         self.submit_queue.init();
-        self.stats.init();
 
         // Initialize all backend pools
+        let pools_base = unsafe {
+            (self as *mut Self as *mut u8).add(Self::backend_pools_offset()) as *mut BackendSlotPool
+        };
         for i in 0..max_backends {
-            let pool = unsafe {
-                let base = (self as *mut Self as *mut u8).add(Self::backend_pools_offset())
-                    as *mut BackendSlotPool;
-                &mut *base.add(i)
-            };
-            pool.init();
+            unsafe { &mut *pools_base.add(i) }.init();
         }
+
+        // Initialize cache control + metadata arrays in shared memory
+        unsafe {
+            let base = self as *mut Self as *mut u8;
+            let slots = base.add(Self::slot_meta_offset(max_backends)) as *mut CacheSlotMeta;
+            let locks = base.add(Self::cache_locks_offset(max_backends)) as *mut AtomicRWLock;
+            let hash = base.add(Self::hash_entries_offset(max_backends)) as *mut CacheHashEntry;
+            self.cache.init(slots, hash, locks);
+        }
+
+        self.stats.init();
     }
 
     /// Byte offset from the start of S3IoControl to the first BackendSlotPool.
@@ -517,9 +563,34 @@ impl S3IoControl {
         (base + align - 1) & !(align - 1)
     }
 
-    /// Total shared memory size for the control structure + backend pools.
+    /// Byte offset to the slot metadata array (after backend pools).
+    fn slot_meta_offset(max_backends: usize) -> usize {
+        let after_pools =
+            Self::backend_pools_offset() + max_backends * std::mem::size_of::<BackendSlotPool>();
+        let align = std::mem::align_of::<CacheSlotMeta>();
+        (after_pools + align - 1) & !(align - 1)
+    }
+
+    /// Byte offset to the hash entries array (after slot metadata).
+    fn hash_entries_offset(max_backends: usize) -> usize {
+        let after_slots = Self::slot_meta_offset(max_backends)
+            + CACHE_NUM_SLOTS as usize * std::mem::size_of::<CacheSlotMeta>();
+        let align = std::mem::align_of::<CacheHashEntry>();
+        (after_slots + align - 1) & !(align - 1)
+    }
+
+    /// Byte offset to the partition locks array (after hash entries).
+    fn cache_locks_offset(max_backends: usize) -> usize {
+        let after_hash = Self::hash_entries_offset(max_backends)
+            + CACHE_NUM_HASH_ENTRIES as usize * std::mem::size_of::<CacheHashEntry>();
+        let align = std::mem::align_of::<AtomicRWLock>();
+        (after_hash + align - 1) & !(align - 1)
+    }
+
+    /// Total shared memory size for the control structure + backend pools + cache arrays.
     pub fn shmem_size(max_backends: usize) -> usize {
-        Self::backend_pools_offset() + max_backends * std::mem::size_of::<BackendSlotPool>()
+        Self::cache_locks_offset(max_backends)
+            + CACHE_NUM_PARTITIONS as usize * std::mem::size_of::<AtomicRWLock>()
     }
 
     /// Get the backend slot pool for a given proc number.
@@ -567,6 +638,11 @@ impl S3IoControl {
             .get()
             .map(|wrapper| unsafe { &*wrapper.0 })
             .expect("S3IoControl::get() called before init_or_attach()")
+    }
+
+    /// Check if shared memory has been initialized (i.e. init_or_attach has been called).
+    pub fn is_initialized() -> bool {
+        S3_IO_CONTROL.get().is_some()
     }
 
     /// Check if s3worker is alive by sending signal 0 to its PID.

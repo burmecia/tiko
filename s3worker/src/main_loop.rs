@@ -112,10 +112,16 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
             ));
         }
 
+        // Log cache stats periodically (every 10000 loops)
+        if loop_count % 10000 == 0 {
+            control.stats.log_summary();
+        }
+
         // Wait for new work or timeout
         wait_for_work();
     }
 
+    control.stats.log_summary();
     pg_log_info(&format!(
         "s3worker: shutting down (loops={}, requests={})",
         loop_count, requests_processed

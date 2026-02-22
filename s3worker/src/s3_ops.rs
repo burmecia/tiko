@@ -16,8 +16,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
-use pgsys::common::{BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber};
+use pgsys::common::{BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber, is_under_postmaster};
+
+use crate::{
+    cache::{BLOCKS_PER_CHUNK, ChunkTag},
+    io_queue::S3IoControl,
+};
 
 /// Build the local file path for a relation fork.
 ///
@@ -321,4 +327,174 @@ pub fn delete_file(
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(io_err_to_errno(&e)),
     }
+}
+
+// ── Cache-aware wrappers ──
+
+/// Cache-aware read. Checks the local cache before reading from the backing file.
+///
+/// Falls back to raw `read_blocks` when the cache is unavailable (initdb,
+/// single-user mode, before shared memory is initialized).
+///
+/// Uses chunk-level granularity: each cache slot holds 256 KB (32 blocks).
+/// On chunk hit, reads individual blocks from the cache. On chunk miss,
+/// allocates a new slot and prefetches the full chunk from S3-sim files.
+pub fn cached_read_blocks(
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_number: BlockNumber,
+    nblocks: BlockNumber,
+    buffer_ptr: *mut u8,
+) -> Result<BlockNumber, i32> {
+    if !S3IoControl::is_initialized() || !is_under_postmaster() {
+        return read_blocks(
+            spc_oid,
+            db_oid,
+            rel_number,
+            fork_number,
+            block_number,
+            nblocks,
+            buffer_ptr,
+        );
+    }
+    let control = S3IoControl::get();
+    let cache = &control.cache;
+    let stats = &control.stats;
+    stats.total_reads.fetch_add(nblocks as u64, Ordering::Relaxed);
+
+    for i in 0..nblocks {
+        let blkno = block_number + i;
+        let chunk_tag = ChunkTag::from_block(spc_oid, db_oid, rel_number, fork_number, blkno);
+        let block_offset = blkno % BLOCKS_PER_CHUNK;
+        let buf_offset = i as usize * BLCKSZ;
+        let buf = unsafe { std::slice::from_raw_parts_mut(buffer_ptr.add(buf_offset), BLCKSZ) };
+
+        if let Some(slot) = cache.lookup(&chunk_tag) {
+            // Chunk hit
+            stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+            cache.pin(slot);
+            if cache.is_block_valid(slot, block_offset) {
+                // Block is populated — read directly from cache
+                cache.read_block(slot, block_offset, buf);
+            } else {
+                // Block not yet populated in this chunk — read from S3-sim, populate cache
+                let blk_ptr = unsafe { buffer_ptr.add(buf_offset) };
+                read_blocks(spc_oid, db_oid, rel_number, fork_number, blkno, 1, blk_ptr)?;
+                cache.write_block(slot, block_offset, buf);
+                cache.set_block_valid(slot, block_offset);
+            }
+            cache.touch(slot);
+            cache.unpin(slot);
+        } else {
+            // Chunk miss — insert new chunk slot, prefetch full chunk from S3-sim
+            stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+            let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
+
+            // Prefetch: read as many blocks as possible from the S3-sim file
+            let chunk_start_blk = chunk_tag.chunk_id * BLOCKS_PER_CHUNK;
+            let file_nblks = file_nblocks(spc_oid, db_oid, rel_number, fork_number).unwrap_or(0);
+
+            if file_nblks > chunk_start_blk {
+                // How many blocks of this chunk exist in the file
+                let avail = std::cmp::min(BLOCKS_PER_CHUNK, file_nblks - chunk_start_blk);
+                let mut chunk_buf = vec![0u8; avail as usize * BLCKSZ];
+                if read_blocks(
+                    spc_oid,
+                    db_oid,
+                    rel_number,
+                    fork_number,
+                    chunk_start_blk,
+                    avail,
+                    chunk_buf.as_mut_ptr(),
+                )
+                .is_ok()
+                {
+                    // Write all fetched blocks into the cache slot
+                    cache.write_blocks_to_slot(slot, 0, avail, &chunk_buf);
+                    // Set valid bits for all fetched blocks
+                    let valid_mask = if avail >= 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << avail) - 1
+                    };
+                    cache.set_valid_blocks_mask(slot, valid_mask);
+                }
+            }
+
+            // Now read the requested block from the cache slot
+            if cache.is_block_valid(slot, block_offset) {
+                cache.read_block(slot, block_offset, buf);
+            } else {
+                // Block beyond file extent — zero-fill
+                buf.fill(0);
+            }
+
+            cache.touch(slot);
+            cache.unpin(slot);
+        }
+    }
+    Ok(nblocks)
+}
+
+/// Cache-aware write. Writes to the local cache only (write-back policy).
+///
+/// Falls back to raw `write_blocks` when the cache is unavailable (initdb).
+///
+/// Dirty blocks are flushed to S3-sim files on eviction — no write-through.
+pub fn cached_write_blocks(
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_number: BlockNumber,
+    nblocks: BlockNumber,
+    buffer_ptr: *const u8,
+) -> Result<BlockNumber, i32> {
+    if !S3IoControl::is_initialized() || !is_under_postmaster() {
+        return write_blocks(
+            spc_oid,
+            db_oid,
+            rel_number,
+            fork_number,
+            block_number,
+            nblocks,
+            buffer_ptr,
+        );
+    }
+    let control = S3IoControl::get();
+    let cache = &control.cache;
+    let stats = &control.stats;
+    stats.total_writes.fetch_add(nblocks as u64, Ordering::Relaxed);
+
+    for i in 0..nblocks {
+        let blkno = block_number + i;
+        let chunk_tag = ChunkTag::from_block(spc_oid, db_oid, rel_number, fork_number, blkno);
+        let block_offset = blkno % BLOCKS_PER_CHUNK;
+        let buf_offset = i as usize * BLCKSZ;
+        let buf = unsafe { std::slice::from_raw_parts(buffer_ptr.add(buf_offset), BLCKSZ) };
+
+        let slot = match cache.lookup(&chunk_tag) {
+            Some(slot) => {
+                stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                cache.pin(slot);
+                slot
+            }
+            None => {
+                // Chunk miss: allocate empty slot (don't fetch from S3-sim)
+                stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+                cache.insert(&chunk_tag) // returns pinned
+            }
+        };
+
+        cache.write_block(slot, block_offset, buf);
+        cache.set_block_valid(slot, block_offset);
+        cache.mark_dirty(slot, block_offset);
+        cache.touch(slot);
+        cache.unpin(slot);
+    }
+
+    // NO write-through — dirty blocks flushed on eviction
+    Ok(nblocks)
 }

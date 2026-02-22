@@ -27,7 +27,7 @@ pub extern "C-unwind" fn s3_writev(
     for entry in &iov {
         let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
 
-        if let Err(errno) = s3_ops::write_blocks(
+        if let Err(errno) = s3_ops::cached_write_blocks(
             loc.spc_oid,
             loc.db_oid,
             loc.rel_number,

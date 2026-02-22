@@ -28,3 +28,13 @@ pub fn acquire_lwlock_wait_until_free(lock: *mut LWLock) -> bool {
 pub fn release_lwlock(lock: *mut LWLock) {
     unsafe { LWLockRelease(lock) }
 }
+
+// ── LWLock tranche allocation ──
+// Used by extensions to allocate named groups of LWLocks in shared memory.
+
+use std::ffi::c_int;
+
+unsafe extern "C" {
+    pub fn RequestNamedLWLockTranche(tranche_name: *const i8, num_lwlocks: c_int);
+    pub fn GetNamedLWLockTranche(tranche_name: *const i8) -> *mut LWLock;
+}

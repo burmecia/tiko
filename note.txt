@@ -10,7 +10,7 @@
     --without-selinux
 
 # minimal build of PostgreSQL with only essential components
-./configure --prefix $(realpath ../)/target/pg-install \
+./configure --prefix $(realpath ../)/target/pg-install2 \
     --enable-debug \
     --enable-cassert \
     --without-readline \
@@ -34,3 +34,30 @@
     --disable-tap-tests \
     --disable-profiling \
     --disable-coverage
+
+
+CFLAGS="-Os" ./configure \
+  --prefix=$(realpath ../)/target/pg-install3 \
+  --without-icu \
+  --without-readline \
+  --without-zlib \
+  --without-llvm \
+  --without-perl \
+  --without-python \
+  --without-tcl \
+  --without-gssapi \
+  --without-pam \
+  --without-ldap \
+  --without-bonjour \
+  --without-systemd \
+  --without-selinux \
+  --without-libxml \
+  --without-libxslt \
+  --disable-nls \
+  --disable-dtrace \
+  --disable-tap-tests \
+  --disable-injection-points \
+  --with-system-tzdata=/usr/share/zoneinfo
+
+make -j$(nproc)
+make install-strip

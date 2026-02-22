@@ -170,3 +170,474 @@ Tokio threads **CANNOT**: call `ConditionVariable*`, `LWLock*`, `ereport`/`elog`
 - All PG-facing functions use `extern "C-unwind"` and `#[unsafe(no_mangle)]`
 - Shared memory pointers stored in `OnceLock<*mut T>` with Send/Sync wrapper types
 - PG hook chaining: always save and call `prev_*_hook` before installing custom hooks
+
+## PITR Support Design (7-Day Retention)
+
+### High-Level Architecture
+
+Since Pico already uses S3-backed storage for data files, PITR primarily requires:
+1. **WAL archiving to S3** with lifecycle policies
+2. **Metadata tracking** for recovery points
+3. **Restore coordination** using PostgreSQL's built-in recovery
+
+### Implementation Plan
+
+#### Phase 1: WAL Archiving to S3
+
+**1.1 Add WAL Archiver Module** (`s3worker/src/wal_archiver.rs`):
+
+```rust
+//! WAL archiver - uploads completed WAL segments to S3
+//!
+//! Integrates with PostgreSQL's archive_command to upload WAL files to S3
+//! with automatic lifecycle management (7-day retention).
+
+use std::path::Path;
+use tokio::fs;
+use aws_sdk_s3::Client as S3Client;
+
+pub struct WalArchiver {
+    s3_client: S3Client,
+    bucket: String,
+    prefix: String,  // e.g., "wal/{cluster_id}/"
+    retention_days: u32,
+}
+
+impl WalArchiver {
+    /// Archive a WAL segment to S3
+    pub async fn archive_segment(&self, wal_path: &Path) -> Result<(), String> {
+        let wal_filename = wal_path.file_name()
+            .ok_or("Invalid WAL path")?
+            .to_str()
+            .ok_or("Invalid filename")?;
+        
+        // S3 key: wal/{cluster_id}/{timeline}/{segment}
+        let s3_key = format!("{}{}", self.prefix, wal_filename);
+        
+        let body = fs::read(wal_path).await
+            .map_err(|e| format!("Failed to read WAL: {}", e))?;
+        
+        // Upload to S3 with lifecycle tag
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .body(body.into())
+            .tagging(&format!("retention-days={}", self.retention_days))
+            .send()
+            .await
+            .map_err(|e| format!("S3 upload failed: {}", e))?;
+        
+        Ok(())
+    }
+    
+    /// Restore a WAL segment from S3
+    pub async fn restore_segment(&self, wal_filename: &str, dest_path: &Path) -> Result<(), String> {
+        let s3_key = format!("{}{}", self.prefix, wal_filename);
+        
+        let response = self.s3_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+            .map_err(|e| format!("S3 download failed: {}", e))?;
+        
+        let body = response.body.collect().await
+            .map_err(|e| format!("Failed to read S3 body: {}", e))?
+            .into_bytes();
+        
+        fs::write(dest_path, &body).await
+            .map_err(|e| format!("Failed to write WAL: {}", e))?;
+        
+        Ok(())
+    }
+}
+```
+
+**1.2 PostgreSQL Configuration** (`postgresql.conf`):
+
+```ini
+# Enable WAL archiving
+wal_level = replica
+archive_mode = on
+archive_timeout = 300  # Force archive every 5 minutes
+
+# Archive command - calls Pico's WAL archiver
+archive_command = '/path/to/pico_archive %p %f'
+
+# For 7-day PITR, keep enough WAL locally too
+max_wal_size = 10GB
+min_wal_size = 1GB
+wal_keep_size = 1GB
+```
+
+**1.3 Archive Command Helper** (`pico_archive` binary):
+
+```rust
+// s3worker/src/bin/pico_archive.rs
+//! Archive command wrapper
+//! Usage: pico_archive <wal_path> <wal_filename>
+
+use tokio::runtime::Runtime;
+use s3worker::wal_archiver::WalArchiver;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: pico_archive <wal_path> <wal_filename>");
+        std::process::exit(1);
+    }
+    
+    let wal_path = &args[1];
+    let wal_filename = &args[2];
+    
+    let rt = Runtime::new().unwrap();
+    rt.block_on(async {
+        let archiver = WalArchiver::from_env();
+        match archiver.archive_segment(wal_path.as_ref()).await {
+            Ok(_) => {
+                // PostgreSQL expects exit code 0 on success
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Archive failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    });
+}
+```
+
+#### Phase 2: Continuous Base Backup Tracking
+
+**2.1 Add Snapshot Metadata Tracker** (`s3worker/src/snapshot.rs`):
+
+```rust
+//! Snapshot metadata for PITR
+//!
+//! Since Pico data files are already in S3-style local cache, we track
+//! "recovery points" rather than full backups.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RecoveryPoint {
+    pub timestamp: i64,  // Unix timestamp
+    pub wal_lsn: String,  // LSN at snapshot time (e.g., "0/3000000")
+    pub checkpoint_lsn: String,  // Last checkpoint LSN
+    pub timeline_id: u32,
+    pub cache_generation: u64,  // Cache generation number
+}
+
+pub struct SnapshotTracker {
+    s3_client: aws_sdk_s3::Client,
+    bucket: String,
+    prefix: String,  // e.g., "snapshots/{cluster_id}/"
+}
+
+impl SnapshotTracker {
+    /// Record a recovery point (called periodically, e.g., every hour)
+    pub async fn record_recovery_point(&self, point: &RecoveryPoint) -> Result<(), String> {
+        let key = format!("{}recovery_point_{}.json", self.prefix, point.timestamp);
+        
+        let json = serde_json::to_string_pretty(point)
+            .map_err(|e| format!("JSON error: {}", e))?;
+        
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(json.into_bytes().into())
+            .send()
+            .await
+            .map_err(|e| format!("S3 upload failed: {}", e))?;
+        
+        Ok(())
+    }
+    
+    /// List available recovery points within retention window
+    pub async fn list_recovery_points(&self, since: i64) -> Result<Vec<RecoveryPoint>, String> {
+        // List S3 objects with prefix, filter by timestamp
+        // Parse JSON and return sorted list
+        todo!()
+    }
+}
+```
+
+**2.2 Background Snapshot Task** (add to `s3worker`):
+
+```rust
+// In s3worker/src/main_loop.rs or new file
+
+use tokio::time::{interval, Duration};
+
+/// Periodic task to record recovery points
+pub async fn snapshot_task(tracker: Arc<SnapshotTracker>) {
+    let mut interval = interval(Duration::from_secs(3600)); // Every hour
+    
+    loop {
+        interval.tick().await;
+        
+        // Get current checkpoint LSN from PostgreSQL
+        let recovery_point = unsafe {
+            let lsn = pgsys::xlog::GetInsertRecPtr();
+            let checkpoint_lsn = pgsys::xlog::GetLastCheckpointRecPtr();
+            
+            RecoveryPoint {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+                wal_lsn: format!("{:X}/{:X}", 
+                    (lsn >> 32) as u32, 
+                    (lsn & 0xFFFFFFFF) as u32),
+                checkpoint_lsn: format!("{:X}/{:X}",
+                    (checkpoint_lsn >> 32) as u32,
+                    (checkpoint_lsn & 0xFFFFFFFF) as u32),
+                timeline_id: pgsys::xlog::GetRecoveryTargetTLI(),
+                cache_generation: CacheControl::global().generation(),
+            }
+        };
+        
+        if let Err(e) = tracker.record_recovery_point(&recovery_point).await {
+            eprintln!("Failed to record recovery point: {}", e);
+        }
+    }
+}
+```
+
+#### Phase 3: Cache Sync to S3
+
+**3.1 Add S3 Sync Logic** (extend `s3worker/src/s3_ops.rs`):
+
+```rust
+/// Upload dirty cache blocks to S3
+pub async fn sync_to_s3(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_num: BlockNumber,
+    data: &[u8],
+) -> Result<(), String> {
+    // S3 key: data/{spc_oid}/{db_oid}/{rel_number}.{fork}/{block_num}
+    let s3_key = format!(
+        "data/{}/{}/{}.{}/{}",
+        spc_oid, db_oid, rel_number, fork_number, block_num
+    );
+    
+    s3_client
+        .put_object()
+        .bucket(bucket)
+        .key(&s3_key)
+        .body(data.to_vec().into())
+        .send()
+        .await
+        .map_err(|e| format!("S3 upload failed: {}", e))?;
+    
+    Ok(())
+}
+
+/// Restore a block from S3 to local cache
+pub async fn restore_from_s3(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_num: BlockNumber,
+) -> Result<Vec<u8>, String> {
+    let s3_key = format!(
+        "data/{}/{}/{}.{}/{}",
+        spc_oid, db_oid, rel_number, fork_number, block_num
+    );
+    
+    let response = s3_client
+        .get_object()
+        .bucket(bucket)
+        .key(&s3_key)
+        .send()
+        .await
+        .map_err(|e| format!("S3 download failed: {}", e))?;
+    
+    let body = response.body.collect().await
+        .map_err(|e| format!("Failed to read S3 body: {}", e))?
+        .into_bytes();
+    
+    Ok(body.to_vec())
+}
+```
+
+**3.2 Checkpoint Hook** (integrate with PostgreSQL checkpoints):
+
+```rust
+// Add to s3worker initialization
+// need patch xlog.c CreateCheckPoint()
+unsafe extern "C" fn checkpoint_hook() {
+    // On checkpoint, flush dirty cache blocks to S3
+    // This ensures S3 has all committed data
+    
+    tokio::spawn(async {
+        // Scan cache for dirty blocks and upload
+        // Mark as clean after successful upload
+    });
+}
+```
+
+#### Phase 4: Recovery (Restore) Process
+
+**4.1 Restore Command Helper** (`pico_restore` binary):
+
+```rust
+// s3worker/src/bin/pico_restore.rs
+//! Restore command for archive recovery
+//! Usage: pico_restore %f %p
+
+use tokio::runtime::Runtime;
+use s3worker::wal_archiver::WalArchiver;
+use std::path::PathBuf;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: pico_restore <wal_filename> <dest_path>");
+        std::process::exit(1);
+    }
+    
+    let wal_filename = &args[1];
+    let dest_path = PathBuf::from(&args[2]);
+    
+    let rt = Runtime::new().unwrap();
+    rt.block_on(async {
+        let archiver = WalArchiver::from_env();
+        match archiver.restore_segment(wal_filename, &dest_path).await {
+            Ok(_) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("Restore failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    });
+}
+```
+
+**4.2 Recovery Configuration**:
+
+To restore to a point in time (within last 7 days):
+
+```bash
+# 1. Stop the database
+pg_ctl stop
+
+# 2. Clear local cache (will be rebuilt from S3)
+rm -rf $PGDATA/pico/cache*
+
+# 3. Configure recovery
+cat >> $PGDATA/postgresql.conf <<EOF
+restore_command = '/path/to/pico_restore %f %p'
+recovery_target_time = '2026-02-20 10:00:00'
+recovery_target_action = 'promote'
+EOF
+
+touch $PGDATA/recovery.signal
+
+# 4. Start recovery
+pg_ctl start
+
+# PostgreSQL will:
+# - Read checkpoint from pg_control
+# - Download WAL from S3 via restore_command
+# - Replay WAL until target time
+# - On cache miss, s3worker downloads blocks from S3
+```
+
+### S3 Lifecycle Policy (7-Day Retention)
+
+Configure S3 bucket lifecycle rules:
+
+```json
+{
+  "Rules": [
+    {
+      "Id": "ExpireOldWAL",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "wal/"
+      },
+      "Expiration": {
+        "Days": 7
+      }
+    },
+    {
+      "Id": "ExpireOldSnapshots",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "snapshots/"
+      },
+      "Expiration": {
+        "Days": 7
+      }
+    }
+  ]
+}
+```
+
+### Implementation Checklist
+
+```rust
+// Add to Cargo.toml dependencies:
+// [dependencies]
+// aws-config = "1.0"
+// aws-sdk-s3 = "1.0"
+// serde = { version = "1.0", features = ["derive"] }
+// serde_json = "1.0"
+```
+
+**Files to create:**
+- [ ] `s3worker/src/wal_archiver.rs` - WAL upload/download
+- [ ] `s3worker/src/snapshot.rs` - Recovery point tracking
+- [ ] `s3worker/src/s3_client.rs` - S3 client initialization
+- [ ] `s3worker/src/bin/pico_archive.rs` - Archive command binary
+- [ ] `s3worker/src/bin/pico_restore.rs` - Restore command binary
+
+**Files to modify:**
+- [ ] `s3worker/src/lib.rs` - Export new modules
+- [ ] `s3worker/src/main_loop.rs` - Add snapshot task
+- [ ] `s3worker/src/s3_ops.rs` - Add S3 sync functions
+- [ ] `postgres/src/test/modules/test_pico/test_pico.c` - Add PITR tests
+
+### Testing Plan
+
+```sql
+-- 1. Setup test database
+CREATE TABLE test_pitr (id int, data text, ts timestamp default now());
+INSERT INTO test_pitr VALUES (1, 'before', now());
+
+-- 2. Create restore point
+SELECT pg_create_restore_point('before_delete');
+
+-- 3. Make changes to recover from
+INSERT INTO test_pitr VALUES (2, 'deleted', now());
+DELETE FROM test_pitr WHERE id = 1;
+
+-- 4. Perform PITR to before_delete
+-- (follow recovery steps above)
+
+-- 5. Verify recovery
+SELECT * FROM test_pitr;  -- Should show id=1, not id=2
+```
+
+### Advantages of This Design
+
+1. **Minimal PostgreSQL patches** - Uses standard `archive_command`/`restore_command`
+2. **Leverages existing infra** - s3worker Tokio runtime handles S3 I/O
+3. **Simple retention** - S3 lifecycle policies handle cleanup automatically
+4. **No full backups needed** - Pico's block-level S3 storage + WAL = complete PITR
+5. **Fast recovery** - Only download blocks accessed during WAL replay
+
+This design provides 7-day PITR with minimal code changes and leverages PostgreSQL's battle-tested recovery mechanisms.

@@ -30,8 +30,10 @@ pub extern "C" fn s3worker_shmem_request() {
         RequestAddinShmemSpace(size);
 
         pg_log_debug1(&format!(
-            "s3worker: requested {} bytes shared memory ({} backend pools)",
-            size, max_backends
+            "s3worker: requested {} bytes shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
+            size,
+            max_backends,
+            crate::cache::CACHE_NUM_SLOTS
         ));
     }
 }
@@ -48,8 +50,9 @@ pub extern "C" fn s3worker_shmem_startup() {
         S3IoControl::init_or_attach(max_backends);
 
         pg_log_debug1(&format!(
-            "s3worker: initialized shared memory ({} backend pools)",
-            max_backends
+            "s3worker: initialized shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
+            max_backends,
+            crate::cache::CACHE_NUM_SLOTS
         ));
     }
 }

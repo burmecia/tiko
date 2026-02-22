@@ -45,7 +45,7 @@ async fn process_io_request(request: IoWorkRequest) {
     let (status, nblocks) = match slot.op {
         S3IoOpKind::Read => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *mut u8;
-            match s3_ops::read_blocks(
+            match s3_ops::cached_read_blocks(
                 slot.spc_oid,
                 slot.db_oid,
                 slot.rel_number,
@@ -60,7 +60,7 @@ async fn process_io_request(request: IoWorkRequest) {
         }
         S3IoOpKind::Write => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *const u8;
-            match s3_ops::write_blocks(
+            match s3_ops::cached_write_blocks(
                 slot.spc_oid,
                 slot.db_oid,
                 slot.rel_number,
