@@ -1,7 +1,5 @@
-use pgsys::{logging::pg_log_error, smgr::*};
+use pgsys::{common::INVALID_BLOCK_NUMBER, logging::pg_log_error, smgr::*};
 use s3worker::s3_ops;
-
-const INVALID_BLOCK_NUMBER: BlockNumber = 0xFFFFFFFF;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_extend(
