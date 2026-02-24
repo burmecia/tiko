@@ -535,7 +535,7 @@ impl CacheControl {
     /// If the evicted slot has dirty blocks, they are flushed to S3-sim files
     /// before the slot is returned.
     fn evict(&self) -> u32 {
-        for _ in 0..(self.num_slots * 2) {
+        for _ in 0..(self.num_slots * MAX_USAGE_COUNT as u32) {
             let slot_index = self.clock_hand.fetch_add(1, Ordering::Relaxed) % self.num_slots;
             let meta = self.slot_meta(slot_index);
 

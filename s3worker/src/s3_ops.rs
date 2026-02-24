@@ -18,7 +18,9 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use pgsys::common::{BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber, is_under_postmaster};
+use pgsys::common::{
+    BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber, is_under_postmaster,
+};
 
 use crate::{
     cache::{BLOCKS_PER_CHUNK, ChunkTag},
@@ -362,7 +364,9 @@ pub fn cached_read_blocks(
     let control = S3IoControl::get();
     let cache = &control.cache;
     let stats = &control.stats;
-    stats.total_reads.fetch_add(nblocks as u64, Ordering::Relaxed);
+    stats
+        .total_reads
+        .fetch_add(nblocks as u64, Ordering::Relaxed);
 
     for i in 0..nblocks {
         let blkno = block_number + i;
@@ -466,7 +470,9 @@ pub fn cached_write_blocks(
     let control = S3IoControl::get();
     let cache = &control.cache;
     let stats = &control.stats;
-    stats.total_writes.fetch_add(nblocks as u64, Ordering::Relaxed);
+    stats
+        .total_writes
+        .fetch_add(nblocks as u64, Ordering::Relaxed);
 
     for i in 0..nblocks {
         let blkno = block_number + i;
