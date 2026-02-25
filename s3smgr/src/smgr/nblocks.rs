@@ -3,8 +3,9 @@ use s3worker::s3_ops;
 
 /// Get the number of blocks stored in a relation fork.
 ///
-/// Unlike `mdnblocks` which iterates across segments and opens file
-/// descriptors, S3 uses a single file per fork — just `file_size / BLCKSZ`.
+/// Returns `max(file_nblocks, cache_max)` — the backing file may lag behind
+/// the cache under the write-back policy, so we must also check the cache for
+/// blocks that have been written but not yet evicted to the S3-sim file.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_nblocks(
     reln: *mut SMgrRelationData,
@@ -12,7 +13,7 @@ pub extern "C-unwind" fn s3_nblocks(
 ) -> BlockNumber {
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    match s3_ops::file_nblocks(loc.spc_oid, loc.db_oid, loc.rel_number, forknum) {
+    match s3_ops::cached_file_nblocks(loc.spc_oid, loc.db_oid, loc.rel_number, forknum) {
         Ok(n) => n,
         Err(errno) => {
             pg_log_error(&format!(

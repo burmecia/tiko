@@ -1,7 +1,7 @@
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use s3worker::{io_queue::S3IoOpKind, s3_ops};
 
-use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline};
+use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipeline};
 
 /// Common implementation for S3 AIO read/write.
 ///
@@ -35,7 +35,7 @@ unsafe fn s3_io_perform(
             let entry = &*iov.add(i);
             let entry_nblocks = (entry.iov_len / BLCKSZ) as u32;
 
-            let result = if crate::use_pipeline() {
+            let result = if use_pipeline() {
                 // Normal: submit to s3worker pipeline
                 pipeline::submit_and_wait_raw(
                     op,

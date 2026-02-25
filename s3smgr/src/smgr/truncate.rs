@@ -32,7 +32,7 @@ pub extern "C-unwind" fn s3_truncate(
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
     if let Err(errno) =
-        s3_ops::truncate_file(loc.spc_oid, loc.db_oid, loc.rel_number, forknum, nblocks)
+        s3_ops::cached_truncate_file(loc.spc_oid, loc.db_oid, loc.rel_number, forknum, nblocks)
     {
         pg_log_error(&format!(
             "s3_truncate: failed for rel {}/{}/{} fork {} nblocks {}: errno {}",

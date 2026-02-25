@@ -48,6 +48,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use pgsys::common::{BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber};
+use pgsys::logging::pg_log_debug1;
 
 // ── Constants ──
 
@@ -175,8 +176,11 @@ impl CacheSlotMeta {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HashStatus {
+    /// Slot was never occupied or has been fully reclaimed. Terminates probes.
     Empty = 0,
     Occupied = 1,
+    /// Slot was deleted (tombstone). Probes continue past it; inserts may reuse it.
+    Deleted = 2,
 }
 
 /// One entry in the open-addressing hash table (PG shared memory).
@@ -413,7 +417,8 @@ impl CacheControl {
             let status = entry.status.load(Ordering::Acquire);
 
             match status {
-                s if s == HashStatus::Empty as u8 => return None,
+                s if s == HashStatus::Empty as u8 => return None, // chain ends
+                s if s == HashStatus::Deleted as u8 => {}         // tombstone: keep probing
                 s if s == HashStatus::Occupied as u8 => {
                     if entry.tag == *tag {
                         return Some(entry.slot_index);
@@ -507,22 +512,43 @@ impl CacheControl {
         lock.write_lock();
 
         let mut idx = start;
+        let mut first_deleted: Option<u32> = None;
         for _ in 0..num_hash {
             let entry = self.hash_entry(idx);
             let status = entry.status.load(Ordering::Acquire);
 
             if status == HashStatus::Empty as u8 {
+                // Use the first tombstone slot if we passed one; else use this empty slot.
+                let target = first_deleted.unwrap_or(idx);
+                let target_entry = self.hash_entry(target);
                 unsafe {
-                    let entry_ptr = entry as *const CacheHashEntry as *mut CacheHashEntry;
+                    let entry_ptr = target_entry as *const CacheHashEntry as *mut CacheHashEntry;
                     (*entry_ptr).tag = *tag;
                     (*entry_ptr).slot_index = slot_index;
                 }
-                entry
+                target_entry
                     .status
                     .store(HashStatus::Occupied as u8, Ordering::Release);
                 break;
+            } else if status == HashStatus::Deleted as u8 && first_deleted.is_none() {
+                first_deleted = Some(idx);
             }
             idx = (idx + 1) % num_hash;
+        }
+        // If no Empty was found but we have a tombstone slot, use it (table is fully
+        // occupied + tombstoned with no Empty sentinel — rare but possible).
+        if let Some(target) = first_deleted {
+            let target_entry = self.hash_entry(target);
+            if target_entry.status.load(Ordering::Acquire) == HashStatus::Deleted as u8 {
+                unsafe {
+                    let entry_ptr = target_entry as *const CacheHashEntry as *mut CacheHashEntry;
+                    (*entry_ptr).tag = *tag;
+                    (*entry_ptr).slot_index = slot_index;
+                }
+                target_entry
+                    .status
+                    .store(HashStatus::Occupied as u8, Ordering::Release);
+            }
         }
 
         lock.write_unlock();
@@ -560,7 +586,7 @@ impl CacheControl {
             let usage = meta.usage_count.load(Ordering::Relaxed);
             if usage > 0 {
                 meta.usage_count.store(usage - 1, Ordering::Relaxed);
-                meta.pin_count.store(0, Ordering::Release);
+                meta.pin_count.fetch_sub(1, Ordering::Release);
                 continue;
             }
 
@@ -579,11 +605,7 @@ impl CacheControl {
                 .evictions
                 .fetch_add(1, Ordering::Relaxed);
 
-            self.remove_from_hash_table(&meta.tag);
-
-            meta.valid_blocks.store(0, Ordering::Release);
-            meta.dirty_blocks.store(0, Ordering::Relaxed);
-            meta.usage_count.store(0, Ordering::Relaxed);
+            self.reset_slot(slot_index);
 
             return slot_index;
         }
@@ -591,7 +613,14 @@ impl CacheControl {
         panic!("cache eviction failed: no evictable slot found after full sweep");
     }
 
-    fn remove_from_hash_table(&self, tag: &ChunkTag) {
+    /// Reset a cache slot: remove it from the hash table and clear its metadata.
+    ///
+    /// Caller must hold the slot pin to ensure exclusive access.
+    fn reset_slot(&self, slot_index: u32) {
+        let meta = self.slot_meta(slot_index);
+        let tag = meta.tag;
+
+        // 1. Remove from hash table
         let num_hash = self.num_hash_entries;
         let hash = tag.hash();
         let start = hash % num_hash;
@@ -607,11 +636,13 @@ impl CacheControl {
 
             match status {
                 s if s == HashStatus::Empty as u8 => break,
+                s if s == HashStatus::Deleted as u8 => {} // keep probing through tombstones
                 s if s == HashStatus::Occupied as u8 => {
-                    if entry.tag == *tag {
+                    if entry.tag == tag {
+                        // Leave a tombstone so probes through this slot continue.
                         entry
                             .status
-                            .store(HashStatus::Empty as u8, Ordering::Release);
+                            .store(HashStatus::Deleted as u8, Ordering::Release);
                         break;
                     }
                 }
@@ -621,6 +652,11 @@ impl CacheControl {
         }
 
         lock.write_unlock();
+
+        // 2. Clear metadata
+        meta.valid_blocks.store(0, Ordering::Release);
+        meta.dirty_blocks.store(0, Ordering::Relaxed);
+        meta.usage_count.store(0, Ordering::Relaxed);
     }
 
     // ── Cache file I/O ──
@@ -709,5 +745,227 @@ impl CacheControl {
             }
         }
         meta.dirty_blocks.store(0, Ordering::Release);
+    }
+
+    /// Scan all cache slots to find the highest block number for a relation fork.
+    ///
+    /// Returns 0 if no blocks for this relation are found in the cache.
+    /// The return value is an exclusive upper bound (i.e. nblocks, not max block index).
+    ///
+    /// Pinned slots (mid-I/O) are skipped without spinning — their contribution is
+    /// either already reflected on disk or will be seen in a future call. The caller
+    /// (`cached_file_nblocks`) always takes `max(disk_nblocks, cache_max)`, so
+    /// skipping a pinned slot is safe for correctness.
+    pub fn max_block_for_relation(
+        &self,
+        spc_oid: Oid,
+        db_oid: Oid,
+        rel_number: RelFileNumber,
+        fork_number: ForkNumber,
+    ) -> BlockNumber {
+        let mut nblocks: BlockNumber = 0;
+
+        for i in 0..self.num_slots {
+            let meta = self.slot_meta(i);
+
+            // Fast pre-filter: skip empty slots without paying for a CAS.
+            let preflight = meta.valid_blocks.load(Ordering::Acquire);
+            if preflight == 0 {
+                continue;
+            }
+
+            // Pin the slot to prevent concurrent eviction/re-insert between the
+            // valid_blocks check above and the tag read below. Without this pin a
+            // concurrent evict() + insert() could replace the tag while we still
+            // hold a stale non-zero valid_blocks observation (TOCTOU), and the
+            // 20-byte ChunkTag struct read would be non-atomic.
+            // Skip without spinning if already pinned — mid-I/O is best-effort.
+            if meta
+                .pin_count
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+
+            // Re-load valid_blocks now that we hold the pin — eviction is blocked.
+            let valid = meta.valid_blocks.load(Ordering::Acquire);
+            if valid != 0 {
+                let tag = &meta.tag;
+                if tag.spc_oid == spc_oid
+                    && tag.db_oid == db_oid
+                    && tag.rel_number == rel_number
+                    && tag.fork_number == fork_number
+                {
+                    // ilog2: position of the highest set bit (panics on 0, safe here).
+                    let highest_bit = valid.ilog2();
+                    let chunk_high = tag.chunk_id * BLOCKS_PER_CHUNK + highest_bit;
+                    nblocks = std::cmp::max(nblocks, chunk_high + 1);
+                }
+            }
+
+            meta.pin_count.fetch_sub(1, Ordering::Release);
+        }
+
+        nblocks
+    }
+
+    /// Flush all dirty chunks to backing files.
+    ///
+    /// Iterates every slot and flushes any with `dirty_blocks != 0`. Spins on
+    /// pinned slots so no dirty block escapes (safe because pins are held only
+    /// for the duration of a single cache I/O and released promptly).
+    ///
+    /// Called from:
+    /// - `s3_checkpoint_flush()` — end of every checkpoint, after buffer pool flush
+    /// - `s3_shutdown()` — smgr shutdown hook (process exit)
+    pub fn flush_all_dirty_chunks(&self) {
+        let mut flushed_count = 0;
+
+        for i in 0..self.num_slots {
+            let meta = self.slot_meta(i);
+
+            // Fast pre-filter: skip clean slots without paying for a CAS.
+            if meta.dirty_blocks.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+
+            // Spin until we can pin the slot exclusively.
+            loop {
+                if meta
+                    .pin_count
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            // Re-check under pin — another flusher may have beaten us here.
+            if meta.dirty_blocks.load(Ordering::Acquire) != 0 {
+                self.flush_dirty_chunk(i);
+                flushed_count += 1;
+            }
+
+            meta.pin_count.fetch_sub(1, Ordering::Release);
+        }
+
+        pg_log_debug1(&format!(
+            "flush_all_dirty_chunks: flushed {} chunk(s)",
+            flushed_count
+        ));
+    }
+
+    /// Flush all dirty chunks belonging to a specific relation fork.
+    ///
+    /// Called from `s3_immedsync()` when PostgreSQL requests an immediate
+    /// sync for a relation (e.g. `smgrdosyncall` during explicit buffer flush).
+    pub fn flush_dirty_chunks_for_relation(
+        &self,
+        spc_oid: Oid,
+        db_oid: Oid,
+        rel_number: RelFileNumber,
+        fork_number: ForkNumber,
+    ) {
+        for i in 0..self.num_slots {
+            let meta = self.slot_meta(i);
+
+            // Fast pre-filter: skip empty or clean slots.
+            if meta.valid_blocks.load(Ordering::Acquire) == 0
+                || meta.dirty_blocks.load(Ordering::Acquire) == 0
+            {
+                continue;
+            }
+
+            // Spin to pin — same rationale as flush_all_dirty_chunks.
+            loop {
+                if meta
+                    .pin_count
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            // Re-check tag and dirty under pin.
+            let tag = &meta.tag;
+            if tag.spc_oid == spc_oid
+                && tag.db_oid == db_oid
+                && tag.rel_number == rel_number
+                && tag.fork_number == fork_number
+                && meta.dirty_blocks.load(Ordering::Acquire) != 0
+            {
+                self.flush_dirty_chunk(i);
+            }
+
+            meta.pin_count.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Invalidate cache slots for a relation fork starting from `first_block`.
+    ///
+    /// Used by truncate and unlink to ensure the cache doesn't return stale data
+    /// or "ghost" blocks beyond the new EOF.
+    pub fn invalidate_range(
+        &self,
+        spc_oid: Oid,
+        db_oid: Oid,
+        rel_number: RelFileNumber,
+        fork_number: ForkNumber,
+        first_block: BlockNumber,
+    ) {
+        for i in 0..self.num_slots {
+            let meta = self.slot_meta(i);
+
+            // Preflight: skip empty slots without a CAS.
+            if meta.valid_blocks.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+
+            // Spin until we acquire exclusive access (pin_count CAS 0 → 1).
+            // Pinners hold the pin briefly (cache I/O only, no sleeping), so
+            // an unbounded spin is safe and avoids skipping slots that need
+            // invalidation — skipping would leave stale blocks in the cache.
+            loop {
+                if meta
+                    .pin_count
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            // Re-check valid_blocks now that we hold the pin — eviction is blocked.
+            let valid = meta.valid_blocks.load(Ordering::Acquire);
+            let tag = &meta.tag;
+
+            if valid != 0
+                && tag.spc_oid == spc_oid
+                && tag.db_oid == db_oid
+                && tag.rel_number == rel_number
+                && tag.fork_number == fork_number
+            {
+                let chunk_start = tag.chunk_id * BLOCKS_PER_CHUNK;
+                let chunk_end = chunk_start + BLOCKS_PER_CHUNK;
+
+                if chunk_start >= first_block {
+                    // Whole chunk is truncated — remove from hash table and reset
+                    self.reset_slot(i);
+                } else if first_block < chunk_end {
+                    // Partial chunk truncation
+                    let offset = first_block - chunk_start;
+                    let mask = !((!0u32) << offset); // bits 0..offset-1 remain valid
+                    meta.valid_blocks.fetch_and(mask, Ordering::Release);
+                    meta.dirty_blocks.fetch_and(mask, Ordering::Release);
+                }
+            }
+
+            meta.pin_count.fetch_sub(1, Ordering::Release);
+        }
     }
 }

@@ -1,7 +1,7 @@
 use pgsys::smgr::*;
 use s3worker::io_queue::S3IoOpKind;
 
-use crate::pipeline;
+use crate::{pipeline, use_pipeline};
 
 /// Initiate asynchronous prefetch of blocks.
 ///
@@ -14,7 +14,7 @@ pub extern "C-unwind" fn s3_prefetch(
     blocknum: BlockNumber,
     nblocks: i32,
 ) -> bool {
-    if !crate::use_pipeline() {
+    if !use_pipeline() {
         return true;
     }
 

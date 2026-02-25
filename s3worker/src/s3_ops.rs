@@ -27,6 +27,19 @@ use crate::{
     io_queue::S3IoControl,
 };
 
+/// True when the shared-memory cache is reachable from this process.
+///
+/// Requires both conditions:
+/// - `is_under_postmaster()` — false during initdb (`--boot`/`--single`) where
+///   `MyProcNumber` is invalid and S3IoControl was never sized via
+///   `shmem_request_hook`.
+/// - `S3IoControl::is_initialized()` — false if the shmem startup hook has not
+///   yet run in this process (e.g. very early in backend startup).
+#[inline]
+fn cache_is_available() -> bool {
+    is_under_postmaster() && S3IoControl::is_initialized()
+}
+
 /// Build the local file path for a relation fork.
 ///
 /// Layout: `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
@@ -118,6 +131,34 @@ pub fn file_nblocks(
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
         Err(e) => Err(io_err_to_errno(&e)),
     }
+}
+
+/// Cache-aware block count. Returns `max(file_nblocks, cache_max)`.
+///
+/// With the write-back cache, `cached_write_blocks` does not extend the
+/// S3-sim backing file immediately — dirty blocks stay in the cache until
+/// eviction. So `file_nblocks` alone would return a stale (smaller) count
+/// for relations that have been extended but not yet evicted.
+///
+/// Falls back to `file_nblocks` when the cache is unavailable (initdb).
+pub fn cached_file_nblocks(
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+) -> Result<BlockNumber, i32> {
+    let disk = file_nblocks(spc_oid, db_oid, rel_number, fork_number)?;
+
+    if !cache_is_available() {
+        return Ok(disk);
+    }
+
+    let cache_max =
+        S3IoControl::get()
+            .cache
+            .max_block_for_relation(spc_oid, db_oid, rel_number, fork_number);
+
+    Ok(disk.max(cache_max))
 }
 
 /// Read blocks from a relation data file into a buffer.
@@ -253,6 +294,11 @@ pub fn write_blocks(
 /// the extended region. Creates the file and parent directories if
 /// they don't exist (matching `mdzeroextend`'s `EXTENSION_CREATE`).
 ///
+/// Never shrinks the file: if the file is already at or beyond the target
+/// size (e.g. during WAL replay or after async cache eviction), this is
+/// a no-op. `set_len` / `ftruncate` would otherwise silently truncate,
+/// discarding data — unlike `mdzeroextend` which only ever grows the file.
+///
 /// # Returns
 /// - `Ok(())` on success
 /// - `Err(errno)` on failure
@@ -277,7 +323,11 @@ pub fn zeroextend_file(
         .map_err(|e| io_err_to_errno(&e))?;
 
     let new_len = (block_number as u64 + nblocks as u64) * BLCKSZ as u64;
-    file.set_len(new_len).map_err(|e| io_err_to_errno(&e))
+    let current_len = file.metadata().map_err(|e| io_err_to_errno(&e))?.len();
+    if new_len > current_len {
+        file.set_len(new_len).map_err(|e| io_err_to_errno(&e))?;
+    }
+    Ok(())
 }
 
 /// Truncate a relation fork file to the given number of blocks.
@@ -308,6 +358,34 @@ pub fn truncate_file(
     file.set_len(new_len).map_err(|e| io_err_to_errno(&e))
 }
 
+/// Cache-aware truncate. Invalidates cache blocks at or beyond `nblocks`
+/// BEFORE shrinking the backing file.
+///
+/// Order matters: invalidating first prevents a dirty block in the truncated
+/// range from being flushed by `flush_dirty_chunk` after `truncate_file`
+/// has shrunk the file — which would silently re-extend it via `pwrite`.
+///
+/// Falls back to raw `truncate_file` when the cache is unavailable (initdb).
+pub fn cached_truncate_file(
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    nblocks: BlockNumber,
+) -> Result<(), i32> {
+    if cache_is_available() {
+        S3IoControl::get().cache.invalidate_range(
+            spc_oid,
+            db_oid,
+            rel_number,
+            fork_number,
+            nblocks,
+        );
+    }
+
+    truncate_file(spc_oid, db_oid, rel_number, fork_number, nblocks)
+}
+
 /// Delete a relation fork file.
 ///
 /// Silently ignores ENOENT — the file may not exist (e.g. non-main forks
@@ -331,6 +409,32 @@ pub fn delete_file(
     }
 }
 
+/// Cache-aware delete. Invalidates ALL cache blocks for the relation fork
+/// BEFORE removing the backing file.
+///
+/// Order matters: invalidating first prevents dirty blocks from being
+/// flushed by `flush_dirty_chunk` after the file is gone — which would
+/// silently recreate it via `write_blocks`'s `create(true)` open flag.
+/// It also prevents stale cache hits if the same `rel_number` is later
+/// reused for a new relation.
+///
+/// Falls back to raw `delete_file` when the cache is unavailable (initdb).
+pub fn cached_delete_file(
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+) -> Result<(), i32> {
+    if cache_is_available() {
+        // first_block=0 invalidates every chunk for this fork
+        S3IoControl::get()
+            .cache
+            .invalidate_range(spc_oid, db_oid, rel_number, fork_number, 0);
+    }
+
+    delete_file(spc_oid, db_oid, rel_number, fork_number)
+}
+
 // ── Cache-aware wrappers ──
 
 /// Cache-aware read. Checks the local cache before reading from the backing file.
@@ -350,7 +454,7 @@ pub fn cached_read_blocks(
     nblocks: BlockNumber,
     buffer_ptr: *mut u8,
 ) -> Result<BlockNumber, i32> {
-    if !S3IoControl::is_initialized() || !is_under_postmaster() {
+    if !cache_is_available() {
         return read_blocks(
             spc_oid,
             db_oid,
@@ -456,7 +560,7 @@ pub fn cached_write_blocks(
     nblocks: BlockNumber,
     buffer_ptr: *const u8,
 ) -> Result<BlockNumber, i32> {
-    if !S3IoControl::is_initialized() || !is_under_postmaster() {
+    if !cache_is_available() {
         return write_blocks(
             spc_oid,
             db_oid,
@@ -502,5 +606,92 @@ pub fn cached_write_blocks(
     }
 
     // NO write-through — dirty blocks flushed on eviction
+    Ok(nblocks)
+}
+
+/// Warm the cache for a block range without copying data to a caller buffer.
+///
+/// Iterates chunk-by-chunk over the requested range. For each chunk:
+/// - **Cache hit**: pin, touch, unpin — data is already present.
+/// - **Cache miss**: insert an empty slot (pinned), prefetch the full chunk
+///   from the S3-sim backing file, mark the loaded blocks valid, then unpin.
+///
+/// This is the backend of `S3IoOpKind::Prefetch` — it allows subsequent
+/// `cached_read_blocks` calls to be served entirely from the cache.
+///
+/// No-op (returns `Ok(0)`) when the cache is unavailable (initdb,
+/// single-user mode).
+pub fn warm_cache_blocks(
+    spc_oid: Oid,
+    db_oid: Oid,
+    rel_number: RelFileNumber,
+    fork_number: ForkNumber,
+    block_number: BlockNumber,
+    nblocks: BlockNumber,
+) -> Result<BlockNumber, i32> {
+    if !cache_is_available() {
+        return Ok(0);
+    }
+
+    let control = S3IoControl::get();
+    let cache = &control.cache;
+    let stats = &control.stats;
+
+    let first_chunk = block_number / BLOCKS_PER_CHUNK;
+    let last_chunk = (block_number + nblocks - 1) / BLOCKS_PER_CHUNK;
+
+    // One call to file_nblocks covers all chunks in the range.
+    let file_nblks = file_nblocks(spc_oid, db_oid, rel_number, fork_number).unwrap_or(0);
+
+    for chunk_id in first_chunk..=last_chunk {
+        let chunk_tag = ChunkTag {
+            spc_oid,
+            db_oid,
+            rel_number,
+            fork_number,
+            chunk_id,
+        };
+
+        if let Some(slot) = cache.lookup(&chunk_tag) {
+            // Already cached — just refresh the usage count.
+            stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+            cache.pin(slot);
+            cache.touch(slot);
+            cache.unpin(slot);
+        } else {
+            // Cache miss — insert empty slot and populate from S3-sim.
+            stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+            let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
+
+            let chunk_start_blk = chunk_id * BLOCKS_PER_CHUNK;
+            if file_nblks > chunk_start_blk {
+                let avail = BLOCKS_PER_CHUNK.min(file_nblks - chunk_start_blk);
+                let mut chunk_buf = vec![0u8; avail as usize * BLCKSZ];
+                if read_blocks(
+                    spc_oid,
+                    db_oid,
+                    rel_number,
+                    fork_number,
+                    chunk_start_blk,
+                    avail,
+                    chunk_buf.as_mut_ptr(),
+                )
+                .is_ok()
+                {
+                    cache.write_blocks_to_slot(slot, 0, avail, &chunk_buf);
+                    let valid_mask = if avail >= BLOCKS_PER_CHUNK {
+                        u32::MAX
+                    } else {
+                        (1u32 << avail) - 1
+                    };
+                    cache.set_valid_blocks_mask(slot, valid_mask);
+                }
+            }
+
+            cache.touch(slot);
+            cache.unpin(slot);
+        }
+    }
+
     Ok(nblocks)
 }

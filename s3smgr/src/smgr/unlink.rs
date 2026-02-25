@@ -31,7 +31,8 @@ pub extern "C-unwind" fn s3_unlink(
 fn unlink_fork(rlocator: *mut RelFileLocatorBackend, forknum: ForkNumber) {
     let loc = unsafe { &(*rlocator).locator };
 
-    if let Err(errno) = s3_ops::delete_file(loc.spc_oid, loc.db_oid, loc.rel_number, forknum) {
+    if let Err(errno) = s3_ops::cached_delete_file(loc.spc_oid, loc.db_oid, loc.rel_number, forknum)
+    {
         pg_log_warning(&format!(
             "s3_unlink: could not remove rel {}/{}/{} fork {}: errno {}",
             loc.spc_oid, loc.db_oid, loc.rel_number, forknum, errno

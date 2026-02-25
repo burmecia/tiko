@@ -19,7 +19,7 @@ pub extern "C-unwind" fn s3_extend(
         return;
     }
 
-    if let Err(errno) = s3_ops::write_blocks(
+    if let Err(errno) = s3_ops::cached_write_blocks(
         loc.spc_oid,
         loc.db_oid,
         loc.rel_number,

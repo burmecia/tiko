@@ -410,84 +410,53 @@ pub async fn snapshot_task(tracker: Arc<SnapshotTracker>) {
 
 #### Phase 3: Cache Sync to S3
 
-**3.1 Add S3 Sync Logic** (extend `s3worker/src/s3_ops.rs`):
+**Status: checkpoint flush is implemented; real S3 client is future work.**
+
+The cache currently uses local S3-sim files as the backing store
+(`{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`). Dirty cache
+blocks are flushed to these files at checkpoint time. When a real S3 client
+is added, `s3_ops::write_blocks` and `read_blocks` will be replaced with
+S3 PUT/GET calls.
+
+**3.1 Checkpoint Flush** (`s3smgr/src/checkpoint.rs`) — **already implemented**:
 
 ```rust
-/// Upload dirty cache blocks to S3
-pub async fn sync_to_s3(
-    s3_client: &aws_sdk_s3::Client,
-    bucket: &str,
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-    block_num: BlockNumber,
-    data: &[u8],
-) -> Result<(), String> {
-    // S3 key: data/{spc_oid}/{db_oid}/{rel_number}.{fork}/{block_num}
-    let s3_key = format!(
-        "data/{}/{}/{}.{}/{}",
-        spc_oid, db_oid, rel_number, fork_number, block_num
-    );
-    
-    s3_client
-        .put_object()
-        .bucket(bucket)
-        .key(&s3_key)
-        .body(data.to_vec().into())
-        .send()
-        .await
-        .map_err(|e| format!("S3 upload failed: {}", e))?;
-    
-    Ok(())
-}
-
-/// Restore a block from S3 to local cache
-pub async fn restore_from_s3(
-    s3_client: &aws_sdk_s3::Client,
-    bucket: &str,
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-    block_num: BlockNumber,
-) -> Result<Vec<u8>, String> {
-    let s3_key = format!(
-        "data/{}/{}/{}.{}/{}",
-        spc_oid, db_oid, rel_number, fork_number, block_num
-    );
-    
-    let response = s3_client
-        .get_object()
-        .bucket(bucket)
-        .key(&s3_key)
-        .send()
-        .await
-        .map_err(|e| format!("S3 download failed: {}", e))?;
-    
-    let body = response.body.collect().await
-        .map_err(|e| format!("Failed to read S3 body: {}", e))?
-        .into_bytes();
-    
-    Ok(body.to_vec())
+/// Called from CheckPointGuts() in xlog.c after CheckPointBuffers().
+/// Flushes all dirty cache chunks to the S3-sim backing files before
+/// the checkpoint WAL record is written.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn s3_checkpoint_flush() {
+    if !S3IoControl::is_initialized() {
+        return;
+    }
+    S3IoControl::get().cache.flush_all_dirty_chunks();
 }
 ```
 
-**3.2 Checkpoint Hook** (integrate with PostgreSQL checkpoints):
+`flush_all_dirty_chunks` scans every cache slot, spins to pin each dirty
+slot exclusively, calls `flush_dirty_chunk` (which reads each dirty block
+from the cache file and writes it to the backing relation file via
+`s3_ops::write_blocks`), clears `dirty_blocks`, then unpins. This is a
+synchronous, blocking flush — it runs on the checkpointer process main thread
+before the checkpoint WAL record is written.
 
-```rust
-// Add to s3worker initialization
-// need patch xlog.c CreateCheckPoint()
-unsafe extern "C" fn checkpoint_hook() {
-    // On checkpoint, flush dirty cache blocks to S3
-    // This ensures S3 has all committed data
-    
-    tokio::spawn(async {
-        // Scan cache for dirty blocks and upload
-        // Mark as clean after successful upload
-    });
-}
+`s3_shutdown` (smgr shutdown hook) is **intentionally empty**: by the time it
+fires, the shutdown checkpoint has already flushed all dirty chunks.
+
+**3.2 Future: Replace S3-sim with real S3** (modify `s3worker/src/s3_ops.rs`):
+
+Chunk granularity is 256 KB (32 blocks). The S3 key layout mirrors the local
+path structure but uses `chunk_id` as the object key suffix:
+
 ```
+S3 key:   {spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}
+Local:    {DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}
+```
+
+`read_blocks` becomes a S3 GET for the chunk containing the requested block;
+`write_blocks` (called from `flush_dirty_chunk` on eviction or checkpoint)
+becomes a S3 PUT. The cache layer above is unchanged — it operates in terms
+of `read_blocks`/`write_blocks` regardless of the backing store.
 
 #### Phase 4: Recovery (Restore) Process
 

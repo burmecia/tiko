@@ -1,5 +1,6 @@
 mod aio;
 pub(crate) mod buffers;
+mod checkpoint;
 mod pipeline;
 mod smgr;
 
@@ -14,7 +15,7 @@ pub(crate) static mut WAIT_EVENT_S3_IO_WRITE: u32 = 0;
 /// (s3worker already terminated), or s3worker crash — callers should fall
 /// back to direct `s3_ops` calls.
 pub(crate) fn use_pipeline() -> bool {
-    use pgsys::common::is_under_postmaster;
+    use pgsys::smgr::is_under_postmaster;
     use s3worker::io_queue::S3IoControl;
     is_under_postmaster() && S3IoControl::get().is_s3worker_alive()
 }

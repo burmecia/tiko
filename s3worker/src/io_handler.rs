@@ -96,16 +96,21 @@ async fn process_io_request(request: IoWorkRequest) {
             }
         }
         S3IoOpKind::Prefetch => {
-            // TODO: warm the local cache by fetching blocks from S3.
-            // On cache miss: issue S3 GET for the requested block range,
-            // write the fetched data into the local cache file. On cache
-            // hit: no-op. This allows subsequent s3_readv calls to hit
-            // the cache instead of going to S3.
-            (0u32, 0u32)
+            match s3_ops::warm_cache_blocks(
+                slot.spc_oid,
+                slot.db_oid,
+                slot.rel_number,
+                slot.fork_number,
+                slot.block_number,
+                slot.nblocks,
+            ) {
+                Ok(n) => (0u32, n),
+                Err(errno) => (errno as u32, 0u32),
+            }
         }
         S3IoOpKind::Truncate => {
             // Target nblocks is stored in block_number
-            match s3_ops::truncate_file(
+            match s3_ops::cached_truncate_file(
                 slot.spc_oid,
                 slot.db_oid,
                 slot.rel_number,
@@ -117,8 +122,12 @@ async fn process_io_request(request: IoWorkRequest) {
             }
         }
         S3IoOpKind::Unlink => {
-            match s3_ops::delete_file(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number)
-            {
+            match s3_ops::cached_delete_file(
+                slot.spc_oid,
+                slot.db_oid,
+                slot.rel_number,
+                slot.fork_number,
+            ) {
                 Ok(()) => (0u32, 0u32),
                 Err(errno) => (errno as u32, 0u32),
             }
