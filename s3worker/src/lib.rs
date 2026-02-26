@@ -8,7 +8,6 @@ mod io_handler;
 mod main_loop;
 mod shmem;
 mod thread_pool;
-mod wait_events;
 
 use pgsys::{
     bgworker::*,

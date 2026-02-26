@@ -15,13 +15,13 @@ use pgsys::{
     cshim::check_for_interrupts,
     latch::*,
     logging::*,
+    wait_events::new_wait_event,
 };
 
 use crate::dispatcher::Dispatcher;
 use crate::io_handler;
 use crate::io_queue::S3IoControl;
 use crate::thread_pool;
-use crate::wait_events::*;
 
 /// Global flags for managing worker lifecycle and configuration
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -51,13 +51,20 @@ fn setup_signal_handlers() {
     pg_log_info("s3worker: signal handlers installed");
 }
 
+/// Wait event identifier for s3worker main loop
+static mut WAIT_EVENT_S3WORKER_MAIN: u32 = 0;
+
 /// Main event loop for s3worker
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
     pg_log_info("s3worker: main loop starting");
 
     setup_signal_handlers();
-    init_wait_events();
+
+    // Initialize wait event identifiers for this worker
+    unsafe {
+        WAIT_EVENT_S3WORKER_MAIN = new_wait_event(c"S3WorkerMain".as_ptr());
+    }
 
     // Initialize Tokio runtime for async I/O
     if let Err(e) = crate::thread_pool::init_tokio_runtime() {
@@ -140,7 +147,7 @@ fn wait_for_work() {
     const TIMEOUT_MS: i64 = 1000;
 
     let latch = LatchGuard::current();
-    let rc = latch.wait(WAIT_FLAGS, TIMEOUT_MS, get_wait_event_s3worker_main());
+    let rc = latch.wait(WAIT_FLAGS, TIMEOUT_MS, unsafe { WAIT_EVENT_S3WORKER_MAIN });
 
     if (rc & WL_LATCH_SET) != 0 {
         latch.reset();

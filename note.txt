@@ -61,3 +61,5 @@ CFLAGS="-Os" ./configure \
 
 make -j$(nproc)
 make install-strip
+
+alternative project names: Tiko
