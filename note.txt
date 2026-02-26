@@ -1,4 +1,4 @@
-
+# build for testing Tiko S3Smgr extension
 ./configure --prefix $(realpath ../)/target/pg-install \
     --enable-debug \
     --enable-cassert \

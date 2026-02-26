@@ -16,7 +16,7 @@
 //!
 //! # Layout
 //!
-//! - **Cache file**: single pre-allocated file at `{DataDir}/pico/cache`,
+//! - **Cache file**: single pre-allocated file at `{DataDir}/tiko/cache`,
 //!   divided into fixed 256 KB chunk slots. Slot N lives at byte offset
 //!   `N * CHUNK_SIZE`. Each chunk holds 32 contiguous 8 KB blocks.
 //! - **Metadata arrays**: slot metadata, hash table, and partition locks live
@@ -324,7 +324,7 @@ impl CacheControl {
 
     fn cache_file_path() -> PathBuf {
         let data_dir = unsafe { std::ffi::CStr::from_ptr(DataDir).to_str().unwrap_or("") };
-        PathBuf::from(data_dir).join("pico").join("cache")
+        PathBuf::from(data_dir).join("tiko").join("cache")
     }
 
     pub fn cache_file() -> &'static File {

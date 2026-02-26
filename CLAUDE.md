@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Pico replaces PostgreSQL's magnetic disk (`md`) storage manager with S3-backed block storage. A local file cache sits in front of S3 as the source of truth. The project is written in Rust and compiled as PostgreSQL shared libraries (extensions).
+Tiko replaces PostgreSQL's magnetic disk (`md`) storage manager with S3-backed block storage. A local file cache sits in front of S3 as the source of truth. The project is written in Rust and compiled as PostgreSQL shared libraries (extensions).
 
 ## Build & Test
 
@@ -132,8 +132,8 @@ wref_wait returns ◄──┘
 **Key design decisions:**
 
 - **No `PGAIO_HF_SYNCHRONOUS` flag**: Without this flag, `pgaio_io_stage` submits the handle to PG's IO worker pool (not the backend). The IO worker calls `pgaio_io_perform_synchronously()` which hits our `PGAIO_OP_S3_READV` switch case. The backend remains non-blocking — true async from its perspective.
-- **IO worker reuses `submit_and_wait()`**: The IO worker is a regular PG process with a valid `MyProcNumber` and `MyLatch`, counted in `MaxBackends`. It gets its own `BackendSlotPool` in `S3IoControl`. From Pico's perspective, it's just another backend — claims slots, publishes requests, waits on latch. No Tokio runtime needed in the IO worker.
-- **s3worker handles all S3 I/O**: The IO worker never touches S3 directly. It submits to the Pico shared-memory pipeline; s3worker's Tokio runtime handles cache checks, S3 fetches, and writes data to the shared-memory buffer pages.
+- **IO worker reuses `submit_and_wait()`**: The IO worker is a regular PG process with a valid `MyProcNumber` and `MyLatch`, counted in `MaxBackends`. It gets its own `BackendSlotPool` in `S3IoControl`. From Tiko's perspective, it's just another backend — claims slots, publishes requests, waits on latch. No Tokio runtime needed in the IO worker.
+- **s3worker handles all S3 I/O**: The IO worker never touches S3 directly. It submits to the Tiko shared-memory pipeline; s3worker's Tokio runtime handles cache checks, S3 fetches, and writes data to the shared-memory buffer pages.
 - **Bufmgr callbacks work unmodified**: `pgaio_io_process_completion` runs the normal callback chain (md byte validation, bufmgr `BM_VALID` flag setting, checksum checks) — no custom AIO callbacks needed.
 
 **PG patch scope** (~6 switch cases + 1 function + enum update):
@@ -175,7 +175,7 @@ Tokio threads **CANNOT**: call `ConditionVariable*`, `LWLock*`, `ereport`/`elog`
 
 ### High-Level Architecture
 
-Since Pico already uses S3-backed storage for data files, PITR primarily requires:
+Since Tiko already uses S3-backed storage for data files, PITR primarily requires:
 1. **WAL archiving to S3** with lifecycle policies
 2. **Metadata tracking** for recovery points
 3. **Restore coordination** using PostgreSQL's built-in recovery
@@ -263,7 +263,7 @@ wal_level = replica
 archive_mode = on
 archive_timeout = 300  # Force archive every 5 minutes
 
-# Archive command - calls Pico's WAL archiver
+# Archive command - calls Tiko's WAL archiver
 archive_command = '/path/to/pico_archive %p %f'
 
 # For 7-day PITR, keep enough WAL locally too
@@ -316,7 +316,7 @@ fn main() {
 ```rust
 //! Snapshot metadata for PITR
 //!
-//! Since Pico data files are already in S3-style local cache, we track
+//! Since Tiko data files are already in S3-style local cache, we track
 //! "recovery points" rather than full backups.
 
 use serde::{Deserialize, Serialize};
@@ -606,7 +606,7 @@ SELECT * FROM test_pitr;  -- Should show id=1, not id=2
 1. **Minimal PostgreSQL patches** - Uses standard `archive_command`/`restore_command`
 2. **Leverages existing infra** - s3worker Tokio runtime handles S3 I/O
 3. **Simple retention** - S3 lifecycle policies handle cleanup automatically
-4. **No full backups needed** - Pico's block-level S3 storage + WAL = complete PITR
+4. **No full backups needed** - Tiko's block-level S3 storage + WAL = complete PITR
 5. **Fast recovery** - Only download blocks accessed during WAL replay
 
 This design provides 7-day PITR with minimal code changes and leverages PostgreSQL's battle-tested recovery mechanisms.

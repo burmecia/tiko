@@ -1,7 +1,7 @@
 # Local Cache Design
 
 The s3worker uses local files as a cache in front of S3 (the source of truth).
-The total cache size is configurable via a GUC (`pico.cache_size`) set at
+The total cache size is configurable via a GUC (`tiko.cache_size`) set at
 server startup. PostgreSQL's WAL provides crash recovery.
 
 ## Position in the I/O Stack
@@ -329,10 +329,10 @@ and related cache operations are no-ops.
 | Component      | Location              | Structure                                        |
 |----------------|-----------------------|--------------------------------------------------|
 | Control        | PG shared memory      | `CacheControl` (~40 bytes): num_slots, clock_hand, array pointers |
-| Chunk data     | Local file            | `1024 x 256 KB` pre-allocated (`{DataDir}/pico/cache`, 256 MB) |
+| Chunk data     | Local file            | `1024 x 256 KB` pre-allocated (`{DataDir}/tiko/cache`, 256 MB) |
 | Slot metadata  | PG shared memory      | `CacheSlotMeta[1024]`: tag(20B) + valid_blocks + dirty_blocks + usage_count + pad + pin_count (~36 KB) |
 | Hash index     | PG shared memory      | `CacheHashEntry[2048]`: open-addressing, FNV-1a hash, tombstone delete (~56 KB) |
 | Partition locks| PG shared memory      | `AtomicRWLock[128]` spin reader-writer locks (512 bytes) |
 | Clock hand     | PG shared memory      | Single `AtomicU32` in `CacheControl`              |
 | Stats          | PG shared memory      | `S3IoStats`: 9 × `AtomicU64` counters (~72 bytes) |
-| S3-sim files   | Local filesystem      | Per-relation files (`{DataDir}/pico/{spc}/{db}/{rel}.{fork}`) |
+| S3-sim files   | Local filesystem      | Per-relation files (`{DataDir}/tiko/{spc}/{db}/{rel}.{fork}`) |

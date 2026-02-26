@@ -8,7 +8,7 @@
 //! 2. **Backend during initdb** (sync): called directly when no s3worker exists.
 //!
 //! Uses S3-style path layout on local filesystem:
-//! `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
+//! `{DataDir}/tiko/{spc_oid}/{db_oid}/{rel_number}.{fork}`
 //!
 //! Will be replaced by real S3 GET/PUT operations once the S3 client is added.
 
@@ -42,7 +42,7 @@ fn cache_is_available() -> bool {
 
 /// Build the local file path for a relation fork.
 ///
-/// Layout: `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
+/// Layout: `{DataDir}/tiko/{spc_oid}/{db_oid}/{rel_number}.{fork}`
 ///
 /// Mirrors the future S3 key structure:
 /// `s3://{bucket}/{spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}`
@@ -55,7 +55,7 @@ pub fn block_path(
     let data_dir = unsafe { std::ffi::CStr::from_ptr(DataDir).to_str().unwrap_or("") };
 
     PathBuf::from(data_dir)
-        .join("pico")
+        .join("tiko")
         .join(spc_oid.to_string())
         .join(db_oid.to_string())
         .join(format!("{}.{}", rel_number, fork_number))

@@ -1,8 +1,8 @@
-# PITR Design — Point-in-Time Recovery for Pico
+# PITR Design — Point-in-Time Recovery for Tiko
 
-Pico's S3-backed storage gives it a structural advantage over standard
+Tiko's S3-backed storage gives it a structural advantage over standard
 PostgreSQL for PITR: all relation data already flows through the smgr and
-lands in S3. The only state outside Pico's control is a small set of
+lands in S3. The only state outside Tiko's control is a small set of
 non-smgr files. This makes a full base backup unnecessary.
 
 ## Why Standard PostgreSQL PITR Does Not Apply Directly
@@ -18,11 +18,11 @@ relation pages from a past cluster, so WAL replay fails immediately — even
 with `full_page_writes = on`, the first modification of a page only contains
 the page image relative to the last checkpoint, not from the dawn of time.
 
-## Pico's Structural Advantage
+## Tiko's Structural Advantage
 
-In Pico, all relation data (including system catalogs in `base/` and
+In Tiko, all relation data (including system catalogs in `base/` and
 `global/`) flows through the smgr and is stored in S3-backed chunk objects.
-The only state that does **not** go through Pico is:
+The only state that does **not** go through Tiko is:
 
 | File/Directory | Size | Content |
 |---|---|---|
@@ -270,7 +270,7 @@ This tells PostgreSQL: "I am at LSN `target_lsn`, WAL replay starts here."
 
 ```ini
 # postgresql.conf
-restore_command = 'pico_restore %f %p'
+restore_command = 'tiko_restore %f %p'
 recovery_target_time = '2026-02-20 10:00:00'
 recovery_target_action = 'promote'
 ```
@@ -281,7 +281,7 @@ touch $PGDATA/recovery.signal
 
 **Step 5 — Signal s3worker to use chunk_map**
 
-Write `chunk_map` to a well-known path (e.g., `$PGDATA/pico_recovery_manifest.json`)
+Write `chunk_map` to a well-known path (e.g., `$PGDATA/tiko_recovery_manifest.json`)
 before starting PostgreSQL. On startup, s3worker detects `recovery.signal`
 and loads this manifest. In recovery mode, block reads resolve `chunk_key`
 to the specific `lsn_hex` from the manifest rather than the latest S3 object.
@@ -314,7 +314,7 @@ S3 objects. The recovery manifest is removed.
 | `s3worker/src/pitr_task.rs` | Background Tokio task: base materialization + GC |
 | `s3worker/src/manifest.rs` | `DeltaManifest` / `BaseManifest` types + merge logic |
 | `s3worker/src/s3_client.rs` | S3 client initialization (shared by pitr_task and io_handler) |
-| `s3worker/src/bin/pico_restore.rs` | WAL restore command binary |
+| `s3worker/src/bin/tiko_restore.rs` | WAL restore command binary |
 | `s3smgr/src/wal_archive.rs` | Blocking S3 client for checkpointer-side delta + WAL writes |
 
 ### Modified Files

@@ -1,4 +1,4 @@
-## Summary: S3 Storage Manager for PostgreSQL (Pico Project)
+## Summary: S3 Storage Manager for PostgreSQL (Tiko Project)
 
 ### Project Goal
 
