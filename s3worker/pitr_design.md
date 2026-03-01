@@ -33,10 +33,11 @@ The only state that does **not** go through Tiko is:
 | `pg_subtrans/` | small | Subtransaction state |
 
 Before upload to S3, all non-smgr state files for a checkpoint are bundled
-into a single `non_smgr_state.tar.zst` archive (tar + zstd). `pg_xact/` and
-`pg_multixact/` are bit-array files that compress to well under 100 KB even
-after weeks of transactions. Total archive size per checkpoint is typically
-50–200 KB — a single S3 PUT. This replaces the traditional base backup entirely.
+into a single `non_smgr_state.tar.zst` archive (tar + zstd). `pg_xact/`,
+`pg_multixact/`, and `pg_subtrans/` are compact state files that usually
+compress aggressively. Exact size is workload-dependent; in practice this
+archive is typically small (often sub-MB), so upload cost remains low.
+This replaces the traditional base backup entirely.
 
 ## Multi-Tenant and Database Branching
 
@@ -192,12 +193,13 @@ scanning all project manifests.
 ```
 1. Download and extract non-smgr state from parent's checkpoint:
      GET {org_id}/pitr/{parent_project_id}/deltas/{branch_checkpoint_lsn}/non_smgr_state.tar.zst
-     tar -xzf → $PGDATA/global/pg_control, $PGDATA/pg_xact/*, $PGDATA/pg_multixact/*, $PGDATA/pg_filenode.map
+    tar -xzf → $PGDATA/global/pg_control, $PGDATA/pg_xact/*, $PGDATA/pg_multixact/*,
+           $PGDATA/pg_subtrans/*, $PGDATA/pg_filenode.map
    No initdb needed — the zero branch already holds all built-in DB pages.
 2. Write tiko_recovery_manifest.bin from the initial base manifest
-   at branch_checkpoint_lsn (fetched from pitr/{parent}/bases/).
+   at branch_checkpoint_lsn (fetched from pitr/{parent_project_id}/bases/).
 3. Configure:
-     restore_command = 'tiko_restore %f %p --project {parent_project_id}'
+    restore_command = 'tiko_restore %f %p --project {parent_project_id} --org {org_id}'
      recovery_target_lsn = '{branch_checkpoint_lsn}'
      recovery_target_action = 'promote'
    Touch $PGDATA/recovery.signal.
@@ -206,6 +208,8 @@ scanning all project manifests.
 5. On promotion, PostgreSQL increments the timeline. The new project now
    has its own independent WAL archive at:
      {org_id}/pitr/{project_id}/wal/{new_timeline_id}/...
+  At this point, switch runtime config from parent WAL bootstrap paths to
+  child project paths (`archive_command` and any future `restore_command`).
 ```
 
 ### Read Path
@@ -276,8 +280,9 @@ idle one keeps all its history indefinitely until it generates enough new
 checkpoints to trigger cleanup.
 
 The policy: keep the last `max_checkpoints` (e.g. 500) delta manifests per
-project. The latest base manifest is always kept regardless of age — it
-records the project's current state.
+project, and keep enough base manifests to guarantee a valid recovery start
+for every retained target checkpoint. In practice this means keeping the
+newest base with `base_lsn ≤ cutoff_lsn` plus all newer bases.
 
 ```rust
 async fn enforce_retention_org(
@@ -298,11 +303,18 @@ async fn enforce_retention_org(
             0
         };
 
-        // Always protect current state: latest base manifest, unconditionally.
-        if let Some(base) = fetch_latest_base(s3, org_id, project_id).await? {
-            for (key, chunk_ref) in &base.chunks {
-                live.insert((chunk_ref.branch_id, key.clone(), chunk_ref.lsn));
-            }
+      // Find the base floor needed to recover any retained delta target:
+      // keep the newest base with base_lsn <= cutoff_lsn.
+      let base_floor_lsn = latest_base_lsn_leq(s3, org_id, project_id, cutoff_lsn)
+        .await?
+        .unwrap_or(0);
+
+      // Protect all base manifests needed for recovery targets >= cutoff_lsn
+      // (base_floor + newer bases, including latest/current state).
+      for base in base_manifests_since(s3, org_id, project_id, base_floor_lsn).await? {
+        for (key, chunk_ref) in &base.chunks {
+          live.insert((chunk_ref.branch_id, key.clone(), chunk_ref.lsn));
+        }
         }
 
         // Protect PITR history: chunks from deltas at or after cutoff_lsn.
@@ -310,9 +322,9 @@ async fn enforce_retention_org(
             live.insert((chunk_ref.branch_id, chunk_ref.key, chunk_ref.lsn));
         }
 
-        // Delete delta manifests before cutoff_lsn and superseded base manifests.
+      // Delete manifests outside the retained window.
         delete_delta_manifests_before(s3, org_id, project_id, cutoff_lsn).await?;
-        delete_old_base_manifests(s3, org_id, project_id).await?;  // keeps only latest
+      delete_base_manifests_before(s3, org_id, project_id, base_floor_lsn).await?;
     }
 
     // Delete versioned {lsn_hex} objects not in the live set.
@@ -602,8 +614,10 @@ struct EvictionLogRecord {
     fork:       u32,
     chunk_id:   u32,
 }
-// 20 bytes — write(2) with O_APPEND is atomic on local Linux filesystems
-// (kernel serialises concurrent appenders via the inode lock).
+// 20 bytes — write(2) with O_APPEND is atomic on local POSIX filesystems
+// (kernel serialises appenders at the file level).
+// Validate this assumption on each supported platform/filesystem (e.g. APFS,
+// ext4/xfs) and fsync the log at checkpoint boundaries.
 // pwrite(2) must NOT be used here: POSIX specifies that pwrite ignores O_APPEND.
 ```
 
@@ -824,8 +838,8 @@ come from the zero branch in S3) and a target time T:
 Search `{org}/{proj}/pitr/deltas/` for the latest checkpoint with
 `timestamp ≤ T`. If no delta qualifies (project has had no activity since
 branch creation, or T is before the first delta), fall back to the latest
-entry in `{org}/{proj}/pitr/bases/` with `timestamp ≤ T`. Call the chosen
-LSN `target_lsn`.
+entry in `{org}/{proj}/pitr/bases/` with `timestamp ≤ T`. Record both
+`target_lsn` and `target_kind ∈ {delta, base}`.
 
 **Step 2 — Build chunk map at target_lsn**
 
@@ -845,13 +859,13 @@ the project's own. For inherited chunks, `branch_id` may be any ancestor's
 
 **Step 3 — Restore non-smgr state**
 
-Download and extract from `{org}/{proj}/pitr/deltas/{target_lsn}/non_smgr_state.tar.zst`:
+Download and extract from `{org}/{proj}/pitr/{target_kind}s/{target_lsn}/non_smgr_state.tar.zst`:
 
 ```bash
 # Single GET; decompress + untar in one pass (no temp file needed)
-GET standard-bucket/{org}/{proj}/pitr/deltas/{target_lsn}/non_smgr_state.tar.zst \
+GET standard-bucket/{org}/{proj}/pitr/{target_kind}s/{target_lsn}/non_smgr_state.tar.zst \
   | zstd -d | tar -xf - -C $PGDATA
-# Extracts: global/pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
+# Extracts: global/pg_control, pg_xact/*, pg_multixact/*, pg_subtrans/*, pg_filenode.map
 ```
 
 This tells PostgreSQL: "I am at LSN `target_lsn`, WAL replay starts here."
@@ -949,10 +963,10 @@ The control plane (not Tiko itself) is responsible for:
 
 | Operation | Action |
 |---|---|
-| Create root project | `initdb`; write `metadata/project.json` (no parent) |
+| Create org zero branch | Run `initdb` once for the org; write `metadata/project.json` for the zero-branch source project |
 | Create branch project | Build chunk map from parent manifests; write `metadata/project.json` + `pitr/{child}/bases/{lsn}/manifest.bin`; provision new PG instance |
 | Delete branch project | Delete express-bucket `{org}/{project_id}/`; delete `{org}/pitr/{project_id}/` and `{org}/metadata/{project_id}/`; standard-bucket `{org}/chunks/{branch_id}/` collected by next GC run |
-| Delete root project | Assert no live child project base manifests reference its branch_id; delete `{org}/{proj}/` prefix |
+| Delete zero-branch source project | Assert no live child project base manifests reference branch `0` objects that would be removed (normally branch 0 is permanent) |
 | GC / retention enforcement | Run `enforce_retention_org` periodically (max_checkpoints cutoff); delete delta manifests beyond the limit; delete unreferenced standard-bucket chunk versions; delete superseded base manifests |
 
 Branch creation is atomic at the metadata level: the critical write is
