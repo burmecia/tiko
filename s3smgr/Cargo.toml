@@ -15,3 +15,5 @@ crate-type = ["staticlib", "rlib"]
 pgsys = { path = "../pgsys" }
 s3worker = { path = "../s3worker" }
 tracing = { workspace = true }
+zstd = { workspace = true }
+tar = { workspace = true }

@@ -1,7 +1,10 @@
 // Module declarations
 pub mod cache;
 pub mod io_queue;
+pub mod manifest;
+pub mod project;
 pub mod s3_ops;
+pub mod sim_store;
 
 mod dispatcher;
 mod io_handler;

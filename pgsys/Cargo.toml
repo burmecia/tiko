@@ -9,4 +9,5 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 
 [dependencies]
+serde = { workspace = true }
 

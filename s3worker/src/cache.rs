@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use pgsys::common::{BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber};
 use pgsys::logging::pg_log_debug1;
+use serde::{Deserialize, Serialize};
 
 // ── Constants ──
 
@@ -79,7 +80,7 @@ static CACHE_FILE: OnceLock<File> = OnceLock::new();
 
 /// Identifies a 256 KB chunk (32 contiguous blocks) within a relation fork.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChunkTag {
     pub spc_oid: Oid,
     pub db_oid: Oid,
@@ -133,6 +134,37 @@ impl ChunkTag {
             h = h.wrapping_mul(FNV_PRIME);
         }
         h
+    }
+
+    /// Format this chunk tag as a storage path segment:
+    /// `{spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}`.
+    pub fn to_path(&self) -> String {
+        format!(
+            "{}/{}/{}.{}/{}",
+            self.spc_oid, self.db_oid, self.rel_number, self.fork_number, self.chunk_id
+        )
+    }
+
+    /// Encode into the 20-byte TIKM on-disk representation (all fields LE).
+    pub fn encode(&self) -> [u8; 20] {
+        let mut buf = [0u8; 20];
+        buf[0..4].copy_from_slice(&self.spc_oid.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.db_oid.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.rel_number.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.fork_number.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.chunk_id.to_le_bytes());
+        buf
+    }
+
+    /// Decode from the 20-byte TIKM on-disk representation.
+    pub fn decode(buf: &[u8; 20]) -> Self {
+        ChunkTag {
+            spc_oid: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            db_oid: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            rel_number: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            fork_number: i32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            chunk_id: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+        }
     }
 }
 

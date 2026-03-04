@@ -10,8 +10,11 @@ pub mod condition_variable;
 pub mod cshim;
 pub mod latch;
 pub mod logging;
+pub mod lsn;
 pub mod lwlock;
 pub mod shmem;
 pub mod smgr;
 pub mod utils;
 pub mod wait_events;
+
+pub use lsn::Lsn;

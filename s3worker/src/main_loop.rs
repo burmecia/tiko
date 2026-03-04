@@ -7,11 +7,12 @@
 //! to Tokio workers. Completions go directly from Tokio → backend via SetLatch
 //! (no harvest step needed on the main thread).
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{CStr, c_int, c_void};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use pgsys::{
-    common::{MyProcPid, SIGHUP, SIGTERM},
+    common::{DataDir, MyProcPid, SIGHUP, SIGTERM},
     cshim::check_for_interrupts,
     latch::*,
     logging::*,
@@ -21,6 +22,8 @@ use pgsys::{
 use crate::dispatcher::Dispatcher;
 use crate::io_handler;
 use crate::io_queue::S3IoControl;
+use crate::project::{ProjectCtx, ProjectNamespace};
+use crate::sim_store::SimStore;
 use crate::thread_pool;
 
 /// Global flags for managing worker lifecycle and configuration
@@ -54,6 +57,49 @@ fn setup_signal_handlers() {
 /// Wait event identifier for s3worker main loop
 static mut WAIT_EVENT_S3WORKER_MAIN: u32 = 0;
 
+/// Attempt to load the project context from environment variables.
+///
+/// Reads `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, and `TIKO_BRANCH_ID`. If any are
+/// absent or zero, logs a notice and skips initialisation (the read-path
+/// fallback — Module 4 — handles the uninitialized case gracefully).
+///
+/// This is called once before the event loop. Module 4 (`init_sim_store`) will
+/// expose a more explicit initialisation path; until then we construct
+/// `SimStore` and `ProjectNamespace` directly here.
+fn try_init_project_ctx() {
+    fn read_u64(name: &str) -> Option<u64> {
+        std::env::var(name).ok()?.parse().ok()
+    }
+
+    let (Some(org_id), Some(project_id), Some(branch_id)) = (
+        read_u64("TIKO_ORG_ID"),
+        read_u64("TIKO_PROJECT_ID"),
+        read_u64("TIKO_BRANCH_ID"),
+    ) else {
+        pg_log_info("s3worker: TIKO_ORG_ID/PROJECT_ID/BRANCH_ID not set; skipping ProjectCtx init");
+        return;
+    };
+
+    if org_id == 0 || project_id == 0 || branch_id == 0 {
+        pg_log_info("s3worker: TIKO identity env vars are zero; skipping ProjectCtx init");
+        return;
+    }
+
+    let data_dir = unsafe { CStr::from_ptr(DataDir).to_str().unwrap_or("") };
+    let ns = ProjectNamespace::new(org_id, project_id, branch_id);
+    let sim = SimStore::from_data_dir();
+
+    match ProjectCtx::load(&sim, &ns, Path::new(data_dir)) {
+        Ok(ctx) => {
+            ProjectCtx::init(ctx);
+            pg_log_info("s3worker: ProjectCtx loaded successfully");
+        }
+        Err(e) => {
+            pg_log_warning(&format!("s3worker: failed to load ProjectCtx: {e}"));
+        }
+    }
+}
+
 /// Main event loop for s3worker
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
@@ -81,14 +127,17 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
     // Spawn io_worker_loop on Tokio — receives requests and spawns per-request tasks
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
 
-    // Get shared memory control structure
-    let control = S3IoControl::get();
+    // Load project context from env vars (best-effort; non-fatal on failure)
+    try_init_project_ctx();
+
+    // Get shared memory IO control structure
+    let io_control = S3IoControl::get();
 
     // Store our PID and latch so backends can check liveness and wake us
-    control
+    io_control
         .s3worker_pid
         .store(unsafe { MyProcPid } as u32, Ordering::Relaxed);
-    control
+    io_control
         .s3worker_latch
         .store(unsafe { MyLatch } as u64, Ordering::Release);
 
@@ -106,7 +155,7 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
         check_for_interrupts();
 
         // Pop from submit queue and dispatch to Tokio
-        match control.poll_submit_queue(&dispatcher) {
+        match io_control.poll_submit_queue(&dispatcher) {
             Ok(dispatched) => requests_processed += dispatched,
             Err(()) => break, // fatal: dispatcher disconnected
         }
@@ -121,22 +170,22 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
 
         // Log cache stats periodically (every 10000 loops)
         if loop_count % 10000 == 0 {
-            control.stats.log_summary();
+            io_control.stats.log_summary();
         }
 
         // Wait for new work or timeout
         wait_for_work();
     }
 
-    control.stats.log_summary();
+    io_control.stats.log_summary();
     pg_log_info(&format!(
         "s3worker: shutting down (loops={}, requests={})",
         loop_count, requests_processed
     ));
 
     // Clear latch and PID so backends detect shutdown
-    control.s3worker_latch.store(0, Ordering::Release);
-    control.s3worker_pid.store(0, Ordering::Release);
+    io_control.s3worker_latch.store(0, Ordering::Release);
+    io_control.s3worker_pid.store(0, Ordering::Release);
 
     thread_pool::shutdown_tokio_runtime();
 }
