@@ -42,8 +42,9 @@
 //! - `usage_count` is atomically bumped on access (saturating at 5).
 
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
@@ -88,6 +89,11 @@ pub struct ChunkTag {
     pub fork_number: ForkNumber,
     pub chunk_id: u32, // = blkno / BLOCKS_PER_CHUNK
 }
+
+// write(2) with O_APPEND is atomic on local Linux/macOS filesystems
+// (kernel serialises concurrent appenders via the inode lock).
+// pwrite(2) must NOT be used: POSIX specifies that pwrite ignores O_APPEND.
+const _: () = assert!(std::mem::size_of::<ChunkTag>() == 20);
 
 impl ChunkTag {
     /// Construct a ChunkTag from a block number.
@@ -748,16 +754,26 @@ impl CacheControl {
 
     /// Flush dirty blocks from a cache slot to S3-sim files.
     ///
-    /// Reads each dirty block from the cache file and writes it to the
-    /// backing relation file via `s3_ops::write_blocks`. Called during
-    /// eviction when `dirty_blocks != 0`.
+    /// 1. Writes each dirty block to the backing relation file via
+    ///    `s3_ops::write_blocks` (existing behaviour).
+    /// 2. PUTs the full 256 KB chunk to the express-bucket `latest` object via
+    ///    `SimStore::put_express_latest` — a plain PUT, no staging, no
+    ///    standard-bucket copy (those happen only at checkpoint time).
+    /// 3. On a successful PUT, appends one `ChunkTag` (20 bytes) to the
+    ///    eviction log with `O_APPEND` — atomic on Linux/macOS for writes this
+    ///    small. No log entry is written if the PUT failed, so there are never
+    ///    phantom entries for chunks that didn't reach express storage.
+    ///
+    /// Steps 2–3 are guarded: they are skipped when `SimStore` or `ProjectCtx`
+    /// are not yet initialised (e.g. during initdb, single-user mode, or very
+    /// early in backend startup before env vars are read).
     ///
     /// No deadlock risk: at this point we hold pin_count=1 but no partition
     /// locks. `write_blocks()` does simple pwrite — no cache/lock interaction.
     pub fn flush_dirty_chunk(&self, slot_index: u32) {
         let meta = self.slot_meta(slot_index);
         let dirty = meta.dirty_blocks.load(Ordering::Relaxed);
-        let tag = &meta.tag;
+        let tag = meta.tag; // copy — avoids holding a borrow across I/O
 
         for bit in 0..BLOCKS_PER_CHUNK {
             if dirty & (1 << bit) != 0 {
@@ -776,6 +792,20 @@ impl CacheControl {
             }
         }
         meta.dirty_blocks.store(0, Ordering::Release);
+
+        // Express PUT + eviction log append.
+        // Guard: only run when SimStore and ProjectCtx are initialised.
+        if let (Some(sim), Some(ctx)) = (
+            crate::sim_store::SIM_STORE.get(),
+            crate::project::ProjectCtx::try_get(),
+        ) {
+            let mut chunk_data = vec![0u8; CHUNK_SIZE];
+            self.read_blocks_from_slot(slot_index, 0, BLOCKS_PER_CHUNK, &mut chunk_data);
+            if sim.put_express_latest(ctx.ns(), &tag, &chunk_data).is_ok() {
+                let log = Self::open_eviction_log();
+                let _ = (&log).write_all(&tag.encode());
+            }
+        }
     }
 
     /// Scan all cache slots to find the highest block number for a relation fork.
@@ -888,6 +918,53 @@ impl CacheControl {
         ));
     }
 
+    // ── Eviction log ──────────────────────────────────────────────────────
+
+    /// Path of the eviction log file: `$PGDATA/tiko/eviction_log`.
+    fn eviction_log_path() -> PathBuf {
+        data_dir_path().join("tiko").join("eviction_log")
+    }
+
+    /// Open (or create) the eviction log for appending.
+    ///
+    /// Each call opens a fresh `File` with `O_APPEND`. This is intentional:
+    /// the checkpoint flush renames `eviction_log` → `eviction_log.ckpt` to
+    /// take an atomic snapshot; subsequent evictions must write to a fresh
+    /// inode. A cached `OnceLock<File>` would still point at the renamed
+    /// inode, so we open fresh on every eviction.
+    fn open_eviction_log() -> File {
+        let path = Self::eviction_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("failed to open eviction log")
+    }
+
+    /// Read all complete `ChunkTag` records from an eviction log file.
+    ///
+    /// Records are densely packed 20-byte entries. Any incomplete trailing
+    /// record (caused by a crash mid-write) is silently skipped. Returns an
+    /// empty `Vec` if the file does not exist.
+    pub fn read_eviction_log(path: &Path) -> Vec<ChunkTag> {
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(_) => return Vec::new(),
+        };
+        let n_complete = data.len() / 20;
+        let mut records = Vec::with_capacity(n_complete);
+        for i in 0..n_complete {
+            let buf: &[u8; 20] = data[i * 20..(i + 1) * 20].try_into().unwrap();
+            records.push(ChunkTag::decode(buf));
+        }
+        records
+    }
+
     /// Flush all dirty chunks belonging to a specific relation fork.
     ///
     /// Called from `s3_immedsync()` when PostgreSQL requests an immediate
@@ -998,5 +1075,169 @@ impl CacheControl {
 
             meta.pin_count.fetch_sub(1, Ordering::Release);
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::ProjectNamespace;
+    use crate::sim_store::SimStore;
+    use pgsys::Lsn;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn make_tag(i: u32) -> ChunkTag {
+        ChunkTag {
+            spc_oid: i,
+            db_oid: i,
+            rel_number: i,
+            fork_number: 0,
+            chunk_id: i,
+        }
+    }
+
+    // ── read_eviction_log ─────────────────────────────────────────────────
+
+    #[test]
+    fn read_eviction_log_missing_file_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let records = CacheControl::read_eviction_log(&dir.path().join("no_such_log"));
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn read_eviction_log_skips_partial_trailing_record() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("eviction_log");
+
+        // Write 2 complete records (40 bytes) + 10 bytes of a partial third record.
+        let tag0 = make_tag(0);
+        let tag1 = make_tag(1);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&tag0.encode()).unwrap();
+        file.write_all(&tag1.encode()).unwrap();
+        file.write_all(&[0xAB; 10]).unwrap(); // partial record
+        drop(file);
+
+        let records = CacheControl::read_eviction_log(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], tag0);
+        assert_eq!(records[1], tag1);
+    }
+
+    #[test]
+    fn read_eviction_log_empty_file_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("eviction_log");
+        std::fs::write(&path, b"").unwrap();
+        let records = CacheControl::read_eviction_log(&path);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn read_eviction_log_exact_n_records() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("eviction_log");
+        let n = 8usize;
+        let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        for tag in &tags {
+            file.write_all(&tag.encode()).unwrap();
+        }
+        drop(file);
+
+        let records = CacheControl::read_eviction_log(&path);
+        assert_eq!(records, tags);
+    }
+
+    // ── Concurrent O_APPEND writes ────────────────────────────────────────
+
+    #[test]
+    fn concurrent_log_appends_produce_n_records_without_corruption() {
+        let dir = TempDir::new().unwrap();
+        let path = Arc::new(dir.path().join("eviction_log"));
+        let n = 16usize;
+        let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
+
+        let handles: Vec<_> = tags
+            .iter()
+            .map(|tag| {
+                let tag = *tag;
+                let p = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .append(true)
+                        .open(&*p)
+                        .unwrap();
+                    (&file).write_all(&tag.encode()).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let records = CacheControl::read_eviction_log(&path);
+        assert_eq!(
+            records.len(),
+            n,
+            "expected {n} records, got {}",
+            records.len()
+        );
+
+        // Every record must be one of the original tags (no corruption).
+        let tag_set: HashSet<ChunkTag> = tags.into_iter().collect();
+        for rec in &records {
+            assert!(tag_set.contains(rec), "unexpected record: {rec:?}");
+        }
+    }
+
+    // ── Express PUT uses put_express_latest (no staging, no standard) ─────
+
+    #[test]
+    fn express_put_creates_only_latest_no_staging_no_standard() {
+        let dir = TempDir::new().unwrap();
+        let sim = SimStore::new(dir.path());
+        let ns = ProjectNamespace::new(1001, 2001, 7);
+        let tag = make_tag(42);
+        let data = vec![0u8; CHUNK_SIZE];
+
+        sim.put_express_latest(&ns, &tag, &data).unwrap();
+
+        // Express latest must exist.
+        assert!(
+            sim.get_express(&ns.chunk_latest_key(&tag))
+                .unwrap()
+                .is_some()
+        );
+
+        // No staging file must exist.
+        let staging_key = ns.chunk_staging_key(&tag, Lsn::INVALID);
+        assert!(sim.get_express(&staging_key).unwrap().is_none());
+
+        // No standard-bucket versioned object must exist.
+        let versioned_key = format!(
+            "{}/chunks/{}/{}/{}",
+            ns.org_id,
+            ns.branch_id,
+            tag.to_path(),
+            Lsn::INVALID.to_hex()
+        );
+        assert!(sim.get_standard(&versioned_key).unwrap().is_none());
     }
 }

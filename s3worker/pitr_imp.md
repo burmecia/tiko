@@ -439,33 +439,33 @@ happen in Module 5 (eviction) and Module 6 (checkpoint).
 ### Todos
 
 **recovery.rs:**
-- [ ] Define globals:
+- [x] Define globals:
   ```rust
   static RECOVERY_MODE: AtomicBool = AtomicBool::new(false);
   /// Recovery manifest: a Manifest loaded from $PGDATA/tiko/recovery_manifest.bin.
   /// Populated by load_recovery_manifest; queried via lookup_recovery_chunk.
   static RECOVERY_MANIFEST: OnceLock<Manifest> = OnceLock::new();
   ```
-- [ ] `pub fn load_recovery_manifest(path: &Path) -> Result<()>`:
+- [x] `pub fn load_recovery_manifest(path: &Path) -> Result<()>`:
   Read file at `path` (= `$PGDATA/tiko/recovery_manifest.bin`);
   `Manifest::from_bytes(&bytes, &local_path)` where `local_path` is a fixed path
   like `{DataDir}/tiko/recovery_manifest_local.bin`; set `RECOVERY_MANIFEST`;
   set `RECOVERY_MODE = true`.
-- [ ] `pub fn clear_recovery_mode()` — set `RECOVERY_MODE = false` (after PG promotion)
-- [ ] `pub fn is_recovery_mode() -> bool`
-- [ ] `pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>>`:
+- [x] `pub fn clear_recovery_mode()` — set `RECOVERY_MODE = false` (after PG promotion)
+- [x] `pub fn is_recovery_mode() -> bool`
+- [x] `pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>>`:
   `RECOVERY_MANIFEST.get()?.lookup(key)` — returns `Ok(None)` if manifest not loaded.
 
 **s3_ops.rs additions:**
-- [ ] Add `static SIM_STORE: OnceLock<SimStore>` — initialised at s3worker startup
-- [ ] Add `static PROJECT_NS: OnceLock<ProjectNamespace>` — from env vars
+- [x] Add `static SIM_STORE: OnceLock<SimStore>` — initialised at s3worker startup
+- [x] Add `static PROJECT_NS: OnceLock<ProjectNamespace>` — from env vars
   (`TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`)
-- [ ] Add `pub fn init_sim_store(data_dir: &Path, org_id: u64, project_id: u64, branch_id: u64)`
+- [x] Add `pub fn init_sim_store(data_dir: &Path, org_id: u64, project_id: u64, branch_id: u64)`
   — populates both statics; called once from `s3worker_main()` before `ProjectCtx::load()`
-- [ ] Add `pub fn get_sim() -> &'static SimStore`
-- [ ] Add `pub fn get_ns() -> &'static ProjectNamespace`
+- [x] Add `pub fn get_sim() -> &'static SimStore`
+- [x] Add `pub fn get_ns() -> &'static ProjectNamespace`
 
-- [ ] Modify `cached_read_blocks()`: on cache miss, after existing pread attempt:
+- [x] Modify `cached_read_blocks()`: on cache miss, after existing pread attempt:
   1. **Recovery mode** (`is_recovery_mode()` = true):
      - `lookup_recovery_chunk(key)?` → GET from standard sim at
        `{org}/chunks/{chunk_ref.branch_id}/{key}/{lsn_hex}`
@@ -481,7 +481,7 @@ happen in Module 5 (eviction) and Module 6 (checkpoint).
      - If found, fill cache slot, continue
   4. All misses: zero-fill (block beyond file extent — existing behaviour)
 
-- [ ] `#[cfg(test)]` (tempdir):
+- [x] `#[cfg(test)]` (tempdir):
   - Level-1 express hit: put data in express `latest`; delete backing file; read → correct data
   - Level-2 branch fallback: put data in standard sim under a different `branch_id`; configure
     base manifest with that `branch_id`; simulate level-1 miss; verify level-2 returns correct data
@@ -493,7 +493,7 @@ happen in Module 5 (eviction) and Module 6 (checkpoint).
 
 ## Module 5 — Cache Eviction Log
 
-**Status:** `[ ]`
+**Status:** `[x]`
 **Depends on:** Modules 1, 2
 **Modified file:** `s3worker/src/cache.rs`
 
@@ -501,39 +501,35 @@ Can be developed in parallel with Module 4.
 
 ### Todos
 
-- [ ] Define `EvictionLogRecord` (exactly 20 bytes — 5 × u32):
+- [x] Reuse `ChunkTag` (already `#[repr(C)]`, 5 × 4 bytes = 20 bytes) as the eviction log
+  record type — no separate `EvictionLogRecord` struct needed:
   ```rust
-  #[repr(C)]
-  pub struct EvictionLogRecord {
-      pub spc_oid:    u32,
-      pub db_oid:     u32,
-      pub rel_number: u32,
-      pub fork:       u32,
-      pub chunk_id:   u32,
-  }
-  const _: () = assert!(std::mem::size_of::<EvictionLogRecord>() == 20);
+  const _: () = assert!(std::mem::size_of::<ChunkTag>() == 20);
   // write(2) with O_APPEND is atomic on local Linux filesystems
   // (kernel serialises concurrent appenders via the inode lock).
   // pwrite(2) must NOT be used: POSIX specifies that pwrite ignores O_APPEND.
   ```
 
-- [ ] Add `fn eviction_log_path() -> PathBuf` → `$PGDATA/tiko/eviction_log`
+- [x] Add `fn eviction_log_path() -> PathBuf` → `$PGDATA/tiko/eviction_log`
+  (implemented as `CacheControl::eviction_log_path()`)
 
-- [ ] Add `fn open_eviction_log() -> File`:
+- [x] Add `fn open_eviction_log() -> File`:
   `OpenOptions::new().write(true).create(true).append(true).open(eviction_log_path())`
+  (implemented as `CacheControl::open_eviction_log()`)
 
-- [ ] Extend `flush_dirty_chunk(slot_index: u32)`:
+- [x] Extend `flush_dirty_chunk(slot_index: u32)`:
   After existing write to `{DataDir}/tiko/` backing file:
   1. Read chunk data from the cache slot
-  2. Call `get_sim().put_express_latest(get_ns(), &chunk_key, &chunk_data)`
+  2. Call `SimStore::get().put_express_latest(ProjectCtx::try_get().ns(), &chunk_key, &chunk_data)`
      — plain PUT to express-bucket `latest`; no staging, no standard-bucket copy
-  3. On PUT success only: `write(fd, &record)` one `EvictionLogRecord` with `O_APPEND`
+  3. On PUT success only: `write(fd, &record)` one `ChunkTag` with `O_APPEND`
      (no phantom log entry if PUT failed)
 
-- [ ] Add `pub fn read_eviction_log(path: &Path) -> Vec<EvictionLogRecord>`:
+- [x] Add `pub fn read_eviction_log(path: &Path) -> Vec<ChunkTag>`:
   Read in 20-byte records; skip any incomplete trailing record (crash safety).
+  (implemented as `CacheControl::read_eviction_log(path)`)
 
-- [ ] `#[cfg(test)]` (tempdir):
+- [x] `#[cfg(test)]` (tempdir):
   - Concurrent `flush_dirty_chunk` from N threads on N different slots: verify log has
     exactly N records; no corruption (aligned 20-byte reads)
   - `read_eviction_log` with truncated final record (write 30 bytes): verify partial record skipped
