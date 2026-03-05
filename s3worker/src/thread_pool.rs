@@ -7,7 +7,49 @@
 //! - 8 blocking threads for CPU-bound work (if needed)
 
 use pgsys::logging::*;
-use std::sync::{Once, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
+
+use crate::pitr_task::{PitrConfig, pitr_background_task};
+use crate::project::{ProjectCtx, ProjectNamespace};
+use crate::sim_store::SimStore;
+
+/// Arc<SimStore> shared with the PITR background task.
+/// Also accessible from Module 5's eviction path via `pitr_sim_store()`.
+static PITR_SIM_STORE: OnceLock<Arc<SimStore>> = OnceLock::new();
+
+/// Return the shared `Arc<SimStore>` used by the PITR task, if initialised.
+pub fn pitr_sim_store() -> Option<&'static Arc<SimStore>> {
+    PITR_SIM_STORE.get()
+}
+
+/// Spawn the PITR background task on the Tokio runtime.
+///
+/// Does nothing if:
+/// - The runtime has not been initialised.
+/// - `ProjectCtx` is not yet loaded (env vars absent).
+///
+/// Call this from `s3worker_main` after both `init_tokio_runtime` and
+/// `init_project_ctx` have completed.
+pub fn spawn_pitr_task(data_dir: &std::path::Path) {
+    let Some(runtime) = TOKIO_RUNTIME.get() else {
+        pg_log_warning("s3worker: spawn_pitr_task called before runtime init; skipping");
+        return;
+    };
+
+    let Some(ctx) = ProjectCtx::try_get() else {
+        pg_log_info("s3worker: ProjectCtx not initialised; skipping PITR background task");
+        return;
+    };
+
+    let ns: ProjectNamespace = ctx.ns().clone();
+    let sim = Arc::new(SimStore::new(data_dir));
+    let cfg = PitrConfig::from_env();
+
+    let _ = PITR_SIM_STORE.set(Arc::clone(&sim));
+
+    runtime.spawn(pitr_background_task(sim, ns, cfg));
+    pg_log_info("s3worker: PITR background task spawned");
+}
 
 /// The global Tokio runtime handle stored safely using OnceLock
 static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();

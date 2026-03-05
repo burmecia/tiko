@@ -649,7 +649,7 @@ or eviction machinery.
 
 ### Todos
 
-- [ ] Implement `pub fn build_initial_manifest(sim: &SimStore, parent_ns: &ProjectNamespace, branch_lsn: Lsn, out_path: &Path) -> Result<Manifest>`:
+- [x] Implement `pub fn build_initial_manifest(sim: &SimStore, parent_ns: &ProjectNamespace, branch_lsn: Lsn, out_path: &Path) -> Result<Manifest>`:
   1. List `{parent_ns.base_prefix()}` → parse LSN dirs → find latest with `base_lsn ≤ branch_lsn`
   2. GET + `Manifest::from_bytes(&bytes, &base_local_path)` for the base manifest
   3. List `{parent_ns.delta_prefix()}` → filter `(base_lsn, branch_lsn]` → GET + `from_bytes`
@@ -657,7 +657,7 @@ or eviction machinery.
   4. `base.apply_deltas(&deltas)?` — result is flat (parent's `branch_id` values preserved)
   5. Return `base` — the merged `Manifest` written to `out_path`
 
-- [ ] Implement `pub fn create_branch(sim: &SimStore, parent_ns: &ProjectNamespace, child_ns: &ProjectNamespace, branch_lsn: Lsn) -> Result<()>`:
+- [x] Implement `pub fn create_branch(sim: &SimStore, parent_ns: &ProjectNamespace, child_ns: &ProjectNamespace, branch_lsn: Lsn) -> Result<()>`:
   ```
   1. initial_manifest = build_initial_manifest(sim, parent_ns, branch_lsn,
                                                &child_initial_manifest_local_path)
@@ -675,13 +675,13 @@ or eviction machinery.
   Branch is valid once step 4 completes — a single S3 PUT.
   No `branch_base.json`, no `branch_refs` markers.
 
-- [ ] Implement `pub fn delete_branch(sim: &SimStore, branch_ns: &ProjectNamespace) -> Result<()>`:
+- [x] Implement `pub fn delete_branch(sim: &SimStore, branch_ns: &ProjectNamespace) -> Result<()>`:
   1. List all keys under `express/{org}/{proj}/` → delete each (express-bucket hot data)
   2. List all keys under `standard/{org}/pitr/{proj}/` → delete each (manifests + WAL)
   3. List all keys under `standard/{org}/metadata/{proj}/` → delete each (project.json)
   4. Log: "standard-bucket {org}/chunks/{branch_id}/ will be collected by next GC run"
 
-- [ ] `#[cfg(test)]` (tempdir):
+- [x] `#[cfg(test)]` (tempdir):
   - `build_initial_manifest` from 3 synthetic deltas → correct merged chunk map with correct `branch_id` values per chunk; result is a valid `Manifest` with correct `entry_count`
   - Cascaded branch (C from B from A): chunks written only on A have `branch_id = A`'s id in C's map
   - `create_branch` → exactly 2 files written to standard sim (`project.json` + `manifest.bin`);
@@ -693,7 +693,7 @@ or eviction machinery.
 
 ## Module 8 — PITR Background Task
 
-**Status:** `[ ]`
+**Status:** `[x]`
 **Depends on:** Modules 1, 2, 3
 **New file:** `s3worker/src/pitr_task.rs`
 **Modified file:** `s3worker/src/thread_pool.rs` (spawn task after runtime starts)

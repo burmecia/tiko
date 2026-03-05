@@ -136,6 +136,11 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
     // Load project context from env vars (best-effort; non-fatal on failure)
     init_project_ctx();
 
+    // Spawn the PITR background task now that both the runtime and ProjectCtx
+    // are initialised.  No-op if ProjectCtx was not loaded.
+    let data_dir = data_dir_path();
+    thread_pool::spawn_pitr_task(&data_dir);
+
     // Get shared memory IO control structure
     let io_control = S3IoControl::get();
 
