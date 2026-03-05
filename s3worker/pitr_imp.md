@@ -426,7 +426,7 @@ file-backed index well.
 
 ## Module 4 — Versioned Chunk Read Path
 
-**Status:** `[ ]`
+**Status:** `[x]`
 **Depends on:** Modules 1, 2, 3
 **Modified file:** `s3worker/src/s3_ops.rs`
 **New file:** `s3worker/src/recovery.rs`

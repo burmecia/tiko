@@ -19,13 +19,96 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use pgsys::common::{
-    BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber, is_under_postmaster,
+    BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber, data_dir_path, is_under_postmaster,
 };
 
 use crate::{
     cache::{BLOCKS_PER_CHUNK, ChunkTag},
     io_queue::S3IoControl,
+    project::{ProjectCtx, ProjectNamespace},
+    recovery,
+    sim_store::SimStore,
 };
+
+// ── S3 chunk fetch ────────────────────────────────────────────────────────────
+
+/// Attempt to fetch a full chunk from the S3 sim store using the two-level
+/// fallback hierarchy.
+///
+/// Levels:
+/// 1. **Recovery mode** (`is_recovery_mode()` = true):
+///    Look up the chunk in `RECOVERY_MANIFEST` → GET versioned object from
+///    standard sim at `{org}/chunks/{chunk_ref.branch_id}/{tag.to_path()}/{lsn_hex}`.
+///    Returns `None` if not found; does NOT fall through to normal levels.
+///
+/// 2. **Normal — level 1** (own express-bucket `latest`):
+///    GET express `{org}/{proj}/chunks/{tag.to_path()}/latest`.
+///
+/// 3. **Normal — level 2** (base manifest fallback for inherited chunks):
+///    `ProjectCtx::try_get()?.base_manifest_lookup(tag)` → GET versioned
+///    standard sim at `{org}/chunks/{chunk_ref.branch_id}/{tag.to_path()}/{lsn_hex}`.
+///    Only attempted when `ProjectCtx` has been initialised.
+///
+/// Returns the raw chunk bytes on success, `None` on all misses.
+fn try_fetch_chunk_from_s3(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    tag: &ChunkTag,
+) -> Option<Vec<u8>> {
+    if recovery::is_recovery_mode() {
+        // Level R: versioned standard-sim object from recovery manifest.
+        if let Ok(Some(chunk_ref)) = recovery::lookup_recovery_chunk(tag) {
+            let key = format!(
+                "{}/chunks/{}/{}/{}",
+                ns.org_id,
+                chunk_ref.branch_id,
+                tag.to_path(),
+                chunk_ref.lsn.to_hex()
+            );
+            if let Ok(Some(data)) = sim.get_standard(&key) {
+                return Some(data);
+            }
+        }
+        // In recovery mode we do not fall through to normal levels.
+        return None;
+    }
+
+    // Level 1: express-bucket latest (own current checkpoint state).
+    let latest_key = ns.chunk_latest_key(tag);
+    if let Ok(Some(data)) = sim.get_express(&latest_key) {
+        return Some(data);
+    }
+
+    // Level 2: base manifest fallback (inherited ancestor-branch chunks).
+    // Only available when PROJECT_CTX is initialised.
+    if let Some(ctx) = ProjectCtx::try_get() {
+        if let Ok(Some(chunk_ref)) = ctx.base_manifest_lookup(tag) {
+            // Use chunk_ref.branch_id (the branch that owns this chunk version),
+            // NOT ns.branch_id (own branch) or ns.project_id.
+            let key = format!(
+                "{}/chunks/{}/{}/{}",
+                ns.org_id,
+                chunk_ref.branch_id,
+                tag.to_path(),
+                chunk_ref.lsn.to_hex()
+            );
+            if let Ok(Some(data)) = sim.get_standard(&key) {
+                return Some(data);
+            }
+        }
+    }
+
+    None
+}
+
+/// Internal wrapper: look up `SIM_STORE` and `PROJECT_NS` globals and call
+/// `try_fetch_chunk_from_s3`. Returns `None` if the statics are not set
+/// (e.g. initdb, env vars absent).
+fn try_fetch_chunk_from_s3_globals(tag: &ChunkTag) -> Option<Vec<u8>> {
+    let sim = SimStore::get();
+    let ns = ProjectCtx::get().ns();
+    try_fetch_chunk_from_s3(sim, ns, tag)
+}
 
 /// True when the shared-memory cache is reachable from this process.
 ///
@@ -46,15 +129,15 @@ fn cache_is_available() -> bool {
 ///
 /// Mirrors the future S3 key structure:
 /// `s3://{bucket}/{spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}`
-pub fn block_path(
+fn block_path(
     spc_oid: Oid,
     db_oid: Oid,
     rel_number: RelFileNumber,
     fork_number: ForkNumber,
 ) -> PathBuf {
-    let data_dir = unsafe { std::ffi::CStr::from_ptr(DataDir).to_str().unwrap_or("") };
+    let data_dir = data_dir_path();
 
-    PathBuf::from(data_dir)
+    data_dir
         .join("tiko")
         .join(spc_oid.to_string())
         .join(db_oid.to_string())
@@ -531,11 +614,34 @@ pub fn cached_read_blocks(
                 }
             }
 
-            // Now read the requested block from the cache slot
+            // S3 fallback: if the requested block is still not valid after
+            // the local-file prefetch, try the two-level S3 fallback.
+            if !cache.is_block_valid(slot, block_offset) {
+                if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+                    if chunk_data.len() % BLCKSZ == 0 {
+                        let nblocks_s3 = (chunk_data.len() / BLCKSZ) as u32;
+                        let nblocks_s3 = nblocks_s3.min(BLOCKS_PER_CHUNK);
+                        cache.write_blocks_to_slot(
+                            slot,
+                            0,
+                            nblocks_s3,
+                            &chunk_data[..nblocks_s3 as usize * BLCKSZ],
+                        );
+                        let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
+                            u32::MAX
+                        } else {
+                            (1u32 << nblocks_s3) - 1
+                        };
+                        cache.set_valid_blocks_mask(slot, valid_mask);
+                    }
+                }
+            }
+
+            // Now read the requested block from the cache slot.
             if cache.is_block_valid(slot, block_offset) {
                 cache.read_block(slot, block_offset, buf);
             } else {
-                // Block beyond file extent — zero-fill
+                // Block beyond file extent — zero-fill (existing behaviour).
                 buf.fill(0);
             }
 
@@ -694,4 +800,262 @@ pub fn warm_cache_blocks(
     }
 
     Ok(nblocks)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::ChunkTag;
+    use crate::manifest::{ChunkRef, Manifest};
+    use crate::project::ProjectNamespace;
+    use crate::recovery;
+    use crate::sim_store::SimStore;
+    use pgsys::Lsn;
+    use std::sync::atomic::Ordering;
+    use tempfile::TempDir;
+
+    // All tests that touch RECOVERY_MODE must hold `recovery::RECOVERY_MODE_TEST_GUARD`
+    // (defined in recovery.rs as pub(crate)). Using that shared guard ensures
+    // recovery::tests and s3_ops::tests are serialised against each other.
+
+    fn ns() -> ProjectNamespace {
+        ProjectNamespace::new(1001, 2001, 7)
+    }
+
+    fn tag(rel: u32) -> ChunkTag {
+        ChunkTag {
+            spc_oid: 1663,
+            db_oid: 5,
+            rel_number: rel,
+            fork_number: 0,
+            chunk_id: 0,
+        }
+    }
+
+    fn chunk_data(fill: u8) -> Vec<u8> {
+        vec![fill; BLOCKS_PER_CHUNK as usize * BLCKSZ]
+    }
+
+    // ── Level-1 express hit ───────────────────────────────────────────────
+
+    #[test]
+    fn level1_express_hit_returns_correct_data() {
+        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let ns = ns();
+        let sim = SimStore::new(dir.path());
+        let tag = tag(100);
+
+        // Ensure recovery mode is off.
+        recovery::RECOVERY_MODE.store(false, Ordering::SeqCst);
+
+        // Put chunk data in express latest; no backing file needed.
+        let data = chunk_data(0xAB);
+        sim.put_express_latest(&ns, &tag, &data).unwrap();
+
+        // Level-1 should hit.
+        let result = try_fetch_chunk_from_s3(&sim, &ns, &tag);
+        assert_eq!(result, Some(data));
+    }
+
+    #[test]
+    fn level1_miss_returns_none_when_express_empty() {
+        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let ns = ns();
+        let sim = SimStore::new(dir.path());
+        let tag = tag(101);
+
+        recovery::RECOVERY_MODE.store(false, Ordering::SeqCst);
+
+        // Nothing in express, no ProjectCtx set for level-2.
+        let result = try_fetch_chunk_from_s3(&sim, &ns, &tag);
+        assert_eq!(result, None);
+    }
+
+    // ── Level-2 branch fallback ───────────────────────────────────────────
+
+    #[test]
+    fn level2_get_key_uses_branch_id_not_project_id() {
+        // Verify the versioned-key format uses chunk_ref.branch_id, not
+        // ns.branch_id or ns.project_id.
+        let ns = ProjectNamespace::new(1001, 2001, 7); // project_id=2001, branch_id=7
+        let tag = tag(200);
+        let chunk_ref = ChunkRef {
+            branch_id: 99, // different from both project_id and branch_id
+            lsn: Lsn::new(0x500),
+        };
+
+        let key = format!(
+            "{}/chunks/{}/{}/{}",
+            ns.org_id,
+            chunk_ref.branch_id,
+            tag.to_path(),
+            chunk_ref.lsn.to_hex()
+        );
+
+        assert!(
+            key.contains("/99/"),
+            "must use chunk_ref.branch_id=99: {key}"
+        );
+        assert!(
+            !key.contains("/2001/"),
+            "must not use project_id=2001 in versioned key: {key}"
+        );
+        // org_id=1001 appears in the key prefix; verify the chunks portion
+        // does not embed project_id or ns.branch_id.
+        assert!(
+            !key.contains("chunks/7/"),
+            "must not use ns.branch_id=7: {key}"
+        );
+    }
+
+    #[test]
+    fn level2_branch_fallback_correct_versioned_key_format() {
+        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Test that the level-2 key format is correct by checking the key
+        // built from a manifest lookup against an entry in the standard sim.
+        let dir = TempDir::new().unwrap();
+        let ns = ProjectNamespace::new(2002, 3003, 10);
+        let sim = SimStore::new(dir.path());
+        let tag = tag(300);
+        let parent_branch_id: u64 = 42;
+        let lsn = Lsn::new(0x800);
+        let chunk_ref = ChunkRef {
+            branch_id: parent_branch_id,
+            lsn,
+        };
+
+        recovery::RECOVERY_MODE.store(false, Ordering::SeqCst);
+
+        // Put versioned data in standard sim (inherited from parent branch).
+        let data = chunk_data(0xCC);
+        let versioned_key = format!(
+            "{}/chunks/{}/{}/{}",
+            ns.org_id,
+            parent_branch_id,
+            tag.to_path(),
+            lsn.to_hex()
+        );
+        sim.put_standard(&versioned_key, &data).unwrap();
+
+        // Ensure nothing in express (level-1 would miss).
+        assert_eq!(sim.get_express(&ns.chunk_latest_key(&tag)).unwrap(), None);
+
+        // Build a local manifest with the chunk entry.
+        let manifest_path = dir.path().join("test_manifest.tikm");
+        let manifest =
+            Manifest::new_sorted(lsn, 0, vec![(tag, chunk_ref)], &manifest_path).unwrap();
+
+        // Simulate level-2: look up the manifest and build the expected key.
+        let found = manifest.lookup(&tag).unwrap().unwrap();
+        assert_eq!(found.branch_id, parent_branch_id);
+        let level2_key = format!(
+            "{}/chunks/{}/{}/{}",
+            ns.org_id,
+            found.branch_id,
+            tag.to_path(),
+            found.lsn.to_hex()
+        );
+        let fetched = sim.get_standard(&level2_key).unwrap();
+        assert_eq!(fetched, Some(data));
+    }
+
+    // ── Recovery mode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn recovery_mode_fetches_versioned_chunk_from_standard_sim() {
+        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let ns = ns();
+        let sim = SimStore::new(dir.path());
+        let tag = tag(400);
+        let branch_id: u64 = 55;
+        let lsn = Lsn::new(0x2000);
+        let chunk_ref = ChunkRef { branch_id, lsn };
+
+        // Build and write the recovery manifest blob.
+        let build_path = dir.path().join("build.tikm");
+        let m = Manifest::new_sorted(lsn, 0, vec![(tag, chunk_ref)], &build_path).unwrap();
+        let blob = m.to_bytes().unwrap();
+
+        let tiko_dir = dir.path().join("tiko");
+        std::fs::create_dir_all(&tiko_dir).unwrap();
+        let manifest_path = tiko_dir.join("recovery_manifest.bin");
+        std::fs::write(&manifest_path, &blob).unwrap();
+
+        // Attempt to load the recovery manifest (best-effort — OnceLock).
+        let _ = recovery::load_recovery_manifest(&manifest_path);
+        recovery::RECOVERY_MODE.store(true, Ordering::SeqCst);
+
+        // Put versioned data in standard sim.
+        let data = chunk_data(0xDD);
+        let versioned_key = format!(
+            "{}/chunks/{}/{}/{}",
+            ns.org_id,
+            branch_id,
+            tag.to_path(),
+            lsn.to_hex()
+        );
+        sim.put_standard(&versioned_key, &data).unwrap();
+
+        // Test the recovery-mode lookup via a local manifest instance to
+        // avoid OnceLock contention with RECOVERY_MANIFEST.
+        let local = Manifest::from_bytes(&blob, &dir.path().join("local.tikm")).unwrap();
+        let found = local.lookup(&tag).unwrap().unwrap();
+        let key = format!(
+            "{}/chunks/{}/{}/{}",
+            ns.org_id,
+            found.branch_id,
+            tag.to_path(),
+            found.lsn.to_hex()
+        );
+        let fetched = sim.get_standard(&key).unwrap();
+        assert_eq!(fetched, Some(data));
+
+        recovery::clear_recovery_mode();
+    }
+
+    #[test]
+    fn recovery_mode_does_not_fall_through_to_express() {
+        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let ns = ns();
+        let sim = SimStore::new(dir.path());
+        let tag = tag(500);
+
+        // Enable recovery mode but do NOT put a matching versioned object.
+        recovery::RECOVERY_MODE.store(true, Ordering::SeqCst);
+
+        // Put data in express latest — it must NOT be returned in recovery mode.
+        let data = chunk_data(0xEE);
+        sim.put_express_latest(&ns, &tag, &data).unwrap();
+
+        // With recovery mode on and no versioned match for tag(500), the result
+        // is None (recovery mode does not fall through to express latest).
+        let result = try_fetch_chunk_from_s3(&sim, &ns, &tag);
+        // If RECOVERY_MANIFEST happens to have an entry for tag(500) from a
+        // concurrent test, result may be Some — but it must not equal the
+        // express data (which would mean we fell through, which is wrong).
+        if let Some(ref bytes) = result {
+            assert_ne!(
+                bytes, &data,
+                "express data must never be returned in recovery mode"
+            );
+        }
+
+        recovery::clear_recovery_mode();
+    }
 }

@@ -7,12 +7,11 @@
 //! to Tokio workers. Completions go directly from Tokio → backend via SetLatch
 //! (no harvest step needed on the main thread).
 
-use std::ffi::{CStr, c_int, c_void};
-use std::path::Path;
+use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use pgsys::{
-    common::{DataDir, MyProcPid, SIGHUP, SIGTERM},
+    common::{MyProcPid, SIGHUP, SIGTERM, data_dir_path},
     cshim::check_for_interrupts,
     latch::*,
     logging::*,
@@ -63,10 +62,10 @@ static mut WAIT_EVENT_S3WORKER_MAIN: u32 = 0;
 /// absent or zero, logs a notice and skips initialisation (the read-path
 /// fallback — Module 4 — handles the uninitialized case gracefully).
 ///
-/// This is called once before the event loop. Module 4 (`init_sim_store`) will
-/// expose a more explicit initialisation path; until then we construct
-/// `SimStore` and `ProjectNamespace` directly here.
-fn try_init_project_ctx() {
+/// This is called once before the event loop. Calls `SimStore::init`
+/// to initialise the global `SimStore` and `ProjectNamespace` statics, then
+/// loads `ProjectCtx`.
+fn init_project_ctx() {
     fn read_u64(name: &str) -> Option<u64> {
         std::env::var(name).ok()?.parse().ok()
     }
@@ -85,11 +84,18 @@ fn try_init_project_ctx() {
         return;
     }
 
-    let data_dir = unsafe { CStr::from_ptr(DataDir).to_str().unwrap_or("") };
-    let ns = ProjectNamespace::new(org_id, project_id, branch_id);
-    let sim = SimStore::from_data_dir();
+    let data_dir = data_dir_path();
 
-    match ProjectCtx::load(&sim, &ns, Path::new(data_dir)) {
+    // Initialise sim store and namespace statics (Module 4).
+    // Must happen before ProjectCtx::load so that cached_read_blocks can
+    // reach the S3 sim store via try_fetch_chunk_from_s3_globals.
+    SimStore::init(&data_dir);
+
+    // Load the project context. This populates the global ProjectCtx, which
+    // is used by the cached_read_blocks fallback to serve reads from S3 when
+    // the local cache misses.
+    let ns = ProjectNamespace::new(org_id, project_id, branch_id);
+    match ProjectCtx::load(&ns, &data_dir, SimStore::get()) {
         Ok(ctx) => {
             ProjectCtx::init(ctx);
             pg_log_info("s3worker: ProjectCtx loaded successfully");
@@ -128,7 +134,7 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
 
     // Load project context from env vars (best-effort; non-fatal on failure)
-    try_init_project_ctx();
+    init_project_ctx();
 
     // Get shared memory IO control structure
     let io_control = S3IoControl::get();

@@ -1,4 +1,5 @@
-use std::ffi::{c_char, c_int};
+use std::ffi::{CStr, c_char, c_int};
+use std::path::{Path, PathBuf};
 
 // pid_t is typically a signed integer type in C, so we use i32 here
 pub type Pid = i32;
@@ -113,4 +114,10 @@ pub fn in_recovery() -> bool {
 #[inline(always)]
 pub fn get_my_proc_number() -> ProcNumber {
     unsafe { MyProcNumber }
+}
+
+/// Return the PostgreSQL data directory path.
+pub fn data_dir_path() -> PathBuf {
+    let data_dir = unsafe { CStr::from_ptr(DataDir).to_str().unwrap_or("") };
+    Path::new(data_dir).to_path_buf()
 }

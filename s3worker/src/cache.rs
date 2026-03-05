@@ -47,7 +47,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
-use pgsys::common::{BLCKSZ, BlockNumber, DataDir, ForkNumber, Oid, RelFileNumber};
+use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber, data_dir_path};
 use pgsys::logging::pg_log_debug1;
 use serde::{Deserialize, Serialize};
 
@@ -355,8 +355,7 @@ impl CacheControl {
     // ── Cache data file ──
 
     fn cache_file_path() -> PathBuf {
-        let data_dir = unsafe { std::ffi::CStr::from_ptr(DataDir).to_str().unwrap_or("") };
-        PathBuf::from(data_dir).join("tiko").join("cache")
+        data_dir_path().join("tiko").join("cache")
     }
 
     pub fn cache_file() -> &'static File {

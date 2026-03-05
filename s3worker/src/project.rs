@@ -185,6 +185,13 @@ impl ProjectCtx {
             .expect("ProjectCtx::get() called before ProjectCtx::init()")
     }
 
+    /// Return a reference to the global project context, or `None` if not yet
+    /// initialised. Used by the S3 read fallback path to avoid a panic when
+    /// `ProjectCtx::init` was skipped (e.g. env vars not set).
+    pub fn try_get() -> Option<&'static Self> {
+        PROJECT_CTX.get()
+    }
+
     /// Populate the global project context. Silently ignored if already set.
     pub fn init(ctx: ProjectCtx) {
         let _ = PROJECT_CTX.set(ctx);
@@ -205,7 +212,7 @@ impl ProjectCtx {
     /// # Branch project with no bases
     /// Returns an error. A branch always has an initial base manifest written
     /// by `create_branch` (Module 7).
-    pub fn load(sim: &SimStore, ns: &ProjectNamespace, data_dir: &Path) -> Result<Self> {
+    pub fn load(ns: &ProjectNamespace, data_dir: &Path, sim: &SimStore) -> Result<Self> {
         // Step 1: fetch project.json
         let meta_key = ns.project_meta_key();
         let meta_bytes = sim
@@ -366,7 +373,7 @@ mod tests {
         let ns = root_ns();
         store_meta(&sim, &make_root_meta(&ns));
 
-        let ctx = ProjectCtx::load(&sim, &ns, dir.path()).unwrap();
+        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
 
         assert!(!ctx.is_branch());
         assert_eq!(ctx.base_manifest_lookup(&tag(42)).unwrap(), None);
@@ -380,7 +387,7 @@ mod tests {
         let ns = root_ns();
         store_meta(&sim, &make_root_meta(&ns));
 
-        let ctx = ProjectCtx::load(&sim, &ns, dir.path()).unwrap();
+        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
 
         // Any key must miss on a zero-entry manifest
         let absent = ChunkTag {
@@ -421,7 +428,7 @@ mod tests {
         sim.put_standard(&child_ns.base_manifest_key(branch_lsn), &bytes)
             .unwrap();
 
-        let ctx = ProjectCtx::load(&sim, &child_ns, dir.path()).unwrap();
+        let ctx = ProjectCtx::load(&child_ns, dir.path(), &sim).unwrap();
 
         assert!(ctx.is_branch());
         assert_eq!(
@@ -441,7 +448,7 @@ mod tests {
         store_meta(&sim, &meta);
 
         // No base manifests written to sim
-        let result = ProjectCtx::load(&sim, &ns, dir.path());
+        let result = ProjectCtx::load(&ns, dir.path(), &sim);
         assert!(result.is_err(), "branch with no bases must return error");
     }
 
@@ -456,7 +463,7 @@ mod tests {
         store_meta(&sim, &make_root_meta(&ns_stored));
 
         // Query with a different namespace than what's in project.json
-        let result = ProjectCtx::load(&sim, &ns_query, dir.path());
+        let result = ProjectCtx::load(&ns_query, dir.path(), &sim);
         assert!(result.is_err(), "namespace mismatch must return error");
     }
 
@@ -468,7 +475,7 @@ mod tests {
         let ns = root_ns();
         // Do NOT store project.json
 
-        let result = ProjectCtx::load(&sim, &ns, dir.path());
+        let result = ProjectCtx::load(&ns, dir.path(), &sim);
         assert!(result.is_err(), "missing project.json must return error");
     }
 
@@ -503,7 +510,7 @@ mod tests {
         sim.put_standard(&ns.base_manifest_key(lsn_new), &bytes_new)
             .unwrap();
 
-        let ctx = ProjectCtx::load(&sim, &ns, dir.path()).unwrap();
+        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
 
         // Should use the newer manifest
         assert_eq!(ctx.base_manifest_lookup(&known_tag).unwrap(), Some(new_ref));

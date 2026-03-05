@@ -13,16 +13,21 @@
 //! to the same root, so the returned strings can be passed directly back
 //! to `get_*`/`delete_*`.
 
-use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use pgsys::Lsn;
-use pgsys::common::DataDir;
 
 use crate::cache::ChunkTag;
 use crate::project::ProjectNamespace;
+
+// ── Globals ───────────────────────────────────────────────────────────────────
+
+/// Sim store initialised by `SimStore::init` at s3worker startup.
+/// Accessed from `cached_read_blocks` via `try_fetch_chunk_from_s3_globals`.
+pub(crate) static SIM_STORE: OnceLock<SimStore> = OnceLock::new();
 
 // ── SimStore ─────────────────────────────────────────────────────────────────
 
@@ -35,19 +40,30 @@ pub struct SimStore {
 }
 
 impl SimStore {
+    /// Initialise the sim store.
+    ///
+    /// Must be called once from `s3worker_main()` before `ProjectCtx::load()`.
+    /// Subsequent calls are silently ignored (OnceLock semantics).
+    pub fn init(data_dir: &Path) {
+        let _ = SIM_STORE.set(SimStore::new(data_dir));
+    }
+
+    /// Return the global `SimStore`.
+    ///
+    /// # Panics
+    /// Panics if `SimStore::init` has not been called.
+    pub fn get() -> &'static Self {
+        SIM_STORE
+            .get()
+            .expect("SimStore::get() called before SimStore::init()")
+    }
+
     pub fn new(data_dir: &Path) -> Self {
         let base = data_dir.join("tiko_sim");
         SimStore {
             express_root: base.join("express"),
             standard_root: base.join("standard"),
         }
-    }
-
-    /// Construct from the PostgreSQL `DataDir` global.
-    /// Must only be called from a PG process context.
-    pub fn from_data_dir() -> Self {
-        let data_dir = unsafe { CStr::from_ptr(DataDir).to_str().unwrap_or("") };
-        Self::new(Path::new(data_dir))
     }
 
     // ── Primitive helpers ─────────────────────────────────────────────────
