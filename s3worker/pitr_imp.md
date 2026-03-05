@@ -551,10 +551,10 @@ uses `std::fs` directly (synchronous), which is correct since `SimStore` is sync
 ### Todos
 
 **wal_archive.rs:**
-- [ ] Implement `pub fn upload_delta_manifest(sim: &SimStore, ns: &ProjectNamespace, checkpoint_lsn: Lsn, manifest: &Manifest) -> Result<()>`:
+- [x] Implement `pub fn upload_delta_manifest(sim: &SimStore, ns: &ProjectNamespace, checkpoint_lsn: Lsn, manifest: &Manifest) -> Result<()>`:
   `manifest.to_bytes()?` → `sim.put_standard(&ns.delta_manifest_key(checkpoint_lsn), &bytes)`
 
-- [ ] Implement `pub fn upload_pg_state(sim: &SimStore, ns: &ProjectNamespace, checkpoint_lsn: Lsn, pgdata: &Path) -> Result<()>`:
+- [x] Implement `pub fn upload_pg_state(sim: &SimStore, ns: &ProjectNamespace, checkpoint_lsn: Lsn, pgdata: &Path) -> Result<()>`:
   Build a tar+zstd archive in memory containing the following PG state files:
   - `pg_control` (8 KB)
   - `pg_xact/*` (all segment files)
@@ -564,16 +564,16 @@ uses `std::fs` directly (synchronous), which is correct since `SimStore` is sync
   `sim.put_standard(&ns.non_smgr_key(checkpoint_lsn), &bytes)` where
   `non_smgr_key` returns `"{org}/pitr/{proj}/deltas/{lsn_hex}/pg_state.tar.zst"`.
 
-- [ ] Implement `pub fn upload_wal_segment(sim: &SimStore, ns: &ProjectNamespace, timeline: u32, segment: &str, path: &Path) -> Result<()>`:
+- [x] Implement `pub fn upload_wal_segment(sim: &SimStore, ns: &ProjectNamespace, timeline: u32, segment: &str, path: &Path) -> Result<()>`:
   `std::fs::read(path)` → `sim.put_standard(&ns.wal_key(timeline, segment), &bytes)`
   Called by `tiko_archive` binary (Module 9).
 
-- [ ] Implement `pub fn download_wal_segment(sim: &SimStore, ns: &ProjectNamespace, timeline: u32, segment: &str, dest: &Path) -> Result<bool>`:
+- [x] Implement `pub fn download_wal_segment(sim: &SimStore, ns: &ProjectNamespace, timeline: u32, segment: &str, dest: &Path) -> Result<bool>`:
   `sim.get_standard(&ns.wal_key(timeline, segment))` → write bytes to `dest`; returns
   `Ok(false)` if not found (caller tries parent namespace).
 
 **checkpoint.rs:**
-- [ ] Replace current stub with `s3_checkpoint_flush(checkpoint_lsn: Lsn)`:
+- [x] Replace current stub with `s3_checkpoint_flush(checkpoint_lsn: Lsn)`:
   ```
   1. evict_all_dirty_chunks()
      // Flushes every remaining dirty cache slot: PUT to express-bucket `latest`
@@ -610,15 +610,15 @@ uses `std::fs` directly (synchronous), which is correct since `SimStore` is sync
   `{DataDir}/tiko/delta_{lsn_hex}.bin`) for the duration of the checkpoint
   flush, then discarded after `upload_delta_manifest` converts it to S3 bytes.
 
-- [ ] Add `fn dedup_by_chunk_tag(records: Vec<EvictionLogRecord>) -> Vec<ChunkTag>`:
+- [x] Add `fn dedup_by_chunk_tag(records: Vec<EvictionLogRecord>) -> Vec<ChunkTag>`:
   Build a `HashSet<ChunkTag>` from all records; return as `Vec`. Order doesn't matter.
 
-- [ ] Keep existing guard: `if !S3IoControl::is_initialized() { return; }`
+- [x] Keep existing guard: `if !S3IoControl::is_initialized() { return; }`
 
-- [ ] Update C call site in `postgres/src/backend/access/transam/xlog.c`:
+- [x] Update C call site in `postgres/src/backend/access/transam/xlog.c`:
   `s3_checkpoint_flush(checkpoint_lsn)` — single argument, no `prev_lsn`
 
-- [ ] `#[cfg(test)]` (tempdir):
+- [x] `#[cfg(test)]` (tempdir):
   Synthesise all 5 eviction scenarios from the design doc:
   1. Chunk dirtied → checkpoint (still in cache) → `evict_all_dirty_chunks` flushes it to log
   2. Chunk dirtied → evicted mid-interval → checkpoint → eviction log has entry
@@ -636,7 +636,7 @@ uses `std::fs` directly (synchronous), which is correct since `SimStore` is sync
 
 ## Module 7 — Branch Creation
 
-**Status:** `[ ]`
+**Status:** `[x]`
 **Depends on:** Modules 1, 2, 3
 **Modified file:** `s3worker/src/project.rs` (add branch creation functions)
 

@@ -7,7 +7,7 @@
 //! page cache beyond what the OS provides.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use pgsys::Lsn;
@@ -32,7 +32,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// All key methods produce strings relative to the bucket root (no leading `/`).
 /// Express-bucket keys are scoped to `{org}/{proj}/`.
 /// Standard-bucket chunk keys are org-scoped with `{branch_id}` (not `project_id`).
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ProjectNamespace {
     pub org_id: u64,
     pub project_id: u64,
@@ -288,6 +288,167 @@ impl ProjectCtx {
     }
 }
 
+// ── Module 7: Branch Creation ─────────────────────────────────────────────────
+
+/// Build the initial base manifest for a new branch.
+///
+/// Finds the latest base manifest for `parent_ns` with `base_lsn ≤ branch_lsn`,
+/// applies all parent deltas in `(base_lsn, branch_lsn]`, and writes the merged
+/// result to `out_path`. Parent `branch_id` values inside each `ChunkRef` are
+/// preserved — no re-keying.
+///
+/// Returns an error if no base manifest exists with `lsn ≤ branch_lsn`.
+pub fn build_initial_manifest(
+    sim: &SimStore,
+    parent_ns: &ProjectNamespace,
+    branch_lsn: Lsn,
+    out_path: &Path,
+) -> Result<Manifest> {
+    // Step 1: list base manifests; find the latest with lsn ≤ branch_lsn.
+    let base_prefix = parent_ns.base_prefix();
+    let base_keys = sim.list_prefix_standard(&base_prefix)?;
+
+    let mut base_lsns: Vec<Lsn> = base_keys
+        .iter()
+        .filter_map(|key| {
+            let rest = key.strip_prefix(&base_prefix)?;
+            let lsn_hex = rest.split('/').next()?;
+            Lsn::from_hex(lsn_hex).ok()
+        })
+        .filter(|&lsn| lsn <= branch_lsn)
+        .collect();
+    base_lsns.sort();
+
+    let chosen_base_lsn = base_lsns
+        .last()
+        .copied()
+        .ok_or_else(|| format!("no base manifest with lsn ≤ {}", branch_lsn.to_hex()))?;
+
+    // Step 2: download the chosen base manifest.
+    let base_manifest_key = parent_ns.base_manifest_key(chosen_base_lsn);
+    let bytes = sim
+        .get_standard(&base_manifest_key)?
+        .ok_or_else(|| format!("base manifest not found: {base_manifest_key}"))?;
+    let base = Manifest::from_bytes(&bytes, out_path)?;
+
+    // Step 3: list deltas in (chosen_base_lsn, branch_lsn] and download each.
+    let delta_prefix = parent_ns.delta_prefix();
+    let delta_keys = sim.list_prefix_standard(&delta_prefix)?;
+
+    let mut delta_lsns: Vec<Lsn> = delta_keys
+        .iter()
+        .filter_map(|key| {
+            let rest = key.strip_prefix(&delta_prefix)?;
+            let lsn_hex = rest.split('/').next()?;
+            Lsn::from_hex(lsn_hex).ok()
+        })
+        .filter(|&lsn| lsn > chosen_base_lsn && lsn <= branch_lsn)
+        .collect();
+    delta_lsns.sort();
+    delta_lsns.dedup();
+
+    let mut deltas: Vec<Manifest> = Vec::with_capacity(delta_lsns.len());
+    for &delta_lsn in &delta_lsns {
+        let key = parent_ns.delta_manifest_key(delta_lsn);
+        let bytes = sim
+            .get_standard(&key)?
+            .ok_or_else(|| format!("delta manifest not found: {key}"))?;
+        // Place each delta TIKM file alongside the output base manifest.
+        let delta_path = out_path.with_file_name(format!("delta_{}.tikm", delta_lsn.to_hex()));
+        deltas.push(Manifest::from_bytes(&bytes, &delta_path)?);
+    }
+
+    // Step 4: merge deltas into the base.
+    base.apply_deltas(&deltas)?;
+
+    Ok(base)
+}
+
+/// Create a child branch at `branch_lsn` forked from `parent_ns`.
+///
+/// Writes exactly two objects to the standard bucket:
+/// - `child_ns.project_meta_key()` — serialised `ProjectMeta`
+/// - `child_ns.base_manifest_key(branch_lsn)` — the merged base manifest
+///
+/// The branch is valid once both writes succeed.
+pub fn create_branch(
+    sim: &SimStore,
+    parent_ns: &ProjectNamespace,
+    child_ns: &ProjectNamespace,
+    branch_lsn: Lsn,
+) -> Result<()> {
+    // Build the initial manifest to a unique temp path.
+    let local_path: PathBuf = std::env::temp_dir().join(format!(
+        "tiko_branch_{}_{}.tikm",
+        child_ns.branch_id,
+        branch_lsn.to_hex()
+    ));
+    let initial_manifest = build_initial_manifest(sim, parent_ns, branch_lsn, &local_path)?;
+
+    // Construct child project metadata.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let meta = ProjectMeta {
+        ns: child_ns.clone(),
+        parent_project_id: Some(parent_ns.project_id),
+        parent_branch_id: Some(parent_ns.branch_id),
+        branch_checkpoint_lsn: Some(branch_lsn),
+        branch_timeline_id: None,
+        created_at: now,
+        status: "active".to_string(),
+    };
+
+    // Write project.json.
+    sim.put_standard(&child_ns.project_meta_key(), &serde_json::to_vec(&meta)?)?;
+
+    // Write manifest.bin — single atomic PUT; branch is valid after this.
+    sim.put_standard(
+        &child_ns.base_manifest_key(branch_lsn),
+        &initial_manifest.to_bytes()?,
+    )?;
+
+    Ok(())
+}
+
+/// Delete all sim objects for `branch_ns`.
+///
+/// Removes:
+/// - Express-bucket hot data: `{org}/{proj}/`
+/// - Standard-bucket PITR data (manifests + WAL): `{org}/pitr/{proj}/`
+/// - Standard-bucket metadata: `{org}/metadata/{proj}/`
+///
+/// Standard-bucket chunk objects (`{org}/chunks/{branch_id}/`) are intentionally
+/// left in place and will be collected by the next GC run.
+pub fn delete_branch(sim: &SimStore, branch_ns: &ProjectNamespace) -> Result<()> {
+    // 1. Remove express-bucket hot data.
+    let express_prefix = format!("{}/{}/", branch_ns.org_id, branch_ns.project_id);
+    for key in sim.list_prefix_express(&express_prefix)? {
+        sim.delete_express(&key)?;
+    }
+
+    // 2. Remove standard-bucket PITR data (manifests + WAL).
+    let pitr_prefix = format!("{}/pitr/{}/", branch_ns.org_id, branch_ns.project_id);
+    for key in sim.list_prefix_standard(&pitr_prefix)? {
+        sim.delete_standard(&key)?;
+    }
+
+    // 3. Remove standard-bucket metadata.
+    let meta_prefix = format!("{}/metadata/{}/", branch_ns.org_id, branch_ns.project_id);
+    for key in sim.list_prefix_standard(&meta_prefix)? {
+        sim.delete_standard(&key)?;
+    }
+
+    // 4. Chunk GC is the control plane's responsibility.
+    eprintln!(
+        "tiko: standard-bucket {}/chunks/{}/ will be collected by next GC run",
+        branch_ns.org_id, branch_ns.branch_id
+    );
+
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -514,5 +675,348 @@ mod tests {
 
         // Should use the newer manifest
         assert_eq!(ctx.base_manifest_lookup(&known_tag).unwrap(), Some(new_ref));
+    }
+}
+
+// ── Module 7 tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod module7_tests {
+    use super::*;
+    use crate::cache::ChunkTag;
+    use crate::manifest::ChunkRef;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, SimStore) {
+        let dir = TempDir::new().unwrap();
+        let store = SimStore::new(dir.path());
+        (dir, store)
+    }
+
+    fn ns_a() -> ProjectNamespace {
+        ProjectNamespace::new(1001, 2001, 1)
+    }
+
+    fn ns_b() -> ProjectNamespace {
+        ProjectNamespace::new(1001, 2002, 2)
+    }
+
+    fn ns_c() -> ProjectNamespace {
+        ProjectNamespace::new(1001, 2003, 3)
+    }
+
+    fn tag(rel: u32) -> ChunkTag {
+        ChunkTag {
+            spc_oid: 1663,
+            db_oid: 5,
+            rel_number: rel,
+            fork_number: 0,
+            chunk_id: 0,
+        }
+    }
+
+    fn cref(branch_id: u64, lsn: Lsn) -> ChunkRef {
+        ChunkRef { branch_id, lsn }
+    }
+
+    fn store_manifest_bytes(
+        sim: &SimStore,
+        key: &str,
+        lsn: Lsn,
+        chunks: Vec<(ChunkTag, ChunkRef)>,
+        tmp_path: &Path,
+    ) {
+        let m = Manifest::new_sorted(lsn, 0, chunks, tmp_path).unwrap();
+        let bytes = m.to_bytes().unwrap();
+        sim.put_standard(key, &bytes).unwrap();
+    }
+
+    // ── build_initial_manifest from base + 3 deltas ───────────────────────
+
+    #[test]
+    fn build_initial_manifest_merges_base_and_deltas() {
+        let (dir, sim) = setup();
+        let ns = ns_a();
+
+        let base_lsn = Lsn::new(0x100);
+        let d1_lsn = Lsn::new(0x200);
+        let d2_lsn = Lsn::new(0x300);
+        let d3_lsn = Lsn::new(0x400); // branch_lsn
+
+        // Base: rel=1 at branch_id=1
+        store_manifest_bytes(
+            &sim,
+            &ns.base_manifest_key(base_lsn),
+            base_lsn,
+            vec![(tag(1), cref(1, base_lsn))],
+            &dir.path().join("b.tikm"),
+        );
+        // Delta 1: adds rel=2
+        store_manifest_bytes(
+            &sim,
+            &ns.delta_manifest_key(d1_lsn),
+            d1_lsn,
+            vec![(tag(2), cref(1, d1_lsn))],
+            &dir.path().join("d1.tikm"),
+        );
+        // Delta 2: updates rel=1, adds rel=3
+        store_manifest_bytes(
+            &sim,
+            &ns.delta_manifest_key(d2_lsn),
+            d2_lsn,
+            vec![(tag(1), cref(1, d2_lsn)), (tag(3), cref(1, d2_lsn))],
+            &dir.path().join("d2.tikm"),
+        );
+        // Delta 3: updates rel=2
+        store_manifest_bytes(
+            &sim,
+            &ns.delta_manifest_key(d3_lsn),
+            d3_lsn,
+            vec![(tag(2), cref(1, d3_lsn))],
+            &dir.path().join("d3.tikm"),
+        );
+
+        let out = dir.path().join("out.tikm");
+        let m = build_initial_manifest(&sim, &ns, d3_lsn, &out).unwrap();
+
+        assert_eq!(m.lookup(&tag(1)).unwrap(), Some(cref(1, d2_lsn))); // updated by d2
+        assert_eq!(m.lookup(&tag(2)).unwrap(), Some(cref(1, d3_lsn))); // updated by d3
+        assert_eq!(m.lookup(&tag(3)).unwrap(), Some(cref(1, d2_lsn))); // added by d2
+        assert_eq!(m.lookup(&tag(99)).unwrap(), None);
+    }
+
+    // ── Deltas beyond branch_lsn are excluded ─────────────────────────────
+
+    #[test]
+    fn build_initial_manifest_excludes_deltas_beyond_branch_lsn() {
+        let (dir, sim) = setup();
+        let ns = ns_a();
+
+        let base_lsn = Lsn::new(0x100);
+        let d1_lsn = Lsn::new(0x200);
+        let d2_lsn = Lsn::new(0x300); // beyond branch point
+        let branch_lsn = Lsn::new(0x200);
+
+        store_manifest_bytes(
+            &sim,
+            &ns.base_manifest_key(base_lsn),
+            base_lsn,
+            vec![(tag(1), cref(1, base_lsn))],
+            &dir.path().join("b.tikm"),
+        );
+        store_manifest_bytes(
+            &sim,
+            &ns.delta_manifest_key(d1_lsn),
+            d1_lsn,
+            vec![(tag(1), cref(1, d1_lsn))],
+            &dir.path().join("d1.tikm"),
+        );
+        // Delta 2 is beyond branch_lsn — must NOT be applied
+        store_manifest_bytes(
+            &sim,
+            &ns.delta_manifest_key(d2_lsn),
+            d2_lsn,
+            vec![(tag(1), cref(1, d2_lsn)), (tag(2), cref(1, d2_lsn))],
+            &dir.path().join("d2.tikm"),
+        );
+
+        let out = dir.path().join("out.tikm");
+        let m = build_initial_manifest(&sim, &ns, branch_lsn, &out).unwrap();
+
+        // rel=1 should reflect d1, not d2
+        assert_eq!(m.lookup(&tag(1)).unwrap(), Some(cref(1, d1_lsn)));
+        // rel=2 (only in d2) must not appear
+        assert_eq!(m.lookup(&tag(2)).unwrap(), None);
+    }
+
+    // ── Cascaded branch: C from B from A ─────────────────────────────────
+
+    #[test]
+    fn cascaded_branch_preserves_original_branch_ids() {
+        let (dir, sim) = setup();
+        let a_ns = ns_a();
+        let b_ns = ns_b();
+        let _c_ns = ns_c();
+
+        let a_lsn = Lsn::new(0x100);
+        let b_lsn = Lsn::new(0x200);
+
+        // A's base: rel=10 with A's branch_id
+        store_manifest_bytes(
+            &sim,
+            &a_ns.base_manifest_key(a_lsn),
+            a_lsn,
+            vec![(tag(10), cref(a_ns.branch_id, a_lsn))],
+            &dir.path().join("a_base.tikm"),
+        );
+
+        // Build B's initial manifest from A at a_lsn and store it as B's base
+        let tmp_b_out = dir.path().join("b_init.tikm");
+        let b_initial = build_initial_manifest(&sim, &a_ns, a_lsn, &tmp_b_out).unwrap();
+        sim.put_standard(
+            &b_ns.base_manifest_key(a_lsn),
+            &b_initial.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        // B adds a delta: rel=20 with B's branch_id
+        store_manifest_bytes(
+            &sim,
+            &b_ns.delta_manifest_key(b_lsn),
+            b_lsn,
+            vec![(tag(20), cref(b_ns.branch_id, b_lsn))],
+            &dir.path().join("b_d1.tikm"),
+        );
+
+        // Build C's manifest from B at b_lsn
+        let tmp_c_out = dir.path().join("c_out.tikm");
+        let c = build_initial_manifest(&sim, &b_ns, b_lsn, &tmp_c_out).unwrap();
+
+        // rel=10 was only on A → branch_id = A's (1)
+        assert_eq!(
+            c.lookup(&tag(10)).unwrap(),
+            Some(cref(a_ns.branch_id, a_lsn))
+        );
+        // rel=20 was added on B → branch_id = B's (2)
+        assert_eq!(
+            c.lookup(&tag(20)).unwrap(),
+            Some(cref(b_ns.branch_id, b_lsn))
+        );
+    }
+
+    // ── create_branch writes project.json + manifest.bin ─────────────────
+
+    #[test]
+    fn create_branch_writes_exactly_two_standard_files() {
+        let (dir, sim) = setup();
+        let parent_ns = ns_a();
+        let child_ns = ns_b();
+        let branch_lsn = Lsn::new(0x100);
+
+        // Set up parent base
+        store_manifest_bytes(
+            &sim,
+            &parent_ns.base_manifest_key(branch_lsn),
+            branch_lsn,
+            vec![(tag(1), cref(parent_ns.branch_id, branch_lsn))],
+            &dir.path().join("parent_base.tikm"),
+        );
+
+        create_branch(&sim, &parent_ns, &child_ns, branch_lsn).unwrap();
+
+        // project.json must exist and deserialise correctly
+        let meta_bytes = sim
+            .get_standard(&child_ns.project_meta_key())
+            .unwrap()
+            .unwrap();
+        let meta: ProjectMeta = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(meta.ns, child_ns);
+        assert_eq!(meta.parent_project_id, Some(parent_ns.project_id));
+        assert_eq!(meta.parent_branch_id, Some(parent_ns.branch_id));
+        assert_eq!(meta.branch_checkpoint_lsn, Some(branch_lsn));
+
+        // manifest.bin must exist and round-trip correctly
+        let manifest_bytes = sim
+            .get_standard(&child_ns.base_manifest_key(branch_lsn))
+            .unwrap()
+            .unwrap();
+        let tmp = dir.path().join("verify.tikm");
+        let m = Manifest::from_bytes(&manifest_bytes, &tmp).unwrap();
+        assert_eq!(
+            m.lookup(&tag(1)).unwrap(),
+            Some(cref(parent_ns.branch_id, branch_lsn))
+        );
+
+        // Exactly 1 base manifest and 1 project.json in standard for the child
+        let base_keys = sim.list_prefix_standard(&child_ns.base_prefix()).unwrap();
+        assert_eq!(base_keys.len(), 1);
+        let meta_keys = sim
+            .list_prefix_standard(&format!(
+                "{}/metadata/{}/",
+                child_ns.org_id, child_ns.project_id
+            ))
+            .unwrap();
+        assert_eq!(meta_keys.len(), 1);
+    }
+
+    // ── delete_branch removes express + pitr/metadata; leaves chunks ──────
+
+    #[test]
+    fn delete_branch_removes_express_and_pitr_not_chunks() {
+        let (dir, sim) = setup();
+        let ns = ns_b();
+        let branch_lsn = Lsn::new(0x100);
+
+        // Express: a chunk latest
+        sim.put_express(&ns.chunk_latest_key(&tag(1)), b"hot-data")
+            .unwrap();
+
+        // Standard PITR: a base manifest
+        store_manifest_bytes(
+            &sim,
+            &ns.base_manifest_key(branch_lsn),
+            branch_lsn,
+            vec![(tag(1), cref(ns.branch_id, branch_lsn))],
+            &dir.path().join("del_base.tikm"),
+        );
+
+        // Standard metadata: project.json
+        let meta = ProjectMeta {
+            ns: ns.clone(),
+            parent_project_id: None,
+            parent_branch_id: None,
+            branch_checkpoint_lsn: None,
+            branch_timeline_id: None,
+            created_at: 0,
+            status: "active".to_string(),
+        };
+        sim.put_standard(&ns.project_meta_key(), &serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+
+        // Standard chunks: versioned object (must NOT be deleted)
+        let chunk_key = ns.chunk_versioned_key(&tag(1), branch_lsn);
+        sim.put_standard(&chunk_key, b"chunk-data").unwrap();
+
+        delete_branch(&sim, &ns).unwrap();
+
+        // Express data removed
+        assert_eq!(
+            sim.get_express(&ns.chunk_latest_key(&tag(1))).unwrap(),
+            None
+        );
+        // PITR data removed
+        assert!(
+            sim.list_prefix_standard(&ns.base_prefix())
+                .unwrap()
+                .is_empty()
+        );
+        // Metadata removed
+        assert_eq!(sim.get_standard(&ns.project_meta_key()).unwrap(), None);
+        // Chunks untouched
+        assert_eq!(
+            sim.get_standard(&chunk_key).unwrap(),
+            Some(b"chunk-data".to_vec())
+        );
+    }
+
+    // ── no base with lsn ≤ branch_lsn → error ────────────────────────────
+
+    #[test]
+    fn build_initial_manifest_no_base_lte_branch_lsn_returns_error() {
+        let (dir, sim) = setup();
+        let ns = ns_a();
+
+        // Only base at 0x500, branch_lsn is 0x100
+        store_manifest_bytes(
+            &sim,
+            &ns.base_manifest_key(Lsn::new(0x500)),
+            Lsn::new(0x500),
+            vec![(tag(1), cref(1, Lsn::new(0x500)))],
+            &dir.path().join("future.tikm"),
+        );
+
+        let out = dir.path().join("out.tikm");
+        let result = build_initial_manifest(&sim, &ns, Lsn::new(0x100), &out);
+        assert!(result.is_err(), "no base ≤ branch_lsn must return error");
     }
 }
