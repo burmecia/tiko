@@ -712,7 +712,7 @@ them directly (acceptable for sim — local FS is fast).
 ### Todos
 
 **pitr_task.rs:**
-- [ ] Define `PitrConfig`:
+- [x] Define `PitrConfig`:
   ```rust
   pub struct PitrConfig {
       pub materialization_interval: std::time::Duration, // TIKO_PITR_INTERVAL_SECS (default 3600)
@@ -720,7 +720,7 @@ them directly (acceptable for sim — local FS is fast).
   impl PitrConfig { pub fn from_env() -> Self }
   ```
 
-- [ ] Implement `pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, config: PitrConfig)`:
+- [x] Implement `pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, config: PitrConfig)`:
   ```rust
   let mut interval = tokio::time::interval(config.materialization_interval);
   loop {
@@ -731,7 +731,7 @@ them directly (acceptable for sim — local FS is fast).
   }
   ```
 
-- [ ] Implement `fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()>`:
+- [x] Implement `fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()>`:
   1. `sim.list_prefix_standard(&ns.base_prefix())` → parse LSN dirs → GET latest `manifest.bin`
      → `Manifest::from_bytes(&bytes, &base_local_path)?`
   2. `sim.list_prefix_standard(&ns.delta_prefix())` → filter deltas newer than `base_lsn` →
@@ -750,7 +750,7 @@ them directly (acceptable for sim — local FS is fast).
   is always updated via `apply_deltas` (not replaced wholesale), so any concurrent
   `lookup` calls see a consistent view under the manifest's internal `Mutex`.
 
-- [ ] `#[cfg(test)]` (tempdir, synchronous):
+- [x] `#[cfg(test)]` (tempdir, synchronous):
   - Seed sim with 10 delta manifests + a base at delta 3 (all as msgpack+zstd blobs)
   - `materialize_base`: verify new base matches expected merged map (base + deltas 4–10);
     new base `manifest.bin` is in sim standard store at correct key
@@ -760,14 +760,14 @@ them directly (acceptable for sim — local FS is fast).
   - All 10 delta files still present after materialization
 
 **thread_pool.rs:**
-- [ ] After `init_tokio_runtime()`, spawn:
+- [x] After `init_tokio_runtime()`, spawn:
   ```rust
   let sim = Arc::new(SimStore::from_data_dir());
   let ns  = global_project_ctx().ns().clone();
   let cfg = PitrConfig::from_env();
   runtime.spawn(pitr_background_task(Arc::clone(&sim), ns, cfg));
   ```
-- [ ] Store `Arc<SimStore>` in a `OnceLock` for access from Module 5's eviction path
+- [x] Store `Arc<SimStore>` in a `OnceLock` for access from Module 5's eviction path
 
 ---
 
