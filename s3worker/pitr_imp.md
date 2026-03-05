@@ -773,7 +773,7 @@ them directly (acceptable for sim — local FS is fast).
 
 ## Module 9 — WAL Archive & Restore
 
-**Status:** `[ ]`
+**Status:** `[x]`
 **Depends on:** Modules 2, 6
 **New files:** `s3worker/src/bin/tiko_restore.rs`, `s3worker/src/bin/tiko_archive.rs`
 **Modified file:** `s3worker/Cargo.toml` (already has `[[bin]]` entries from prerequisites)
@@ -784,25 +784,25 @@ Both binaries are short (<100 lines each) — pure `std::fs` + `SimStore`.
 ### Todos
 
 **tiko_archive.rs:**
-- [ ] Parse `archive_command = 'tiko_archive %p %f'` args: `argv[1]` = WAL path, `argv[2]` = WAL filename
-- [ ] Build `SimStore::from_data_dir()` and `ProjectNamespace` from env
+- [x] Parse `archive_command = 'tiko_archive %p %f'` args: `argv[1]` = WAL path, `argv[2]` = WAL filename
+- [x] Build `SimStore::from_data_dir()` and `ProjectNamespace` from env
   (`TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`)
-- [ ] `timeline = parse_timeline_from_filename(argv[2])` (first 8 hex chars of segment name)
-- [ ] Call `upload_wal_segment(sim, ns, timeline, filename, path)` from Module 6
-- [ ] Exit 0 on success, exit 1 on any error (PG retries non-zero exit)
+- [x] `timeline = parse_timeline_from_filename(argv[2])` (first 8 hex chars of segment name)
+- [x] Call `upload_wal_segment(sim, ns, timeline, filename, path)` from Module 6
+- [x] Exit 0 on success, exit 1 on any error (PG retries non-zero exit)
 
 **tiko_restore.rs:**
-- [ ] Parse `restore_command = 'tiko_restore %f %p'` args: `argv[1]` = WAL filename, `argv[2]` = dest path
-- [ ] Build `SimStore::from_data_dir()`, own `ProjectNamespace` from
+- [x] Parse `restore_command = 'tiko_restore %f %p'` args: `argv[1]` = WAL filename, `argv[2]` = dest path
+- [x] Build `SimStore::from_data_dir()`, own `ProjectNamespace` from
   `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`
-- [ ] Read optional env vars `TIKO_PARENT_PROJECT_ID`, `TIKO_PARENT_BRANCH_ID`,
+- [x] Read optional env vars `TIKO_PARENT_PROJECT_ID`, `TIKO_PARENT_BRANCH_ID`,
   `TIKO_BRANCH_CHECKPOINT_LSN` for branch WAL fallback
-- [ ] `restore_segment(sim, own_ns, parent_ns_opt, branch_lsn_opt, filename, dest)`:
+- [x] `restore_segment(sim, own_ns, parent_ns_opt, branch_lsn_opt, filename, dest)`:
   1. Try `download_wal_segment(sim, own_ns, timeline, filename, dest)` → found: exit 0
   2. If not found AND branch context present AND `segment_lsn ≤ branch_checkpoint_lsn`:
      try `download_wal_segment(sim, parent_ns, timeline, filename, dest)` → found: exit 0
   3. All misses: exit 1
-- [ ] Exit 0 on success, exit 1 on failure
+- [x] Exit 0 on success, exit 1 on failure
 
 **PostgreSQL configuration:**
 ```ini
@@ -825,7 +825,7 @@ export TIKO_BRANCH_CHECKPOINT_LSN=000000003A000028   # 16-char hex Lsn::to_hex()
 touch $PGDATA/recovery.signal
 ```
 
-- [ ] `#[cfg(test)]` (tempdir):
+- [x] `#[cfg(test)]` (tempdir):
   - Archive a synthetic WAL file → verify sim standard `wal/` file exists with correct bytes
   - Restore it via `download_wal_segment` → byte equality
   - Branch fallback: segment only in parent's sim namespace → restore finds it

@@ -11,6 +11,14 @@ rust-version = { workspace = true }
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "tiko_archive"
+path = "src/bin/tiko_archive.rs"
+
+[[bin]]
+name = "tiko_restore"
+path = "src/bin/tiko_restore.rs"
+
 [dependencies]
 pgsys = { path = "../pgsys" }
 libc = { workspace = true }

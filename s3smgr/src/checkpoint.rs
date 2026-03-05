@@ -47,8 +47,6 @@ use s3worker::manifest::{ChunkRef, Manifest};
 use s3worker::project::{ProjectCtx, ProjectNamespace};
 use s3worker::sim_store::SimStore;
 
-use crate::wal_archive::{upload_delta_manifest, upload_pg_state};
-
 // ── extern "C" entry point ────────────────────────────────────────────────────
 
 /// Called from `CheckPointGuts()` after `CheckPointBuffers()`.
@@ -157,7 +155,7 @@ fn checkpoint_flush_inner(
 /// A chunk evicted multiple times during the interval should only be uploaded
 /// once (the latest data is already in express `latest`). Order is not
 /// significant.
-pub(crate) fn dedup_by_chunk_tag(records: Vec<ChunkTag>) -> Vec<ChunkTag> {
+fn dedup_by_chunk_tag(records: Vec<ChunkTag>) -> Vec<ChunkTag> {
     let set: HashSet<ChunkTag> = records.into_iter().collect();
     set.into_iter().collect()
 }
@@ -175,6 +173,84 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+// ── WAL archive helpers ───────────────────────────────────────────────────────
+
+/// Serialise `manifest` to the S3 wire format and PUT it at the delta manifest
+/// key `{org}/pitr/{proj}/deltas/{lsn_hex}/manifest.bin` in the standard bucket.
+fn upload_delta_manifest(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    checkpoint_lsn: Lsn,
+    manifest: &Manifest,
+) -> io::Result<()> {
+    let bytes = manifest.to_bytes()?;
+    sim.put_standard(&ns.delta_manifest_key(checkpoint_lsn), &bytes)
+}
+
+/// Build a tar+zstd archive of the critical PG state files and PUT it at
+/// `{org}/pitr/{proj}/deltas/{lsn_hex}/pg_state.tar.zst` in the standard bucket.
+///
+/// Included paths (relative to `pgdata`):
+/// - `global/pg_control`
+/// - `pg_xact/**`
+/// - `pg_multixact/members/**`
+/// - `pg_multixact/offsets/**`
+/// - `global/pg_filenode.map`
+///
+/// Missing files or directories are silently skipped — this is intentional for
+/// test environments where PG state files may not exist. In production the
+/// checkpointer always runs inside a live PostgreSQL data directory.
+fn upload_pg_state(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    checkpoint_lsn: Lsn,
+    pgdata: &Path,
+) -> io::Result<()> {
+    let compressed = build_pg_state_archive(pgdata)?;
+    sim.put_standard(&ns.pg_state_key(checkpoint_lsn), &compressed)
+}
+
+/// Build the in-memory tar+zstd archive.  Returns compressed bytes.
+fn build_pg_state_archive(pgdata: &Path) -> io::Result<Vec<u8>> {
+    let buf: Vec<u8> = Vec::new();
+    let enc = zstd::Encoder::new(buf, 3)?;
+    let mut builder = tar::Builder::new(enc);
+
+    // global/pg_control
+    let pg_control = pgdata.join("global").join("pg_control");
+    if pg_control.exists() {
+        builder.append_path_with_name(&pg_control, "global/pg_control")?;
+    }
+
+    // pg_xact/
+    let pg_xact = pgdata.join("pg_xact");
+    if pg_xact.is_dir() {
+        builder.append_dir_all("pg_xact", &pg_xact)?;
+    }
+
+    // pg_multixact/members/
+    let multixact_members = pgdata.join("pg_multixact").join("members");
+    if multixact_members.is_dir() {
+        builder.append_dir_all("pg_multixact/members", &multixact_members)?;
+    }
+
+    // pg_multixact/offsets/
+    let multixact_offsets = pgdata.join("pg_multixact").join("offsets");
+    if multixact_offsets.is_dir() {
+        builder.append_dir_all("pg_multixact/offsets", &multixact_offsets)?;
+    }
+
+    // global/pg_filenode.map
+    let filenode_map = pgdata.join("global").join("pg_filenode.map");
+    if filenode_map.exists() {
+        builder.append_path_with_name(&filenode_map, "global/pg_filenode.map")?;
+    }
+
+    let enc = builder.into_inner()?;
+    let compressed = enc.finish()?;
+    Ok(compressed)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -182,9 +258,10 @@ mod tests {
     use super::*;
     use pgsys::Lsn;
     use s3worker::cache::ChunkTag;
-    use s3worker::manifest::Manifest;
+    use s3worker::manifest::{ChunkRef, Manifest};
     use s3worker::project::ProjectNamespace;
     use s3worker::sim_store::SimStore;
+    use std::fs;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -497,5 +574,93 @@ mod tests {
         let mut result = dedup_by_chunk_tag(records);
         result.sort(); // HashSet order is non-deterministic
         assert_eq!(result, vec![t1, t2]);
+    }
+
+    // ── upload_delta_manifest ─────────────────────────────────────────────
+
+    fn make_manifest(dir: &std::path::Path, lsn: Lsn) -> Manifest {
+        let path = dir.join("m.tikm");
+        let tag = ChunkTag {
+            spc_oid: 1,
+            db_oid: 1,
+            rel_number: 1,
+            fork_number: 0,
+            chunk_id: 0,
+        };
+        let cref = ChunkRef { branch_id: 7, lsn };
+        Manifest::new_sorted(lsn, 0, vec![(tag, cref)], &path).unwrap()
+    }
+
+    #[test]
+    fn upload_delta_manifest_stores_at_correct_key() {
+        let dir = TempDir::new().unwrap();
+        let sim = SimStore::new(dir.path());
+        let ns = ns();
+        let lsn = Lsn::new(0x200);
+        let manifest = make_manifest(dir.path(), lsn);
+
+        upload_delta_manifest(&sim, &ns, lsn, &manifest).unwrap();
+
+        let key = ns.delta_manifest_key(lsn);
+        let bytes = sim.get_standard(&key).unwrap();
+        assert!(bytes.is_some(), "delta manifest must be stored at {key}");
+
+        // Round-trip: deserialise should succeed
+        let tmp = dir.path().join("rt.tikm");
+        let m2 = Manifest::from_bytes(&bytes.unwrap(), &tmp).unwrap();
+        assert_eq!(m2.checkpoint_lsn(), lsn);
+    }
+
+    // ── upload_pg_state ───────────────────────────────────────────────────
+
+    #[test]
+    fn upload_pg_state_empty_pgdata_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let sim = SimStore::new(dir.path());
+        let ns = ns();
+        let lsn = Lsn::new(0x300);
+
+        upload_pg_state(&sim, &ns, lsn, dir.path()).unwrap();
+
+        let key = ns.pg_state_key(lsn);
+        let bytes = sim.get_standard(&key).unwrap();
+        assert!(bytes.is_some(), "pg_state archive must exist at {key}");
+        assert!(!bytes.unwrap().is_empty());
+    }
+
+    #[test]
+    fn upload_pg_state_includes_pg_control_and_xact() {
+        let dir = TempDir::new().unwrap();
+        let sim = SimStore::new(dir.path());
+        let ns = ns();
+        let lsn = Lsn::new(0x400);
+
+        let global = dir.path().join("global");
+        fs::create_dir_all(&global).unwrap();
+        fs::write(global.join("pg_control"), b"pg_control_data").unwrap();
+        let pg_xact = dir.path().join("pg_xact");
+        fs::create_dir_all(&pg_xact).unwrap();
+        fs::write(pg_xact.join("0000"), b"xact_segment").unwrap();
+
+        upload_pg_state(&sim, &ns, lsn, dir.path()).unwrap();
+
+        let bytes = sim.get_standard(&ns.pg_state_key(lsn)).unwrap().unwrap();
+
+        let decompressed = zstd::decode_all(bytes.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decompressed.as_slice());
+        let entry_names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.path().ok().map(|p| p.to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            entry_names.iter().any(|n| n.contains("pg_control")),
+            "pg_control must be in archive; found: {entry_names:?}"
+        );
+        assert!(
+            entry_names.iter().any(|n| n.contains("pg_xact")),
+            "pg_xact segment must be in archive; found: {entry_names:?}"
+        );
     }
 }
