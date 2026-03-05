@@ -540,7 +540,7 @@ Can be developed in parallel with Module 4.
 
 ## Module 6 — Checkpoint Flush
 
-**Status:** `[ ]`
+**Status:** `[x]`
 **Depends on:** Modules 1, 2, 4, 5
 **Rewritten file:** `s3smgr/src/checkpoint.rs` (expand from 20 lines)
 **New file:** `s3smgr/src/wal_archive.rs`

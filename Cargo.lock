@@ -385,6 +385,7 @@ dependencies = [
  "pgsys",
  "s3worker",
  "tar",
+ "tempfile",
  "tracing",
  "zstd",
 ]

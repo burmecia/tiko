@@ -58,6 +58,11 @@ impl SimStore {
             .expect("SimStore::get() called before SimStore::init()")
     }
 
+    /// Return the global `SimStore`, or `None` if not yet initialised.
+    pub fn try_get() -> Option<&'static Self> {
+        SIM_STORE.get()
+    }
+
     pub fn new(data_dir: &Path) -> Self {
         let base = data_dir.join("tiko_sim");
         SimStore {
