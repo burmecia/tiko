@@ -18,6 +18,11 @@ use crate::cache::{ChunkTag, RelFork};
 use crate::manifest::{ChunkRef, Manifest};
 use crate::sim_store::SimStore;
 
+// Environment variable names for project identity (org_id, project_id, branch_id).
+pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";
+pub const ENV_PROJECT_ID: &str = "TIKO_PROJECT_ID";
+pub const ENV_BRANCH_ID: &str = "TIKO_BRANCH_ID";
+
 /// Global project context for the running s3worker process.
 static PROJECT_CTX: OnceLock<ProjectCtx> = OnceLock::new();
 
@@ -199,6 +204,11 @@ pub struct ProjectCtx {
 }
 
 impl ProjectCtx {
+    /// Populate the global project context. Silently ignored if already set.
+    pub fn init(ctx: ProjectCtx) {
+        let _ = PROJECT_CTX.set(ctx);
+    }
+
     /// Return a reference to the global project context.
     ///
     /// # Panics
@@ -216,9 +226,61 @@ impl ProjectCtx {
         PROJECT_CTX.get()
     }
 
-    /// Populate the global project context. Silently ignored if already set.
-    pub fn init(ctx: ProjectCtx) {
-        let _ = PROJECT_CTX.set(ctx);
+    /// Initialize the global `ProjectCtx` from environment variables.
+    ///
+    /// Reads `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`. Panics if
+    /// any are absent or not valid u64s.
+    ///
+    /// If `project.json` exists in SimStore, loads the full `ProjectCtx`
+    /// (namespace + base manifest). Otherwise falls back to `bootstrap`,
+    /// which creates a namespace-only ctx with an empty manifest — correct
+    /// for initdb where no project data exists yet.
+    ///
+    /// Silently ignored if `ProjectCtx` is already initialized (OnceLock).
+    /// `SimStore::init()` must be called before this.
+    pub fn init_from_env(data_dir: &Path) {
+        fn read_u64(name: &str) -> u64 {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("Environment variable {name} must be set"))
+                .parse()
+                .unwrap_or_else(|_| panic!("Environment variable {name} must be a valid u64"))
+        }
+        let org_id = read_u64(ENV_ORG_ID);
+        let project_id = read_u64(ENV_PROJECT_ID);
+        let branch_id = read_u64(ENV_BRANCH_ID);
+        let sim = SimStore::get();
+        let ns = ProjectNamespace::new(org_id, project_id, branch_id);
+        // During initdb, project.json has not been written yet — fall back to
+        // a namespace-only ctx with an empty manifest so writes are routed
+        // correctly. The manifest is irrelevant during initdb (no reads).
+        let ctx = ProjectCtx::load(&ns, data_dir, sim)
+            .unwrap_or_else(|_| ProjectCtx::bootstrap(&ns, data_dir));
+        ProjectCtx::init(ctx);
+    }
+
+    /// Construct a minimal `ProjectCtx` when `project.json` does not exist yet
+    /// (e.g. during `initdb`).
+    ///
+    /// Sets the namespace so writes are routed to the correct SimStore paths.
+    /// Uses an empty zero-entry manifest — level-2 reads are never needed
+    /// before the first checkpoint writes a base manifest.
+    fn bootstrap(ns: &ProjectNamespace, data_dir: &Path) -> Self {
+        let meta = ProjectMeta {
+            ns: ns.clone(),
+            parent_project_id: None,
+            parent_branch_id: None,
+            branch_checkpoint_lsn: None,
+            branch_timeline_id: None,
+            created_at: 0,
+            status: "active".to_string(),
+        };
+        let local_path = Manifest::local_manifest_path(data_dir);
+        let base_manifest = Manifest::new(Lsn::INVALID, 0, vec![], HashMap::new(), &local_path)
+            .expect("failed to create empty manifest");
+        ProjectCtx {
+            meta,
+            base_manifest,
+        }
     }
 
     /// Load project.json from the sim store, download the latest base manifest,
@@ -304,32 +366,6 @@ impl ProjectCtx {
     /// Return `true` if this project is a branch (has a parent project).
     pub fn is_branch(&self) -> bool {
         self.meta.parent_project_id.is_some()
-    }
-
-    /// Try to initialize the global `ProjectCtx` from environment variables.
-    ///
-    /// Reads `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.
-    /// Returns without initializing if any are absent.
-    /// Silently ignored if `ProjectCtx` is already initialized (OnceLock).
-    ///
-    /// Called from `s3_init()` so the initdb write path can reach SimStore.
-    /// `SimStore::init()` must be called before this.
-    pub fn try_init_from_env(data_dir: &Path) {
-        fn read_u64(name: &str) -> Option<u64> {
-            std::env::var(name).ok()?.parse().ok()
-        }
-        let (Some(org_id), Some(project_id), Some(branch_id)) = (
-            read_u64("TIKO_ORG_ID"),
-            read_u64("TIKO_PROJECT_ID"),
-            read_u64("TIKO_BRANCH_ID"),
-        ) else {
-            return;
-        };
-        let sim = SimStore::get();
-        let ns = ProjectNamespace::new(org_id, project_id, branch_id);
-        if let Ok(ctx) = ProjectCtx::load(&ns, data_dir, sim) {
-            ProjectCtx::init(ctx);
-        }
     }
 
     /// Level-2 chunk lookup: binary search into the on-disk Manifest.

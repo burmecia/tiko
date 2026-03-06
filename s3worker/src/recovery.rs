@@ -146,7 +146,7 @@ mod tests {
         let blob = m.to_bytes().unwrap();
 
         // Write the blob as the recovery manifest file.
-        let tiko_dir = dir.path().join("tiko");
+        let tiko_dir = dir.path().join(crate::TIKO_DIR);
         std::fs::create_dir_all(&tiko_dir).unwrap();
         let manifest_path = tiko_dir.join("recovery_manifest.bin");
         std::fs::write(&manifest_path, &blob).unwrap();

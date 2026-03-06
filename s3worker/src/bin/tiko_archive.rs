@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use s3worker::project::ProjectNamespace;
+use s3worker::project::{ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, ProjectNamespace};
 use s3worker::sim_store::SimStore;
 
 fn main() {
@@ -74,9 +74,9 @@ fn sim_from_env() -> Result<SimStore, String> {
 
 /// Build a `ProjectNamespace` from `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.
 fn namespace_from_env() -> Result<ProjectNamespace, String> {
-    let org_id = read_u64("TIKO_ORG_ID")?;
-    let project_id = read_u64("TIKO_PROJECT_ID")?;
-    let branch_id = read_u64("TIKO_BRANCH_ID")?;
+    let org_id = read_u64(ENV_ORG_ID)?;
+    let project_id = read_u64(ENV_PROJECT_ID)?;
+    let branch_id = read_u64(ENV_BRANCH_ID)?;
     Ok(ProjectNamespace::new(org_id, project_id, branch_id))
 }
 

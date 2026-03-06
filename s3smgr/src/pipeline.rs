@@ -161,7 +161,7 @@ pub unsafe fn submit_and_wait_raw(
             SetLatch(s3worker_latch);
         }
 
-        pg_log_debug1(&format!(
+        pg_log_debug2(&format!(
             "{}({}): submitted {:?} for rel {} fork {} block {} nblocks {}",
             label, proc_num, op, rel_number, forknum, blocknum, nblocks
         ));
@@ -201,7 +201,7 @@ pub unsafe fn submit_and_wait_raw(
         // 8. Release slot back to pool (Completed → Free + set free bit)
         pool.release(slot_idx);
 
-        pg_log_debug1(&format!(
+        pg_log_debug2(&format!(
             "{}({}): completed {:?} for rel {} block {} nblocks {}, result: (status {}, nblocks {}), slot {} released",
             label,
             proc_num,

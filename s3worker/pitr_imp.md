@@ -6,7 +6,7 @@ Work in the order listed — each module's dependencies are noted explicitly.
 
 **S3 sim policy:** All S3 I/O is simulated using the local filesystem.
 Real `aws-sdk-s3` integration is deferred. The sim store mirrors the S3 key
-layout exactly under `{DataDir}/tiko_sim/{express,standard}/`, so migrating
+layout exactly under `{DataDir}/tiko/sim/{express,standard}/`, so migrating
 to real S3 later is a drop-in replacement of `SimStore` only.
 
 **Serialisation:** All structured data (manifests, project metadata) uses
@@ -238,14 +238,14 @@ local TIKM file; `to_bytes` converts local TIKM file → S3 bytes.
 **Modified file:** `s3worker/src/lib.rs` (add `pub mod sim_store;`)
 
 `SimStore` replaces the S3 SDK. It implements the same logical operations using
-local files under `{DataDir}/tiko_sim/`. The filesystem layout mirrors the S3
+local files under `{DataDir}/tiko/sim/`. The filesystem layout mirrors the S3
 key structure exactly so that migrating to real S3 later is a drop-in swap of
 this module only.
 
 ### Directory layout
 
 ```
-{DataDir}/tiko_sim/
+{DataDir}/tiko/sim/
   express/                           ← sim for S3 Express One Zone (hot latest objects)
     {org_id}/{project_id}/
       chunks/{spc}/{db}/{rel}.{fork}/{chunk_id}/

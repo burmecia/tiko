@@ -384,7 +384,7 @@ impl CacheControl {
     // ── Cache data file ──
 
     fn cache_file_path() -> PathBuf {
-        data_dir_path().join("tiko").join("cache")
+        data_dir_path().join(crate::TIKO_DIR).join("cache")
     }
 
     pub fn cache_file() -> &'static File {
@@ -795,8 +795,6 @@ impl CacheControl {
         let meta = self.slot_meta(slot_index);
         let tag = meta.tag; // copy — avoids holding a borrow across I/O
 
-        meta.dirty_blocks.store(0, Ordering::Release);
-
         // Express PUT + eviction log append.
         // Guard: only run when SimStore and ProjectCtx are initialised.
         if let (Some(sim), Some(ctx)) = (
@@ -806,6 +804,9 @@ impl CacheControl {
             let mut chunk_data = vec![0u8; CHUNK_SIZE];
             self.read_blocks_from_slot(slot_index, 0, BLOCKS_PER_CHUNK, &mut chunk_data);
             if sim.put_express_latest(ctx.ns(), &tag, &chunk_data).is_ok() {
+                // Clear dirty only after a successful PUT — if the PUT failed,
+                // the slot stays dirty so the next checkpoint retries.
+                meta.dirty_blocks.store(0, Ordering::Release);
                 let log = Self::open_eviction_log();
                 let _ = (&log).write_all(&tag.encode());
             }
@@ -914,9 +915,9 @@ impl CacheControl {
 
     // ── Eviction log ──────────────────────────────────────────────────────
 
-    /// Path of the eviction log file: `$PGDATA/tiko/eviction_log`.
-    fn eviction_log_path() -> PathBuf {
-        data_dir_path().join("tiko").join("eviction_log")
+    /// Path of the eviction log file: `{data_dir}/tiko/eviction_log`.
+    pub fn eviction_log_path(data_dir: &Path) -> PathBuf {
+        data_dir.join(crate::TIKO_DIR).join("eviction_log")
     }
 
     /// Open (or create) the eviction log for appending.
@@ -927,7 +928,7 @@ impl CacheControl {
     /// inode. A cached `OnceLock<File>` would still point at the renamed
     /// inode, so we open fresh on every eviction.
     fn open_eviction_log() -> File {
-        let path = Self::eviction_log_path();
+        let path = Self::eviction_log_path(&data_dir_path());
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }

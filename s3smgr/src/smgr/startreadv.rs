@@ -1,4 +1,4 @@
-use pgsys::{aio::*, common::get_my_proc_number, logging::pg_log_debug1, smgr::*};
+use pgsys::{aio::*, common::get_my_proc_number, logging, smgr::*};
 
 use crate::buffers;
 
@@ -14,7 +14,7 @@ pub extern "C-unwind" fn s3_startreadv(
     unsafe {
         let loc = &(*reln).smgr_rlocator.locator;
         let proc_num = get_my_proc_number();
-        pg_log_debug1(&format!(
+        logging::pg_log_debug2(&format!(
             "s3_startreadv({}): rel {} fork {} block {} nblocks {}",
             proc_num, loc.rel_number, forknum, blocknum, nblocks
         ));

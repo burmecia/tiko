@@ -6,9 +6,12 @@
 //!
 //! # Six-step algorithm
 //!
+//! 0. **Guard**: returns early if `S3IoControl`, `SimStore`, or `ProjectCtx`
+//!    are not yet initialised — nothing to flush or upload.
+//!
 //! 1. **Flush dirty chunks** (`flush_all_dirty_chunks`): every dirty cache
-//!    slot is flushed to the backing relation file, PUT to the express-bucket
-//!    `latest` object, and its `ChunkTag` appended to the eviction log.
+//!    slot is PUT to the express-bucket `latest` object and its `ChunkTag`
+//!    appended to the eviction log.
 //!    After this step the eviction log contains ALL chunks touched during this
 //!    checkpoint interval (both mid-interval evictions and those just flushed).
 //!
@@ -16,7 +19,8 @@
 //!    snapshot of the log.  New evictions after this point write to a fresh
 //!    inode.
 //!
-//! 3. **Read + dedup** eviction log; build the set of unique dirty chunks.
+//! 3. **Read + dedup** eviction log. If the dirty set is empty, remove
+//!    `eviction_log.ckpt` and return — nothing to upload.
 //!
 //! 4. **Three-step write** each dirty chunk to S3 (staging → versioned copy
 //!    in standard-bucket → atomic rename to `latest` in express-bucket),
@@ -41,6 +45,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use pgsys::{Lsn, common::data_dir_path};
+use s3worker::TIKO_DIR;
 use s3worker::cache::{CHUNK_SIZE, CacheControl, ChunkTag, RelFork};
 use s3worker::io_queue::S3IoControl;
 use s3worker::manifest::{ChunkRef, Manifest};
@@ -61,20 +66,17 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
         return;
     }
 
-    let lsn = Lsn::new(checkpoint_lsn);
-    let control = S3IoControl::get();
-
-    // Step 1 — flush all dirty chunks to backing files + express latest + log.
-    // Always executed, even when sim/ctx are absent (e.g. env vars not set).
-    control.cache.flush_all_dirty_chunks();
-
-    // Steps 2-6 require both SimStore and ProjectCtx to be initialised.
     let (sim, ctx) = match (SimStore::try_get(), ProjectCtx::try_get()) {
         (Some(s), Some(c)) => (s, c),
-        _ => return, // not initialised — skip S3 / manifest work
+        _ => return, // not initialised — nothing to flush or upload
     };
 
+    let control = S3IoControl::get();
+    let lsn = Lsn::new(checkpoint_lsn);
     let data_dir = data_dir_path();
+
+    // Step 1 — flush all dirty chunks to express latest + eviction log.
+    control.cache.flush_all_dirty_chunks();
 
     if let Err(e) = checkpoint_flush_inner(sim, ctx.ns(), lsn, &data_dir) {
         // Non-fatal: log and continue.  WAL will cover the gap on recovery.
@@ -94,9 +96,8 @@ fn checkpoint_flush_inner(
     checkpoint_lsn: Lsn,
     data_dir: &Path,
 ) -> io::Result<()> {
-    let tiko_dir = data_dir.join("tiko");
-    let log_path = tiko_dir.join("eviction_log");
-    let ckpt_path = tiko_dir.join("eviction_log.ckpt");
+    let log_path = CacheControl::eviction_log_path(data_dir);
+    let ckpt_path = log_path.with_extension("ckpt");
 
     // Step 2 — atomic snapshot.
     // If `.ckpt` already exists (crash recovery), re-process it.
@@ -104,13 +105,19 @@ fn checkpoint_flush_inner(
         if log_path.exists() {
             fs::rename(&log_path, &ckpt_path)?;
         }
-        // If neither file exists: no evictions occurred — proceed with empty
-        // dirty set; still write an empty delta manifest + pg_state below.
+        // If neither file exists: no evictions occurred — dirty set will be
+        // empty and the function returns early after step 3.
     }
 
     // Step 3 — read + dedup.
     let records = CacheControl::read_eviction_log(&ckpt_path);
     let dirty_chunks = dedup_by_chunk_tag(records);
+
+    // Nothing changed this interval — skip S3 writes and manifest entirely.
+    if dirty_chunks.is_empty() {
+        let _ = fs::remove_file(&ckpt_path);
+        return Ok(());
+    }
 
     // Step 4 — three-step write for each dirty chunk.
     for chunk_key in &dirty_chunks {
@@ -138,7 +145,7 @@ fn checkpoint_flush_inner(
         .collect();
 
     // Collect nblocks for every relation that had dirty chunks.
-    // Key: (spc_oid, db_oid, rel_number, fork_number) → nblocks.
+    // Key: RelFork → nblocks.
     let mut rel_nblocks: HashMap<RelFork, u32> = HashMap::new();
     for key in &dirty_chunks {
         let rf = key.rel_fork();
@@ -154,19 +161,20 @@ fn checkpoint_flush_inner(
         });
     }
 
-    let tmp_path = delta_tmp_path(data_dir, checkpoint_lsn);
+    let tmp_delta_manifest_path = delta_tmp_path(data_dir, checkpoint_lsn);
     let delta = Manifest::new(
         checkpoint_lsn,
         now_unix(),
         delta_entries,
         rel_nblocks,
-        &tmp_path,
+        &tmp_delta_manifest_path,
     )?;
     upload_delta_manifest(sim, ns, checkpoint_lsn, &delta)?;
     upload_pg_state(sim, ns, checkpoint_lsn, data_dir)?;
 
-    // Step 6 — remove checkpoint snapshot.
+    // Step 6 — remove checkpoint snapshot and local build file.
     let _ = fs::remove_file(&ckpt_path); // silently ignore ENOENT
+    let _ = fs::remove_file(&tmp_delta_manifest_path); // remove local build file
 
     Ok(())
 }
@@ -185,7 +193,7 @@ fn dedup_by_chunk_tag(records: Vec<ChunkTag>) -> Vec<ChunkTag> {
 
 fn delta_tmp_path(data_dir: &Path, lsn: Lsn) -> PathBuf {
     data_dir
-        .join("tiko")
+        .join(TIKO_DIR)
         .join(format!("delta_{}.bin", lsn.to_hex()))
 }
 
@@ -348,7 +356,7 @@ mod tests {
             .get_standard(&ns.delta_manifest_key(lsn))
             .unwrap()
             .expect("delta manifest must exist");
-        let path = dir.path().join("tiko").join("read_delta.tikm");
+        let path = dir.path().join(TIKO_DIR).join("read_delta.tikm");
         Manifest::from_bytes(&bytes, &path).unwrap()
     }
 
@@ -365,7 +373,7 @@ mod tests {
         let tag = make_tag(1);
 
         // Simulate step 1 output: eviction log has one entry.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xAA);
 
@@ -391,7 +399,7 @@ mod tests {
         let tag = make_tag(2);
 
         // Mid-interval: eviction_log written by `flush_dirty_chunk`.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xBB);
 
@@ -412,7 +420,7 @@ mod tests {
         let tag = make_tag(3);
 
         // Two log entries for the same chunk (evicted, re-dirtied, evicted again).
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &[tag, tag]);
         setup_express(&sim, &ns, &[tag], 0xCC);
 
@@ -430,7 +438,7 @@ mod tests {
                 .get_standard(&ns.delta_manifest_key(lsn))
                 .unwrap()
                 .unwrap();
-            let path = dir.path().join("tiko").join("count.tikm");
+            let path = dir.path().join(TIKO_DIR).join("count.tikm");
             let m2 = Manifest::from_bytes(&bytes, &path).unwrap();
             let _ = m2.checkpoint_lsn();
             // entry_count is internal; verify via lookup
@@ -456,7 +464,7 @@ mod tests {
         let tag = make_tag(5);
 
         // Simulate crash: eviction_log.ckpt exists, eviction_log is absent.
-        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
+        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
         write_eviction_log(&ckpt_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xEE);
 
@@ -485,7 +493,7 @@ mod tests {
         let lsn = Lsn::new(0x6000);
         let tags: Vec<ChunkTag> = (10..15).map(make_tag).collect();
 
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &tags);
         setup_express(&sim, &ns, &tags, 0xDD);
 
@@ -510,7 +518,7 @@ mod tests {
         let tag = make_tag(77);
 
         // Populate log and express.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xFF);
 
@@ -522,7 +530,7 @@ mod tests {
             .unwrap();
 
         // Simulate crash recovery: re-create .ckpt manually.
-        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
+        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
         write_eviction_log(&ckpt_path, &[tag]);
 
         // Second call — must succeed and produce the same manifest content.
@@ -533,8 +541,8 @@ mod tests {
             .unwrap();
 
         // Both manifests must decode to the same entries.
-        let p1 = dir.path().join("tiko").join("cmp1.tikm");
-        let p2 = dir.path().join("tiko").join("cmp2.tikm");
+        let p1 = dir.path().join(TIKO_DIR).join("cmp1.tikm");
+        let p2 = dir.path().join(TIKO_DIR).join("cmp2.tikm");
         let m1 = Manifest::from_bytes(&bytes_first, &p1).unwrap();
         let m2 = Manifest::from_bytes(&bytes_second, &p2).unwrap();
         assert_eq!(m1.lookup(&tag).unwrap(), m2.lookup(&tag).unwrap());
@@ -549,42 +557,48 @@ mod tests {
         let ns = ns();
         let lsn = Lsn::new(0x8000);
 
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &[make_tag(99)]);
         setup_express(&sim, &ns, &[make_tag(99)], 0x11);
 
         run_flush(&dir, &sim, &ns, lsn).unwrap();
 
-        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
+        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
         assert!(
             !ckpt_path.exists(),
             "eviction_log.ckpt must not exist after success"
         );
     }
 
-    // ── Empty eviction log → empty delta manifest written ────────────────
+    // ── Empty eviction log → no delta manifest written (no-op) ──────────
 
     #[test]
-    fn empty_eviction_log_produces_empty_delta_manifest() {
+    fn empty_eviction_log_produces_no_delta_manifest() {
         let dir = TempDir::new().unwrap();
         let sim = SimStore::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x9000);
 
         // Create an empty eviction log.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &[]);
 
         run_flush(&dir, &sim, &ns, lsn).unwrap();
 
-        let bytes = sim
-            .get_standard(&ns.delta_manifest_key(lsn))
-            .unwrap()
-            .unwrap();
-        let m = Manifest::from_bytes(&bytes, &dir.path().join("tiko").join("empty.tikm")).unwrap();
-        assert_eq!(m.checkpoint_lsn(), lsn);
-        // Any lookup on an empty manifest returns None.
-        assert_eq!(m.lookup(&make_tag(0)).unwrap(), None);
+        // No dirty chunks → no manifest should be written.
+        assert!(
+            sim.get_standard(&ns.delta_manifest_key(lsn))
+                .unwrap()
+                .is_none(),
+            "no delta manifest should be written when eviction log is empty"
+        );
+
+        // eviction_log.ckpt should be cleaned up.
+        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
+        assert!(
+            !ckpt_path.exists(),
+            "eviction_log.ckpt must be removed on no-op"
+        );
     }
 
     // ── dedup_by_chunk_tag unit test ──────────────────────────────────────

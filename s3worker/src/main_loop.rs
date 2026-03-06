@@ -21,7 +21,7 @@ use pgsys::{
 use crate::dispatcher::Dispatcher;
 use crate::io_handler;
 use crate::io_queue::S3IoControl;
-use crate::project::{ProjectCtx, ProjectNamespace};
+use crate::project::ProjectCtx;
 use crate::sim_store::SimStore;
 use crate::thread_pool;
 
@@ -56,56 +56,6 @@ fn setup_signal_handlers() {
 /// Wait event identifier for s3worker main loop
 static mut WAIT_EVENT_S3WORKER_MAIN: u32 = 0;
 
-/// Attempt to load the project context from environment variables.
-///
-/// Reads `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, and `TIKO_BRANCH_ID`. If any are
-/// absent or zero, logs a notice and skips initialisation (the read-path
-/// fallback — Module 4 — handles the uninitialized case gracefully).
-///
-/// This is called once before the event loop. Calls `SimStore::init`
-/// to initialise the global `SimStore` and `ProjectNamespace` statics, then
-/// loads `ProjectCtx`.
-fn init_project_ctx() {
-    fn read_u64(name: &str) -> Option<u64> {
-        std::env::var(name).ok()?.parse().ok()
-    }
-
-    let (Some(org_id), Some(project_id), Some(branch_id)) = (
-        read_u64("TIKO_ORG_ID"),
-        read_u64("TIKO_PROJECT_ID"),
-        read_u64("TIKO_BRANCH_ID"),
-    ) else {
-        pg_log_info("s3worker: TIKO_ORG_ID/PROJECT_ID/BRANCH_ID not set; skipping ProjectCtx init");
-        return;
-    };
-
-    if org_id == 0 || project_id == 0 || branch_id == 0 {
-        pg_log_info("s3worker: TIKO identity env vars are zero; skipping ProjectCtx init");
-        return;
-    }
-
-    let data_dir = data_dir_path();
-
-    // Initialise sim store and namespace statics (Module 4).
-    // Must happen before ProjectCtx::load so that cached_read_blocks can
-    // reach the S3 sim store via try_fetch_chunk_from_s3.
-    SimStore::init(&data_dir);
-
-    // Load the project context. This populates the global ProjectCtx, which
-    // is used by the cached_read_blocks fallback to serve reads from S3 when
-    // the local cache misses.
-    let ns = ProjectNamespace::new(org_id, project_id, branch_id);
-    match ProjectCtx::load(&ns, &data_dir, SimStore::get()) {
-        Ok(ctx) => {
-            ProjectCtx::init(ctx);
-            pg_log_info("s3worker: ProjectCtx loaded successfully");
-        }
-        Err(e) => {
-            pg_log_warning(&format!("s3worker: failed to load ProjectCtx: {e}"));
-        }
-    }
-}
-
 /// Main event loop for s3worker
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
@@ -133,12 +83,12 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
     // Spawn io_worker_loop on Tokio — receives requests and spawns per-request tasks
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
 
-    // Load project context from env vars (best-effort; non-fatal on failure)
-    init_project_ctx();
-
-    // Spawn the PITR background task now that both the runtime and ProjectCtx
-    // are initialised.  No-op if ProjectCtx was not loaded.
+    // Initialize SimStore and ProjectCtx from the data directory and env vars
     let data_dir = data_dir_path();
+    SimStore::init(&data_dir);
+    ProjectCtx::init_from_env(&data_dir);
+
+    // Spawn the PITR background task now that the runtime and ProjectCtx are initialised.
     thread_pool::spawn_pitr_task(&data_dir);
 
     // Get shared memory IO control structure

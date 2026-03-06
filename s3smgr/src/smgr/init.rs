@@ -24,7 +24,7 @@ pub extern "C-unwind" fn s3_init() {
 
     // Try to initialize ProjectCtx from env vars (TIKO_ORG_ID/PROJECT_ID/BRANCH_ID).
     // This enables the initdb write path to reach SimStore express.
-    ProjectCtx::try_init_from_env(&data_dir);
+    ProjectCtx::init_from_env(&data_dir);
 
     // Skip shared memory attachment in initdb (--boot) and single-user mode.
     // In those modes MyProcNumber is invalid and the S3IoControl shmem block

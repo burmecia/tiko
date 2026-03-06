@@ -21,6 +21,9 @@ use pgsys::{
 };
 use std::ffi::{c_char, c_int};
 
+/// Subdirectory name under `$PGDATA` for all Tiko data.
+pub const TIKO_DIR: &str = "tiko";
+
 // PostgreSQL extension magic function
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn Pg_magic_func() -> &'static PgMagicStruct {

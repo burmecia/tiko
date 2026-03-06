@@ -2,7 +2,7 @@
 //!
 //! Mirrors S3 Express One Zone (hot mutable objects) and Standard S3
 //! (versioned immutable objects) using the local filesystem under
-//! `{DataDir}/tiko_sim/`. The key structure is identical to the real S3
+//! `{DataDir}/tiko/sim/`. The key structure is identical to the real S3
 //! layout, so switching to `aws-sdk-s3` later is a drop-in replacement
 //! of this file only.
 //!
@@ -33,9 +33,9 @@ pub(crate) static SIM_STORE: OnceLock<SimStore> = OnceLock::new();
 
 /// Local-filesystem simulation of S3 Express + Standard buckets.
 pub struct SimStore {
-    /// `{DataDir}/tiko_sim/express`
+    /// `{DataDir}/tiko/sim/express`
     express_root: PathBuf,
-    /// `{DataDir}/tiko_sim/standard`
+    /// `{DataDir}/tiko/sim/standard`
     standard_root: PathBuf,
 }
 
@@ -64,7 +64,7 @@ impl SimStore {
     }
 
     pub fn new(data_dir: &Path) -> Self {
-        let base = data_dir.join("tiko_sim");
+        let base = data_dir.join("tiko/sim");
         SimStore {
             express_root: base.join("express"),
             standard_root: base.join("standard"),
