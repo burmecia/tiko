@@ -296,6 +296,18 @@ impl Manifest {
         self.inner.lock().unwrap().timestamp
     }
 
+    /// Return all `(ChunkTag, ChunkRef)` entries from the on-disk TIKM file.
+    pub fn entries(&self) -> io::Result<Vec<(ChunkTag, ChunkRef)>> {
+        let inner = self.inner.lock().unwrap();
+        read_all_entries(&inner)
+    }
+
+    /// Return the `rel_nblocks` map (populated from the S3 wire format only;
+    /// empty when opened from a local TIKM file via [`Manifest::open`]).
+    pub fn rel_nblocks(&self) -> HashMap<RelFork, u32> {
+        self.inner.lock().unwrap().rel_nblocks.clone()
+    }
+
     /// Canonical local path for the base manifest TIKM file.
     pub fn local_manifest_path(data_dir: &Path) -> PathBuf {
         data_dir.join(crate::TIKO_DIR).join("base_manifest.bin")
