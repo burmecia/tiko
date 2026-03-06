@@ -1,5 +1,5 @@
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
-use s3worker::{io_queue::S3IoOpKind, s3_ops};
+use s3worker::{cache::RelFork, io_queue::S3IoOpKind, s3_ops};
 
 use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipeline};
 
@@ -52,22 +52,22 @@ unsafe fn s3_io_perform(
                 .map(|_| ())
             } else {
                 // No pipeline (initdb / shutdown / s3worker dead): direct s3_ops call
+                let rf = RelFork {
+                    spc_oid,
+                    db_oid,
+                    rel_number,
+                    fork_number,
+                };
                 match op {
-                    S3IoOpKind::Read => s3_ops::read_blocks(
-                        spc_oid,
-                        db_oid,
-                        rel_number,
-                        fork_number,
+                    S3IoOpKind::Read => s3_ops::cached_read_blocks(
+                        rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *mut u8,
                     )
                     .map(|_| ()),
-                    S3IoOpKind::Write => s3_ops::write_blocks(
-                        spc_oid,
-                        db_oid,
-                        rel_number,
-                        fork_number,
+                    S3IoOpKind::Write => s3_ops::cached_write_blocks(
+                        rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *const u8,

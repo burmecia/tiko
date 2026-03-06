@@ -1,4 +1,5 @@
 use pgsys::{logging::pg_log_error, smgr::*};
+use s3worker::cache::RelFork;
 use s3worker::s3_ops;
 
 #[unsafe(no_mangle)]
@@ -9,7 +10,12 @@ pub extern "C-unwind" fn s3_create(
 ) {
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    match s3_ops::create_file(loc.spc_oid, loc.db_oid, loc.rel_number, forknum) {
+    match s3_ops::store_create(RelFork {
+        spc_oid: loc.spc_oid,
+        db_oid: loc.db_oid,
+        rel_number: loc.rel_number,
+        fork_number: forknum,
+    }) {
         Ok(true) => {}             // newly created
         Ok(false) if is_redo => {} // exists, WAL replay — OK
         Ok(false) => {

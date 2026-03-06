@@ -27,6 +27,7 @@
 //! ```
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Write};
 use std::os::unix::fs::FileExt;
@@ -36,7 +37,7 @@ use std::sync::Mutex;
 use pgsys::Lsn;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::ChunkTag;
+use crate::cache::{ChunkTag, RelFork};
 
 // ── TIKM constants ──
 
@@ -85,6 +86,9 @@ struct ManifestInner {
     file: File,
     /// Total number of 36-byte entries in the current file.
     entry_count: u64,
+    /// Relation block counts: (spc_oid, db_oid, rel_number, fork_number) → nblocks.
+    /// Carried in the msgpack wire format only; not stored in the TIKM binary.
+    rel_nblocks: HashMap<RelFork, u32>,
 }
 
 // ── Manifest ──
@@ -92,7 +96,7 @@ struct ManifestInner {
 /// File-backed sorted manifest for chunk lookup and PITR merge operations.
 ///
 /// Invariant: the local TIKM file at `path` is always valid with entries sorted
-/// ascending by `ChunkTag`. Only `new_sorted`, `from_bytes`, and `apply_deltas`
+/// ascending by `ChunkTag`. Only `new`, `from_bytes`, and `apply_deltas`
 /// may create or overwrite this file.
 pub struct Manifest {
     /// All mutable state; replaced atomically on `apply_deltas`.
@@ -185,13 +189,15 @@ fn read_all_entries(inner: &ManifestInner) -> io::Result<Vec<(ChunkTag, ChunkRef
 
 impl Manifest {
     /// Construct a `Manifest` from an arbitrary list of chunks, writing the
-    /// TIKM file at `path`. The `chunks` slice need not be sorted — this
-    /// function sorts it. Use this everywhere a manifest is constructed from
-    /// scratch (checkpoint flush, `build_initial_manifest`).
-    pub fn new_sorted(
+    /// TIKM file at `path`. `chunks` need not be pre-sorted.
+    ///
+    /// `rel_nblocks` is carried in the msgpack wire format (`to_bytes`) but not
+    /// in the local TIKM binary. Pass `HashMap::new()` when nblocks are unknown.
+    pub fn new(
         checkpoint_lsn: Lsn,
         timestamp: i64,
         mut chunks: Vec<(ChunkTag, ChunkRef)>,
+        rel_nblocks: HashMap<RelFork, u32>,
         path: &Path,
     ) -> io::Result<Self> {
         chunks.sort_unstable_by_key(|(tag, _)| *tag);
@@ -203,6 +209,7 @@ impl Manifest {
                 path: path.to_path_buf(),
                 file,
                 entry_count: chunks.len() as u64,
+                rel_nblocks,
             }),
         })
     }
@@ -238,27 +245,43 @@ impl Manifest {
                 path: path.to_path_buf(),
                 file,
                 entry_count,
+                rel_nblocks: HashMap::new(),
             }),
         })
     }
 
     /// Deserialize from the S3 wire format (`zstd(msgpack(...))`).
     /// Writes the decoded entries to a local TIKM file at `path`.
+    ///
+    /// Wire format: 4-tuple `(lsn, timestamp, chunks, rel_nblocks)`.
     pub fn from_bytes(data: &[u8], path: &Path) -> io::Result<Self> {
         let msgpack =
             zstd::decode_all(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let (checkpoint_lsn, timestamp, chunks): (Lsn, i64, Vec<(ChunkTag, ChunkRef)>) =
-            rmp_serde::from_slice(&msgpack)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Self::new_sorted(checkpoint_lsn, timestamp, chunks, path)
+
+        let (checkpoint_lsn, timestamp, chunks, rel_nblocks): (
+            Lsn,
+            i64,
+            Vec<(ChunkTag, ChunkRef)>,
+            HashMap<RelFork, u32>,
+        ) = rmp_serde::from_slice(&msgpack)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Self::new(checkpoint_lsn, timestamp, chunks, rel_nblocks, path)
     }
 
     /// Serialize to the S3 wire format (`zstd(msgpack(...))`).
+    ///
+    /// Format: 4-tuple `(checkpoint_lsn, timestamp, chunks, rel_nblocks)`.
     pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         let entries = read_all_entries(&inner)?;
-        let msgpack = rmp_serde::to_vec(&(inner.checkpoint_lsn, inner.timestamp, &entries))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let msgpack = rmp_serde::to_vec(&(
+            inner.checkpoint_lsn,
+            inner.timestamp,
+            &entries,
+            &inner.rel_nblocks,
+        ))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let compressed = zstd::encode_all(Cursor::new(&msgpack), 3)?;
         Ok(compressed)
     }
@@ -338,6 +361,8 @@ impl Manifest {
         let mut combined_delta: Vec<(ChunkTag, ChunkRef)> = Vec::new();
         let mut last_lsn = inner.checkpoint_lsn;
         let mut last_ts = inner.timestamp;
+        // Start with self's rel_nblocks; delta wins per relation key.
+        let mut merged_nblocks: HashMap<RelFork, u32> = inner.rel_nblocks.clone();
 
         for delta in deltas {
             let delta_inner = delta.inner.lock().unwrap();
@@ -347,6 +372,10 @@ impl Manifest {
                 last_ts = delta_inner.timestamp;
             }
             combined_delta.extend(entries);
+            // Delta's nblocks win over base's nblocks.
+            for (&k, &v) in &delta_inner.rel_nblocks {
+                merged_nblocks.insert(k, v);
+            }
             // delta_inner lock released here
         }
 
@@ -404,8 +433,17 @@ impl Manifest {
         inner.entry_count = output.len() as u64;
         inner.checkpoint_lsn = last_lsn;
         inner.timestamp = last_ts;
+        inner.rel_nblocks = merged_nblocks;
 
         Ok(())
+    }
+
+    /// Look up the block count for a relation fork stored in this manifest.
+    ///
+    /// Returns `None` if no nblocks entry was recorded (e.g. legacy manifest
+    /// or a relation that wasn't touched since the last checkpoint).
+    pub fn lookup_nblocks(&self, rf: RelFork) -> Option<u32> {
+        self.inner.lock().unwrap().rel_nblocks.get(&rf).copied()
     }
 }
 
@@ -471,10 +509,11 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let k1 = chunk(1663, 5, 1, 0, 0);
         let k2 = chunk(1663, 5, 2, 0, 0);
-        let _m = Manifest::new_sorted(
+        let _m = Manifest::new(
             Lsn::new(0x100),
             42,
             vec![(k2, cref(2, 0x100)), (k1, cref(1, 0x100))],
+            HashMap::new(),
             &path,
         )
         .unwrap();
@@ -494,10 +533,11 @@ mod tests {
         let k3 = chunk(1663, 5, 3, 0, 0);
         let k1 = chunk(1663, 5, 1, 0, 0);
         let k2 = chunk(1663, 5, 2, 0, 0);
-        let _m = Manifest::new_sorted(
+        let _m = Manifest::new(
             Lsn::new(1),
             0,
             vec![(k3, cref(1, 1)), (k1, cref(1, 1)), (k2, cref(1, 1))],
+            HashMap::new(),
             &path,
         )
         .unwrap();
@@ -525,7 +565,7 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let k = chunk(1663, 5, 42, 0, 7);
         let r = cref(99, 0x300);
-        let m = Manifest::new_sorted(Lsn::new(0x300), 0, vec![(k, r)], &path).unwrap();
+        let m = Manifest::new(Lsn::new(0x300), 0, vec![(k, r)], HashMap::new(), &path).unwrap();
         assert_eq!(m.lookup(&k).unwrap(), Some(r));
     }
 
@@ -535,7 +575,8 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let k = chunk(1663, 5, 1, 0, 0);
         let absent = chunk(1663, 5, 999, 0, 0);
-        let m = Manifest::new_sorted(Lsn::new(1), 0, vec![(k, cref(1, 1))], &path).unwrap();
+        let m =
+            Manifest::new(Lsn::new(1), 0, vec![(k, cref(1, 1))], HashMap::new(), &path).unwrap();
         assert_eq!(m.lookup(&absent).unwrap(), None);
     }
 
@@ -543,7 +584,7 @@ mod tests {
     fn lookup_empty_manifest_returns_none() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("m.tikm");
-        let m = Manifest::new_sorted(Lsn::new(0), 0, vec![], &path).unwrap();
+        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), &path).unwrap();
         assert_eq!(m.lookup(&chunk(1663, 5, 1, 0, 0)).unwrap(), None);
     }
 
@@ -553,7 +594,7 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let keys: Vec<ChunkTag> = (0..20).map(|i| chunk(1663, 5, i, 0, 0)).collect();
         let chunks: Vec<_> = keys.iter().map(|k| (*k, cref(1, 100))).collect();
-        let m = Manifest::new_sorted(Lsn::new(100), 0, chunks, &path).unwrap();
+        let m = Manifest::new(Lsn::new(100), 0, chunks, HashMap::new(), &path).unwrap();
 
         assert!(
             m.lookup(&keys[0]).unwrap().is_some(),
@@ -577,8 +618,14 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("m.tikm");
         let k = chunk(1663, 5, 7, 0, 0);
-        let _m =
-            Manifest::new_sorted(Lsn::new(0x200), 999, vec![(k, cref(5, 0x200))], &path).unwrap();
+        let _m = Manifest::new(
+            Lsn::new(0x200),
+            999,
+            vec![(k, cref(5, 0x200))],
+            HashMap::new(),
+            &path,
+        )
+        .unwrap();
 
         let m2 = Manifest::open(&path).unwrap();
         assert_eq!(m2.checkpoint_lsn(), Lsn::new(0x200));
@@ -605,10 +652,11 @@ mod tests {
 
         let k1 = chunk(1663, 5, 10, 0, 0);
         let k2 = chunk(1663, 5, 20, 0, 1);
-        let m = Manifest::new_sorted(
+        let m = Manifest::new(
             Lsn::new(0x400),
             1234,
             vec![(k1, cref(7, 0x400)), (k2, cref(8, 0x300))],
+            HashMap::new(),
             &path,
         )
         .unwrap();
@@ -628,7 +676,7 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let path2 = tmp.path().join("m2.tikm");
 
-        let m = Manifest::new_sorted(Lsn::new(0), 0, vec![], &path).unwrap();
+        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), &path).unwrap();
         let wire = m.to_bytes().unwrap();
         let m2 = Manifest::from_bytes(&wire, &path2).unwrap();
 
@@ -650,7 +698,7 @@ mod tests {
         let k_b = chunk(1663, 5, 200, 0, 0);
         let k_c = chunk(1663, 5, 300, 0, 0);
 
-        let base = Manifest::new_sorted(
+        let base = Manifest::new(
             Lsn::new(0x100),
             1,
             vec![
@@ -658,24 +706,38 @@ mod tests {
                 (k_b, cref(1, 0x100)),
                 (k_c, cref(1, 0x100)),
             ],
+            HashMap::new(),
             &base_path,
         )
         .unwrap();
 
         // d1 updates k_a to branch 2
-        let d1 = Manifest::new_sorted(Lsn::new(0x200), 2, vec![(k_a, cref(2, 0x200))], &d1_path)
-            .unwrap();
+        let d1 = Manifest::new(
+            Lsn::new(0x200),
+            2,
+            vec![(k_a, cref(2, 0x200))],
+            HashMap::new(),
+            &d1_path,
+        )
+        .unwrap();
         // d2 updates k_b and k_c to branch 3
-        let d2 = Manifest::new_sorted(
+        let d2 = Manifest::new(
             Lsn::new(0x300),
             3,
             vec![(k_b, cref(3, 0x300)), (k_c, cref(3, 0x300))],
+            HashMap::new(),
             &d2_path,
         )
         .unwrap();
         // d3 updates k_a again to branch 4 (highest)
-        let d3 = Manifest::new_sorted(Lsn::new(0x400), 4, vec![(k_a, cref(4, 0x400))], &d3_path)
-            .unwrap();
+        let d3 = Manifest::new(
+            Lsn::new(0x400),
+            4,
+            vec![(k_a, cref(4, 0x400))],
+            HashMap::new(),
+            &d3_path,
+        )
+        .unwrap();
 
         base.apply_deltas(&[d1, d2, d3]).unwrap();
 
@@ -690,8 +752,14 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("m.tikm");
         let k = chunk(1663, 5, 42, 0, 0);
-        let m =
-            Manifest::new_sorted(Lsn::new(0x100), 10, vec![(k, cref(1, 0x100))], &path).unwrap();
+        let m = Manifest::new(
+            Lsn::new(0x100),
+            10,
+            vec![(k, cref(1, 0x100))],
+            HashMap::new(),
+            &path,
+        )
+        .unwrap();
 
         // Capture mtime before to verify no file I/O happens.
         let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
@@ -712,17 +780,35 @@ mod tests {
         let d_path = tmp.path().join("d.tikm");
 
         let k = chunk(1663, 5, 7, 0, 0);
-        let base = Manifest::new_sorted(Lsn::new(0x100), 1, vec![(k, cref(1, 0x100))], &base_path)
-            .unwrap();
-        let delta =
-            Manifest::new_sorted(Lsn::new(0x200), 2, vec![(k, cref(2, 0x200))], &d_path).unwrap();
+        let base = Manifest::new(
+            Lsn::new(0x100),
+            1,
+            vec![(k, cref(1, 0x100))],
+            HashMap::new(),
+            &base_path,
+        )
+        .unwrap();
+        let delta = Manifest::new(
+            Lsn::new(0x200),
+            2,
+            vec![(k, cref(2, 0x200))],
+            HashMap::new(),
+            &d_path,
+        )
+        .unwrap();
 
         base.apply_deltas(&[delta]).unwrap();
         let after_first = base.lookup(&k).unwrap();
 
         // Re-open the delta (since apply_deltas consumed it) and apply again.
-        let delta2 =
-            Manifest::new_sorted(Lsn::new(0x200), 2, vec![(k, cref(2, 0x200))], &d_path).unwrap();
+        let delta2 = Manifest::new(
+            Lsn::new(0x200),
+            2,
+            vec![(k, cref(2, 0x200))],
+            HashMap::new(),
+            &d_path,
+        )
+        .unwrap();
         base.apply_deltas(&[delta2]).unwrap();
         let after_second = base.lookup(&k).unwrap();
 
@@ -740,11 +826,23 @@ mod tests {
 
         let k = chunk(1663, 5, 55, 0, 0);
         // Base has branch_id=10 at LSN 0x300.
-        let base = Manifest::new_sorted(Lsn::new(0x300), 1, vec![(k, cref(10, 0x300))], &base_path)
-            .unwrap();
+        let base = Manifest::new(
+            Lsn::new(0x300),
+            1,
+            vec![(k, cref(10, 0x300))],
+            HashMap::new(),
+            &base_path,
+        )
+        .unwrap();
         // Delta has branch_id=99 at the same LSN 0x300 — tie.
-        let delta =
-            Manifest::new_sorted(Lsn::new(0x300), 2, vec![(k, cref(99, 0x300))], &d_path).unwrap();
+        let delta = Manifest::new(
+            Lsn::new(0x300),
+            2,
+            vec![(k, cref(99, 0x300))],
+            HashMap::new(),
+            &d_path,
+        )
+        .unwrap();
 
         base.apply_deltas(&[delta]).unwrap();
 
@@ -763,10 +861,22 @@ mod tests {
         let d_path = tmp.path().join("d.tikm");
 
         let k = chunk(1663, 5, 77, 0, 0);
-        let base = Manifest::new_sorted(Lsn::new(0x100), 1, vec![(k, cref(1, 0x100))], &base_path)
-            .unwrap();
-        let delta =
-            Manifest::new_sorted(Lsn::new(0x200), 2, vec![(k, cref(22, 0x200))], &d_path).unwrap();
+        let base = Manifest::new(
+            Lsn::new(0x100),
+            1,
+            vec![(k, cref(1, 0x100))],
+            HashMap::new(),
+            &base_path,
+        )
+        .unwrap();
+        let delta = Manifest::new(
+            Lsn::new(0x200),
+            2,
+            vec![(k, cref(22, 0x200))],
+            HashMap::new(),
+            &d_path,
+        )
+        .unwrap();
 
         base.apply_deltas(&[delta]).unwrap();
 
@@ -781,10 +891,22 @@ mod tests {
 
         let k = chunk(1663, 5, 88, 0, 0);
         // Base already has a newer LSN.
-        let base = Manifest::new_sorted(Lsn::new(0x300), 3, vec![(k, cref(10, 0x300))], &base_path)
-            .unwrap();
-        let stale_delta =
-            Manifest::new_sorted(Lsn::new(0x200), 2, vec![(k, cref(99, 0x200))], &d_path).unwrap();
+        let base = Manifest::new(
+            Lsn::new(0x300),
+            3,
+            vec![(k, cref(10, 0x300))],
+            HashMap::new(),
+            &base_path,
+        )
+        .unwrap();
+        let stale_delta = Manifest::new(
+            Lsn::new(0x200),
+            2,
+            vec![(k, cref(99, 0x200))],
+            HashMap::new(),
+            &d_path,
+        )
+        .unwrap();
 
         base.apply_deltas(&[stale_delta]).unwrap();
 

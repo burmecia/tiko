@@ -77,6 +77,30 @@ const MAX_USAGE_COUNT: u8 = 5;
 /// PG shared memory. Initialized lazily on first access.
 static CACHE_FILE: OnceLock<File> = OnceLock::new();
 
+// ── RelFork ──
+
+/// Identifies a specific fork of a relation — the (spc, db, rel, fork) key
+/// that appears throughout the storage layer. A [`ChunkTag`] is a `RelFork`
+/// plus a `chunk_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RelFork {
+    pub spc_oid: Oid,
+    pub db_oid: Oid,
+    pub rel_number: RelFileNumber,
+    pub fork_number: ForkNumber,
+}
+
+impl From<ChunkTag> for RelFork {
+    fn from(tag: ChunkTag) -> Self {
+        RelFork {
+            spc_oid: tag.spc_oid,
+            db_oid: tag.db_oid,
+            rel_number: tag.rel_number,
+            fork_number: tag.fork_number,
+        }
+    }
+}
+
 // ── ChunkTag ──
 
 /// Identifies a 256 KB chunk (32 contiguous blocks) within a relation fork.
@@ -96,21 +120,20 @@ pub struct ChunkTag {
 const _: () = assert!(std::mem::size_of::<ChunkTag>() == 20);
 
 impl ChunkTag {
-    /// Construct a ChunkTag from a block number.
-    pub fn from_block(
-        spc_oid: Oid,
-        db_oid: Oid,
-        rel_number: RelFileNumber,
-        fork_number: ForkNumber,
-        blkno: BlockNumber,
-    ) -> Self {
+    /// Construct a ChunkTag from a [`RelFork`] and a block number.
+    pub fn from_block(rf: RelFork, blkno: BlockNumber) -> Self {
         ChunkTag {
-            spc_oid,
-            db_oid,
-            rel_number,
-            fork_number,
+            spc_oid: rf.spc_oid,
+            db_oid: rf.db_oid,
+            rel_number: rf.rel_number,
+            fork_number: rf.fork_number,
             chunk_id: blkno / BLOCKS_PER_CHUNK,
         }
+    }
+
+    /// Return the [`RelFork`] this chunk belongs to.
+    pub fn rel_fork(&self) -> RelFork {
+        RelFork::from(*self)
     }
 
     /// FNV-1a hash for fast hash table probing.
@@ -752,45 +775,26 @@ impl CacheControl {
             .expect("cache write_blocks_to_slot: pwrite failed");
     }
 
-    /// Flush dirty blocks from a cache slot to S3-sim files.
+    /// Flush dirty blocks from a cache slot to SimStore express.
     ///
-    /// 1. Writes each dirty block to the backing relation file via
-    ///    `s3_ops::write_blocks` (existing behaviour).
-    /// 2. PUTs the full 256 KB chunk to the express-bucket `latest` object via
+    /// 1. PUTs the full 256 KB chunk to the express-bucket `latest` object via
     ///    `SimStore::put_express_latest` — a plain PUT, no staging, no
     ///    standard-bucket copy (those happen only at checkpoint time).
-    /// 3. On a successful PUT, appends one `ChunkTag` (20 bytes) to the
+    /// 2. On a successful PUT, appends one `ChunkTag` (20 bytes) to the
     ///    eviction log with `O_APPEND` — atomic on Linux/macOS for writes this
     ///    small. No log entry is written if the PUT failed, so there are never
     ///    phantom entries for chunks that didn't reach express storage.
     ///
-    /// Steps 2–3 are guarded: they are skipped when `SimStore` or `ProjectCtx`
+    /// Both steps are guarded: they are skipped when `SimStore` or `ProjectCtx`
     /// are not yet initialised (e.g. during initdb, single-user mode, or very
     /// early in backend startup before env vars are read).
     ///
     /// No deadlock risk: at this point we hold pin_count=1 but no partition
-    /// locks. `write_blocks()` does simple pwrite — no cache/lock interaction.
+    /// locks.
     pub fn flush_dirty_chunk(&self, slot_index: u32) {
         let meta = self.slot_meta(slot_index);
-        let dirty = meta.dirty_blocks.load(Ordering::Relaxed);
         let tag = meta.tag; // copy — avoids holding a borrow across I/O
 
-        for bit in 0..BLOCKS_PER_CHUNK {
-            if dirty & (1 << bit) != 0 {
-                let mut buf = [0u8; BLCKSZ];
-                self.read_block(slot_index, bit, &mut buf);
-                let blkno = tag.chunk_id * BLOCKS_PER_CHUNK + bit;
-                let _ = crate::s3_ops::write_blocks(
-                    tag.spc_oid,
-                    tag.db_oid,
-                    tag.rel_number,
-                    tag.fork_number,
-                    blkno,
-                    1,
-                    buf.as_ptr(),
-                );
-            }
-        }
         meta.dirty_blocks.store(0, Ordering::Release);
 
         // Express PUT + eviction log append.
@@ -817,13 +821,7 @@ impl CacheControl {
     /// either already reflected on disk or will be seen in a future call. The caller
     /// (`cached_file_nblocks`) always takes `max(disk_nblocks, cache_max)`, so
     /// skipping a pinned slot is safe for correctness.
-    pub fn max_block_for_relation(
-        &self,
-        spc_oid: Oid,
-        db_oid: Oid,
-        rel_number: RelFileNumber,
-        fork_number: ForkNumber,
-    ) -> BlockNumber {
+    pub fn max_block_for_relation(&self, rf: RelFork) -> BlockNumber {
         let mut nblocks: BlockNumber = 0;
 
         for i in 0..self.num_slots {
@@ -853,11 +851,7 @@ impl CacheControl {
             let valid = meta.valid_blocks.load(Ordering::Acquire);
             if valid != 0 {
                 let tag = &meta.tag;
-                if tag.spc_oid == spc_oid
-                    && tag.db_oid == db_oid
-                    && tag.rel_number == rel_number
-                    && tag.fork_number == fork_number
-                {
+                if tag.rel_fork() == rf {
                     // ilog2: position of the highest set bit (panics on 0, safe here).
                     let highest_bit = valid.ilog2();
                     let chunk_high = tag.chunk_id * BLOCKS_PER_CHUNK + highest_bit;
@@ -1017,14 +1011,7 @@ impl CacheControl {
     ///
     /// Used by truncate and unlink to ensure the cache doesn't return stale data
     /// or "ghost" blocks beyond the new EOF.
-    pub fn invalidate_range(
-        &self,
-        spc_oid: Oid,
-        db_oid: Oid,
-        rel_number: RelFileNumber,
-        fork_number: ForkNumber,
-        first_block: BlockNumber,
-    ) {
+    pub fn invalidate_range(&self, rf: RelFork, first_block: BlockNumber) {
         for i in 0..self.num_slots {
             let meta = self.slot_meta(i);
 
@@ -1052,12 +1039,7 @@ impl CacheControl {
             let valid = meta.valid_blocks.load(Ordering::Acquire);
             let tag = &meta.tag;
 
-            if valid != 0
-                && tag.spc_oid == spc_oid
-                && tag.db_oid == db_oid
-                && tag.rel_number == rel_number
-                && tag.fork_number == fork_number
-            {
+            if valid != 0 && tag.rel_fork() == rf {
                 let chunk_start = tag.chunk_id * BLOCKS_PER_CHUNK;
                 let chunk_end = chunk_start + BLOCKS_PER_CHUNK;
 

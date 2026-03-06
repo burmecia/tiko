@@ -1,4 +1,5 @@
 use pgsys::{common::in_recovery, logging::pg_log_error, smgr::*};
+use s3worker::cache::RelFork;
 use s3worker::s3_ops;
 
 /// Truncate a relation fork to the given number of blocks.
@@ -31,9 +32,15 @@ pub extern "C-unwind" fn s3_truncate(
 
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    if let Err(errno) =
-        s3_ops::cached_truncate_file(loc.spc_oid, loc.db_oid, loc.rel_number, forknum, nblocks)
-    {
+    if let Err(errno) = s3_ops::cached_truncate_file(
+        RelFork {
+            spc_oid: loc.spc_oid,
+            db_oid: loc.db_oid,
+            rel_number: loc.rel_number,
+            fork_number: forknum,
+        },
+        nblocks,
+    ) {
         pg_log_error(&format!(
             "s3_truncate: failed for rel {}/{}/{} fork {} nblocks {}: errno {}",
             loc.spc_oid, loc.db_oid, loc.rel_number, forknum, nblocks, errno

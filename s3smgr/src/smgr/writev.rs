@@ -1,4 +1,5 @@
 use pgsys::{common::in_recovery, logging::pg_log_error, smgr::*};
+use s3worker::cache::RelFork;
 use s3worker::s3_ops;
 
 use crate::buffers;
@@ -21,6 +22,12 @@ pub extern "C-unwind" fn s3_writev(
     }
 
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
+    let rf = RelFork {
+        spc_oid: loc.spc_oid,
+        db_oid: loc.db_oid,
+        rel_number: loc.rel_number,
+        fork_number: forknum,
+    };
     let iov = unsafe { buffers::buffers_to_iov(buffers, nblocks) };
 
     let mut block_offset: u32 = 0;
@@ -28,10 +35,7 @@ pub extern "C-unwind" fn s3_writev(
         let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
 
         if let Err(errno) = s3_ops::cached_write_blocks(
-            loc.spc_oid,
-            loc.db_oid,
-            loc.rel_number,
-            forknum,
+            rf,
             blocknum + block_offset,
             run_nblocks,
             entry.iov_base as *const u8,

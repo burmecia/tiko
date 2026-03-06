@@ -6,6 +6,7 @@
 //! concurrent lookups via binary search + direct `pread` — no in-memory
 //! page cache beyond what the OS provides.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -13,7 +14,7 @@ use std::sync::OnceLock;
 use pgsys::Lsn;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::ChunkTag;
+use crate::cache::{ChunkTag, RelFork};
 use crate::manifest::{ChunkRef, Manifest};
 use crate::sim_store::SimStore;
 
@@ -143,6 +144,29 @@ impl ProjectNamespace {
     pub fn base_prefix(&self) -> String {
         format!("{}/pitr/{}/bases/", self.org_id, self.project_id)
     }
+
+    // ── Relation-level express keys ───────────────────────────────────────
+
+    /// `{org}/{proj}/chunks/{spc}/{db}/{rel}.{fork}/nblocks`
+    ///
+    /// Key for the live block count of a relation fork in the express bucket.
+    /// Value: 4-byte little-endian `u32`.
+    pub fn rel_nblocks_key(&self, rf: RelFork) -> String {
+        format!(
+            "{}/{}/chunks/{}/{}/{}.{}/nblocks",
+            self.org_id, self.project_id, rf.spc_oid, rf.db_oid, rf.rel_number, rf.fork_number
+        )
+    }
+
+    /// `{org}/{proj}/chunks/{spc}/{db}/{rel}.{fork}/`
+    ///
+    /// Prefix covering all express keys for a relation fork (chunks + nblocks).
+    pub fn rel_chunks_prefix(&self, rf: RelFork) -> String {
+        format!(
+            "{}/{}/chunks/{}/{}/{}.{}/",
+            self.org_id, self.project_id, rf.spc_oid, rf.db_oid, rf.rel_number, rf.fork_number
+        )
+    }
 }
 
 // ── ProjectMeta ───────────────────────────────────────────────────────────────
@@ -261,7 +285,7 @@ impl ProjectCtx {
             Manifest::from_bytes(&bytes, &local_path)?
         } else if meta.parent_project_id.is_none() {
             // Root project with no bases yet — zero-entry manifest is valid.
-            Manifest::new_sorted(Lsn::INVALID, 0, vec![], &local_path)?
+            Manifest::new(Lsn::INVALID, 0, vec![], HashMap::new(), &local_path)?
         } else {
             return Err("branch project has no base manifests".into());
         };
@@ -280,6 +304,32 @@ impl ProjectCtx {
     /// Return `true` if this project is a branch (has a parent project).
     pub fn is_branch(&self) -> bool {
         self.meta.parent_project_id.is_some()
+    }
+
+    /// Try to initialize the global `ProjectCtx` from environment variables.
+    ///
+    /// Reads `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.
+    /// Returns without initializing if any are absent.
+    /// Silently ignored if `ProjectCtx` is already initialized (OnceLock).
+    ///
+    /// Called from `s3_init()` so the initdb write path can reach SimStore.
+    /// `SimStore::init()` must be called before this.
+    pub fn try_init_from_env(data_dir: &Path) {
+        fn read_u64(name: &str) -> Option<u64> {
+            std::env::var(name).ok()?.parse().ok()
+        }
+        let (Some(org_id), Some(project_id), Some(branch_id)) = (
+            read_u64("TIKO_ORG_ID"),
+            read_u64("TIKO_PROJECT_ID"),
+            read_u64("TIKO_BRANCH_ID"),
+        ) else {
+            return;
+        };
+        let sim = SimStore::get();
+        let ns = ProjectNamespace::new(org_id, project_id, branch_id);
+        if let Ok(ctx) = ProjectCtx::load(&ns, data_dir, sim) {
+            ProjectCtx::init(ctx);
+        }
     }
 
     /// Level-2 chunk lookup: binary search into the on-disk Manifest.
@@ -512,7 +562,7 @@ mod tests {
         chunks: Vec<(ChunkTag, ChunkRef)>,
         tmp_path: &Path,
     ) -> Vec<u8> {
-        let m = Manifest::new_sorted(lsn, 0, chunks, tmp_path).unwrap();
+        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), tmp_path).unwrap();
         m.to_bytes().unwrap()
     }
 
@@ -726,7 +776,7 @@ mod module7_tests {
         chunks: Vec<(ChunkTag, ChunkRef)>,
         tmp_path: &Path,
     ) {
-        let m = Manifest::new_sorted(lsn, 0, chunks, tmp_path).unwrap();
+        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), tmp_path).unwrap();
         let bytes = m.to_bytes().unwrap();
         sim.put_standard(key, &bytes).unwrap();
     }

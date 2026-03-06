@@ -80,6 +80,7 @@ mod tests {
     use crate::cache::ChunkTag;
     use crate::manifest::{ChunkRef, Manifest};
     use pgsys::Lsn;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn tag(rel: u32) -> ChunkTag {
@@ -134,10 +135,11 @@ mod tests {
 
         // Build the msgpack+zstd blob.
         let build_path = dir.path().join("build.tikm");
-        let m = Manifest::new_sorted(
+        let m = Manifest::new(
             Lsn::new(0x1000),
             0,
             vec![(known_tag, known_ref)],
+            HashMap::new(),
             &build_path,
         )
         .unwrap();

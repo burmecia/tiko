@@ -161,6 +161,7 @@ mod tests {
     use super::*;
     use crate::cache::ChunkTag;
     use crate::manifest::ChunkRef;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, SimStore) {
@@ -194,7 +195,7 @@ mod tests {
         chunks: Vec<(ChunkTag, ChunkRef)>,
         tmp: &std::path::Path,
     ) {
-        let m = Manifest::new_sorted(lsn, 0, chunks, tmp).unwrap();
+        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), tmp).unwrap();
         sim.put_standard(key, &m.to_bytes().unwrap()).unwrap();
     }
 

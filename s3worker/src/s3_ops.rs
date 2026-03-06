@@ -1,29 +1,29 @@
 //! S3 block-level read/write operations.
 //!
-//! Provides `read_blocks()` and `write_blocks()` — synchronous functions that
-//! perform actual file I/O. Called from two contexts:
+//! Two-layer storage: **shared-memory chunk cache → SimStore (express bucket)**.
+//! The local backing-file layer (`{DataDir}/tiko/`) has been removed.
 //!
-//! 1. **s3worker io_handler** (Tokio): `process_io_request` calls these for
-//!    Read/Write slot operations.
-//! 2. **Backend during initdb** (sync): called directly when no s3worker exists.
+//! # Public surface
 //!
-//! Uses S3-style path layout on local filesystem:
-//! `{DataDir}/tiko/{spc_oid}/{db_oid}/{rel_number}.{fork}`
-//!
-//! Will be replaced by real S3 GET/PUT operations once the S3 client is added.
+//! | Function | Purpose |
+//! |---|---|
+//! | `store_exists` | Check whether a relation fork exists (nblocks key present) |
+//! | `store_create` | Create a relation fork (write nblocks=0) |
+//! | `cached_zeroextend` | Extend a relation fork (update nblocks if larger) |
+//! | `cached_file_nblocks` | Block count: max(SimStore nblocks, cache max) |
+//! | `cached_read_blocks` | Read blocks: cache hit or SimStore fetch |
+//! | `cached_write_blocks` | Write blocks: cache (or initdb SimStore RMW) |
+//! | `cached_truncate_file` | Truncate: invalidate cache + trim SimStore + update nblocks |
+//! | `cached_delete_file` | Delete: invalidate cache + remove all SimStore chunks |
+//! | `warm_cache_blocks` | Prefetch: populate cache from SimStore |
 
-use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use pgsys::common::{
-    BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber, data_dir_path, is_under_postmaster,
-};
+use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 
 use crate::{
-    cache::{BLOCKS_PER_CHUNK, ChunkTag},
+    cache::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork},
     io_queue::S3IoControl,
     project::{ProjectCtx, ProjectNamespace},
     recovery,
@@ -101,9 +101,9 @@ fn try_fetch_chunk_from_s3(
     None
 }
 
-/// Internal wrapper: look up `SIM_STORE` and `PROJECT_NS` globals and call
-/// `try_fetch_chunk_from_s3`. Returns `None` if the statics are not set
-/// (e.g. initdb, env vars absent).
+/// Internal wrapper: look up `SIM_STORE` and `PROJECT_CTX` globals and call
+/// `try_fetch_chunk_from_s3`. Panics if either static is uninitialized
+/// (misconfiguration = loud failure).
 fn try_fetch_chunk_from_s3_globals(tag: &ChunkTag) -> Option<Vec<u8>> {
     let sim = SimStore::get();
     let ns = ProjectCtx::get().ns();
@@ -123,431 +123,227 @@ fn cache_is_available() -> bool {
     is_under_postmaster() && S3IoControl::is_initialized()
 }
 
-/// Build the local file path for a relation fork.
-///
-/// Layout: `{DataDir}/tiko/{spc_oid}/{db_oid}/{rel_number}.{fork}`
-///
-/// Mirrors the future S3 key structure:
-/// `s3://{bucket}/{spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}`
-fn block_path(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-) -> PathBuf {
-    let data_dir = data_dir_path();
-
-    data_dir
-        .join("tiko")
-        .join(spc_oid.to_string())
-        .join(db_oid.to_string())
-        .join(format!("{}.{}", rel_number, fork_number))
-}
-
 /// Map `std::io::Error` to a raw errno value.
 fn io_err_to_errno(e: &io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
 
-/// Check if a relation fork file exists.
-///
-/// # Returns
-/// - `true` if the file exists
-/// - `false` otherwise
-pub fn file_exists(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-) -> bool {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
-    path.exists()
-}
+// ── SimStore-backed relation metadata ─────────────────────────────────────────
 
-/// Create a relation fork file. Creates parent directories if needed.
-///
-/// # Returns
-/// - `Ok(false)` if the file already existed
-/// - `Ok(true)` if a new file was created
-/// - `Err(errno)` on failure
-pub fn create_file(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-) -> Result<bool, i32> {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err_to_errno(&e))?;
-    }
-
-    let created = !path.exists();
-
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| io_err_to_errno(&e))?;
-
-    Ok(created)
-}
-
-/// Get the number of blocks in a relation fork file.
-///
-/// Unlike `mdnblocks` which iterates across segments, S3 uses a single file
-/// per fork — just `file_size / BLCKSZ`. Returns 0 if the file doesn't exist.
-///
-/// # Returns
-/// - `Ok(nblocks)` — number of whole blocks in the file
-/// - `Err(errno)` on I/O failure (other than file-not-found)
-pub fn file_nblocks(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-) -> Result<BlockNumber, i32> {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
-
-    match fs::metadata(&path) {
-        Ok(meta) => Ok(meta.len() as u32 / BLCKSZ as u32),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(io_err_to_errno(&e)),
+/// Read the live block count for a relation fork from the express nblocks key.
+/// Returns 0 if the key doesn't exist.
+fn store_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> BlockNumber {
+    let key = ns.rel_nblocks_key(rf);
+    match sim.get_express(&key) {
+        Ok(Some(bytes)) if bytes.len() >= 4 => u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        _ => 0,
     }
 }
 
-/// Cache-aware block count. Returns `max(file_nblocks, cache_max)`.
-///
-/// With the write-back cache, `cached_write_blocks` does not extend the
-/// S3-sim backing file immediately — dirty blocks stay in the cache until
-/// eviction. So `file_nblocks` alone would return a stale (smaller) count
-/// for relations that have been extended but not yet evicted.
-///
-/// Falls back to `file_nblocks` when the cache is unavailable (initdb).
-pub fn cached_file_nblocks(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-) -> Result<BlockNumber, i32> {
-    let disk = file_nblocks(spc_oid, db_oid, rel_number, fork_number)?;
-
-    if !cache_is_available() {
-        return Ok(disk);
-    }
-
-    let cache_max =
-        S3IoControl::get()
-            .cache
-            .max_block_for_relation(spc_oid, db_oid, rel_number, fork_number);
-
-    Ok(disk.max(cache_max))
+/// Write the live block count for a relation fork to the express nblocks key.
+fn store_set_nblocks(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    rf: RelFork,
+    n: BlockNumber,
+) -> io::Result<()> {
+    let key = ns.rel_nblocks_key(rf);
+    sim.put_express(&key, &n.to_le_bytes())
 }
 
-/// Read blocks from a relation data file into a buffer.
-///
-/// Implements retry loop for short reads, matching PostgreSQL's FileReadV
-/// behavior. Continues reading until all requested blocks are transferred
-/// or EOF/error occurs.
+/// Check whether a relation fork exists (nblocks key is present in express).
+pub fn store_exists(rf: RelFork) -> bool {
+    let sim = SimStore::get();
+    let ns = ProjectCtx::get().ns();
+    let key = ns.rel_nblocks_key(rf);
+    matches!(sim.get_express(&key), Ok(Some(_)))
+}
+
+/// Create a relation fork. Writes nblocks=0 to the express nblocks key.
 ///
 /// # Returns
-/// - `Ok(nblocks)` on full read
-/// - `Ok(partial)` on EOF (fewer blocks than requested)
+/// - `Ok(false)` if the fork already existed
+/// - `Ok(true)` if a new fork was created
 /// - `Err(errno)` on I/O failure
-pub fn read_blocks(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-    block_number: BlockNumber,
-    nblocks: BlockNumber,
-    buffer_ptr: *mut u8,
-) -> Result<BlockNumber, i32> {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
-
-    let file = File::open(&path).map_err(|e| io_err_to_errno(&e))?;
-
-    let mut total_blocks_read = 0u32;
-    let mut remaining = nblocks;
-
-    // Retry loop: handle short reads (partial transfers)
-    while remaining > 0 {
-        let offset = (block_number + total_blocks_read) as u64 * BLCKSZ as u64;
-        let bytes_to_read = remaining as usize * BLCKSZ;
-        let buf_offset = total_blocks_read as usize * BLCKSZ;
-        let buf =
-            unsafe { std::slice::from_raw_parts_mut(buffer_ptr.add(buf_offset), bytes_to_read) };
-
-        match file.read_at(buf, offset) {
-            Ok(0) => break, // EOF reached
-            Ok(bytes_read) => {
-                let blocks_read = bytes_read as u32 / BLCKSZ as u32;
-                total_blocks_read += blocks_read;
-                remaining -= blocks_read;
-
-                // Partial block at EOF — shouldn't happen with aligned I/O,
-                // but handle it gracefully (matches md behavior)
-                if bytes_read % BLCKSZ != 0 {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue, // EINTR: retry
-            Err(e) => return Err(io_err_to_errno(&e)),
+pub fn store_create(rf: RelFork) -> Result<bool, i32> {
+    let sim = SimStore::get();
+    let ns = ProjectCtx::get().ns();
+    let key = ns.rel_nblocks_key(rf);
+    match sim.get_express(&key) {
+        Ok(Some(_)) => Ok(false), // already exists
+        _ => {
+            store_set_nblocks(sim, ns, rf, 0).map_err(|e| io_err_to_errno(&e))?;
+            Ok(true)
         }
     }
-
-    Ok(total_blocks_read)
 }
 
-/// Write blocks from a buffer to a relation data file.
+/// Extend a relation fork's block count. Only updates the nblocks metadata key
+/// if `blkno + nblocks` exceeds the current value.
 ///
-/// Creates parent directories if they don't exist. Uses `write_at` (pwrite),
-/// which extends the file and zero-fills gaps if `block_number` is beyond EOF —
-/// same semantics as `mdextend`'s `FileWrite`. In the future S3 implementation
-/// this becomes a PUT to a per-block key, so extend vs overwrite is irrelevant.
-///
-/// Implements retry loop for short writes, matching PostgreSQL's FileWriteV
-/// behavior. Continues writing until all requested blocks are transferred
-/// or an error occurs.
-///
-/// # Returns
-/// - `Ok(nblocks)` on full write
-/// - `Err(errno)` on I/O failure (short writes are retried until completion)
-pub fn write_blocks(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-    block_number: BlockNumber,
-    nblocks: BlockNumber,
-    buffer_ptr: *const u8,
-) -> Result<BlockNumber, i32> {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
-
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err_to_errno(&e))?;
-    }
-
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| io_err_to_errno(&e))?;
-
-    let mut total_blocks_written = 0u32;
-    let mut remaining = nblocks;
-
-    // Retry loop: handle short writes (partial transfers)
-    while remaining > 0 {
-        let offset = (block_number + total_blocks_written) as u64 * BLCKSZ as u64;
-        let bytes_to_write = remaining as usize * BLCKSZ;
-        let buf_offset = total_blocks_written as usize * BLCKSZ;
-        let buf = unsafe { std::slice::from_raw_parts(buffer_ptr.add(buf_offset), bytes_to_write) };
-
-        match file.write_at(buf, offset) {
-            Ok(0) => {
-                // Short write with 0 bytes written — likely ENOSPC (disk full)
-                // Return an error like md does
-                return Err(libc::ENOSPC);
-            }
-            Ok(bytes_written) => {
-                let blocks_written = bytes_written as u32 / BLCKSZ as u32;
-                total_blocks_written += blocks_written;
-                remaining -= blocks_written;
-
-                // Partial block write — shouldn't happen with aligned I/O,
-                // but handle it as potential ENOSPC
-                if bytes_written % BLCKSZ != 0 && remaining > 0 {
-                    return Err(libc::ENOSPC);
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue, // EINTR: retry
-            Err(e) => return Err(io_err_to_errno(&e)),
-        }
-    }
-
-    Ok(total_blocks_written)
-}
-
-/// Extend a relation fork file with zero-filled blocks.
-///
-/// Uses `File::set_len()` (ftruncate) to extend the file to
-/// `(blocknum + nblocks) * BLCKSZ`. On POSIX, `ftruncate` zero-fills
-/// the extended region. Creates the file and parent directories if
-/// they don't exist (matching `mdzeroextend`'s `EXTENSION_CREATE`).
-///
-/// Never shrinks the file: if the file is already at or beyond the target
-/// size (e.g. during WAL replay or after async cache eviction), this is
-/// a no-op. `set_len` / `ftruncate` would otherwise silently truncate,
-/// discarding data — unlike `mdzeroextend` which only ever grows the file.
-///
-/// # Returns
-/// - `Ok(())` on success
-/// - `Err(errno)` on failure
-pub fn zeroextend_file(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-    block_number: BlockNumber,
-    nblocks: BlockNumber,
-) -> Result<(), i32> {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err_to_errno(&e))?;
-    }
-
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&path)
-        .map_err(|e| io_err_to_errno(&e))?;
-
-    let new_len = (block_number as u64 + nblocks as u64) * BLCKSZ as u64;
-    let current_len = file.metadata().map_err(|e| io_err_to_errno(&e))?.len();
-    if new_len > current_len {
-        file.set_len(new_len).map_err(|e| io_err_to_errno(&e))?;
+/// Actual chunk data for extended-but-never-written blocks is implicitly zero:
+/// cache returns zeros for non-existent blocks, and SimStore returns None.
+pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) -> Result<(), i32> {
+    let sim = SimStore::get();
+    let ns = ProjectCtx::get().ns();
+    let new_nblocks = blkno + nblocks;
+    let current = store_nblocks(sim, ns, rf);
+    if new_nblocks > current {
+        store_set_nblocks(sim, ns, rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
     }
     Ok(())
 }
 
-/// Truncate a relation fork file to the given number of blocks.
-///
-/// Uses `File::set_len()` (ftruncate) to shrink the file. If the file
-/// doesn't exist, this is a no-op (the relation was already dropped or
-/// never created).
-///
-/// # Returns
-/// - `Ok(())` on success or if the file doesn't exist
-/// - `Err(errno)` on failure
-pub fn truncate_file(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-    nblocks: BlockNumber,
-) -> Result<(), i32> {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
+/// Delete all express chunk objects for a relation fork (chunk latest + staging keys).
+/// Does NOT delete the nblocks key — the caller handles that.
+fn store_delete_all_chunks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> io::Result<()> {
+    let prefix = ns.rel_chunks_prefix(rf);
+    for key in sim.list_prefix_express(&prefix)? {
+        sim.delete_express(&key)?;
+    }
+    Ok(())
+}
 
-    let file = match OpenOptions::new().write(true).open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(io_err_to_errno(&e)),
+/// Parse the numeric chunk_id from an express key given a relation prefix.
+///
+/// Keys under the prefix follow these patterns:
+/// - `{prefix}{chunk_id}/latest`
+/// - `{prefix}{chunk_id}/.staging_{lsn}`
+/// - `{prefix}nblocks`  ← no numeric chunk_id; returns `None`
+fn parse_chunk_id_from_key(key: &str, prefix: &str) -> Option<u32> {
+    let rest = key.strip_prefix(prefix)?;
+    let chunk_id_str = rest.split('/').next()?;
+    chunk_id_str.parse().ok()
+}
+
+// ── Cache-aware wrappers ──────────────────────────────────────────────────────
+
+/// Cache-aware block count. Returns `max(store_nblocks, cache_max)`.
+///
+/// With the write-back cache, `cached_write_blocks` does not update the
+/// SimStore nblocks key immediately — dirty blocks stay in the cache until
+/// eviction. So `store_nblocks` alone would return a stale (smaller) count
+/// for relations that have been extended but not yet evicted.
+///
+/// Falls back to `store_nblocks` alone when the cache is unavailable (initdb).
+pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
+    let store = if let (Some(sim), Some(ctx)) = (SimStore::try_get(), ProjectCtx::try_get()) {
+        store_nblocks(sim, ctx.ns(), rf)
+    } else {
+        0
     };
 
-    let new_len = nblocks as u64 * BLCKSZ as u64;
-    file.set_len(new_len).map_err(|e| io_err_to_errno(&e))
+    if !cache_is_available() {
+        return Ok(store);
+    }
+
+    let cache_max = S3IoControl::get().cache.max_block_for_relation(rf);
+
+    Ok(store.max(cache_max))
 }
 
-/// Cache-aware truncate. Invalidates cache blocks at or beyond `nblocks`
-/// BEFORE shrinking the backing file.
+/// Cache-aware truncate. Invalidates cache blocks at or beyond `nblocks`,
+/// deletes excess chunks from SimStore, then updates the nblocks key.
 ///
 /// Order matters: invalidating first prevents a dirty block in the truncated
-/// range from being flushed by `flush_dirty_chunk` after `truncate_file`
-/// has shrunk the file — which would silently re-extend it via `pwrite`.
+/// range from being flushed by `flush_dirty_chunk` after the SimStore chunks
+/// are removed.
 ///
-/// Falls back to raw `truncate_file` when the cache is unavailable (initdb).
-pub fn cached_truncate_file(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-    nblocks: BlockNumber,
-) -> Result<(), i32> {
+/// Falls back to only updating the nblocks key when the cache is unavailable.
+pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32> {
     if cache_is_available() {
-        S3IoControl::get().cache.invalidate_range(
-            spc_oid,
-            db_oid,
-            rel_number,
-            fork_number,
-            nblocks,
-        );
+        S3IoControl::get().cache.invalidate_range(rf, nblocks);
     }
 
-    truncate_file(spc_oid, db_oid, rel_number, fork_number, nblocks)
-}
+    let sim = SimStore::get();
+    let ns = ProjectCtx::get().ns();
 
-/// Delete a relation fork file.
-///
-/// Silently ignores ENOENT — the file may not exist (e.g. non-main forks
-/// that were never created, or WAL redo replaying a drop).
-///
-/// # Returns
-/// - `Ok(())` on success or if the file doesn't exist
-/// - `Err(errno)` on failure
-pub fn delete_file(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-) -> Result<(), i32> {
-    let path = block_path(spc_oid, db_oid, rel_number, fork_number);
-
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err_to_errno(&e)),
+    // Delete express chunk keys for chunks beyond the new nblocks boundary.
+    let first_excess_chunk = (nblocks + BLOCKS_PER_CHUNK - 1) / BLOCKS_PER_CHUNK;
+    let prefix = ns.rel_chunks_prefix(rf);
+    match sim.list_prefix_express(&prefix) {
+        Ok(keys) => {
+            for key in &keys {
+                if let Some(chunk_id) = parse_chunk_id_from_key(&key, &prefix) {
+                    if chunk_id >= first_excess_chunk {
+                        let _ = sim.delete_express(key);
+                    }
+                }
+            }
+        }
+        Err(_) => {} // relation may not have any chunks yet; no-op
     }
+
+    // Update the nblocks key.
+    store_set_nblocks(sim, ns, rf, nblocks).map_err(|e| io_err_to_errno(&e))
 }
 
-/// Cache-aware delete. Invalidates ALL cache blocks for the relation fork
-/// BEFORE removing the backing file.
+/// Cache-aware delete. Invalidates ALL cache blocks for the relation fork,
+/// then removes all express objects (chunks + nblocks key) from SimStore.
 ///
-/// Order matters: invalidating first prevents dirty blocks from being
-/// flushed by `flush_dirty_chunk` after the file is gone — which would
-/// silently recreate it via `write_blocks`'s `create(true)` open flag.
-/// It also prevents stale cache hits if the same `rel_number` is later
-/// reused for a new relation.
+/// Order matters: invalidating first prevents dirty blocks from being flushed
+/// by `flush_dirty_chunk` after the SimStore objects are gone — which would
+/// silently recreate them. It also prevents stale cache hits if the same
+/// `rel_number` is later reused.
 ///
-/// Falls back to raw `delete_file` when the cache is unavailable (initdb).
-pub fn cached_delete_file(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
-) -> Result<(), i32> {
+/// Falls back to only removing SimStore objects when the cache is unavailable.
+pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
     if cache_is_available() {
         // first_block=0 invalidates every chunk for this fork
-        S3IoControl::get()
-            .cache
-            .invalidate_range(spc_oid, db_oid, rel_number, fork_number, 0);
+        S3IoControl::get().cache.invalidate_range(rf, 0);
     }
 
-    delete_file(spc_oid, db_oid, rel_number, fork_number)
+    let sim = SimStore::get();
+    let ns = ProjectCtx::get().ns();
+
+    // Remove all chunk express objects (includes chunk latest/staging keys).
+    store_delete_all_chunks(sim, ns, rf).map_err(|e| io_err_to_errno(&e))?;
+
+    // Remove the nblocks key.
+    let nblocks_key = ns.rel_nblocks_key(rf);
+    sim.delete_express(&nblocks_key)
+        .map_err(|e| io_err_to_errno(&e))
 }
 
-// ── Cache-aware wrappers ──
-
-/// Cache-aware read. Checks the local cache before reading from the backing file.
+/// Cache-aware read. Checks the local cache before fetching from SimStore.
 ///
-/// Falls back to raw `read_blocks` when the cache is unavailable (initdb,
+/// Falls back to direct SimStore reads when the cache is unavailable (initdb,
 /// single-user mode, before shared memory is initialized).
 ///
 /// Uses chunk-level granularity: each cache slot holds 256 KB (32 blocks).
-/// On chunk hit, reads individual blocks from the cache. On chunk miss,
-/// allocates a new slot and prefetches the full chunk from S3-sim files.
+/// On chunk hit with a valid block, reads directly from cache.
+/// On chunk hit with an invalid block, or chunk miss, fetches the full chunk
+/// from SimStore and populates the cache.
 pub fn cached_read_blocks(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
+    rf: RelFork,
     block_number: BlockNumber,
     nblocks: BlockNumber,
     buffer_ptr: *mut u8,
 ) -> Result<BlockNumber, i32> {
     if !cache_is_available() {
-        return read_blocks(
-            spc_oid,
-            db_oid,
-            rel_number,
-            fork_number,
-            block_number,
-            nblocks,
-            buffer_ptr,
-        );
+        // initdb / single-user: read directly from SimStore express.
+        for i in 0..nblocks {
+            let blkno = block_number + i;
+            let chunk_tag = ChunkTag::from_block(rf, blkno);
+            let block_offset = (blkno % BLOCKS_PER_CHUNK) as usize;
+            let buf_offset = i as usize * BLCKSZ;
+            let buf = unsafe { std::slice::from_raw_parts_mut(buffer_ptr.add(buf_offset), BLCKSZ) };
+
+            if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+                let start = block_offset * BLCKSZ;
+                let end = start + BLCKSZ;
+                if end <= chunk_data.len() {
+                    buf.copy_from_slice(&chunk_data[start..end]);
+                } else {
+                    buf.fill(0);
+                }
+            } else {
+                buf.fill(0);
+            }
+        }
+        return Ok(nblocks);
     }
+
     let control = S3IoControl::get();
     let cache = &control.cache;
     let stats = &control.stats;
@@ -557,7 +353,7 @@ pub fn cached_read_blocks(
 
     for i in 0..nblocks {
         let blkno = block_number + i;
-        let chunk_tag = ChunkTag::from_block(spc_oid, db_oid, rel_number, fork_number, blkno);
+        let chunk_tag = ChunkTag::from_block(rf, blkno);
         let block_offset = blkno % BLOCKS_PER_CHUNK;
         let buf_offset = i as usize * BLCKSZ;
         let buf = unsafe { std::slice::from_raw_parts_mut(buffer_ptr.add(buf_offset), BLCKSZ) };
@@ -567,81 +363,59 @@ pub fn cached_read_blocks(
             stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             cache.pin(slot);
             if cache.is_block_valid(slot, block_offset) {
-                // Block is populated — read directly from cache
+                // Block is populated — read directly from cache.
                 cache.read_block(slot, block_offset, buf);
             } else {
-                // Block not yet populated in this chunk — read from S3-sim, populate cache
-                let blk_ptr = unsafe { buffer_ptr.add(buf_offset) };
-                read_blocks(spc_oid, db_oid, rel_number, fork_number, blkno, 1, blk_ptr)?;
-                cache.write_block(slot, block_offset, buf);
-                cache.set_block_valid(slot, block_offset);
+                // Block not in cache — fetch whole chunk from SimStore and
+                // populate only the invalid slots (preserve dirty/valid blocks).
+                if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+                    if chunk_data.len() % BLCKSZ == 0 {
+                        let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
+                        for bit in 0..nblocks_s3 {
+                            if !cache.is_block_valid(slot, bit) {
+                                let start = bit as usize * BLCKSZ;
+                                cache.write_block(slot, bit, &chunk_data[start..start + BLCKSZ]);
+                                cache.set_block_valid(slot, bit);
+                            }
+                        }
+                    }
+                }
+                if cache.is_block_valid(slot, block_offset) {
+                    cache.read_block(slot, block_offset, buf);
+                } else {
+                    // Block beyond file extent — zero-fill.
+                    buf.fill(0);
+                }
             }
             cache.touch(slot);
             cache.unpin(slot);
         } else {
-            // Chunk miss — insert new chunk slot, prefetch full chunk from S3-sim
+            // Chunk miss — insert new slot, fetch full chunk from SimStore.
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
             let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
 
-            // Prefetch: read as many blocks as possible from the S3-sim file
-            let chunk_start_blk = chunk_tag.chunk_id * BLOCKS_PER_CHUNK;
-            let file_nblks = file_nblocks(spc_oid, db_oid, rel_number, fork_number).unwrap_or(0);
-
-            if file_nblks > chunk_start_blk {
-                // How many blocks of this chunk exist in the file
-                let avail = std::cmp::min(BLOCKS_PER_CHUNK, file_nblks - chunk_start_blk);
-                let mut chunk_buf = vec![0u8; avail as usize * BLCKSZ];
-                if read_blocks(
-                    spc_oid,
-                    db_oid,
-                    rel_number,
-                    fork_number,
-                    chunk_start_blk,
-                    avail,
-                    chunk_buf.as_mut_ptr(),
-                )
-                .is_ok()
-                {
-                    // Write all fetched blocks into the cache slot
-                    cache.write_blocks_to_slot(slot, 0, avail, &chunk_buf);
-                    // Set valid bits for all fetched blocks
-                    let valid_mask = if avail >= 32 {
+            if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+                if chunk_data.len() % BLCKSZ == 0 {
+                    let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
+                    cache.write_blocks_to_slot(
+                        slot,
+                        0,
+                        nblocks_s3,
+                        &chunk_data[..nblocks_s3 as usize * BLCKSZ],
+                    );
+                    let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
                         u32::MAX
                     } else {
-                        (1u32 << avail) - 1
+                        (1u32 << nblocks_s3) - 1
                     };
                     cache.set_valid_blocks_mask(slot, valid_mask);
                 }
             }
 
-            // S3 fallback: if the requested block is still not valid after
-            // the local-file prefetch, try the two-level S3 fallback.
-            if !cache.is_block_valid(slot, block_offset) {
-                if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
-                    if chunk_data.len() % BLCKSZ == 0 {
-                        let nblocks_s3 = (chunk_data.len() / BLCKSZ) as u32;
-                        let nblocks_s3 = nblocks_s3.min(BLOCKS_PER_CHUNK);
-                        cache.write_blocks_to_slot(
-                            slot,
-                            0,
-                            nblocks_s3,
-                            &chunk_data[..nblocks_s3 as usize * BLCKSZ],
-                        );
-                        let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
-                            u32::MAX
-                        } else {
-                            (1u32 << nblocks_s3) - 1
-                        };
-                        cache.set_valid_blocks_mask(slot, valid_mask);
-                    }
-                }
-            }
-
-            // Now read the requested block from the cache slot.
             if cache.is_block_valid(slot, block_offset) {
                 cache.read_block(slot, block_offset, buf);
             } else {
-                // Block beyond file extent — zero-fill (existing behaviour).
+                // Block beyond file extent — zero-fill.
                 buf.fill(0);
             }
 
@@ -654,29 +428,53 @@ pub fn cached_read_blocks(
 
 /// Cache-aware write. Writes to the local cache only (write-back policy).
 ///
-/// Falls back to raw `write_blocks` when the cache is unavailable (initdb).
+/// Falls back to chunk-level read-modify-write on SimStore when the cache is
+/// unavailable (initdb). Namespace must be initialized before initdb writes.
 ///
-/// Dirty blocks are flushed to S3-sim files on eviction — no write-through.
+/// Dirty blocks are flushed to SimStore express on eviction — no write-through.
 pub fn cached_write_blocks(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
+    rf: RelFork,
     block_number: BlockNumber,
     nblocks: BlockNumber,
     buffer_ptr: *const u8,
 ) -> Result<BlockNumber, i32> {
     if !cache_is_available() {
-        return write_blocks(
-            spc_oid,
-            db_oid,
-            rel_number,
-            fork_number,
-            block_number,
-            nblocks,
-            buffer_ptr,
-        );
+        // initdb: chunk-level read-modify-write on SimStore express.
+        let sim = SimStore::get();
+        let ns = ProjectCtx::get().ns();
+        for i in 0..nblocks {
+            let blkno = block_number + i;
+            let chunk_tag = ChunkTag::from_block(rf, blkno);
+            let block_offset = (blkno % BLOCKS_PER_CHUNK) as usize;
+            let buf_offset = i as usize * BLCKSZ;
+            let buf = unsafe { std::slice::from_raw_parts(buffer_ptr.add(buf_offset), BLCKSZ) };
+
+            // Read existing chunk from express (or use zeros for a new chunk).
+            let latest_key = ns.chunk_latest_key(&chunk_tag);
+            let mut chunk_data = match sim.get_express(&latest_key) {
+                Ok(Some(data)) if data.len() == CHUNK_SIZE => data,
+                _ => vec![0u8; CHUNK_SIZE],
+            };
+
+            // Apply the block update.
+            let start = block_offset * BLCKSZ;
+            chunk_data[start..start + BLCKSZ].copy_from_slice(buf);
+
+            // Write back the whole chunk.
+            sim.put_express(&latest_key, &chunk_data)
+                .map_err(|e| io_err_to_errno(&e))?;
+        }
+
+        // Update nblocks if we extended the relation.
+        let new_nblocks = block_number + nblocks;
+        let current = store_nblocks(sim, ns, rf);
+        if new_nblocks > current {
+            store_set_nblocks(sim, ns, rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
+        }
+
+        return Ok(nblocks);
     }
+
     let control = S3IoControl::get();
     let cache = &control.cache;
     let stats = &control.stats;
@@ -686,7 +484,7 @@ pub fn cached_write_blocks(
 
     for i in 0..nblocks {
         let blkno = block_number + i;
-        let chunk_tag = ChunkTag::from_block(spc_oid, db_oid, rel_number, fork_number, blkno);
+        let chunk_tag = ChunkTag::from_block(rf, blkno);
         let block_offset = blkno % BLOCKS_PER_CHUNK;
         let buf_offset = i as usize * BLCKSZ;
         let buf = unsafe { std::slice::from_raw_parts(buffer_ptr.add(buf_offset), BLCKSZ) };
@@ -698,7 +496,7 @@ pub fn cached_write_blocks(
                 slot
             }
             None => {
-                // Chunk miss: allocate empty slot (don't fetch from S3-sim)
+                // Chunk miss: allocate empty slot (don't fetch from SimStore)
                 stats.cache_misses.fetch_add(1, Ordering::Relaxed);
                 cache.insert(&chunk_tag) // returns pinned
             }
@@ -719,8 +517,8 @@ pub fn cached_write_blocks(
 ///
 /// Iterates chunk-by-chunk over the requested range. For each chunk:
 /// - **Cache hit**: pin, touch, unpin — data is already present.
-/// - **Cache miss**: insert an empty slot (pinned), prefetch the full chunk
-///   from the S3-sim backing file, mark the loaded blocks valid, then unpin.
+/// - **Cache miss**: insert an empty slot (pinned), fetch the full chunk from
+///   SimStore express, mark loaded blocks valid, then unpin.
 ///
 /// This is the backend of `S3IoOpKind::Prefetch` — it allows subsequent
 /// `cached_read_blocks` calls to be served entirely from the cache.
@@ -728,10 +526,7 @@ pub fn cached_write_blocks(
 /// No-op (returns `Ok(0)`) when the cache is unavailable (initdb,
 /// single-user mode).
 pub fn warm_cache_blocks(
-    spc_oid: Oid,
-    db_oid: Oid,
-    rel_number: RelFileNumber,
-    fork_number: ForkNumber,
+    rf: RelFork,
     block_number: BlockNumber,
     nblocks: BlockNumber,
 ) -> Result<BlockNumber, i32> {
@@ -746,15 +541,12 @@ pub fn warm_cache_blocks(
     let first_chunk = block_number / BLOCKS_PER_CHUNK;
     let last_chunk = (block_number + nblocks - 1) / BLOCKS_PER_CHUNK;
 
-    // One call to file_nblocks covers all chunks in the range.
-    let file_nblks = file_nblocks(spc_oid, db_oid, rel_number, fork_number).unwrap_or(0);
-
     for chunk_id in first_chunk..=last_chunk {
         let chunk_tag = ChunkTag {
-            spc_oid,
-            db_oid,
-            rel_number,
-            fork_number,
+            spc_oid: rf.spc_oid,
+            db_oid: rf.db_oid,
+            rel_number: rf.rel_number,
+            fork_number: rf.fork_number,
             chunk_id,
         };
 
@@ -765,30 +557,23 @@ pub fn warm_cache_blocks(
             cache.touch(slot);
             cache.unpin(slot);
         } else {
-            // Cache miss — insert empty slot and populate from S3-sim.
+            // Cache miss — insert empty slot and populate from SimStore.
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
             let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
 
-            let chunk_start_blk = chunk_id * BLOCKS_PER_CHUNK;
-            if file_nblks > chunk_start_blk {
-                let avail = BLOCKS_PER_CHUNK.min(file_nblks - chunk_start_blk);
-                let mut chunk_buf = vec![0u8; avail as usize * BLCKSZ];
-                if read_blocks(
-                    spc_oid,
-                    db_oid,
-                    rel_number,
-                    fork_number,
-                    chunk_start_blk,
-                    avail,
-                    chunk_buf.as_mut_ptr(),
-                )
-                .is_ok()
-                {
-                    cache.write_blocks_to_slot(slot, 0, avail, &chunk_buf);
-                    let valid_mask = if avail >= BLOCKS_PER_CHUNK {
+            if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+                if chunk_data.len() % BLCKSZ == 0 {
+                    let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
+                    cache.write_blocks_to_slot(
+                        slot,
+                        0,
+                        nblocks_s3,
+                        &chunk_data[..nblocks_s3 as usize * BLCKSZ],
+                    );
+                    let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
                         u32::MAX
                     } else {
-                        (1u32 << avail) - 1
+                        (1u32 << nblocks_s3) - 1
                     };
                     cache.set_valid_blocks_mask(slot, valid_mask);
                 }
@@ -813,6 +598,7 @@ mod tests {
     use crate::recovery;
     use crate::sim_store::SimStore;
     use pgsys::Lsn;
+    use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
@@ -952,8 +738,14 @@ mod tests {
 
         // Build a local manifest with the chunk entry.
         let manifest_path = dir.path().join("test_manifest.tikm");
-        let manifest =
-            Manifest::new_sorted(lsn, 0, vec![(tag, chunk_ref)], &manifest_path).unwrap();
+        let manifest = Manifest::new(
+            lsn,
+            0,
+            vec![(tag, chunk_ref)],
+            HashMap::new(),
+            &manifest_path,
+        )
+        .unwrap();
 
         // Simulate level-2: look up the manifest and build the expected key.
         let found = manifest.lookup(&tag).unwrap().unwrap();
@@ -986,7 +778,7 @@ mod tests {
 
         // Build and write the recovery manifest blob.
         let build_path = dir.path().join("build.tikm");
-        let m = Manifest::new_sorted(lsn, 0, vec![(tag, chunk_ref)], &build_path).unwrap();
+        let m = Manifest::new(lsn, 0, vec![(tag, chunk_ref)], HashMap::new(), &build_path).unwrap();
         let blob = m.to_bytes().unwrap();
 
         let tiko_dir = dir.path().join("tiko");

@@ -1,4 +1,5 @@
 use pgsys::{logging::pg_log_error, smgr::*};
+use s3worker::cache::RelFork;
 use s3worker::s3_ops;
 
 /// Get the number of blocks stored in a relation fork.
@@ -13,7 +14,12 @@ pub extern "C-unwind" fn s3_nblocks(
 ) -> BlockNumber {
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    match s3_ops::cached_file_nblocks(loc.spc_oid, loc.db_oid, loc.rel_number, forknum) {
+    match s3_ops::cached_file_nblocks(RelFork {
+        spc_oid: loc.spc_oid,
+        db_oid: loc.db_oid,
+        rel_number: loc.rel_number,
+        fork_number: forknum,
+    }) {
         Ok(n) => n,
         Err(errno) => {
             pg_log_error(&format!(

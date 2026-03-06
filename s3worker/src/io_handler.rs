@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use pgsys::latch::SetLatch;
 use tokio::sync::mpsc;
 
+use crate::cache::RelFork;
 use crate::dispatcher::IoWorkRequest;
 use crate::io_queue::{S3IoControl, S3IoOpKind};
 use crate::s3_ops;
@@ -41,106 +42,64 @@ async fn process_io_request(request: IoWorkRequest) {
     let pool = control.backend_pool(request.backend_id as i32);
     let slot = pool.slot(request.slot_index as usize);
 
+    let rf = RelFork {
+        spc_oid: slot.spc_oid,
+        db_oid: slot.db_oid,
+        rel_number: slot.rel_number,
+        fork_number: slot.fork_number,
+    };
+
     // Perform I/O based on operation type
     let (status, nblocks) = match slot.op {
         S3IoOpKind::Read => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *mut u8;
-            match s3_ops::cached_read_blocks(
-                slot.spc_oid,
-                slot.db_oid,
-                slot.rel_number,
-                slot.fork_number,
-                slot.block_number,
-                slot.nblocks,
-                buffer_ptr,
-            ) {
+            match s3_ops::cached_read_blocks(rf, slot.block_number, slot.nblocks, buffer_ptr) {
                 Ok(n) => (0u32, n),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
         S3IoOpKind::Write => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *const u8;
-            match s3_ops::cached_write_blocks(
-                slot.spc_oid,
-                slot.db_oid,
-                slot.rel_number,
-                slot.fork_number,
-                slot.block_number,
-                slot.nblocks,
-                buffer_ptr,
-            ) {
+            match s3_ops::cached_write_blocks(rf, slot.block_number, slot.nblocks, buffer_ptr) {
                 Ok(n) => (0u32, n),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
         S3IoOpKind::Exists => {
-            if s3_ops::file_exists(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number) {
+            if s3_ops::store_exists(rf) {
                 (0u32, 1)
             } else {
-                // file doesn't exist — not an error, just report 0 nblocks
+                // fork doesn't exist — not an error, just report 0
                 (0u32, 0)
             }
         }
-        S3IoOpKind::Create => {
-            match s3_ops::create_file(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number)
-            {
-                Ok(created) => (0u32, if created { 1 } else { 0 }),
-                Err(errno) => (errno as u32, 0u32),
-            }
-        }
-        S3IoOpKind::Nblocks => {
-            match s3_ops::file_nblocks(slot.spc_oid, slot.db_oid, slot.rel_number, slot.fork_number)
-            {
-                Ok(n) => (0u32, n),
-                Err(errno) => (errno as u32, 0u32),
-            }
-        }
+        S3IoOpKind::Create => match s3_ops::store_create(rf) {
+            Ok(created) => (0u32, if created { 1 } else { 0 }),
+            Err(errno) => (errno as u32, 0u32),
+        },
+        S3IoOpKind::Nblocks => match s3_ops::cached_file_nblocks(rf) {
+            Ok(n) => (0u32, n),
+            Err(errno) => (errno as u32, 0u32),
+        },
         S3IoOpKind::Prefetch => {
-            match s3_ops::warm_cache_blocks(
-                slot.spc_oid,
-                slot.db_oid,
-                slot.rel_number,
-                slot.fork_number,
-                slot.block_number,
-                slot.nblocks,
-            ) {
+            match s3_ops::warm_cache_blocks(rf, slot.block_number, slot.nblocks) {
                 Ok(n) => (0u32, n),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
         S3IoOpKind::Truncate => {
             // Target nblocks is stored in block_number
-            match s3_ops::cached_truncate_file(
-                slot.spc_oid,
-                slot.db_oid,
-                slot.rel_number,
-                slot.fork_number,
-                slot.block_number,
-            ) {
+            match s3_ops::cached_truncate_file(rf, slot.block_number) {
                 Ok(()) => (0u32, 0u32),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
-        S3IoOpKind::Unlink => {
-            match s3_ops::cached_delete_file(
-                slot.spc_oid,
-                slot.db_oid,
-                slot.rel_number,
-                slot.fork_number,
-            ) {
-                Ok(()) => (0u32, 0u32),
-                Err(errno) => (errno as u32, 0u32),
-            }
-        }
+        S3IoOpKind::Unlink => match s3_ops::cached_delete_file(rf) {
+            Ok(()) => (0u32, 0u32),
+            Err(errno) => (errno as u32, 0u32),
+        },
         S3IoOpKind::ZeroExtend => {
-            match s3_ops::zeroextend_file(
-                slot.spc_oid,
-                slot.db_oid,
-                slot.rel_number,
-                slot.fork_number,
-                slot.block_number,
-                slot.nblocks,
-            ) {
+            match s3_ops::cached_zeroextend(rf, slot.block_number, slot.nblocks) {
                 Ok(()) => (0u32, 0u32),
                 Err(errno) => (errno as u32, 0u32),
             }

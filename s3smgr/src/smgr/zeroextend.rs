@@ -1,4 +1,5 @@
 use pgsys::{common::INVALID_BLOCK_NUMBER, logging::pg_log_error, smgr::*};
+use s3worker::cache::RelFork;
 use s3worker::s3_ops;
 
 /// Extend a relation fork with zero-filled blocks.
@@ -33,11 +34,13 @@ pub extern "C-unwind" fn s3_zeroextend(
         return;
     }
 
-    if let Err(errno) = s3_ops::zeroextend_file(
-        loc.spc_oid,
-        loc.db_oid,
-        loc.rel_number,
-        forknum,
+    if let Err(errno) = s3_ops::cached_zeroextend(
+        RelFork {
+            spc_oid: loc.spc_oid,
+            db_oid: loc.db_oid,
+            rel_number: loc.rel_number,
+            fork_number: forknum,
+        },
         blocknum,
         nblocks_u32,
     ) {

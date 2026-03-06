@@ -35,13 +35,13 @@
 //! re-processes the existing `.ckpt` file (idempotent because
 //! `three_step_write` is crash-safe and the delta manifest PUT is atomic).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use pgsys::{Lsn, common::data_dir_path};
-use s3worker::cache::{CHUNK_SIZE, CacheControl, ChunkTag};
+use s3worker::cache::{CHUNK_SIZE, CacheControl, ChunkTag, RelFork};
 use s3worker::io_queue::S3IoControl;
 use s3worker::manifest::{ChunkRef, Manifest};
 use s3worker::project::{ProjectCtx, ProjectNamespace};
@@ -137,8 +137,31 @@ fn checkpoint_flush_inner(
         })
         .collect();
 
+    // Collect nblocks for every relation that had dirty chunks.
+    // Key: (spc_oid, db_oid, rel_number, fork_number) → nblocks.
+    let mut rel_nblocks: HashMap<RelFork, u32> = HashMap::new();
+    for key in &dirty_chunks {
+        let rf = key.rel_fork();
+        // Only query once per relation (dedup across chunks of the same fork).
+        rel_nblocks.entry(rf).or_insert_with(|| {
+            let nblocks_key = ns.rel_nblocks_key(rf);
+            match sim.get_express(&nblocks_key) {
+                Ok(Some(bytes)) if bytes.len() >= 4 => {
+                    u32::from_le_bytes(bytes[0..4].try_into().unwrap())
+                }
+                _ => 0,
+            }
+        });
+    }
+
     let tmp_path = delta_tmp_path(data_dir, checkpoint_lsn);
-    let delta = Manifest::new_sorted(checkpoint_lsn, now_unix(), delta_entries, &tmp_path)?;
+    let delta = Manifest::new(
+        checkpoint_lsn,
+        now_unix(),
+        delta_entries,
+        rel_nblocks,
+        &tmp_path,
+    )?;
     upload_delta_manifest(sim, ns, checkpoint_lsn, &delta)?;
     upload_pg_state(sim, ns, checkpoint_lsn, data_dir)?;
 
@@ -588,7 +611,7 @@ mod tests {
             chunk_id: 0,
         };
         let cref = ChunkRef { branch_id: 7, lsn };
-        Manifest::new_sorted(lsn, 0, vec![(tag, cref)], &path).unwrap()
+        Manifest::new(lsn, 0, vec![(tag, cref)], HashMap::new(), &path).unwrap()
     }
 
     #[test]
