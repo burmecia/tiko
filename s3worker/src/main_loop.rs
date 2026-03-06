@@ -88,7 +88,7 @@ fn init_project_ctx() {
 
     // Initialise sim store and namespace statics (Module 4).
     // Must happen before ProjectCtx::load so that cached_read_blocks can
-    // reach the S3 sim store via try_fetch_chunk_from_s3_globals.
+    // reach the S3 sim store via try_fetch_chunk_from_s3.
     SimStore::init(&data_dir);
 
     // Load the project context. This populates the global ProjectCtx, which

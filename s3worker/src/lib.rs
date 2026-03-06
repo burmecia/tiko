@@ -43,8 +43,8 @@ pub extern "C-unwind" fn Pg_magic_func() -> &'static PgMagicStruct {
                 arr
             },
         },
-        name: b"s3worker\0".as_ptr() as *const c_char,
-        version: b"1.0\0".as_ptr() as *const c_char,
+        name: c"s3worker".as_ptr(),
+        version: c"1.0".as_ptr(),
     };
     &MAGIC
 }

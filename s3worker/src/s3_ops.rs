@@ -50,7 +50,7 @@ use crate::{
 ///    Only attempted when `ProjectCtx` has been initialised.
 ///
 /// Returns the raw chunk bytes on success, `None` on all misses.
-fn try_fetch_chunk_from_s3(
+fn try_fetch_chunk_from_s3_with(
     sim: &SimStore,
     ns: &ProjectNamespace,
     tag: &ChunkTag,
@@ -101,13 +101,10 @@ fn try_fetch_chunk_from_s3(
     None
 }
 
-/// Internal wrapper: look up `SIM_STORE` and `PROJECT_CTX` globals and call
-/// `try_fetch_chunk_from_s3`. Panics if either static is uninitialized
-/// (misconfiguration = loud failure).
-fn try_fetch_chunk_from_s3_globals(tag: &ChunkTag) -> Option<Vec<u8>> {
+fn try_fetch_chunk_from_s3(tag: &ChunkTag) -> Option<Vec<u8>> {
     let sim = SimStore::get();
     let ns = ProjectCtx::get().ns();
-    try_fetch_chunk_from_s3(sim, ns, tag)
+    try_fetch_chunk_from_s3_with(sim, ns, tag)
 }
 
 /// True when the shared-memory cache is reachable from this process.
@@ -329,7 +326,7 @@ pub fn cached_read_blocks(
             let buf_offset = i as usize * BLCKSZ;
             let buf = unsafe { std::slice::from_raw_parts_mut(buffer_ptr.add(buf_offset), BLCKSZ) };
 
-            if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+            if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
                 let start = block_offset * BLCKSZ;
                 let end = start + BLCKSZ;
                 if end <= chunk_data.len() {
@@ -368,7 +365,7 @@ pub fn cached_read_blocks(
             } else {
                 // Block not in cache — fetch whole chunk from SimStore and
                 // populate only the invalid slots (preserve dirty/valid blocks).
-                if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+                if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
                     if chunk_data.len() % BLCKSZ == 0 {
                         let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
                         for bit in 0..nblocks_s3 {
@@ -394,7 +391,7 @@ pub fn cached_read_blocks(
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
             let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
 
-            if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+            if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
                 if chunk_data.len() % BLCKSZ == 0 {
                     let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
                     cache.write_blocks_to_slot(
@@ -518,7 +515,8 @@ pub fn cached_write_blocks(
 /// Iterates chunk-by-chunk over the requested range. For each chunk:
 /// - **Cache hit**: pin, touch, unpin — data is already present.
 /// - **Cache miss**: insert an empty slot (pinned), fetch the full chunk from
-///   SimStore express, mark loaded blocks valid, then unpin.
+///   SimStore (express latest first, then standard bucket via base manifest
+///   for inherited ancestor-branch chunks), mark loaded blocks valid, then unpin.
 ///
 /// This is the backend of `S3IoOpKind::Prefetch` — it allows subsequent
 /// `cached_read_blocks` calls to be served entirely from the cache.
@@ -561,7 +559,7 @@ pub fn warm_cache_blocks(
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
             let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
 
-            if let Some(chunk_data) = try_fetch_chunk_from_s3_globals(&chunk_tag) {
+            if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
                 if chunk_data.len() % BLCKSZ == 0 {
                     let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
                     cache.write_blocks_to_slot(
@@ -644,7 +642,7 @@ mod tests {
         sim.put_express_latest(&ns, &tag, &data).unwrap();
 
         // Level-1 should hit.
-        let result = try_fetch_chunk_from_s3(&sim, &ns, &tag);
+        let result = try_fetch_chunk_from_s3_with(&sim, &ns, &tag);
         assert_eq!(result, Some(data));
     }
 
@@ -661,7 +659,7 @@ mod tests {
         recovery::RECOVERY_MODE.store(false, Ordering::SeqCst);
 
         // Nothing in express, no ProjectCtx set for level-2.
-        let result = try_fetch_chunk_from_s3(&sim, &ns, &tag);
+        let result = try_fetch_chunk_from_s3_with(&sim, &ns, &tag);
         assert_eq!(result, None);
     }
 
@@ -837,7 +835,7 @@ mod tests {
 
         // With recovery mode on and no versioned match for tag(500), the result
         // is None (recovery mode does not fall through to express latest).
-        let result = try_fetch_chunk_from_s3(&sim, &ns, &tag);
+        let result = try_fetch_chunk_from_s3_with(&sim, &ns, &tag);
         // If RECOVERY_MANIFEST happens to have an entry for tag(500) from a
         // concurrent test, result may be Some — but it must not equal the
         // express data (which would mean we fell through, which is wrong).

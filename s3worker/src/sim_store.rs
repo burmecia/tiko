@@ -26,7 +26,7 @@ use crate::project::ProjectNamespace;
 // ── Globals ───────────────────────────────────────────────────────────────────
 
 /// Sim store initialised by `SimStore::init` at s3worker startup.
-/// Accessed from `cached_read_blocks` via `try_fetch_chunk_from_s3_globals`.
+/// Accessed from `cached_read_blocks` via `try_fetch_chunk_from_s3`.
 pub(crate) static SIM_STORE: OnceLock<SimStore> = OnceLock::new();
 
 // ── SimStore ─────────────────────────────────────────────────────────────────
