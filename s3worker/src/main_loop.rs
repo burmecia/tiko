@@ -123,7 +123,7 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
 
         // Periodic logging
         if loop_count % 4 == 0 {
-            pg_log_debug1(&format!(
+            pg_log_debug2(&format!(
                 "s3worker: loop_count={}, requests={}",
                 loop_count, requests_processed
             ));

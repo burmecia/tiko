@@ -718,7 +718,7 @@ impl S3IoControl {
             match dispatcher.send_work(request) {
                 Ok(()) => {
                     dispatched_count += 1;
-                    pg_log_debug1(&format!(
+                    pg_log_debug2(&format!(
                         "s3worker: dispatched backend={} slot={} op={:?} blk={} nblk={}",
                         backend_id, slot_idx, slot.op, slot.block_number, slot.nblocks
                     ));
