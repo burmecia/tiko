@@ -5,6 +5,7 @@ pub use crate::common::*;
 
 // Corresponds to PostgreSQL's RelFileLocator struct
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RelFileLocator {
     pub spc_oid: Oid,              // tablespace OID
     pub db_oid: Oid,               // database OID
@@ -13,6 +14,7 @@ pub struct RelFileLocator {
 
 // Corresponds to PostgreSQL's RelFileLocatorBackend struct
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RelFileLocatorBackend {
     pub locator: RelFileLocator,
     pub backend: ProcNumber,

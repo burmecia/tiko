@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 
 use crate::{
-    cache::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork},
+    cache::{BLOCKS_PER_CHUNK, CHUNK_SIZE, CacheControl, ChunkTag, RelFork},
     io_queue::S3IoControl,
     project::{ProjectCtx, ProjectNamespace},
     recovery,
@@ -389,8 +389,11 @@ pub fn cached_read_blocks(
         } else {
             // Chunk miss — insert new slot, fetch full chunk from SimStore.
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-            let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
+            // insert() returns a pinned slot; may be an existing slot if a concurrent
+            // thread inserted the same tag between our lookup miss and now.
+            let slot = cache.insert(&chunk_tag);
 
+            // Newly allocated slot — fetch from SimStore and populate.
             if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
                 if chunk_data.len() % BLCKSZ == 0 {
                     let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
@@ -408,6 +411,8 @@ pub fn cached_read_blocks(
                     cache.set_valid_blocks_mask(slot, valid_mask);
                 }
             }
+            // If SimStore had no data, slot stays with valid_blocks=0; caller
+            // handles via is_block_valid check below (zero-fill for new blocks).
 
             if cache.is_block_valid(slot, block_offset) {
                 cache.read_block(slot, block_offset, buf);
@@ -423,7 +428,9 @@ pub fn cached_read_blocks(
     Ok(nblocks)
 }
 
-/// Cache-aware write. Writes to the local cache only (write-back policy).
+/// Cache-aware write. On a cache miss, pre-populates the slot from SimStore
+/// (read-modify-write) so that `flush_dirty_chunk` never emits stale bytes
+/// from the previous slot occupant for blocks the caller didn't write.
 ///
 /// Falls back to chunk-level read-modify-write on SimStore when the cache is
 /// unavailable (initdb). Namespace must be initialized before initdb writes.
@@ -460,6 +467,11 @@ pub fn cached_write_blocks(
             // Write back the whole chunk.
             sim.put_express(&latest_key, &chunk_data)
                 .map_err(|e| io_err_to_errno(&e))?;
+
+            // Log the chunk so the shutdown checkpoint can archive it and
+            // build the initial delta/base manifests — mirrors what flush_dirty_chunk
+            // does on the normal shmem-cache path.
+            CacheControl::append_chunk_tag_to_eviction_log(&chunk_tag);
         }
 
         // Update nblocks if we extended the relation.
@@ -493,9 +505,43 @@ pub fn cached_write_blocks(
                 slot
             }
             None => {
-                // Chunk miss: allocate empty slot (don't fetch from SimStore)
+                // Chunk miss — allocate a fresh slot (evicts an existing entry if full).
+                // insert() may return an existing slot if a concurrent thread inserted
+                // the same tag between our lookup miss and now (concurrent-insert race).
                 stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-                cache.insert(&chunk_tag) // returns pinned
+                let slot = cache.insert(&chunk_tag);
+
+                // Newly allocated slot: pre-populate from SimStore before writing.
+                //
+                // `insert()` resets `valid_blocks` but does NOT zero the cache
+                // file region — it retains raw bytes from the previous occupant.
+                // Without this step, `flush_dirty_chunk` reads the full 256 KB
+                // slot on eviction and emits stale bytes for every block the
+                // caller never explicitly wrote — silently corrupting those blocks.
+                if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
+                    if chunk_data.len() % BLCKSZ == 0 {
+                        let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
+                        cache.write_blocks_to_slot(
+                            slot,
+                            0,
+                            nblocks_s3,
+                            &chunk_data[..nblocks_s3 as usize * BLCKSZ],
+                        );
+                        let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
+                            u32::MAX
+                        } else {
+                            (1u32 << nblocks_s3) - 1
+                        };
+                        cache.set_valid_blocks_mask(slot, valid_mask);
+                    }
+                } else {
+                    // New chunk (no data in SimStore yet) — zero the slot so
+                    // flush_dirty_chunk never emits stale bytes from the prior
+                    // occupant for blocks the caller doesn't write.
+                    cache.write_blocks_to_slot(slot, 0, BLOCKS_PER_CHUNK, &vec![0u8; CHUNK_SIZE]);
+                }
+
+                slot
             }
         };
 
@@ -557,7 +603,7 @@ pub fn warm_cache_blocks(
         } else {
             // Cache miss — insert empty slot and populate from SimStore.
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-            let slot = cache.insert(&chunk_tag); // returns pinned, valid_blocks=0
+            let slot = cache.insert(&chunk_tag);
 
             if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
                 if chunk_data.len() % BLCKSZ == 0 {

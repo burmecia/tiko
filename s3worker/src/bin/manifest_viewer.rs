@@ -9,7 +9,7 @@
 //! manifest_viewer <file>                   Auto-detect by magic bytes
 //! manifest_viewer --s3 <key>               Read from SimStore standard bucket ($PGDATA required)
 //! manifest_viewer --s3-express <key>       Read from SimStore express bucket ($PGDATA required)
-//! manifest_viewer --no-entries [...]       Suppress per-entry table; show summary only
+//! manifest_viewer --no-entries [...]       Suppress rel_nblocks and entries table; show summary only
 //! ```
 //!
 //! Auto-detection: if the file begins with the `TIKM` magic it is opened as a
@@ -69,7 +69,7 @@ fn usage() -> ! {
   manifest_viewer --s3-express <key>  (requires $PGDATA)
 
 Flags:
-  --no-entries   Print header summary only; skip the entries table."
+  --no-entries   Print header summary only; skip rel_nblocks and entries table."
     );
     std::process::exit(1);
 }
@@ -197,6 +197,10 @@ fn print_manifest(manifest: &Manifest, format_label: &str, no_entries: bool) {
     println!("  timestamp:       {}  ({})", format_timestamp(ts), ts);
     println!("  entry_count:     {entry_count}");
 
+    if no_entries {
+        return;
+    }
+
     let rel_nblocks = manifest.rel_nblocks();
     if !rel_nblocks.is_empty() {
         println!();
@@ -214,10 +218,6 @@ fn print_manifest(manifest: &Manifest, format_label: &str, no_entries: bool) {
         // S3 format can legitimately have an empty rel_nblocks map.
         println!();
         println!("rel_nblocks:     (empty)");
-    }
-
-    if no_entries {
-        return;
     }
 
     let entries = match manifest.entries() {

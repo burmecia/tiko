@@ -6,7 +6,6 @@
 //! concurrent lookups via binary search + direct `pread` — no in-memory
 //! page cache beyond what the OS provides.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -275,8 +274,7 @@ impl ProjectCtx {
             status: "active".to_string(),
         };
         let local_path = Manifest::local_manifest_path(data_dir);
-        let base_manifest = Manifest::new(Lsn::INVALID, 0, vec![], HashMap::new(), &local_path)
-            .expect("failed to create empty manifest");
+        let base_manifest = Manifest::empty(&local_path).expect("failed to create empty manifest");
         ProjectCtx {
             meta,
             base_manifest,
@@ -296,8 +294,10 @@ impl ProjectCtx {
     /// `Ok(None)` for any key. This is correct: a fresh DB has no chunks yet.
     ///
     /// # Branch project with no bases
-    /// Returns an error. A branch always has an initial base manifest written
-    /// by `create_branch` (Module 7).
+    /// Constructs a zero-entry manifest (same as root). `is_branch()` still
+    /// returns `true` so callers can skip root-only operations (e.g. base
+    /// compaction after initdb). The initial base is written by the
+    /// restore-from-parent process after initdb completes.
     pub fn load(ns: &ProjectNamespace, data_dir: &Path, sim: &SimStore) -> Result<Self> {
         // Step 1: fetch project.json
         let meta_key = ns.project_meta_key();
@@ -345,11 +345,12 @@ impl ProjectCtx {
                 .get_standard(&manifest_key)?
                 .ok_or_else(|| format!("manifest.bin not found at key: {manifest_key}"))?;
             Manifest::from_bytes(&bytes, &local_path)?
-        } else if meta.parent_project_id.is_none() {
-            // Root project with no bases yet — zero-entry manifest is valid.
-            Manifest::new(Lsn::INVALID, 0, vec![], HashMap::new(), &local_path)?
         } else {
-            return Err("branch project has no base manifests".into());
+            // No bases yet — either root project (before initdb checkpoint) or
+            // branch project (before restore-from-parent). Zero-entry manifest
+            // is valid; is_branch() still returns true for branches, letting
+            // callers skip root-only operations such as base compaction.
+            Manifest::empty(&local_path)?
         };
 
         Ok(ProjectCtx {
@@ -450,6 +451,38 @@ pub fn build_initial_manifest(
     Ok(base)
 }
 
+/// Write `project.json` for a root project to SimStore if it does not already exist.
+///
+/// Called once after the initdb shutdown checkpoint so that subsequent
+/// `init_from_env` calls use `load()` (which fetches the real base manifest
+/// from SimStore) instead of falling back to `bootstrap()` (which overwrites
+/// `base_manifest.bin` with an empty file on every process start).
+///
+/// Idempotent: if `project.json` already exists it is left unchanged.
+/// Only call for root projects (`parent_project_id: None`); branches write
+/// their `project.json` via `create_branch`.
+pub fn ensure_root_project_meta(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
+    let key = ns.project_meta_key();
+    if sim.get_standard(&key)?.is_some() {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let meta = ProjectMeta {
+        ns: ns.clone(),
+        parent_project_id: None,
+        parent_branch_id: None,
+        branch_checkpoint_lsn: None,
+        branch_timeline_id: None,
+        created_at: now,
+        status: "active".to_string(),
+    };
+    sim.put_standard(&key, &serde_json::to_vec(&meta)?)?;
+    Ok(())
+}
+
 /// Create a child branch at `branch_lsn` forked from `parent_ns`.
 ///
 /// Writes exactly two objects to the standard bucket:
@@ -542,6 +575,7 @@ mod tests {
     use super::*;
     use crate::cache::ChunkTag;
     use crate::manifest::ChunkRef;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, SimStore) {
@@ -685,18 +719,20 @@ mod tests {
         assert_eq!(ctx.base_manifest_lookup(&tag(999)).unwrap(), None);
     }
 
-    // ── Branch project, no base manifests → error ─────────────────────────
+    // ── Branch project, no base manifests → succeeds with empty manifest ────
 
     #[test]
-    fn branch_project_no_base_manifests_returns_error() {
+    fn branch_project_no_base_manifests_returns_empty_manifest() {
         let (dir, sim) = setup();
         let ns = branch_ns();
         let meta = make_branch_meta(&ns, 2001, 1, Lsn::new(0x100));
         store_meta(&sim, &meta);
 
-        // No base manifests written to sim
-        let result = ProjectCtx::load(&ns, dir.path(), &sim);
-        assert!(result.is_err(), "branch with no bases must return error");
+        // No base manifests written to sim — load() must still succeed.
+        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
+        assert!(ctx.is_branch(), "is_branch() must be true");
+        // Empty manifest returns None for any lookup.
+        assert_eq!(ctx.base_manifest_lookup(&tag(1)).unwrap(), None);
     }
 
     // ── Namespace mismatch → error ────────────────────────────────────────
@@ -762,6 +798,36 @@ mod tests {
         // Should use the newer manifest
         assert_eq!(ctx.base_manifest_lookup(&known_tag).unwrap(), Some(new_ref));
     }
+
+    // ── Branch with no base manifests succeeds and is_branch() == true ────────
+
+    #[test]
+    fn load_branch_no_base_returns_ok_and_is_branch_true() {
+        let (dir, sim) = setup();
+        let ns = branch_ns();
+
+        // Pre-write project.json with parent_project_id set (branch project).
+        let meta = make_branch_meta(&ns, 2001, 1, Lsn::new(0x100));
+        store_meta(&sim, &meta);
+
+        // No base manifests exist yet (initdb has run but restore has not).
+        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
+
+        assert!(ctx.is_branch(), "is_branch() must return true");
+        // Base manifest is empty — no entries.
+        assert_eq!(
+            ctx.base_manifest_lookup(&ChunkTag {
+                spc_oid: 1,
+                db_oid: 1,
+                rel_number: 1,
+                fork_number: 0,
+                chunk_id: 0,
+            })
+            .unwrap(),
+            None,
+            "empty manifest must return None for any lookup"
+        );
+    }
 }
 
 // ── Module 7 tests ─────────────────────────────────────────────────────────────
@@ -771,6 +837,7 @@ mod module7_tests {
     use super::*;
     use crate::cache::ChunkTag;
     use crate::manifest::ChunkRef;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, SimStore) {

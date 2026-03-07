@@ -107,6 +107,27 @@ Child project (branches from another project):
 
 ### Initial Base Manifest
 
+#### Root project (initdb)
+
+For a root project the initial base is written automatically at the end of the
+`initdb` shutdown checkpoint:
+
+1. `cached_write_blocks` (initdb path, no S3IoControl) writes each block to
+   SimStore express and appends the `ChunkTag` to the eviction log.
+2. At shutdown, `s3_checkpoint_flush` skips `flush_all_dirty_chunks` (no shmem
+   cache), runs `checkpoint_flush_inner` to process the eviction log into a
+   delta manifest + pg_state archive, then calls `materialize_base` to merge
+   all deltas into the first base at `checkpoint_lsn`.
+
+After `initdb`, SimStore contains:
+```
+{org}/pitr/{project_id}/deltas/{checkpoint_lsn}/manifest.bin
+{org}/pitr/{project_id}/deltas/{checkpoint_lsn}/pg_state.tar.zst
+{org}/pitr/{project_id}/bases/{checkpoint_lsn}/manifest.bin   ← initial base
+```
+
+#### Branch project (branch creation)
+
 At branch creation, the control plane builds the frozen chunk map at
 `branch_checkpoint_lsn` and writes it directly as the project's first base
 manifest:
@@ -191,21 +212,31 @@ scanning all project manifests.
 **Step 3 — Provision new PostgreSQL instance (async)**
 
 ```
-1. Download and extract non-smgr state from parent's checkpoint:
-     GET {org_id}/pitr/{parent_project_id}/deltas/{branch_checkpoint_lsn}/non_smgr_state.tar.zst
+1. Pre-write project.json to SimStore with parent_project_id set (required
+   before initdb so ProjectCtx::load() can detect is_branch() == true and
+   skip root-only base compaction):
+     PUT {org_id}/metadata/{child_project_id}/project.json
+
+2. Run initdb to create the $PGDATA filesystem structure.
+   - s3_checkpoint_flush at end of initdb detects is_branch() == true
+     and skips materialize_base — no base manifest is written.
+
+3. Download and extract non-smgr state from parent's checkpoint:
+     GET {org_id}/pitr/{parent_project_id}/deltas/{branch_checkpoint_lsn}/pg_state.tar.zst
     tar -xzf → $PGDATA/global/pg_control, $PGDATA/pg_xact/*, $PGDATA/pg_multixact/*,
            $PGDATA/pg_subtrans/*, $PGDATA/pg_filenode.map
-   No initdb needed — the zero branch already holds all built-in DB pages.
-2. Write tiko_recovery_manifest.bin from the initial base manifest
+   (Overwrites the pg_control etc. that initdb wrote — this is the restore step.)
+
+4. Write tiko_recovery_manifest.bin from the initial base manifest
    at branch_checkpoint_lsn (fetched from pitr/{parent_project_id}/bases/).
-3. Configure:
+5. Configure:
     restore_command = 'tiko_restore %f %p --project {parent_project_id} --org {org_id}'
      recovery_target_lsn = '{branch_checkpoint_lsn}'
      recovery_target_action = 'promote'
    Touch $PGDATA/recovery.signal.
-4. Start PostgreSQL. WAL replay brings instance to branch_checkpoint_lsn,
+6. Start PostgreSQL. WAL replay brings instance to branch_checkpoint_lsn,
    then promotes. s3worker exits recovery mode.
-5. On promotion, PostgreSQL increments the timeline. The new project now
+7. On promotion, PostgreSQL increments the timeline. The new project now
    has its own independent WAL archive at:
      {org_id}/pitr/{project_id}/wal/{new_timeline_id}/...
   At this point, switch runtime config from parent WAL bootstrap paths to
@@ -649,10 +680,23 @@ records.
 
 ```rust
 pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
-    // 1. Evict all remaining in-cache dirty chunks: PUT each to express-bucket
-    //    `latest` and append a record to the eviction log. After this step the
-    //    eviction log contains every dirty chunk from this checkpoint interval.
-    evict_all_dirty_chunks();
+    // --boot phase: checkpoint_lsn == 0; SimStore/ProjectCtx not yet
+    // initialised. Nothing to do.
+    if checkpoint_lsn == 0 { return; }
+
+    let (sim, ctx) = match (SimStore::try_get(), ProjectCtx::try_get()) {
+        (Some(s), Some(c)) => (s, c),
+        _ => return,
+    };
+
+    if S3IoControl::is_initialized() {
+        // Normal path (server running under postmaster):
+        // 1. Evict all remaining in-cache dirty chunks: PUT each to
+        //    express-bucket `latest` and append to eviction log.
+        evict_all_dirty_chunks();
+    }
+    // Initdb path: cached_write_blocks already PUT to express + appended to
+    // eviction log on every block write. No in-shmem cache to flush.
 
     // 2. Atomically snapshot the eviction log.
     rename("tiko/eviction_log", "tiko/eviction_log.ckpt");
@@ -668,11 +712,20 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
         upload_versioned_chunk(chunk_key, checkpoint_lsn);
     }
 
-    // 5. Write delta manifest + non-smgr state to standard-bucket.
+    // 5. Write delta manifest + pg_state archive to standard-bucket.
     write_delta_manifest(checkpoint_lsn, &dirty_chunks);
+    upload_pg_state(checkpoint_lsn);
 
     // 6. Remove snapshot file.
     fs::remove("tiko/eviction_log.ckpt");
+
+    // Initdb-only: after the shutdown checkpoint, bootstrap the initial base
+    // manifest for root projects by materializing all deltas just produced.
+    // Branch projects skip this — their initial base is created by the
+    // restore-from-parent step.
+    if !S3IoControl::is_initialized() && !ctx.is_branch() {
+        materialize_base(sim, ctx.ns());
+    }
 }
 ```
 
@@ -756,33 +809,30 @@ pub async fn pitr_background_task(s3: Arc<S3Client>, config: PitrConfig) {
     }
 }
 
-async fn materialize_base(s3: &S3Client, config: &PitrConfig) -> Result<()> {
-    // 1. Load current base manifest (if any)
-    let base = fetch_latest_base(s3, config).await?;
-    let base_lsn = base.as_ref().map(|b| b.checkpoint_lsn);
-
-    // 2. Fetch all delta manifests newer than the current base
-    let deltas = fetch_deltas_since(s3, config, base_lsn).await?;
-    if deltas.is_empty() {
-        return Ok(());
-    }
-
-    // 3. Merge: base.chunks + each delta in LSN order (later LSN wins).
-    //    ChunkRef.branch_id is preserved from whichever entry wins.
-    let mut merged: HashMap<ChunkKey, ChunkRef> =
-        base.map(|b| b.chunks).unwrap_or_default();
-    for delta in &deltas {
-        merged.extend(delta.chunks.clone());
-    }
-
-    let new_base = Manifest {
-        checkpoint_lsn: deltas.last().unwrap().checkpoint_lsn,
-        timestamp: now_unix(),
-        chunks: merged,
+pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
+    // 1. Load current base manifest, or start from empty if none exists yet.
+    //    Lsn::INVALID == 0, so every real delta LSN passes the `lsn > base_lsn`
+    //    filter when bootstrapping the first base from scratch.
+    let (base, base_lsn) = if let Some(latest_lsn) = fetch_latest_base_lsn(sim, ns)? {
+        (fetch_base_manifest(sim, ns, latest_lsn)?, latest_lsn)
+    } else {
+        (Manifest::empty(), Lsn::INVALID)  // bootstrap from scratch
     };
 
-    // 4. Write new base atomically (single S3 PUT)
-    put_base_manifest(s3, config, &new_base).await?;
+    // 2. Collect delta LSNs strictly newer than base_lsn.
+    let delta_lsns = fetch_delta_lsns_after(sim, ns, base_lsn)?;
+    if delta_lsns.is_empty() {
+        return Ok(());  // nothing to merge
+    }
+
+    // 3. Apply each delta in LSN order (later LSN wins; branch_id preserved).
+    let deltas = fetch_delta_manifests(sim, ns, &delta_lsns)?;
+    base.apply_deltas(&deltas)?;
+
+    // 4. Write new base atomically (single PUT).
+    //    Key: {org}/pitr/{proj}/bases/{new_lsn}/manifest.bin
+    let new_lsn = *delta_lsns.last().unwrap();
+    sim.put_standard(&ns.base_manifest_key(new_lsn), &base.to_bytes()?)?;
 
     // NOTE: deltas are NOT deleted here — they remain for arbitrary-point
     // recovery within the retention window. Retention GC (manifest + chunk
@@ -949,12 +999,14 @@ express-bucket latest). The recovery manifest is removed.
 
 | File | Change |
 |---|---|
-| `s3worker/src/cache.rs` | Extend `flush_dirty_chunk()` to PUT chunk to express-bucket `latest` and append 20-byte `EvictionLogRecord` to eviction log |
+| `s3worker/src/cache.rs` | `flush_dirty_chunk()` PUT chunk to express-bucket `latest` and append `ChunkTag` to eviction log. Added `pub append_chunk_tag_to_eviction_log(tag)` for use by the initdb write path |
+| `s3worker/src/s3_ops.rs` | initdb path of `cached_write_blocks`: after express PUT, call `CacheControl::append_chunk_tag_to_eviction_log` (guarded by `!is_under_postmaster()`). Normal path: PUT to shmem cache (write-back). `read_blocks` normal: GET own express `latest`, fallback to base manifest → standard-bucket; recovery mode: GET standard-bucket `{lsn_hex}` via chunk_map |
+| `s3worker/src/pitr_task.rs` | `materialize_base` made `pub`. "No base" early-return replaced: bootstrap from `Manifest::empty()` at `Lsn::INVALID`, merge all deltas, write first base |
+| `s3worker/src/project.rs` | `ProjectCtx::load()` branch-with-no-base case changed from `Err` to empty manifest. `is_branch()` still returns `true` when `parent_project_id.is_some()`. Enables initdb to succeed for branch projects without a pre-existing base |
 | `s3worker/src/io_handler.rs` | Pass project namespace to `read_blocks`/`write_blocks` |
 | `s3worker/src/thread_pool.rs` | Spawn `pitr_background_task` after Tokio runtime starts |
-| `s3worker/src/s3_ops.rs` | `write_blocks`: PUT to express-bucket `latest` (eviction path); `read_blocks` normal mode: GET own express-bucket `latest`, fallback to `base_manifest` ChunkRef from standard-bucket; recovery mode: GET standard-bucket `{lsn_hex}` via chunk_map |
 | `s3worker/src/lib.rs` | Export `manifest`, `pitr_task`, `project` modules |
-| `s3smgr/src/checkpoint.rs` | Evict all dirty chunks; rename-swap eviction log; dedup log records; 3-step PUT→COPY→Rename for each chunk to standard-bucket; write delta manifest + non-smgr state |
+| `s3smgr/src/checkpoint.rs` | `s3_checkpoint_flush`: `checkpoint_lsn == 0` guard replaces `!S3IoControl::is_initialized()` guard. `flush_all_dirty_chunks()` only called when S3IoControl is initialized. `checkpoint_flush_inner` runs in both normal and initdb paths. After initdb checkpoint: calls `materialize_base` for root projects (`!is_initialized() && !is_branch()`) |
 | `postgres/src/backend/access/transam/xlog.c` | Call `s3_checkpoint_flush(checkpoint_lsn)` from `CheckPointGuts()` |
 
 ### Control-Plane Responsibilities
@@ -963,8 +1015,8 @@ The control plane (not Tiko itself) is responsible for:
 
 | Operation | Action |
 |---|---|
-| Create org zero branch | Run `initdb` once for the org; write `metadata/project.json` for the zero-branch source project |
-| Create branch project | Build chunk map from parent manifests; write `metadata/project.json` + `pitr/{child}/bases/{lsn}/manifest.bin`; provision new PG instance |
+| Create root project | Run `initdb`; `s3_checkpoint_flush` automatically produces initial delta + base manifests. Write `metadata/project.json` |
+| Create branch project | Write `metadata/project.json` (with `parent_project_id`) to SimStore **before** `initdb`. Run `initdb` (creates $PGDATA structure; skips base compaction because `is_branch()==true`). Build chunk map from parent manifests; write `pitr/{child}/bases/{lsn}/manifest.bin`. Restore pg_state from parent checkpoint. Start PG in recovery mode |
 | Delete branch project | Delete express-bucket `{org}/{project_id}/`; delete `{org}/pitr/{project_id}/` and `{org}/metadata/{project_id}/`; standard-bucket `{org}/chunks/{branch_id}/` collected by next GC run |
 | Delete zero-branch source project | Assert no live child project base manifests reference branch `0` objects that would be removed (normally branch 0 is permanent) |
 | GC / retention enforcement | Run `enforce_retention_org` periodically (max_checkpoints cutoff); delete delta manifests beyond the limit; delete unreferenced standard-bucket chunk versions; delete superseded base manifests |

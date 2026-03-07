@@ -16,21 +16,21 @@ use s3worker::s3_ops;
 /// convention — this is usually called outside a transaction.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_unlink(
-    rlocator: *mut RelFileLocatorBackend,
+    rlocator: RelFileLocatorBackend,
     forknum: ForkNumber,
     _is_redo: bool,
 ) {
     if forknum == INVALID_FORK_NUMBER {
         for fork in 0..=MAX_FORKNUM {
-            unlink_fork(rlocator, fork);
+            unlink_fork(&rlocator, fork);
         }
     } else {
-        unlink_fork(rlocator, forknum);
+        unlink_fork(&rlocator, forknum);
     }
 }
 
-fn unlink_fork(rlocator: *mut RelFileLocatorBackend, forknum: ForkNumber) {
-    let loc = unsafe { &(*rlocator).locator };
+fn unlink_fork(rlocator: &RelFileLocatorBackend, forknum: ForkNumber) {
+    let loc = &rlocator.locator;
 
     if let Err(errno) = s3_ops::cached_delete_file(RelFork {
         spc_oid: loc.spc_oid,

@@ -49,7 +49,8 @@ use s3worker::TIKO_DIR;
 use s3worker::cache::{CHUNK_SIZE, CacheControl, ChunkTag, RelFork};
 use s3worker::io_queue::S3IoControl;
 use s3worker::manifest::{ChunkRef, Manifest};
-use s3worker::project::{ProjectCtx, ProjectNamespace};
+use s3worker::pitr_task::materialize_base;
+use s3worker::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
 use s3worker::sim_store::SimStore;
 
 // ── extern "C" entry point ────────────────────────────────────────────────────
@@ -62,25 +63,48 @@ use s3worker::sim_store::SimStore;
 /// guard handles both cases.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
-    if !S3IoControl::is_initialized() {
+    // During --boot (BOOTSTRAP_PROCESSING), checkpoint_lsn is 0 and neither
+    // SimStore nor ProjectCtx are initialised — nothing to do.
+    if checkpoint_lsn == 0 {
         return;
     }
 
     let (sim, ctx) = match (SimStore::try_get(), ProjectCtx::try_get()) {
         (Some(s), Some(c)) => (s, c),
-        _ => return, // not initialised — nothing to flush or upload
+        _ => return, // env vars absent or SimStore not yet initialised
     };
 
-    let control = S3IoControl::get();
     let lsn = Lsn::new(checkpoint_lsn);
     let data_dir = data_dir_path();
 
-    // Step 1 — flush all dirty chunks to express latest + eviction log.
-    control.cache.flush_all_dirty_chunks();
+    if S3IoControl::is_initialized() {
+        // Normal path (server running under postmaster): flush dirty shmem
+        // cache chunks to express + eviction log before processing the log.
+        S3IoControl::get().cache.flush_all_dirty_chunks();
+    }
+    // Initdb path: writes already went directly to express + eviction log
+    // (via cached_write_blocks), so flush_all_dirty_chunks is not needed.
 
+    // Steps 2-6: process eviction log → standard bucket → delta manifest.
+    // Non-fatal: log and continue. WAL will cover any gap on recovery.
     if let Err(e) = checkpoint_flush_inner(sim, ctx.ns(), lsn, &data_dir) {
-        // Non-fatal: log and continue.  WAL will cover the gap on recovery.
         pgsys::logging::pg_log_warning(&format!("s3_checkpoint_flush: {e}"));
+    }
+
+    // After the initdb shutdown checkpoint, bootstrap the initial base manifest
+    // for root projects by running standard materialization over the delta just
+    // produced by checkpoint_flush_inner above. Skipped for branch projects —
+    // their initial base is created by the restore-from-parent process.
+    if !S3IoControl::is_initialized() && !ctx.is_branch() {
+        if let Err(e) = materialize_base(sim, ctx.ns()) {
+            eprintln!("s3_checkpoint_flush: initial base materialization failed: {e}");
+        }
+        // Write project.json so subsequent process starts use load() instead
+        // of bootstrap(), which would overwrite base_manifest.bin with an
+        // empty file on every restart.
+        if let Err(e) = ensure_root_project_meta(sim, ctx.ns()) {
+            eprintln!("s3_checkpoint_flush: ensure_root_project_meta failed: {e}");
+        }
     }
 }
 

@@ -547,7 +547,14 @@ impl CacheControl {
     /// Insert a chunk into the cache. Returns the slot index, **pinned**.
     ///
     /// Evicts an existing slot if necessary (flushing dirty blocks to S3-sim).
-    /// The returned slot has valid_blocks=0 and dirty_blocks=0.
+    ///
+    /// Returns a **pinned** slot for `tag`.  The slot is either:
+    /// - **Newly allocated** (`is_populated()` returns `false`): eviction ran
+    ///   normally; the caller must populate the slot before using it.
+    /// - **An existing slot** (`is_populated()` may return `true`): a concurrent
+    ///   thread inserted the same tag between the caller's `lookup_and_pin` miss
+    ///   and this call.  The unnecessarily evicted slot is released back to the
+    ///   pool; the caller should skip population and use existing content.
     pub fn insert(&self, tag: &ChunkTag) -> u32 {
         let slot_index = self.evict();
         let meta = self.slot_meta(slot_index);
@@ -562,7 +569,17 @@ impl CacheControl {
         meta.valid_blocks.store(0, Ordering::Relaxed);
         meta.dirty_blocks.store(0, Ordering::Relaxed);
 
-        // Insert into hash table
+        // Insert into hash table — but first check for concurrent insertion.
+        //
+        // Multiple threads can simultaneously miss on the same chunk and all call
+        // insert().  Without this check each thread would allocate a distinct slot,
+        // producing duplicate hash entries.  On eviction the flushes would race and
+        // one would overwrite the other's dirty blocks — silent data corruption.
+        //
+        // Under the write lock we re-probe the hash table.  If another thread
+        // already inserted this tag, we pin its slot, release the one we evicted
+        // (valid_blocks=0, no hash entry — reclaimed quickly by the next evict()),
+        // and return the existing slot.
         let num_hash = self.num_hash_entries;
         let hash = tag.hash();
         let start = hash % num_hash;
@@ -918,6 +935,17 @@ impl CacheControl {
     /// Path of the eviction log file: `{data_dir}/tiko/eviction_log`.
     pub fn eviction_log_path(data_dir: &Path) -> PathBuf {
         data_dir.join(crate::TIKO_DIR).join("eviction_log")
+    }
+
+    /// Append a single chunk tag to the process-local eviction log.
+    ///
+    /// Used by the initdb write path (`cached_write_blocks` without S3IoControl)
+    /// to ensure the shutdown checkpoint can discover and archive all chunks
+    /// written during initdb, identical to what `flush_dirty_chunk` does on the
+    /// normal (shmem-cache) path.
+    pub fn append_chunk_tag_to_eviction_log(tag: &ChunkTag) {
+        let log = Self::open_eviction_log();
+        let _ = (&log).write_all(&tag.encode());
     }
 
     /// Open (or create) the eviction log for appending.

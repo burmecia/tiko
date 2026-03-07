@@ -193,6 +193,12 @@ impl Manifest {
     ///
     /// `rel_nblocks` is carried in the msgpack wire format (`to_bytes`) but not
     /// in the local TIKM binary. Pass `HashMap::new()` when nblocks are unknown.
+    /// Create a zero-entry manifest at `Lsn::INVALID` (used as a bootstrap
+    /// starting point before the first real base exists).
+    pub fn empty(path: &Path) -> io::Result<Self> {
+        Self::new(Lsn::INVALID, 0, vec![], HashMap::new(), path)
+    }
+
     pub fn new(
         checkpoint_lsn: Lsn,
         timestamp: i64,

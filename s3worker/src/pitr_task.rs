@@ -70,7 +70,7 @@ pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, conf
 /// Returns `Ok(())` immediately if there are no new deltas (idempotent).
 /// Does NOT delete delta manifests — cleanup is enforce_retention_org's
 /// responsibility.
-fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
+pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
     // Step 1: find latest base manifest LSN.
     let base_prefix = ns.base_prefix();
     let base_keys = sim.list_prefix_standard(&base_prefix)?;
@@ -85,19 +85,21 @@ fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
         .collect();
     base_lsns.sort();
 
-    let base_lsn = match base_lsns.last().copied() {
-        Some(l) => l,
-        None => return Ok(()), // no base yet; nothing to merge
-    };
-
     // Download the base manifest to a deterministic temp path.
     let base_local_path =
         std::env::temp_dir().join(format!("tiko_pitr_base_{}.tikm", ns.project_id));
-    let manifest_key = ns.base_manifest_key(base_lsn);
-    let bytes = sim
-        .get_standard(&manifest_key)?
-        .ok_or_else(|| format!("base manifest not found: {manifest_key}"))?;
-    let base = Manifest::from_bytes(&bytes, &base_local_path)?;
+
+    let (base, base_lsn) = if let Some(&l) = base_lsns.last() {
+        let manifest_key = ns.base_manifest_key(l);
+        let bytes = sim
+            .get_standard(&manifest_key)?
+            .ok_or_else(|| format!("base manifest not found: {manifest_key}"))?;
+        (Manifest::from_bytes(&bytes, &base_local_path)?, l)
+    } else {
+        // No base yet — bootstrap from empty and merge ALL deltas.
+        // Lsn::INVALID == 0, so every real delta LSN passes the `lsn > base_lsn` filter.
+        (Manifest::empty(&base_local_path)?, Lsn::INVALID)
+    };
 
     // Step 2: collect delta LSNs strictly newer than the current base.
     let delta_prefix = ns.delta_prefix();
@@ -146,8 +148,17 @@ fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
     // Step 6: refresh the global manifest in-place.
     // Must run after the S3 PUT so the on-disk index always reflects a committed
     // base.  Skipped if ProjectCtx was never initialised (env vars absent).
+    //
+    // We pass [base, deltas...] rather than just [deltas] so that the result is
+    // always correct regardless of whether ctx.base_manifest is empty (e.g. a
+    // fresh process that called bootstrap() instead of load(), which happens
+    // during initdb --single because project.json is not yet written).  Passing
+    // the loaded SimStore base first is idempotent when ctx already has the
+    // correct history: ties at equal LSN keep the in-memory (self) entry.
     if let Some(ctx) = ProjectCtx::try_get() {
-        ctx.base_manifest.apply_deltas(&deltas)?;
+        let mut all_updates = vec![base];
+        all_updates.extend(deltas);
+        ctx.base_manifest.apply_deltas(&all_updates)?;
     }
 
     // Deltas are intentionally preserved — GC runs on the control plane only.
@@ -388,7 +399,7 @@ mod tests {
         );
     }
 
-    // ── No base at all: returns Ok without panicking ──────────────────────────
+    // ── No base at all, no deltas: still returns Ok ──────────────────────────
 
     #[test]
     fn materialize_no_base_returns_ok() {
@@ -396,5 +407,52 @@ mod tests {
         let ns = ns_with_project(20_005);
         // No base, no deltas.
         materialize_base(&sim, &ns).unwrap();
+        // No base manifest should be written either.
+        let keys = sim.list_prefix_standard(&ns.base_prefix()).unwrap();
+        assert!(
+            keys.is_empty(),
+            "no base should be written when no deltas exist"
+        );
+    }
+
+    // ── No base + deltas: first base is bootstrapped from scratch ─────────────
+
+    #[test]
+    fn materialize_no_base_with_deltas_creates_first_base() {
+        let (dir, sim) = setup();
+        let ns = ns_with_project(20_006);
+
+        let d1_lsn = Lsn::new(0x100);
+        let d2_lsn = Lsn::new(0x200);
+
+        // Two delta manifests — no base exists yet.
+        store_manifest(
+            &sim,
+            &ns.delta_manifest_key(d1_lsn),
+            d1_lsn,
+            vec![(tag(1), cref(1, d1_lsn))],
+            &dir.path().join("d1.tikm"),
+        );
+        store_manifest(
+            &sim,
+            &ns.delta_manifest_key(d2_lsn),
+            d2_lsn,
+            vec![(tag(2), cref(1, d2_lsn))],
+            &dir.path().join("d2.tikm"),
+        );
+
+        materialize_base(&sim, &ns).unwrap();
+
+        // Base must be created at the highest delta LSN.
+        let bytes = sim
+            .get_standard(&ns.base_manifest_key(d2_lsn))
+            .unwrap()
+            .expect("initial base manifest must exist after materialization");
+        let tmp = dir.path().join("verify.tikm");
+        let m = Manifest::from_bytes(&bytes, &tmp).unwrap();
+
+        // Both deltas must be present.
+        assert_eq!(m.lookup(&tag(1)).unwrap(), Some(cref(1, d1_lsn)));
+        assert_eq!(m.lookup(&tag(2)).unwrap(), Some(cref(1, d2_lsn)));
     }
 }

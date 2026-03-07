@@ -4,6 +4,15 @@
 
 set -e  # Exit on any error
 
+# Clean up orphaned System V shmem segments from previously killed postgres runs.
+# macOS default limit is 32 (kern.sysv.shmmni); each unclean exit leaks one segment.
+ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
+
+# Set environment variables for Tiko configuration
+TIKO_ORG_ID="123"
+TIKO_PROJECT_ID="0"
+TIKO_BRANCH_ID="0"
+
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${BASE_DIR}/target"
 TEST_DIR="${BASE_DIR}/postgres/src/test/modules/test_tiko"
