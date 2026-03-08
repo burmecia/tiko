@@ -12,12 +12,13 @@
 //! Exits 0 on success; exits 1 on any error (PostgreSQL retries on non-zero exit).
 //!
 //! Required environment variables:
-//! - `PGDATA`            — PostgreSQL data directory (used to locate the sim store)
+//! - `PGDATA`           — PostgreSQL data directory (used to locate the sim store)
 //! - `TIKO_ORG_ID`      — organisation identifier (u64)
 //! - `TIKO_PROJECT_ID`  — project identifier (u64)
 //! - `TIKO_BRANCH_ID`   — branch identifier (u64)
 
 use std::path::{Path, PathBuf};
+use std::process::exit;
 
 use s3worker::project::{ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, ProjectNamespace};
 use s3worker::sim_store::SimStore;
@@ -26,7 +27,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
         eprintln!("Usage: tiko_archive <wal_path> <wal_filename>");
-        std::process::exit(1);
+        exit(1);
     }
 
     let wal_path = PathBuf::from(&args[1]);
@@ -36,7 +37,7 @@ fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tiko_archive: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     };
 
@@ -44,7 +45,7 @@ fn main() {
         Ok(n) => n,
         Err(e) => {
             eprintln!("tiko_archive: {e}");
-            std::process::exit(1);
+            exit(1);
         }
     };
 
@@ -52,16 +53,16 @@ fn main() {
         Some(t) => t,
         None => {
             eprintln!("tiko_archive: cannot parse timeline from filename: {wal_filename}");
-            std::process::exit(1);
+            exit(1);
         }
     };
 
     if let Err(e) = upload_wal_segment(&sim, &ns, timeline, wal_filename, &wal_path) {
         eprintln!("tiko_archive: upload failed: {e}");
-        std::process::exit(1);
+        exit(1);
     }
 
-    std::process::exit(0);
+    exit(0);
 }
 
 // ── Core helpers (also used by tests) ────────────────────────────────────────

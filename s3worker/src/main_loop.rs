@@ -21,6 +21,7 @@ use pgsys::{
 use crate::dispatcher::Dispatcher;
 use crate::io_handler;
 use crate::io_queue::S3IoControl;
+use crate::log_relay;
 use crate::project::ProjectCtx;
 use crate::sim_store::SimStore;
 use crate::thread_pool;
@@ -68,6 +69,10 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
         WAIT_EVENT_S3WORKER_MAIN = new_wait_event(c"S3WorkerMain".as_ptr());
     }
 
+    // Initialize the log relay channel before spawning any Tokio tasks so that
+    // relay_log() calls from Tokio threads are forwarded here via pg_log_*.
+    let log_rx = log_relay::init();
+
     // Initialize Tokio runtime for async I/O
     if let Err(e) = crate::thread_pool::init_tokio_runtime() {
         pg_log_error(&format!(
@@ -114,6 +119,9 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
 
         // Check for interrupts (SIGTERM, postmaster death, etc.)
         check_for_interrupts();
+
+        // Forward any log messages queued by Tokio threads.
+        log_relay::drain(&log_rx);
 
         // Pop from submit queue and dispatch to Tokio
         match io_control.poll_submit_queue(&dispatcher) {

@@ -488,7 +488,7 @@ impl S3IoStats {
             0.0
         };
 
-        pgsys::logging::pg_log_info(&format!(
+        pgsys::logging::pg_log_debug1(&format!(
             "s3worker cache stats: reads={} writes={} hits={} misses={} hit_rate={:.1}% evictions={} dirty_evictions={}",
             self.total_reads.load(Ordering::Relaxed),
             self.total_writes.load(Ordering::Relaxed),

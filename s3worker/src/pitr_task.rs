@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use pgsys::Lsn;
 
+use crate::log_relay;
 use crate::manifest::Manifest;
 use crate::project::{ProjectCtx, ProjectNamespace};
 use crate::sim_store::SimStore;
@@ -51,15 +52,59 @@ impl PitrConfig {
 /// skipped.  A failed materialization only means the next recovery will replay
 /// more deltas; correctness is never compromised.
 pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, config: PitrConfig) {
+    // pg_log_* must not be called from a Tokio thread (requires PG process-local
+    // state).  Use log_relay::relay_* instead — messages are queued and forwarded
+    // to pg_log_* by the main PG thread each loop iteration.
+    log_relay::relay_info(format!(
+        "s3worker: pitr_background_task started (project={}, interval={}s)",
+        ns.project_id,
+        config.materialization_interval.as_secs(),
+    ));
     let mut interval = tokio::time::interval(config.materialization_interval);
     loop {
         interval.tick().await;
-        if let Err(e) = materialize_base(&sim, &ns) {
-            // pg_log_warning must not be called from a Tokio thread (requires
-            // PG process-local state).  Use stderr instead.
-            eprintln!("s3worker: pitr_background_task: materialize_base failed: {e}");
+        match materialize_base(&sim, &ns) {
+            Ok(MaterializeResult::NoNewDeltas { base_lsn }) => {
+                log_relay::relay_info(format!(
+                    "s3worker: pitr: no new deltas since base {base_lsn} — skipping (project={})",
+                    ns.project_id
+                ));
+            }
+            Ok(MaterializeResult::Materialized {
+                prev_base_lsn,
+                new_lsn,
+                delta_count,
+            }) => {
+                log_relay::relay_info(format!(
+                    "s3worker: pitr: materialized new base at lsn={} \
+                     ({delta_count} delta(s) merged, prev_base={prev_base_lsn}, project={})",
+                    new_lsn.to_hex(),
+                    ns.project_id,
+                ));
+            }
+            Err(e) => {
+                log_relay::relay_warning(format!(
+                    "s3worker: pitr: materialize_base failed (project={}): {e}",
+                    ns.project_id
+                ));
+            }
         }
     }
+}
+
+// ── Materialization result ─────────────────────────────────────────────────────
+
+/// Outcome of a single `materialize_base` call.
+#[derive(Debug)]
+pub enum MaterializeResult {
+    /// No new deltas were found; the existing base is already up to date.
+    NoNewDeltas { base_lsn: Lsn },
+    /// A new base manifest was uploaded.
+    Materialized {
+        prev_base_lsn: Lsn,
+        new_lsn: Lsn,
+        delta_count: usize,
+    },
 }
 
 // ── Core materialization ──────────────────────────────────────────────────────
@@ -67,10 +112,10 @@ pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, conf
 /// Merge all delta manifests newer than the latest base into a new base and
 /// upload it to the standard store.
 ///
-/// Returns `Ok(())` immediately if there are no new deltas (idempotent).
-/// Does NOT delete delta manifests — cleanup is enforce_retention_org's
-/// responsibility.
-pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
+/// Returns [`MaterializeResult::NoNewDeltas`] immediately if there are no new
+/// deltas (idempotent).  Does NOT delete delta manifests — cleanup is
+/// enforce_retention_org's responsibility.
+pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<MaterializeResult> {
     // Step 1: find latest base manifest LSN.
     let base_prefix = ns.base_prefix();
     let base_keys = sim.list_prefix_standard(&base_prefix)?;
@@ -119,7 +164,10 @@ pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
 
     // Step 3: nothing new to merge.
     if delta_lsns.is_empty() {
-        return Ok(());
+        log_relay::relay_debug1(format!(
+            "s3worker: pitr: no new deltas since base {base_lsn}"
+        ));
+        return Ok(MaterializeResult::NoNewDeltas { base_lsn });
     }
 
     // Step 4: download each delta manifest.
@@ -143,6 +191,13 @@ pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
     // Step 5: upload the merged base at the new LSN (the last delta's LSN).
     // This is a single atomic write; the new base is valid after this PUT.
     let new_lsn = *delta_lsns.last().unwrap(); // non-empty: checked above
+    let delta_count = delta_lsns.len();
+    log_relay::relay_debug1(format!(
+        "s3worker: pitr: uploading new base manifest at lsn={} ({} delta(s) merged, prev_base={})",
+        new_lsn.to_hex(),
+        delta_count,
+        base_lsn,
+    ));
     sim.put_standard(&ns.base_manifest_key(new_lsn), &base.to_bytes()?)?;
 
     // Step 6: refresh the global manifest in-place.
@@ -162,7 +217,11 @@ pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
     }
 
     // Deltas are intentionally preserved — GC runs on the control plane only.
-    Ok(())
+    Ok(MaterializeResult::Materialized {
+        prev_base_lsn: base_lsn,
+        new_lsn,
+        delta_count,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

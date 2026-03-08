@@ -10,6 +10,7 @@ pub mod sim_store;
 
 mod dispatcher;
 mod io_handler;
+pub mod log_relay;
 mod main_loop;
 mod shmem;
 mod thread_pool;

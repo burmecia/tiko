@@ -44,7 +44,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use pgsys::{Lsn, common::data_dir_path};
+use pgsys::{Lsn, common::data_dir_path, logging::*};
 use s3worker::TIKO_DIR;
 use s3worker::cache::{CHUNK_SIZE, CacheControl, ChunkTag, RelFork};
 use s3worker::io_queue::S3IoControl;
@@ -80,6 +80,10 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
     if S3IoControl::is_initialized() {
         // Normal path (server running under postmaster): flush dirty shmem
         // cache chunks to express + eviction log before processing the log.
+        pg_log_debug1(&format!(
+            "s3_checkpoint_flush: step 1: flushing dirty cache chunks (lsn={})",
+            lsn.to_hex()
+        ));
         S3IoControl::get().cache.flush_all_dirty_chunks();
     }
     // Initdb path: writes already went directly to express + eviction log
@@ -87,8 +91,39 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
 
     // Steps 2-6: process eviction log → standard bucket → delta manifest.
     // Non-fatal: log and continue. WAL will cover any gap on recovery.
-    if let Err(e) = checkpoint_flush_inner(sim, ctx.ns(), lsn, &data_dir) {
-        pgsys::logging::pg_log_warning(&format!("s3_checkpoint_flush: {e}"));
+    pg_log_debug1(&format!(
+        "s3_checkpoint_flush: step 2-6: processing eviction log (lsn={})",
+        lsn.to_hex()
+    ));
+    match checkpoint_flush_inner(sim, ctx.ns(), lsn, &data_dir) {
+        Ok(None) => {
+            pg_log_info(&format!(
+                "s3_checkpoint_flush: no dirty chunks — skipped (lsn={})",
+                lsn.to_hex()
+            ));
+        }
+        Ok(Some(stats)) => {
+            if stats.crash_recovery {
+                pg_log_debug1(&format!(
+                    "s3_checkpoint_flush: step 2: crash recovery — re-processed existing .ckpt (lsn={})",
+                    lsn.to_hex()
+                ));
+            }
+            pg_log_debug1(&format!(
+                "s3_checkpoint_flush: step 4-5: uploaded {} chunk(s) + delta manifest + pg_state (lsn={})",
+                stats.dirty_chunks,
+                lsn.to_hex()
+            ));
+            pg_log_info(&format!(
+                "s3_checkpoint_flush: complete — {} chunk(s) uploaded, lsn={}, crash_recovery={}",
+                stats.dirty_chunks,
+                lsn.to_hex(),
+                stats.crash_recovery,
+            ));
+        }
+        Err(e) => {
+            pg_log_warning(&format!("s3_checkpoint_flush: {e}"));
+        }
     }
 
     // After the initdb shutdown checkpoint, bootstrap the initial base manifest
@@ -96,42 +131,63 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
     // produced by checkpoint_flush_inner above. Skipped for branch projects —
     // their initial base is created by the restore-from-parent process.
     if !S3IoControl::is_initialized() && !ctx.is_branch() {
-        if let Err(e) = materialize_base(sim, ctx.ns()) {
-            eprintln!("s3_checkpoint_flush: initial base materialization failed: {e}");
+        match materialize_base(sim, ctx.ns()) {
+            Ok(result) => {
+                pg_log_debug1(&format!(
+                    "s3_checkpoint_flush: initial base materialization: {result:?}"
+                ));
+            }
+            Err(e) => {
+                pg_log_warning(&format!(
+                    "s3_checkpoint_flush: initial base materialization failed: {e}"
+                ));
+            }
         }
         // Write project.json so subsequent process starts use load() instead
         // of bootstrap(), which would overwrite base_manifest.bin with an
         // empty file on every restart.
         if let Err(e) = ensure_root_project_meta(sim, ctx.ns()) {
-            eprintln!("s3_checkpoint_flush: ensure_root_project_meta failed: {e}");
+            pg_log_warning(&format!(
+                "s3_checkpoint_flush: ensure_root_project_meta failed: {e}"
+            ));
         }
     }
 }
 
 // ── Inner implementation (also used by tests) ─────────────────────────────────
 
+/// Stats returned by a successful `checkpoint_flush_inner` run.
+/// `None` means the dirty set was empty and no work was done.
+struct CheckpointStats {
+    /// Number of unique dirty chunks written to the standard bucket.
+    dirty_chunks: usize,
+    /// True when `.ckpt` already existed on entry (crash-recovery re-run).
+    crash_recovery: bool,
+}
+
 /// Execute steps 2-6 of the checkpoint flush algorithm.
 ///
 /// Separated from the `extern "C"` wrapper so that unit tests can call it
 /// directly without needing `S3IoControl` or the real PG shared memory.
+///
+/// Returns `Ok(None)` when the dirty set is empty (no-op).
 fn checkpoint_flush_inner(
     sim: &SimStore,
     ns: &ProjectNamespace,
     checkpoint_lsn: Lsn,
     data_dir: &Path,
-) -> io::Result<()> {
+) -> io::Result<Option<CheckpointStats>> {
     let log_path = CacheControl::eviction_log_path(data_dir);
     let ckpt_path = log_path.with_extension("ckpt");
 
     // Step 2 — atomic snapshot.
     // If `.ckpt` already exists (crash recovery), re-process it.
-    if !ckpt_path.exists() {
-        if log_path.exists() {
-            fs::rename(&log_path, &ckpt_path)?;
-        }
-        // If neither file exists: no evictions occurred — dirty set will be
-        // empty and the function returns early after step 3.
+    let crash_recovery = ckpt_path.exists();
+    if !crash_recovery && log_path.exists() {
+        fs::rename(&log_path, &ckpt_path)?;
     }
+    // If neither file exists: no evictions occurred — dirty set will be
+    // empty and the function returns early after step 3.
 
     // Step 3 — read + dedup.
     let records = CacheControl::read_eviction_log(&ckpt_path);
@@ -140,7 +196,7 @@ fn checkpoint_flush_inner(
     // Nothing changed this interval — skip S3 writes and manifest entirely.
     if dirty_chunks.is_empty() {
         let _ = fs::remove_file(&ckpt_path);
-        return Ok(());
+        return Ok(None);
     }
 
     // Step 4 — three-step write for each dirty chunk.
@@ -200,7 +256,10 @@ fn checkpoint_flush_inner(
     let _ = fs::remove_file(&ckpt_path); // silently ignore ENOENT
     let _ = fs::remove_file(&tmp_delta_manifest_path); // remove local build file
 
-    Ok(())
+    Ok(Some(CheckpointStats {
+        dirty_chunks: dirty_chunks.len(),
+        crash_recovery,
+    }))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -366,7 +425,7 @@ mod tests {
 
     // Run `checkpoint_flush_inner` with a fresh tempdir.
     fn run_flush(dir: &TempDir, sim: &SimStore, ns: &ProjectNamespace, lsn: Lsn) -> io::Result<()> {
-        checkpoint_flush_inner(sim, ns, lsn, dir.path())
+        checkpoint_flush_inner(sim, ns, lsn, dir.path()).map(|_| ())
     }
 
     /// Deserialise the delta manifest from the standard sim for `lsn`.
