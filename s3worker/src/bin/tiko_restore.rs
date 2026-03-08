@@ -12,7 +12,7 @@
 //! Exits 0 if the segment was found and written; exits 1 if not found or on error.
 //!
 //! Required environment variables:
-//! - `PGDATA`            — PostgreSQL data directory (used to locate the sim store)
+//! - `TIKO_ROOT_PATH`    — root path for the sim store (replaces `PGDATA`)
 //! - `TIKO_ORG_ID`      — organisation identifier (u64)
 //! - `TIKO_PROJECT_ID`  — project identifier (u64)
 //! - `TIKO_BRANCH_ID`   — branch identifier (u64)
@@ -82,10 +82,10 @@ fn main() {
 
 // ── Core helpers (also used by tests) ────────────────────────────────────────
 
-/// Build a `SimStore` from `$PGDATA`.
+/// Build a `SimStore` from `$TIKO_ROOT_PATH`.
 fn sim_from_env() -> Result<SimStore, String> {
-    let pgdata = std::env::var("PGDATA").map_err(|_| "PGDATA not set".to_string())?;
-    Ok(SimStore::new(Path::new(&pgdata)))
+    let root = std::env::var("TIKO_ROOT_PATH").map_err(|_| "TIKO_ROOT_PATH not set".to_string())?;
+    Ok(SimStore::new(Path::new(&root)))
 }
 
 /// Build own `ProjectNamespace` from `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.

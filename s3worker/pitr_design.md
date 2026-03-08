@@ -32,8 +32,8 @@ The only state that does **not** go through Tiko is:
 | `pg_filenode.map`, `global/pg_filenode.map` | KB | OID→filenode mapping |
 | `pg_subtrans/` | small | Subtransaction state |
 
-Before upload to S3, all non-smgr state files for a checkpoint are bundled
-into a single `non_smgr_state.tar.zst` archive (tar + zstd). `pg_xact/`,
+Before upload to S3, all pg state files for a checkpoint are bundled
+into a single `pg_state.tar.zst` archive (tar + zstd). `pg_xact/`,
 `pg_multixact/`, and `pg_subtrans/` are compact state files that usually
 compress aggressively. Exact size is workload-dependent; in practice this
 archive is typically small (often sub-MB), so upload cost remains low.
@@ -221,7 +221,7 @@ scanning all project manifests.
    - s3_checkpoint_flush at end of initdb detects is_branch() == true
      and skips materialize_base — no base manifest is written.
 
-3. Download and extract non-smgr state from parent's checkpoint:
+3. Download and extract pg state from parent's checkpoint:
      GET {org_id}/pitr/{parent_project_id}/deltas/{branch_checkpoint_lsn}/pg_state.tar.zst
     tar -xzf → $PGDATA/global/pg_control, $PGDATA/pg_xact/*, $PGDATA/pg_multixact/*,
            $PGDATA/pg_subtrans/*, $PGDATA/pg_filenode.map
@@ -495,11 +495,11 @@ the ground truth for recovery.
       bases/
         {checkpoint_lsn}/
           manifest.bin              ← full chunk_key → ChunkRef map (materialized)
-          non_smgr_state.tar.zst    ← tar+zstd: pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
+          pg_state.tar.zst    ← tar+zstd: pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
       deltas/
         {checkpoint_lsn}/
           manifest.bin                 ← dirty chunks at this checkpoint only
-          non_smgr_state.tar.zst    ← tar+zstd: pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
+          pg_state.tar.zst    ← tar+zstd: pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
       wal/
         {timeline_id}/
           {wal_segment}   ← archived WAL segments
@@ -907,13 +907,13 @@ the project's own. For inherited chunks, `branch_id` may be any ancestor's
 (including `0` for built-in pages). The S3 GET is always
 `standard-bucket/{org}/chunks/{chunk_ref.branch_id}/{key}/{lsn}`.
 
-**Step 3 — Restore non-smgr state**
+**Step 3 — Restore pg state**
 
-Download and extract from `{org}/{proj}/pitr/{target_kind}s/{target_lsn}/non_smgr_state.tar.zst`:
+Download and extract from `{org}/{proj}/pitr/{target_kind}s/{target_lsn}/pg_state.tar.zst`:
 
 ```bash
 # Single GET; decompress + untar in one pass (no temp file needed)
-GET standard-bucket/{org}/{proj}/pitr/{target_kind}s/{target_lsn}/non_smgr_state.tar.zst \
+GET standard-bucket/{org}/{proj}/pitr/{target_kind}s/{target_lsn}/pg_state.tar.zst \
   | zstd -d | tar -xf - -C $PGDATA
 # Extracts: global/pg_control, pg_xact/*, pg_multixact/*, pg_subtrans/*, pg_filenode.map
 ```
@@ -993,7 +993,7 @@ express-bucket latest). The recovery manifest is removed.
 | `s3worker/src/project.rs` | `ProjectCtx`: org_id, project_id, branch_id, base_manifest loaded at startup |
 | `s3worker/src/bin/tiko_restore.rs` | WAL restore command: downloads WAL segments from standard-bucket during recovery |
 | `s3worker/src/bin/tiko_archive.rs` | WAL archive command: uploads completed WAL segments to standard-bucket |
-| `s3smgr/src/wal_archive.rs` | Blocking S3 client for checkpointer-side delta manifest + non-smgr state writes |
+| `s3smgr/src/wal_archive.rs` | Blocking S3 client for checkpointer-side delta manifest + pg state writes |
 
 ### Modified Files
 
