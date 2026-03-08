@@ -107,6 +107,30 @@ fn try_fetch_chunk_from_s3(tag: &ChunkTag) -> Option<Vec<u8>> {
     try_fetch_chunk_from_s3_with(sim, ns, tag)
 }
 
+/// Fetch chunk data from SimStore and populate the cache slot.
+/// Returns `true` if data was found and written, `false` if SimStore had no data.
+fn populate_cache_slot_from_s3(cache: &CacheControl, slot: u32, chunk_tag: &ChunkTag) -> bool {
+    if let Some(chunk_data) = try_fetch_chunk_from_s3(chunk_tag) {
+        if chunk_data.len() % BLCKSZ == 0 {
+            let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
+            cache.write_blocks_to_slot(
+                slot,
+                0,
+                nblocks_s3,
+                &chunk_data[..nblocks_s3 as usize * BLCKSZ],
+            );
+            let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
+                u32::MAX
+            } else {
+                (1u32 << nblocks_s3) - 1
+            };
+            cache.set_valid_blocks_mask(slot, valid_mask);
+            return true;
+        }
+    }
+    false
+}
+
 /// True when the shared-memory cache is reachable from this process.
 ///
 /// Requires both conditions:
@@ -394,23 +418,7 @@ pub fn cached_read_blocks(
             let slot = cache.insert(&chunk_tag);
 
             // Newly allocated slot — fetch from SimStore and populate.
-            if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
-                if chunk_data.len() % BLCKSZ == 0 {
-                    let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
-                    cache.write_blocks_to_slot(
-                        slot,
-                        0,
-                        nblocks_s3,
-                        &chunk_data[..nblocks_s3 as usize * BLCKSZ],
-                    );
-                    let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
-                        u32::MAX
-                    } else {
-                        (1u32 << nblocks_s3) - 1
-                    };
-                    cache.set_valid_blocks_mask(slot, valid_mask);
-                }
-            }
+            populate_cache_slot_from_s3(cache, slot, &chunk_tag);
             // If SimStore had no data, slot stays with valid_blocks=0; caller
             // handles via is_block_valid check below (zero-fill for new blocks).
 
@@ -500,6 +508,7 @@ pub fn cached_write_blocks(
 
         let slot = match cache.lookup(&chunk_tag) {
             Some(slot) => {
+                // Chunk hit — pin and write directly to cache.
                 stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                 cache.pin(slot);
                 slot
@@ -516,23 +525,7 @@ pub fn cached_write_blocks(
                 // Without this step, `flush_dirty_chunk` reads the full 256 KB
                 // slot on eviction and emits stale bytes for every block the
                 // caller never explicitly wrote — silently corrupting those blocks.
-                if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
-                    if chunk_data.len() % BLCKSZ == 0 {
-                        let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
-                        cache.write_blocks_to_slot(
-                            slot,
-                            0,
-                            nblocks_s3,
-                            &chunk_data[..nblocks_s3 as usize * BLCKSZ],
-                        );
-                        let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
-                            u32::MAX
-                        } else {
-                            (1u32 << nblocks_s3) - 1
-                        };
-                        cache.set_valid_blocks_mask(slot, valid_mask);
-                    }
-                } else {
+                if !populate_cache_slot_from_s3(cache, slot, &chunk_tag) {
                     // New chunk (no data in SimStore yet) — zero the slot so
                     // flush_dirty_chunk never emits stale bytes from the prior
                     // occupant for blocks the caller doesn't write.
@@ -603,23 +596,7 @@ pub fn warm_cache_blocks(
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
             let slot = cache.insert(&chunk_tag);
 
-            if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
-                if chunk_data.len() % BLCKSZ == 0 {
-                    let nblocks_s3 = ((chunk_data.len() / BLCKSZ) as u32).min(BLOCKS_PER_CHUNK);
-                    cache.write_blocks_to_slot(
-                        slot,
-                        0,
-                        nblocks_s3,
-                        &chunk_data[..nblocks_s3 as usize * BLCKSZ],
-                    );
-                    let valid_mask = if nblocks_s3 >= BLOCKS_PER_CHUNK {
-                        u32::MAX
-                    } else {
-                        (1u32 << nblocks_s3) - 1
-                    };
-                    cache.set_valid_blocks_mask(slot, valid_mask);
-                }
-            }
+            populate_cache_slot_from_s3(cache, slot, &chunk_tag);
 
             cache.touch(slot);
             cache.unpin(slot);
