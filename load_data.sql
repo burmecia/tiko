@@ -66,3 +66,5 @@ create table orders (
 
 --\copy orders from '/Users/bolu/supabase/tmp/ecommerce_dataset_small.csv' WITH (FORMAT csv, HEADER true);
 \copy orders from '/Users/bolu/supabase/tmp/ecommerce_dataset_large.csv' WITH (FORMAT csv, HEADER true);
+
+select category, count(*) as cnt from orders group by category order by cnt desc;
