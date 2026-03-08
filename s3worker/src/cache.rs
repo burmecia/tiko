@@ -925,7 +925,7 @@ impl CacheControl {
         }
 
         pg_log_debug1(&format!(
-            "flush_all_dirty_chunks: flushed {} chunk(s)",
+            "tiko: flush_all_dirty_chunks: flushed {} chunk(s)",
             flushed_count
         ));
     }

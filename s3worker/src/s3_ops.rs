@@ -506,8 +506,6 @@ pub fn cached_write_blocks(
             }
             None => {
                 // Chunk miss — allocate a fresh slot (evicts an existing entry if full).
-                // insert() may return an existing slot if a concurrent thread inserted
-                // the same tag between our lookup miss and now (concurrent-insert race).
                 stats.cache_misses.fetch_add(1, Ordering::Relaxed);
                 let slot = cache.insert(&chunk_tag);
 
