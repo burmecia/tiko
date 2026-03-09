@@ -171,7 +171,7 @@ Tokio threads **CANNOT**: call `ConditionVariable*`, `LWLock*`, `ereport`/`elog`
 - Shared memory pointers stored in `OnceLock<*mut T>` with Send/Sync wrapper types
 - PG hook chaining: always save and call `prev_*_hook` before installing custom hooks
 
-## PITR Support Design (7-Day Retention)
+## PITR Support Design
 
 ### High-Level Architecture
 
@@ -605,8 +605,40 @@ SELECT * FROM test_pitr;  -- Should show id=1, not id=2
 
 1. **Minimal PostgreSQL patches** - Uses standard `archive_command`/`restore_command`
 2. **Leverages existing infra** - s3worker Tokio runtime handles S3 I/O
-3. **Simple retention** - S3 lifecycle policies handle cleanup automatically
+3. **Checkpoint-count retention** - Retention is activity-based, not time-based (see GC Policy below)
 4. **No full backups needed** - Tiko's block-level S3 storage + WAL = complete PITR
 5. **Fast recovery** - Only download blocks accessed during WAL replay
 
-This design provides 7-day PITR with minimal code changes and leverages PostgreSQL's battle-tested recovery mechanisms.
+### GC Policy (Retention Enforcement)
+
+GC is run by `tikod` (control plane), not by `s3worker`. The entry point is
+`enforce_retention_org(org_id, max_checkpoints)` in `tikod/src/gc.rs`.
+
+**Retention is checkpoint-count-based, not time-based.**
+A time-based cutoff would delete data from inactive projects (a paused project
+still has a valid current state). Counting checkpoints ties retention to database
+activity: a busy project fills the window quickly; an idle one keeps all its history
+indefinitely until it generates enough new checkpoints to trigger cleanup.
+
+Policy: keep the last `max_checkpoints` (default 500) delta manifests per project.
+
+**Cutoff derivation:**
+```
+all_delta_lsns = sorted ascending list of delta manifest LSNs for the project
+if len > max_checkpoints:
+    cutoff_lsn = all_delta_lsns[len - max_checkpoints]
+else:
+    skip (nothing to GC)
+```
+
+**Four GC phases (run in order):**
+
+| Phase | What is deleted |
+|---|---|
+| Delta manifest GC | Manifests + `pg_state.tar.zst` with LSN < `cutoff_lsn` |
+| Base manifest GC | All bases with `base_lsn < cutoff_lsn`, except the newest one (needed as recovery anchor) |
+| WAL GC | Segments whose end LSN is entirely before `cutoff_lsn` |
+| Chunk GC | Versioned `{lsn_hex}` objects not referenced by any retained base or delta manifest; zero branch is permanent |
+
+In a multi-server cluster, GC acquires a per-org GC lease (`{org}/gc_lease.json`)
+before running — only one server runs GC for a given org at a time.

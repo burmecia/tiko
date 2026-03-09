@@ -86,6 +86,7 @@ unsafe extern "C" {
     /// True during WAL replay (crash recovery or standby).
     /// Set by the startup process; other processes see false (xlogutils.h).
     pub static InRecovery: bool;
+
 }
 
 #[inline(always)]

@@ -84,6 +84,7 @@ produced by `initdb` when the zero branch was provisioned):
   "parent_branch_id":     0,
   "branch_checkpoint_lsn": 22020096,
   "branch_timeline_id":    1,
+  "current_timeline_id":   1,
   "created_at": 1740480000,
   "status": "active"
 }
@@ -100,10 +101,20 @@ Child project (branches from another project):
   "parent_branch_id":     1,
   "branch_checkpoint_lsn": 973078568,
   "branch_timeline_id":    1,
+  "current_timeline_id":   1,
   "created_at": 1740490000,
   "status": "active"
 }
 ```
+
+`current_timeline_id` tracks the PostgreSQL timeline the project is currently running on.
+It starts at 1 (or `branch_timeline_id + 1` for branches that go through recovery).
+The control plane (`tikod`) updates it in `post_recovery_cleanup` after each PITR restore:
+- **Before recovery**: `current_timeline_id` = old timeline (read by tikod to target WAL bulk-delete `{org}/pitr/{proj}/wal/{old_tl}/`)
+- **After recovery shutdown**: tikod reads the new timeline ID from `$PGDATA/global/pg_control`, then updates `current_timeline_id = new_tl`
+
+This enables WAL cleanup to use a simple prefix delete (`{old_tl}/`) rather than LSN filtering,
+and provides operational clarity about which timeline's WAL archive is active for the project.
 
 ### Initial Base Manifest
 
@@ -121,9 +132,9 @@ For a root project the initial base is written automatically at the end of the
 
 After `initdb`, SimStore contains:
 ```
-{org}/pitr/{project_id}/deltas/{checkpoint_lsn}/manifest.bin
-{org}/pitr/{project_id}/deltas/{checkpoint_lsn}/pg_state.tar.zst
-{org}/pitr/{project_id}/bases/{checkpoint_lsn}/manifest.bin   ← initial base
+{org}/pitr/{project_id}/deltas/{timeline:08X}/{checkpoint_lsn}/manifest.bin
+{org}/pitr/{project_id}/deltas/{timeline:08X}/{checkpoint_lsn}/pg_state.tar.zst
+{org}/pitr/{project_id}/bases/{timeline:08X}/{checkpoint_lsn}/manifest.bin   ← initial base
 ```
 
 #### Branch project (branch creation)
@@ -133,8 +144,9 @@ At branch creation, the control plane builds the frozen chunk map at
 manifest:
 
 ```
-{org_id}/pitr/{child_project_id}/bases/{branch_checkpoint_lsn}/manifest.bin
+{org_id}/pitr/{child_project_id}/bases/{timeline:08X}/{branch_checkpoint_lsn}/manifest.bin
 ```
+(Child branches always start on timeline 1.)
 
 This object IS the branch base — there is no separate `branch_base.bin` file.
 It serves two roles:
@@ -462,7 +474,7 @@ and durability requirements, so they live in different S3 service types:
 | Bucket type | Contents | Why |
 |---|---|---|
 | **S3 Express One Zone** (Directory Bucket) | `{org}/{proj}/chunks/{key}/latest` | Single-digit ms GET on every cache miss; `RenameObject` available |
-| **Standard S3** (multi-AZ) | `{org}/chunks/{branch_id}/{key}/{lsn_hex}`, `{org}/pitr/{proj}/` manifests, WAL | 11-9s durability for PITR archive; Intelligent-Tiering; rarely read |
+| **Standard S3** (multi-AZ) | `{org}/chunks/{branch_id}/{key}/{tl:08X}/{lsn_hex}`, `{org}/pitr/{proj}/deltas/{tl:08X}/…`, `{org}/pitr/{proj}/bases/{tl:08X}/…`, WAL | 11-9s durability for PITR archive; Intelligent-Tiering; rarely read |
 
 Express One Zone's single-AZ limitation is acceptable for `latest`: it is
 always reconstructible from `{lsn_hex}` + WAL replay. Standard S3's multi-AZ
@@ -484,22 +496,25 @@ the ground truth for recovery.
   chunks/
     0/                    ← zero branch: built-in DB state; permanent, never GC'd
       {spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}/
-        {lsn_hex}
+        {timeline:08X}/
+          {lsn_hex}
     {branch_id}/          ← one prefix per project (branch_id is org-scoped, ≠ project_id)
       {spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}/
-        {lsn_A_hex}       ← immutable 256 KB version sealed at checkpoint A
-        {lsn_C_hex}       ← immutable 256 KB version sealed at checkpoint C
+        {timeline:08X}/
+          {lsn_A_hex}     ← immutable 256 KB version sealed at checkpoint A on this timeline
+          {lsn_C_hex}     ← immutable 256 KB version sealed at checkpoint C on this timeline
 
   pitr/
     {project_id}/
       bases/
-        {checkpoint_lsn}/
-          manifest.bin              ← full chunk_key → ChunkRef map (materialized)
-          pg_state.tar.zst    ← tar+zstd: pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
+        {timeline:08X}/
+          {checkpoint_lsn}/
+            manifest.bin            ← full chunk_key → ChunkRef map (materialized)
       deltas/
-        {checkpoint_lsn}/
-          manifest.bin                 ← dirty chunks at this checkpoint only
-          pg_state.tar.zst    ← tar+zstd: pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
+        {timeline:08X}/
+          {checkpoint_lsn}/
+            manifest.bin            ← dirty chunks at this checkpoint only
+            pg_state.tar.zst        ← tar+zstd: pg_control, pg_xact/*, pg_multixact/*, pg_filenode.map
       wal/
         {timeline_id}/
           {wal_segment}   ← archived WAL segments

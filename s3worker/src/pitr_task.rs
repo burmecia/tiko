@@ -63,7 +63,13 @@ pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, conf
     let mut interval = tokio::time::interval(config.materialization_interval);
     loop {
         interval.tick().await;
-        match materialize_base(&sim, &ns) {
+        // Read current timeline from ProjectCtx each iteration so that PITR
+        // recovery (which bumps current_timeline_id) is picked up without
+        // restarting the background task.
+        let timeline = ProjectCtx::try_get()
+            .map(|ctx| ctx.current_timeline_id())
+            .unwrap_or(1);
+        match materialize_base(&sim, &ns, timeline) {
             Ok(MaterializeResult::NoNewDeltas { base_lsn }) => {
                 log_relay::relay_info(format!(
                     "s3worker: pitr: no new deltas since base {base_lsn} — skipping (project={})",
@@ -115,9 +121,13 @@ pub enum MaterializeResult {
 /// Returns [`MaterializeResult::NoNewDeltas`] immediately if there are no new
 /// deltas (idempotent).  Does NOT delete delta manifests — cleanup is
 /// enforce_retention_org's responsibility.
-pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<MaterializeResult> {
-    // Step 1: find latest base manifest LSN.
-    let base_prefix = ns.base_prefix();
+pub fn materialize_base(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    timeline: u32,
+) -> Result<MaterializeResult> {
+    // Step 1: find latest base manifest LSN (scoped to this timeline).
+    let base_prefix = ns.base_prefix_for_timeline(timeline);
     let base_keys = sim.list_prefix_standard(&base_prefix)?;
 
     let mut base_lsns: Vec<Lsn> = base_keys
@@ -135,7 +145,7 @@ pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<Materia
         std::env::temp_dir().join(format!("tiko_pitr_base_{}.tikm", ns.project_id));
 
     let (base, base_lsn) = if let Some(&l) = base_lsns.last() {
-        let manifest_key = ns.base_manifest_key(l);
+        let manifest_key = ns.base_manifest_key(timeline, l);
         let bytes = sim
             .get_standard(&manifest_key)?
             .ok_or_else(|| format!("base manifest not found: {manifest_key}"))?;
@@ -146,8 +156,8 @@ pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<Materia
         (Manifest::empty(&base_local_path)?, Lsn::INVALID)
     };
 
-    // Step 2: collect delta LSNs strictly newer than the current base.
-    let delta_prefix = ns.delta_prefix();
+    // Step 2: collect delta LSNs strictly newer than the current base (scoped to this timeline).
+    let delta_prefix = ns.delta_prefix_for_timeline(timeline);
     let delta_keys = sim.list_prefix_standard(&delta_prefix)?;
 
     let mut delta_lsns: Vec<Lsn> = delta_keys
@@ -173,7 +183,7 @@ pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<Materia
     // Step 4: download each delta manifest.
     let mut deltas = Vec::with_capacity(delta_lsns.len());
     for &delta_lsn in &delta_lsns {
-        let key = ns.delta_manifest_key(delta_lsn);
+        let key = ns.delta_manifest_key(timeline, delta_lsn);
         let delta_bytes = sim
             .get_standard(&key)?
             .ok_or_else(|| format!("delta manifest not found: {key}"))?;
@@ -198,7 +208,7 @@ pub fn materialize_base(sim: &SimStore, ns: &ProjectNamespace) -> Result<Materia
         delta_count,
         base_lsn,
     ));
-    sim.put_standard(&ns.base_manifest_key(new_lsn), &base.to_bytes()?)?;
+    sim.put_standard(&ns.base_manifest_key(timeline, new_lsn), &base.to_bytes()?)?;
 
     // Step 6: refresh the global manifest in-place.
     // Must run after the S3 PUT so the on-disk index always reflects a committed
@@ -255,7 +265,11 @@ mod tests {
     }
 
     fn cref(branch_id: u64, lsn: Lsn) -> ChunkRef {
-        ChunkRef { branch_id, lsn }
+        ChunkRef {
+            branch_id,
+            timeline_id: 1,
+            lsn,
+        }
     }
 
     fn store_manifest(
@@ -285,7 +299,7 @@ mod tests {
             .collect();
         store_manifest(
             &sim,
-            &ns.base_manifest_key(lsns[2]),
+            &ns.base_manifest_key(1, lsns[2]),
             lsns[2],
             base_chunks,
             &dir.path().join("base.tikm"),
@@ -297,18 +311,18 @@ mod tests {
             let chunks = vec![(tag(i), cref(1, delta_lsn)), (tag(0), cref(1, delta_lsn))];
             store_manifest(
                 &sim,
-                &ns.delta_manifest_key(delta_lsn),
+                &ns.delta_manifest_key(1, delta_lsn),
                 delta_lsn,
                 chunks,
                 &dir.path().join(format!("d{i}.tikm")),
             );
         }
 
-        materialize_base(&sim, &ns).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
 
         // New base must exist at lsns[9] (delta 10).
         let bytes = sim
-            .get_standard(&ns.base_manifest_key(lsns[9]))
+            .get_standard(&ns.base_manifest_key(1, lsns[9]))
             .unwrap()
             .expect("new base manifest must exist after materialization");
         let tmp = dir.path().join("verify.tikm");
@@ -322,7 +336,7 @@ mod tests {
         // All 10 delta files must still be present (no GC in this task).
         for i in 1u32..=10 {
             assert!(
-                sim.get_standard(&ns.delta_manifest_key(lsns[i as usize - 1]))
+                sim.get_standard(&ns.delta_manifest_key(1, lsns[i as usize - 1]))
                     .unwrap()
                     .is_some(),
                 "delta {i} must not be deleted by materialize_base"
@@ -344,7 +358,7 @@ mod tests {
         // Base at LSN 0x300 covering tags 1–3.
         store_manifest(
             &sim,
-            &ns.base_manifest_key(Lsn::new(0x300)),
+            &ns.base_manifest_key(1, Lsn::new(0x300)),
             Lsn::new(0x300),
             vec![
                 (tag(1), cref(1, base_lsn)),
@@ -357,7 +371,7 @@ mod tests {
         // Delta at 0x400: updates tag(2).
         store_manifest(
             &sim,
-            &ns.delta_manifest_key(d4_lsn),
+            &ns.delta_manifest_key(1, d4_lsn),
             d4_lsn,
             vec![(tag(2), cref(1, d4_lsn))],
             &dir.path().join("d4.tikm"),
@@ -366,16 +380,16 @@ mod tests {
         // Delta at 0x700: adds tag(7).
         store_manifest(
             &sim,
-            &ns.delta_manifest_key(d7_lsn),
+            &ns.delta_manifest_key(1, d7_lsn),
             d7_lsn,
             vec![(tag(7), cref(1, d7_lsn))],
             &dir.path().join("d7.tikm"),
         );
 
-        materialize_base(&sim, &ns).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
 
         let bytes = sim
-            .get_standard(&ns.base_manifest_key(d7_lsn))
+            .get_standard(&ns.base_manifest_key(1, d7_lsn))
             .unwrap()
             .expect("new base at d7_lsn must exist");
         let tmp = dir.path().join("verify.tikm");
@@ -398,32 +412,34 @@ mod tests {
 
         store_manifest(
             &sim,
-            &ns.base_manifest_key(base_lsn),
+            &ns.base_manifest_key(1, base_lsn),
             base_lsn,
             vec![(tag(1), cref(1, base_lsn))],
             &dir.path().join("base.tikm"),
         );
         store_manifest(
             &sim,
-            &ns.delta_manifest_key(delta_lsn),
+            &ns.delta_manifest_key(1, delta_lsn),
             delta_lsn,
             vec![(tag(1), cref(1, delta_lsn))],
             &dir.path().join("d1.tikm"),
         );
 
         // First materialization.
-        materialize_base(&sim, &ns).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
 
         // Second materialization: no new deltas after the newly written base.
-        materialize_base(&sim, &ns).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
 
         // Exactly 2 base manifests: original + the materialized one.
-        let keys = sim.list_prefix_standard(&ns.base_prefix()).unwrap();
+        let keys = sim
+            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
+            .unwrap();
         assert_eq!(keys.len(), 2, "second run must not write another base");
 
         // Result unchanged from first run.
         let bytes = sim
-            .get_standard(&ns.base_manifest_key(delta_lsn))
+            .get_standard(&ns.base_manifest_key(1, delta_lsn))
             .unwrap()
             .expect("materialized base must exist");
         let tmp = dir.path().join("verify.tikm");
@@ -441,16 +457,18 @@ mod tests {
         let lsn = Lsn::new(0x100);
         store_manifest(
             &sim,
-            &ns.base_manifest_key(lsn),
+            &ns.base_manifest_key(1, lsn),
             lsn,
             vec![(tag(1), cref(1, lsn))],
             &dir.path().join("base.tikm"),
         );
 
         // No deltas written.
-        materialize_base(&sim, &ns).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
 
-        let keys = sim.list_prefix_standard(&ns.base_prefix()).unwrap();
+        let keys = sim
+            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
+            .unwrap();
         assert_eq!(
             keys.len(),
             1,
@@ -465,9 +483,11 @@ mod tests {
         let (_dir, sim) = setup();
         let ns = ns_with_project(20_005);
         // No base, no deltas.
-        materialize_base(&sim, &ns).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
         // No base manifest should be written either.
-        let keys = sim.list_prefix_standard(&ns.base_prefix()).unwrap();
+        let keys = sim
+            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
+            .unwrap();
         assert!(
             keys.is_empty(),
             "no base should be written when no deltas exist"
@@ -487,24 +507,24 @@ mod tests {
         // Two delta manifests — no base exists yet.
         store_manifest(
             &sim,
-            &ns.delta_manifest_key(d1_lsn),
+            &ns.delta_manifest_key(1, d1_lsn),
             d1_lsn,
             vec![(tag(1), cref(1, d1_lsn))],
             &dir.path().join("d1.tikm"),
         );
         store_manifest(
             &sim,
-            &ns.delta_manifest_key(d2_lsn),
+            &ns.delta_manifest_key(1, d2_lsn),
             d2_lsn,
             vec![(tag(2), cref(1, d2_lsn))],
             &dir.path().join("d2.tikm"),
         );
 
-        materialize_base(&sim, &ns).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
 
         // Base must be created at the highest delta LSN.
         let bytes = sim
-            .get_standard(&ns.base_manifest_key(d2_lsn))
+            .get_standard(&ns.base_manifest_key(1, d2_lsn))
             .unwrap()
             .expect("initial base manifest must exist after materialization");
         let tmp = dir.path().join("verify.tikm");

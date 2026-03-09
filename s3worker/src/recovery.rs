@@ -130,6 +130,7 @@ mod tests {
         let known_tag = tag(42);
         let known_ref = ChunkRef {
             branch_id: 7,
+            timeline_id: 1,
             lsn: Lsn::new(0x1000),
         };
 

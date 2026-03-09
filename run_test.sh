@@ -9,6 +9,7 @@ set -e  # Exit on any error
 ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 
 # Set environment variables for Tiko configuration
+TIKO_ROOT_PATH="/Users/bolu/supabase/tiko/tt"
 TIKO_ORG_ID="123"
 TIKO_PROJECT_ID="0"
 TIKO_BRANCH_ID="0"

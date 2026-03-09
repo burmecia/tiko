@@ -58,12 +58,11 @@ fn try_fetch_chunk_from_s3_with(
     if recovery::is_recovery_mode() {
         // Level R: versioned standard-sim object from recovery manifest.
         if let Ok(Some(chunk_ref)) = recovery::lookup_recovery_chunk(tag) {
-            let key = format!(
-                "{}/chunks/{}/{}/{}",
-                ns.org_id,
+            let key = ns.chunk_versioned_key(
+                tag,
                 chunk_ref.branch_id,
-                tag.to_path(),
-                chunk_ref.lsn.to_hex()
+                chunk_ref.timeline_id,
+                chunk_ref.lsn,
             );
             if let Ok(Some(data)) = sim.get_standard(&key) {
                 return Some(data);
@@ -83,14 +82,13 @@ fn try_fetch_chunk_from_s3_with(
     // Only available when PROJECT_CTX is initialised.
     if let Some(ctx) = ProjectCtx::try_get() {
         if let Ok(Some(chunk_ref)) = ctx.base_manifest_lookup(tag) {
-            // Use chunk_ref.branch_id (the branch that owns this chunk version),
-            // NOT ns.branch_id (own branch) or ns.project_id.
-            let key = format!(
-                "{}/chunks/{}/{}/{}",
-                ns.org_id,
+            // Use chunk_ref.branch_id and chunk_ref.timeline_id to locate the
+            // exact versioned S3 object (may belong to a different branch/timeline).
+            let key = ns.chunk_versioned_key(
+                tag,
                 chunk_ref.branch_id,
-                tag.to_path(),
-                chunk_ref.lsn.to_hex()
+                chunk_ref.timeline_id,
+                chunk_ref.lsn,
             );
             if let Ok(Some(data)) = sim.get_standard(&key) {
                 return Some(data);
@@ -694,15 +692,15 @@ mod tests {
         let tag = tag(200);
         let chunk_ref = ChunkRef {
             branch_id: 99, // different from both project_id and branch_id
+            timeline_id: 1,
             lsn: Lsn::new(0x500),
         };
 
-        let key = format!(
-            "{}/chunks/{}/{}/{}",
-            ns.org_id,
+        let key = ns.chunk_versioned_key(
+            &tag,
             chunk_ref.branch_id,
-            tag.to_path(),
-            chunk_ref.lsn.to_hex()
+            chunk_ref.timeline_id,
+            chunk_ref.lsn,
         );
 
         assert!(
@@ -736,6 +734,7 @@ mod tests {
         let lsn = Lsn::new(0x800);
         let chunk_ref = ChunkRef {
             branch_id: parent_branch_id,
+            timeline_id: 1,
             lsn,
         };
 
@@ -743,13 +742,8 @@ mod tests {
 
         // Put versioned data in standard sim (inherited from parent branch).
         let data = chunk_data(0xCC);
-        let versioned_key = format!(
-            "{}/chunks/{}/{}/{}",
-            ns.org_id,
-            parent_branch_id,
-            tag.to_path(),
-            lsn.to_hex()
-        );
+        let versioned_key =
+            ns.chunk_versioned_key(&tag, chunk_ref.branch_id, chunk_ref.timeline_id, lsn);
         sim.put_standard(&versioned_key, &data).unwrap();
 
         // Ensure nothing in express (level-1 would miss).
@@ -769,13 +763,8 @@ mod tests {
         // Simulate level-2: look up the manifest and build the expected key.
         let found = manifest.lookup(&tag).unwrap().unwrap();
         assert_eq!(found.branch_id, parent_branch_id);
-        let level2_key = format!(
-            "{}/chunks/{}/{}/{}",
-            ns.org_id,
-            found.branch_id,
-            tag.to_path(),
-            found.lsn.to_hex()
-        );
+        let level2_key =
+            ns.chunk_versioned_key(&tag, found.branch_id, found.timeline_id, found.lsn);
         let fetched = sim.get_standard(&level2_key).unwrap();
         assert_eq!(fetched, Some(data));
     }
@@ -793,7 +782,11 @@ mod tests {
         let tag = tag(400);
         let branch_id: u64 = 55;
         let lsn = Lsn::new(0x2000);
-        let chunk_ref = ChunkRef { branch_id, lsn };
+        let chunk_ref = ChunkRef {
+            branch_id,
+            timeline_id: 1,
+            lsn,
+        };
 
         // Build and write the recovery manifest blob.
         let build_path = dir.path().join("build.tikm");
@@ -811,26 +804,14 @@ mod tests {
 
         // Put versioned data in standard sim.
         let data = chunk_data(0xDD);
-        let versioned_key = format!(
-            "{}/chunks/{}/{}/{}",
-            ns.org_id,
-            branch_id,
-            tag.to_path(),
-            lsn.to_hex()
-        );
+        let versioned_key = ns.chunk_versioned_key(&tag, branch_id, 1, lsn);
         sim.put_standard(&versioned_key, &data).unwrap();
 
         // Test the recovery-mode lookup via a local manifest instance to
         // avoid OnceLock contention with RECOVERY_MANIFEST.
         let local = Manifest::from_bytes(&blob, &dir.path().join("local.tikm")).unwrap();
         let found = local.lookup(&tag).unwrap().unwrap();
-        let key = format!(
-            "{}/chunks/{}/{}/{}",
-            ns.org_id,
-            found.branch_id,
-            tag.to_path(),
-            found.lsn.to_hex()
-        );
+        let key = ns.chunk_versioned_key(&tag, found.branch_id, found.timeline_id, found.lsn);
         let fetched = sim.get_standard(&key).unwrap();
         assert_eq!(fetched, Some(data));
 

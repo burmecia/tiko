@@ -79,45 +79,58 @@ impl ProjectNamespace {
 
     // ── Standard-bucket chunk keys (org-level, keyed by branch_id) ───────
 
-    /// `{org}/chunks/{branch_id}/{chunk_path}/{lsn_hex}`
-    pub fn chunk_versioned_key(&self, tag: &ChunkTag, lsn: Lsn) -> String {
+    /// `{org}/chunks/{branch_id}/{chunk_path}/{timeline:08X}/{lsn_hex}`
+    ///
+    /// `branch_id` is the writer's branch — use `self.branch_id` for writes,
+    /// or `chunk_ref.branch_id` when resolving a manifest entry from a parent.
+    pub fn chunk_versioned_key(
+        &self,
+        tag: &ChunkTag,
+        branch_id: u64,
+        timeline: u32,
+        lsn: Lsn,
+    ) -> String {
         format!(
-            "{}/chunks/{}/{}/{}",
+            "{}/chunks/{}/{}/{:08X}/{}",
             self.org_id,
-            self.branch_id,
+            branch_id,
             tag.to_path(),
+            timeline,
             lsn.to_hex()
         )
     }
 
     // ── Standard-bucket PITR manifest keys (per-project) ─────────────────
 
-    /// `{org}/pitr/{proj}/deltas/{lsn_hex}/manifest.bin`
-    pub fn delta_manifest_key(&self, lsn: Lsn) -> String {
+    /// `{org}/pitr/{proj}/deltas/{timeline:08X}/{lsn_hex}/manifest.bin`
+    pub fn delta_manifest_key(&self, timeline: u32, lsn: Lsn) -> String {
         format!(
-            "{}/pitr/{}/deltas/{}/manifest.bin",
+            "{}/pitr/{}/deltas/{:08X}/{}/manifest.bin",
             self.org_id,
             self.project_id,
+            timeline,
             lsn.to_hex()
         )
     }
 
-    /// `{org}/pitr/{proj}/bases/{lsn_hex}/manifest.bin`
-    pub fn base_manifest_key(&self, lsn: Lsn) -> String {
+    /// `{org}/pitr/{proj}/bases/{timeline:08X}/{lsn_hex}/manifest.bin`
+    pub fn base_manifest_key(&self, timeline: u32, lsn: Lsn) -> String {
         format!(
-            "{}/pitr/{}/bases/{}/manifest.bin",
+            "{}/pitr/{}/bases/{:08X}/{}/manifest.bin",
             self.org_id,
             self.project_id,
+            timeline,
             lsn.to_hex()
         )
     }
 
-    /// `{org}/pitr/{proj}/deltas/{lsn_hex}/pg_state.tar.zst`
-    pub fn pg_state_key(&self, lsn: Lsn) -> String {
+    /// `{org}/pitr/{proj}/deltas/{timeline:08X}/{lsn_hex}/pg_state.tar.zst`
+    pub fn pg_state_key(&self, timeline: u32, lsn: Lsn) -> String {
         format!(
-            "{}/pitr/{}/deltas/{}/pg_state.tar.zst",
+            "{}/pitr/{}/deltas/{:08X}/{}/pg_state.tar.zst",
             self.org_id,
             self.project_id,
+            timeline,
             lsn.to_hex()
         )
     }
@@ -139,14 +152,30 @@ impl ProjectNamespace {
 
     // ── List prefixes (for scanning) ──────────────────────────────────────
 
-    /// `{org}/pitr/{proj}/deltas/`
+    /// `{org}/pitr/{proj}/deltas/` — all timelines (used by GC for cross-timeline scanning).
     pub fn delta_prefix(&self) -> String {
         format!("{}/pitr/{}/deltas/", self.org_id, self.project_id)
     }
 
-    /// `{org}/pitr/{proj}/bases/`
+    /// `{org}/pitr/{proj}/bases/` — all timelines (used by GC for cross-timeline scanning).
     pub fn base_prefix(&self) -> String {
         format!("{}/pitr/{}/bases/", self.org_id, self.project_id)
+    }
+
+    /// `{org}/pitr/{proj}/deltas/{timeline:08X}/` — scoped to one timeline.
+    pub fn delta_prefix_for_timeline(&self, timeline: u32) -> String {
+        format!(
+            "{}/pitr/{}/deltas/{:08X}/",
+            self.org_id, self.project_id, timeline
+        )
+    }
+
+    /// `{org}/pitr/{proj}/bases/{timeline:08X}/` — scoped to one timeline.
+    pub fn base_prefix_for_timeline(&self, timeline: u32) -> String {
+        format!(
+            "{}/pitr/{}/bases/{:08X}/",
+            self.org_id, self.project_id, timeline
+        )
     }
 
     // ── Relation-level express keys ───────────────────────────────────────
@@ -188,8 +217,18 @@ pub struct ProjectMeta {
     pub parent_branch_id: Option<u64>,
     pub branch_checkpoint_lsn: Option<Lsn>,
     pub branch_timeline_id: Option<u32>,
+    /// The active timeline ID after the most recent recovery or initial start.
+    /// Starts at 1 for new projects. Updated by tikod in `post_recovery_cleanup`
+    /// after each PITR recovery. Used to scope delta/base/chunk S3 keys to
+    /// the current timeline, preventing key collisions across PITR recoveries.
+    #[serde(default = "default_timeline_id")]
+    pub current_timeline_id: u32,
     pub created_at: i64,
     pub status: String,
+}
+
+fn default_timeline_id() -> u32 {
+    1
 }
 
 // ── ProjectCtx ────────────────────────────────────────────────────────────────
@@ -223,6 +262,12 @@ impl ProjectCtx {
     /// `ProjectCtx::init` was skipped (e.g. env vars not set).
     pub fn try_get() -> Option<&'static Self> {
         PROJECT_CTX.get()
+    }
+
+    /// Current timeline ID for this project.
+    /// Used to scope delta/base/chunk S3 keys to the active timeline.
+    pub fn current_timeline_id(&self) -> u32 {
+        self.meta.current_timeline_id
     }
 
     /// Initialize the global `ProjectCtx` from environment variables.
@@ -270,6 +315,7 @@ impl ProjectCtx {
             parent_branch_id: None,
             branch_checkpoint_lsn: None,
             branch_timeline_id: None,
+            current_timeline_id: 1,
             created_at: 0,
             status: "active".to_string(),
         };
@@ -320,12 +366,13 @@ impl ProjectCtx {
             .into());
         }
 
-        // Step 3: list base manifests and find the latest LSN
-        let base_prefix = ns.base_prefix();
+        // Step 3: list base manifests for the current timeline and find the latest LSN.
+        // Keys look like "{org}/pitr/{proj}/bases/{tl:08X}/{lsn_hex}/manifest.bin".
+        // After stripping the timeline-scoped prefix we get "{lsn_hex}/manifest.bin".
+        let timeline = meta.current_timeline_id;
+        let base_prefix = ns.base_prefix_for_timeline(timeline);
         let keys = sim.list_prefix_standard(&base_prefix)?;
 
-        // Keys look like "{org}/pitr/{proj}/bases/{lsn_hex}/manifest.bin".
-        // After stripping the prefix we get "{lsn_hex}/manifest.bin".
         let mut base_lsns: Vec<Lsn> = keys
             .iter()
             .filter_map(|key| {
@@ -340,7 +387,7 @@ impl ProjectCtx {
 
         // Step 4: download or construct the base manifest
         let base_manifest = if let Some(&latest_lsn) = base_lsns.last() {
-            let manifest_key = ns.base_manifest_key(latest_lsn);
+            let manifest_key = ns.base_manifest_key(timeline, latest_lsn);
             let bytes = sim
                 .get_standard(&manifest_key)?
                 .ok_or_else(|| format!("manifest.bin not found at key: {manifest_key}"))?;
@@ -388,11 +435,14 @@ impl ProjectCtx {
 pub fn build_initial_manifest(
     sim: &SimStore,
     parent_ns: &ProjectNamespace,
+    parent_timeline: u32,
     branch_lsn: Lsn,
     out_path: &Path,
 ) -> Result<Manifest> {
-    // Step 1: list base manifests; find the latest with lsn ≤ branch_lsn.
-    let base_prefix = parent_ns.base_prefix();
+    // Step 1: list base manifests on the parent's timeline; find the latest
+    // with lsn ≤ branch_lsn.
+    // Keys look like "{org}/pitr/{proj}/bases/{tl:08X}/{lsn_hex}/manifest.bin".
+    let base_prefix = parent_ns.base_prefix_for_timeline(parent_timeline);
     let base_keys = sim.list_prefix_standard(&base_prefix)?;
 
     let mut base_lsns: Vec<Lsn> = base_keys
@@ -412,14 +462,14 @@ pub fn build_initial_manifest(
         .ok_or_else(|| format!("no base manifest with lsn ≤ {}", branch_lsn.to_hex()))?;
 
     // Step 2: download the chosen base manifest.
-    let base_manifest_key = parent_ns.base_manifest_key(chosen_base_lsn);
+    let base_manifest_key = parent_ns.base_manifest_key(parent_timeline, chosen_base_lsn);
     let bytes = sim
         .get_standard(&base_manifest_key)?
         .ok_or_else(|| format!("base manifest not found: {base_manifest_key}"))?;
     let base = Manifest::from_bytes(&bytes, out_path)?;
 
-    // Step 3: list deltas in (chosen_base_lsn, branch_lsn] and download each.
-    let delta_prefix = parent_ns.delta_prefix();
+    // Step 3: list deltas on the parent's timeline in (chosen_base_lsn, branch_lsn].
+    let delta_prefix = parent_ns.delta_prefix_for_timeline(parent_timeline);
     let delta_keys = sim.list_prefix_standard(&delta_prefix)?;
 
     let mut delta_lsns: Vec<Lsn> = delta_keys
@@ -436,7 +486,7 @@ pub fn build_initial_manifest(
 
     let mut deltas: Vec<Manifest> = Vec::with_capacity(delta_lsns.len());
     for &delta_lsn in &delta_lsns {
-        let key = parent_ns.delta_manifest_key(delta_lsn);
+        let key = parent_ns.delta_manifest_key(parent_timeline, delta_lsn);
         let bytes = sim
             .get_standard(&key)?
             .ok_or_else(|| format!("delta manifest not found: {key}"))?;
@@ -476,6 +526,7 @@ pub fn ensure_root_project_meta(sim: &SimStore, ns: &ProjectNamespace) -> Result
         parent_branch_id: None,
         branch_checkpoint_lsn: None,
         branch_timeline_id: None,
+        current_timeline_id: 1,
         created_at: now,
         status: "active".to_string(),
     };
@@ -487,22 +538,27 @@ pub fn ensure_root_project_meta(sim: &SimStore, ns: &ProjectNamespace) -> Result
 ///
 /// Writes exactly two objects to the standard bucket:
 /// - `child_ns.project_meta_key()` — serialised `ProjectMeta`
-/// - `child_ns.base_manifest_key(branch_lsn)` — the merged base manifest
+/// - `child_ns.base_manifest_key(1, branch_lsn)` — the merged base manifest (child starts on tl=1)
 ///
 /// The branch is valid once both writes succeed.
 pub fn create_branch(
     sim: &SimStore,
     parent_ns: &ProjectNamespace,
+    parent_timeline: u32,
     child_ns: &ProjectNamespace,
     branch_lsn: Lsn,
 ) -> Result<()> {
+    // Child branch always starts on timeline 1.
+    const CHILD_TIMELINE: u32 = 1;
+
     // Build the initial manifest to a unique temp path.
     let local_path: PathBuf = std::env::temp_dir().join(format!(
         "tiko_branch_{}_{}.tikm",
         child_ns.branch_id,
         branch_lsn.to_hex()
     ));
-    let initial_manifest = build_initial_manifest(sim, parent_ns, branch_lsn, &local_path)?;
+    let initial_manifest =
+        build_initial_manifest(sim, parent_ns, parent_timeline, branch_lsn, &local_path)?;
 
     // Construct child project metadata.
     let now = std::time::SystemTime::now()
@@ -514,7 +570,8 @@ pub fn create_branch(
         parent_project_id: Some(parent_ns.project_id),
         parent_branch_id: Some(parent_ns.branch_id),
         branch_checkpoint_lsn: Some(branch_lsn),
-        branch_timeline_id: None,
+        branch_timeline_id: Some(parent_timeline),
+        current_timeline_id: CHILD_TIMELINE,
         created_at: now,
         status: "active".to_string(),
     };
@@ -524,7 +581,7 @@ pub fn create_branch(
 
     // Write manifest.bin — single atomic PUT; branch is valid after this.
     sim.put_standard(
-        &child_ns.base_manifest_key(branch_lsn),
+        &child_ns.base_manifest_key(CHILD_TIMELINE, branch_lsn),
         &initial_manifest.to_bytes()?,
     )?;
 
@@ -599,6 +656,7 @@ mod tests {
             parent_branch_id: None,
             branch_checkpoint_lsn: None,
             branch_timeline_id: None,
+            current_timeline_id: 1,
             created_at: 1_000_000,
             status: "active".to_string(),
         }
@@ -616,6 +674,7 @@ mod tests {
             parent_branch_id: Some(parent_branch_id),
             branch_checkpoint_lsn: Some(lsn),
             branch_timeline_id: Some(1),
+            current_timeline_id: 1,
             created_at: 1_000_000,
             status: "active".to_string(),
         }
@@ -702,11 +761,12 @@ mod tests {
         let known_tag = tag(42);
         let known_ref = ChunkRef {
             branch_id: 1,
+            timeline_id: 1,
             lsn: branch_lsn,
         };
         let tmp = dir.path().join("tmp_manifest.tikm");
         let bytes = make_manifest_bytes(branch_lsn, vec![(known_tag, known_ref)], &tmp);
-        sim.put_standard(&child_ns.base_manifest_key(branch_lsn), &bytes)
+        sim.put_standard(&child_ns.base_manifest_key(1, branch_lsn), &bytes)
             .unwrap();
 
         let ctx = ProjectCtx::load(&child_ns, dir.path(), &sim).unwrap();
@@ -776,10 +836,12 @@ mod tests {
         let known_tag = tag(1);
         let old_ref = ChunkRef {
             branch_id: 1,
+            timeline_id: 1,
             lsn: lsn_old,
         };
         let new_ref = ChunkRef {
             branch_id: 1,
+            timeline_id: 1,
             lsn: lsn_new,
         };
 
@@ -788,9 +850,9 @@ mod tests {
         let tmp_new = dir.path().join("tmp_new.tikm");
         let bytes_new = make_manifest_bytes(lsn_new, vec![(known_tag, new_ref)], &tmp_new);
 
-        sim.put_standard(&ns.base_manifest_key(lsn_old), &bytes_old)
+        sim.put_standard(&ns.base_manifest_key(1, lsn_old), &bytes_old)
             .unwrap();
-        sim.put_standard(&ns.base_manifest_key(lsn_new), &bytes_new)
+        sim.put_standard(&ns.base_manifest_key(1, lsn_new), &bytes_new)
             .unwrap();
 
         let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
@@ -869,7 +931,11 @@ mod module7_tests {
     }
 
     fn cref(branch_id: u64, lsn: Lsn) -> ChunkRef {
-        ChunkRef { branch_id, lsn }
+        ChunkRef {
+            branch_id,
+            timeline_id: 1,
+            lsn,
+        }
     }
 
     fn store_manifest_bytes(
@@ -899,7 +965,7 @@ mod module7_tests {
         // Base: rel=1 at branch_id=1
         store_manifest_bytes(
             &sim,
-            &ns.base_manifest_key(base_lsn),
+            &ns.base_manifest_key(1, base_lsn),
             base_lsn,
             vec![(tag(1), cref(1, base_lsn))],
             &dir.path().join("b.tikm"),
@@ -907,7 +973,7 @@ mod module7_tests {
         // Delta 1: adds rel=2
         store_manifest_bytes(
             &sim,
-            &ns.delta_manifest_key(d1_lsn),
+            &ns.delta_manifest_key(1, d1_lsn),
             d1_lsn,
             vec![(tag(2), cref(1, d1_lsn))],
             &dir.path().join("d1.tikm"),
@@ -915,7 +981,7 @@ mod module7_tests {
         // Delta 2: updates rel=1, adds rel=3
         store_manifest_bytes(
             &sim,
-            &ns.delta_manifest_key(d2_lsn),
+            &ns.delta_manifest_key(1, d2_lsn),
             d2_lsn,
             vec![(tag(1), cref(1, d2_lsn)), (tag(3), cref(1, d2_lsn))],
             &dir.path().join("d2.tikm"),
@@ -923,14 +989,14 @@ mod module7_tests {
         // Delta 3: updates rel=2
         store_manifest_bytes(
             &sim,
-            &ns.delta_manifest_key(d3_lsn),
+            &ns.delta_manifest_key(1, d3_lsn),
             d3_lsn,
             vec![(tag(2), cref(1, d3_lsn))],
             &dir.path().join("d3.tikm"),
         );
 
         let out = dir.path().join("out.tikm");
-        let m = build_initial_manifest(&sim, &ns, d3_lsn, &out).unwrap();
+        let m = build_initial_manifest(&sim, &ns, 1, d3_lsn, &out).unwrap();
 
         assert_eq!(m.lookup(&tag(1)).unwrap(), Some(cref(1, d2_lsn))); // updated by d2
         assert_eq!(m.lookup(&tag(2)).unwrap(), Some(cref(1, d3_lsn))); // updated by d3
@@ -952,14 +1018,14 @@ mod module7_tests {
 
         store_manifest_bytes(
             &sim,
-            &ns.base_manifest_key(base_lsn),
+            &ns.base_manifest_key(1, base_lsn),
             base_lsn,
             vec![(tag(1), cref(1, base_lsn))],
             &dir.path().join("b.tikm"),
         );
         store_manifest_bytes(
             &sim,
-            &ns.delta_manifest_key(d1_lsn),
+            &ns.delta_manifest_key(1, d1_lsn),
             d1_lsn,
             vec![(tag(1), cref(1, d1_lsn))],
             &dir.path().join("d1.tikm"),
@@ -967,14 +1033,14 @@ mod module7_tests {
         // Delta 2 is beyond branch_lsn — must NOT be applied
         store_manifest_bytes(
             &sim,
-            &ns.delta_manifest_key(d2_lsn),
+            &ns.delta_manifest_key(1, d2_lsn),
             d2_lsn,
             vec![(tag(1), cref(1, d2_lsn)), (tag(2), cref(1, d2_lsn))],
             &dir.path().join("d2.tikm"),
         );
 
         let out = dir.path().join("out.tikm");
-        let m = build_initial_manifest(&sim, &ns, branch_lsn, &out).unwrap();
+        let m = build_initial_manifest(&sim, &ns, 1, branch_lsn, &out).unwrap();
 
         // rel=1 should reflect d1, not d2
         assert_eq!(m.lookup(&tag(1)).unwrap(), Some(cref(1, d1_lsn)));
@@ -997,7 +1063,7 @@ mod module7_tests {
         // A's base: rel=10 with A's branch_id
         store_manifest_bytes(
             &sim,
-            &a_ns.base_manifest_key(a_lsn),
+            &a_ns.base_manifest_key(1, a_lsn),
             a_lsn,
             vec![(tag(10), cref(a_ns.branch_id, a_lsn))],
             &dir.path().join("a_base.tikm"),
@@ -1005,9 +1071,9 @@ mod module7_tests {
 
         // Build B's initial manifest from A at a_lsn and store it as B's base
         let tmp_b_out = dir.path().join("b_init.tikm");
-        let b_initial = build_initial_manifest(&sim, &a_ns, a_lsn, &tmp_b_out).unwrap();
+        let b_initial = build_initial_manifest(&sim, &a_ns, 1, a_lsn, &tmp_b_out).unwrap();
         sim.put_standard(
-            &b_ns.base_manifest_key(a_lsn),
+            &b_ns.base_manifest_key(1, a_lsn),
             &b_initial.to_bytes().unwrap(),
         )
         .unwrap();
@@ -1015,7 +1081,7 @@ mod module7_tests {
         // B adds a delta: rel=20 with B's branch_id
         store_manifest_bytes(
             &sim,
-            &b_ns.delta_manifest_key(b_lsn),
+            &b_ns.delta_manifest_key(1, b_lsn),
             b_lsn,
             vec![(tag(20), cref(b_ns.branch_id, b_lsn))],
             &dir.path().join("b_d1.tikm"),
@@ -1023,7 +1089,7 @@ mod module7_tests {
 
         // Build C's manifest from B at b_lsn
         let tmp_c_out = dir.path().join("c_out.tikm");
-        let c = build_initial_manifest(&sim, &b_ns, b_lsn, &tmp_c_out).unwrap();
+        let c = build_initial_manifest(&sim, &b_ns, 1, b_lsn, &tmp_c_out).unwrap();
 
         // rel=10 was only on A → branch_id = A's (1)
         assert_eq!(
@@ -1049,13 +1115,13 @@ mod module7_tests {
         // Set up parent base
         store_manifest_bytes(
             &sim,
-            &parent_ns.base_manifest_key(branch_lsn),
+            &parent_ns.base_manifest_key(1, branch_lsn),
             branch_lsn,
             vec![(tag(1), cref(parent_ns.branch_id, branch_lsn))],
             &dir.path().join("parent_base.tikm"),
         );
 
-        create_branch(&sim, &parent_ns, &child_ns, branch_lsn).unwrap();
+        create_branch(&sim, &parent_ns, 1, &child_ns, branch_lsn).unwrap();
 
         // project.json must exist and deserialise correctly
         let meta_bytes = sim
@@ -1070,7 +1136,7 @@ mod module7_tests {
 
         // manifest.bin must exist and round-trip correctly
         let manifest_bytes = sim
-            .get_standard(&child_ns.base_manifest_key(branch_lsn))
+            .get_standard(&child_ns.base_manifest_key(1, branch_lsn))
             .unwrap()
             .unwrap();
         let tmp = dir.path().join("verify.tikm");
@@ -1107,7 +1173,7 @@ mod module7_tests {
         // Standard PITR: a base manifest
         store_manifest_bytes(
             &sim,
-            &ns.base_manifest_key(branch_lsn),
+            &ns.base_manifest_key(1, branch_lsn),
             branch_lsn,
             vec![(tag(1), cref(ns.branch_id, branch_lsn))],
             &dir.path().join("del_base.tikm"),
@@ -1120,6 +1186,7 @@ mod module7_tests {
             parent_branch_id: None,
             branch_checkpoint_lsn: None,
             branch_timeline_id: None,
+            current_timeline_id: 1,
             created_at: 0,
             status: "active".to_string(),
         };
@@ -1127,7 +1194,7 @@ mod module7_tests {
             .unwrap();
 
         // Standard chunks: versioned object (must NOT be deleted)
-        let chunk_key = ns.chunk_versioned_key(&tag(1), branch_lsn);
+        let chunk_key = ns.chunk_versioned_key(&tag(1), ns.branch_id, 1, branch_lsn);
         sim.put_standard(&chunk_key, b"chunk-data").unwrap();
 
         delete_branch(&sim, &ns).unwrap();
@@ -1162,14 +1229,14 @@ mod module7_tests {
         // Only base at 0x500, branch_lsn is 0x100
         store_manifest_bytes(
             &sim,
-            &ns.base_manifest_key(Lsn::new(0x500)),
+            &ns.base_manifest_key(1, Lsn::new(0x500)),
             Lsn::new(0x500),
             vec![(tag(1), cref(1, Lsn::new(0x500)))],
             &dir.path().join("future.tikm"),
         );
 
         let out = dir.path().join("out.tikm");
-        let result = build_initial_manifest(&sim, &ns, Lsn::new(0x100), &out);
+        let result = build_initial_manifest(&sim, &ns, 1, Lsn::new(0x100), &out);
         assert!(result.is_err(), "no base ≤ branch_lsn must return error");
     }
 }

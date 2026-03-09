@@ -142,11 +142,12 @@ impl SimStore {
         &self,
         ns: &ProjectNamespace,
         key: &ChunkTag,
+        timeline: u32,
         checkpoint_lsn: Lsn,
         data: &[u8],
     ) -> io::Result<()> {
         let staging = ns.chunk_staging_key(key, checkpoint_lsn);
-        let versioned = ns.chunk_versioned_key(key, checkpoint_lsn);
+        let versioned = ns.chunk_versioned_key(key, ns.branch_id, timeline, checkpoint_lsn);
         let latest = ns.chunk_latest_key(key);
         self.put_express(&staging, data)?;
         self.copy_express_to_standard(&staging, &versioned)?;
@@ -304,7 +305,7 @@ mod tests {
         assert_eq!(store.get_express(&staging_key).unwrap(), None);
 
         // no versioned object in standard
-        let versioned_key = ns.chunk_versioned_key(&tag, lsn);
+        let versioned_key = ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn);
         assert_eq!(store.get_standard(&versioned_key).unwrap(), None);
     }
 
@@ -318,7 +319,7 @@ mod tests {
         let lsn = Lsn::new(0x200);
 
         store
-            .three_step_write(&ns, &tag, lsn, b"block-data")
+            .three_step_write(&ns, &tag, 1, lsn, b"block-data")
             .unwrap();
 
         // latest in express
@@ -329,7 +330,7 @@ mod tests {
         // versioned in standard
         assert_eq!(
             store
-                .get_standard(&ns.chunk_versioned_key(&tag, lsn))
+                .get_standard(&ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn))
                 .unwrap(),
             Some(b"block-data".to_vec())
         );
@@ -361,7 +362,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_standard(&ns.chunk_versioned_key(&tag, lsn))
+                .get_standard(&ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn))
                 .unwrap(),
             None
         );
@@ -380,7 +381,10 @@ mod tests {
         let staging = ns.chunk_staging_key(&tag, lsn);
         store.put_express(&staging, b"new-data").unwrap();
         store
-            .copy_express_to_standard(&staging, &ns.chunk_versioned_key(&tag, lsn))
+            .copy_express_to_standard(
+                &staging,
+                &ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn),
+            )
             .unwrap();
 
         // latest still old
@@ -391,7 +395,7 @@ mod tests {
         // versioned is valid
         assert_eq!(
             store
-                .get_standard(&ns.chunk_versioned_key(&tag, lsn))
+                .get_standard(&ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn))
                 .unwrap(),
             Some(b"new-data".to_vec())
         );
@@ -423,22 +427,22 @@ mod tests {
     fn key_format_chunk_versioned_uses_branch_id_not_project_id() {
         let ns = ProjectNamespace::new(1, 42, 7);
         let tag = chunk_tag();
-        // branch_id=7, project_id=42 — key must use 7
-        let key = ns.chunk_versioned_key(&tag, Lsn::new(0x100));
+        // branch_id=7, project_id=42 — key must use 7; timeline=1 (00000001)
+        let key = ns.chunk_versioned_key(&tag, ns.branch_id, 1, Lsn::new(0x100));
         assert!(key.contains("/7/"), "expected branch_id 7 in key: {key}");
         assert!(
             !key.contains("/42/chunks"),
             "must not use project_id in versioned key"
         );
-        assert_eq!(key, "1/chunks/7/1663/5/1000.0/3/0000000000000100");
+        assert_eq!(key, "1/chunks/7/1663/5/1000.0/3/00000001/0000000000000100");
     }
 
     #[test]
     fn key_format_delta_manifest() {
         let ns = ProjectNamespace::new(1, 42, 7);
         assert_eq!(
-            ns.delta_manifest_key(Lsn::new(0x200)),
-            "1/pitr/42/deltas/0000000000000200/manifest.bin"
+            ns.delta_manifest_key(1, Lsn::new(0x200)),
+            "1/pitr/42/deltas/00000001/0000000000000200/manifest.bin"
         );
     }
 
@@ -446,8 +450,8 @@ mod tests {
     fn key_format_base_manifest() {
         let ns = ProjectNamespace::new(1, 42, 7);
         assert_eq!(
-            ns.base_manifest_key(Lsn::new(0x100)),
-            "1/pitr/42/bases/0000000000000100/manifest.bin"
+            ns.base_manifest_key(1, Lsn::new(0x100)),
+            "1/pitr/42/bases/00000001/0000000000000100/manifest.bin"
         );
     }
 
@@ -455,8 +459,8 @@ mod tests {
     fn key_format_pg_state() {
         let ns = ProjectNamespace::new(1, 42, 7);
         assert_eq!(
-            ns.pg_state_key(Lsn::new(0x300)),
-            "1/pitr/42/deltas/0000000000000300/pg_state.tar.zst"
+            ns.pg_state_key(1, Lsn::new(0x300)),
+            "1/pitr/42/deltas/00000001/0000000000000300/pg_state.tar.zst"
         );
     }
 

@@ -20,10 +20,10 @@
 //!   timestamp:      i64 (unix secs)    (little-endian)
 //!   entry_count:    u64                (little-endian)
 //!
-//! Body (entry_count × 36 bytes, sorted ascending by ChunkTag):
+//! Body (entry_count × 40 bytes, sorted ascending by ChunkTag):
 //!   ChunkTag  20 bytes  (spc_oid u32, db_oid u32, rel_number u32,
 //!                         fork_number i32, chunk_id u32 — all LE)
-//!   ChunkRef  16 bytes  (branch_id u64, lsn u64 — both LE)
+//!   ChunkRef  20 bytes  (branch_id u64, timeline_id u32, lsn u64 — all LE)
 //! ```
 
 use std::cmp::Ordering;
@@ -45,8 +45,8 @@ const TIKM_MAGIC: [u8; 4] = *b"TIKM";
 const TIKM_VERSION: u32 = 1;
 /// Header size in bytes.
 const HEADER_SIZE: u64 = 32;
-/// Entry size in bytes (ChunkTag[20] + ChunkRef[16]).
-const ENTRY_SIZE: u64 = 36;
+/// Entry size in bytes (ChunkTag[20] + ChunkRef[20]).
+const ENTRY_SIZE: u64 = 40;
 
 // ── ChunkRef ──
 
@@ -55,22 +55,28 @@ const ENTRY_SIZE: u64 = 36;
 pub struct ChunkRef {
     /// Branch-scoped id: selects `{org}/chunks/{branch_id}/` in the standard bucket.
     pub branch_id: u64,
+    /// Timeline on which this chunk version was written.
+    /// Together with `branch_id` and `lsn`, uniquely identifies the S3 object:
+    /// `{org}/chunks/{branch_id}/{tag}/{timeline_id:08X}/{lsn_hex}`.
+    pub timeline_id: u32,
     /// Checkpoint LSN at which this chunk version was sealed.
     pub lsn: Lsn,
 }
 
 impl ChunkRef {
-    fn encode(&self) -> [u8; 16] {
-        let mut buf = [0u8; 16];
+    fn encode(&self) -> [u8; 20] {
+        let mut buf = [0u8; 20];
         buf[0..8].copy_from_slice(&self.branch_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.lsn.as_u64().to_le_bytes());
+        buf[8..12].copy_from_slice(&self.timeline_id.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.lsn.as_u64().to_le_bytes());
         buf
     }
 
-    fn decode(buf: &[u8; 16]) -> Self {
+    fn decode(buf: &[u8; 20]) -> Self {
         ChunkRef {
             branch_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            lsn: Lsn::new(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
+            timeline_id: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            lsn: Lsn::new(u64::from_le_bytes(buf[12..20].try_into().unwrap())),
         }
     }
 }
@@ -179,7 +185,7 @@ fn read_all_entries(inner: &ManifestInner) -> io::Result<Vec<(ChunkTag, ChunkRef
     for i in 0..n {
         let off = i * ENTRY_SIZE as usize;
         let tag = ChunkTag::decode(buf[off..off + 20].try_into().unwrap());
-        let cref = ChunkRef::decode(buf[off + 20..off + 36].try_into().unwrap());
+        let cref = ChunkRef::decode(buf[off + 20..off + 40].try_into().unwrap());
         entries.push((tag, cref));
     }
     Ok(entries)
@@ -330,7 +336,7 @@ impl Manifest {
 
         let mut lo: u64 = 0;
         let mut hi: u64 = entry_count;
-        let mut buf = [0u8; 36];
+        let mut buf = [0u8; 40];
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
@@ -340,7 +346,7 @@ impl Manifest {
             let tag = ChunkTag::decode(buf[0..20].try_into().unwrap());
             match tag.cmp(key) {
                 Ordering::Equal => {
-                    let cref = ChunkRef::decode(buf[20..36].try_into().unwrap());
+                    let cref = ChunkRef::decode(buf[20..40].try_into().unwrap());
                     return Ok(Some(cref));
                 }
                 Ordering::Less => lo = mid + 1,
@@ -488,6 +494,7 @@ mod tests {
     fn cref(branch_id: u64, lsn_val: u64) -> ChunkRef {
         ChunkRef {
             branch_id,
+            timeline_id: 1,
             lsn: Lsn::new(lsn_val),
         }
     }
@@ -511,9 +518,9 @@ mod tests {
         let entry_count = u64::from_le_bytes(data[24..32].try_into().unwrap()) as usize;
         let mut result = Vec::with_capacity(entry_count);
         for i in 0..entry_count {
-            let off = 32 + i * 36;
+            let off = 32 + i * 40;
             let tag = ChunkTag::decode(data[off..off + 20].try_into().unwrap());
-            let cref = ChunkRef::decode(data[off + 20..off + 36].try_into().unwrap());
+            let cref = ChunkRef::decode(data[off + 20..off + 40].try_into().unwrap());
             result.push((tag, cref));
         }
         result

@@ -1,0 +1,12 @@
+[package]
+name = "tikod"
+edition = "2024"
+version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+s3worker = { path = "../s3worker" }
+tokio = { workspace = true }

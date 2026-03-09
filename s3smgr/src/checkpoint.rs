@@ -62,7 +62,7 @@ use s3worker::sim_store::SimStore;
 /// `S3IoControl::is_initialized()` will also be false, so the early-return
 /// guard handles both cases.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
+pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u64) {
     // During --boot (BOOTSTRAP_PROCESSING), checkpoint_lsn is 0 and neither
     // SimStore nor ProjectCtx are initialised — nothing to do.
     if checkpoint_lsn == 0 {
@@ -75,6 +75,7 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
     };
 
     let lsn = Lsn::new(checkpoint_lsn);
+    let timeline = timeline_id;
     let data_dir = data_dir_path();
 
     if S3IoControl::is_initialized() {
@@ -95,7 +96,7 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
         "s3_checkpoint_flush: step 2-6: processing eviction log (lsn={})",
         lsn.to_hex()
     ));
-    match checkpoint_flush_inner(sim, ctx.ns(), lsn, &data_dir) {
+    match checkpoint_flush_inner(sim, ctx.ns(), timeline, lsn, &data_dir) {
         Ok(None) => {
             pg_log_info(&format!(
                 "s3_checkpoint_flush: no dirty chunks — skipped (lsn={})",
@@ -131,7 +132,7 @@ pub extern "C-unwind" fn s3_checkpoint_flush(checkpoint_lsn: u64) {
     // produced by checkpoint_flush_inner above. Skipped for branch projects —
     // their initial base is created by the restore-from-parent process.
     if !S3IoControl::is_initialized() && !ctx.is_branch() {
-        match materialize_base(sim, ctx.ns()) {
+        match materialize_base(sim, ctx.ns(), timeline) {
             Ok(result) => {
                 pg_log_debug1(&format!(
                     "s3_checkpoint_flush: initial base materialization: {result:?}"
@@ -174,6 +175,7 @@ struct CheckpointStats {
 fn checkpoint_flush_inner(
     sim: &SimStore,
     ns: &ProjectNamespace,
+    timeline: u32,
     checkpoint_lsn: Lsn,
     data_dir: &Path,
 ) -> io::Result<Option<CheckpointStats>> {
@@ -207,7 +209,7 @@ fn checkpoint_flush_inner(
         let chunk_data = sim
             .get_express(&latest_key)?
             .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]);
-        sim.three_step_write(ns, chunk_key, checkpoint_lsn, &chunk_data)?;
+        sim.three_step_write(ns, chunk_key, timeline, checkpoint_lsn, &chunk_data)?;
     }
 
     // Step 5 — delta manifest + pg_state.
@@ -218,6 +220,7 @@ fn checkpoint_flush_inner(
                 *key,
                 ChunkRef {
                     branch_id: ns.branch_id,
+                    timeline_id: timeline,
                     lsn: checkpoint_lsn,
                 },
             )
@@ -249,8 +252,8 @@ fn checkpoint_flush_inner(
         rel_nblocks,
         &tmp_delta_manifest_path,
     )?;
-    upload_delta_manifest(sim, ns, checkpoint_lsn, &delta)?;
-    upload_pg_state(sim, ns, checkpoint_lsn, data_dir)?;
+    upload_delta_manifest(sim, ns, timeline, checkpoint_lsn, &delta)?;
+    upload_pg_state(sim, ns, timeline, checkpoint_lsn, data_dir)?;
 
     // Step 6 — remove checkpoint snapshot and local build file.
     let _ = fs::remove_file(&ckpt_path); // silently ignore ENOENT
@@ -294,11 +297,12 @@ fn now_unix() -> i64 {
 fn upload_delta_manifest(
     sim: &SimStore,
     ns: &ProjectNamespace,
+    timeline: u32,
     checkpoint_lsn: Lsn,
     manifest: &Manifest,
 ) -> io::Result<()> {
     let bytes = manifest.to_bytes()?;
-    sim.put_standard(&ns.delta_manifest_key(checkpoint_lsn), &bytes)
+    sim.put_standard(&ns.delta_manifest_key(timeline, checkpoint_lsn), &bytes)
 }
 
 /// Build a tar+zstd archive of the critical PG state files and PUT it at
@@ -309,6 +313,7 @@ fn upload_delta_manifest(
 /// - `pg_xact/**`
 /// - `pg_multixact/members/**`
 /// - `pg_multixact/offsets/**`
+/// - `pg_subtrans/**`
 /// - `global/pg_filenode.map`
 ///
 /// Missing files or directories are silently skipped — this is intentional for
@@ -317,11 +322,12 @@ fn upload_delta_manifest(
 fn upload_pg_state(
     sim: &SimStore,
     ns: &ProjectNamespace,
+    timeline: u32,
     checkpoint_lsn: Lsn,
     pgdata: &Path,
 ) -> io::Result<()> {
     let compressed = build_pg_state_archive(pgdata)?;
-    sim.put_standard(&ns.pg_state_key(checkpoint_lsn), &compressed)
+    sim.put_standard(&ns.pg_state_key(timeline, checkpoint_lsn), &compressed)
 }
 
 /// Build the in-memory tar+zstd archive.  Returns compressed bytes.
@@ -352,6 +358,12 @@ fn build_pg_state_archive(pgdata: &Path) -> io::Result<Vec<u8>> {
     let multixact_offsets = pgdata.join("pg_multixact").join("offsets");
     if multixact_offsets.is_dir() {
         builder.append_dir_all("pg_multixact/offsets", &multixact_offsets)?;
+    }
+
+    // pg_subtrans/
+    let pg_subtrans = pgdata.join("pg_subtrans");
+    if pg_subtrans.is_dir() {
+        builder.append_dir_all("pg_subtrans", &pg_subtrans)?;
     }
 
     // global/pg_filenode.map
@@ -424,8 +436,14 @@ mod tests {
     }
 
     // Run `checkpoint_flush_inner` with a fresh tempdir.
-    fn run_flush(dir: &TempDir, sim: &SimStore, ns: &ProjectNamespace, lsn: Lsn) -> io::Result<()> {
-        checkpoint_flush_inner(sim, ns, lsn, dir.path()).map(|_| ())
+    fn run_flush(
+        dir: &TempDir,
+        sim: &SimStore,
+        ns: &ProjectNamespace,
+        lsn: Lsn,
+        timeline: u32,
+    ) -> io::Result<()> {
+        checkpoint_flush_inner(sim, ns, timeline, lsn, dir.path()).map(|_| ())
     }
 
     /// Deserialise the delta manifest from the standard sim for `lsn`.
@@ -433,10 +451,11 @@ mod tests {
         dir: &TempDir,
         sim: &SimStore,
         ns: &ProjectNamespace,
+        timeline: u32,
         lsn: Lsn,
     ) -> Manifest {
         let bytes = sim
-            .get_standard(&ns.delta_manifest_key(lsn))
+            .get_standard(&ns.delta_manifest_key(timeline, lsn))
             .unwrap()
             .expect("delta manifest must exist");
         let path = dir.path().join(TIKO_DIR).join("read_delta.tikm");
@@ -460,9 +479,9 @@ mod tests {
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xAA);
 
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
-        let m = read_delta_manifest(&dir, &sim, &ns, lsn);
+        let m = read_delta_manifest(&dir, &sim, &ns, 1, lsn);
         assert_eq!(m.checkpoint_lsn(), lsn);
         let cref = m.lookup(&tag).unwrap();
         assert!(cref.is_some(), "chunk must appear in delta manifest");
@@ -486,9 +505,9 @@ mod tests {
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xBB);
 
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
-        let m = read_delta_manifest(&dir, &sim, &ns, lsn);
+        let m = read_delta_manifest(&dir, &sim, &ns, 1, lsn);
         assert!(m.lookup(&tag).unwrap().is_some());
     }
 
@@ -507,18 +526,18 @@ mod tests {
         write_eviction_log(&log_path, &[tag, tag]);
         setup_express(&sim, &ns, &[tag], 0xCC);
 
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
         // Only one versioned object must exist in standard sim.
-        let versioned_key = ns.chunk_versioned_key(&tag, lsn);
+        let versioned_key = ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn);
         assert!(sim.get_standard(&versioned_key).unwrap().is_some());
 
         // Delta manifest has exactly one entry for this chunk.
-        let m = read_delta_manifest(&dir, &sim, &ns, lsn);
+        let m = read_delta_manifest(&dir, &sim, &ns, 1, lsn);
         let entries: Vec<_> = {
             // Re-open the bytes and count entries via entry_count field.
             let bytes = sim
-                .get_standard(&ns.delta_manifest_key(lsn))
+                .get_standard(&ns.delta_manifest_key(1, lsn))
                 .unwrap()
                 .unwrap();
             let path = dir.path().join(TIKO_DIR).join("count.tikm");
@@ -551,9 +570,9 @@ mod tests {
         write_eviction_log(&ckpt_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xEE);
 
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
-        let m = read_delta_manifest(&dir, &sim, &ns, lsn);
+        let m = read_delta_manifest(&dir, &sim, &ns, 1, lsn);
         assert!(
             m.lookup(&tag).unwrap().is_some(),
             "chunk must be in manifest after re-processing .ckpt"
@@ -580,13 +599,14 @@ mod tests {
         write_eviction_log(&log_path, &tags);
         setup_express(&sim, &ns, &tags, 0xDD);
 
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
-        let m = read_delta_manifest(&dir, &sim, &ns, lsn);
+        let m = read_delta_manifest(&dir, &sim, &ns, 1, lsn);
         for tag in &tags {
             let cref = m.lookup(tag).unwrap().expect("tag must be in manifest");
             assert_eq!(cref.lsn, lsn, "lsn must equal checkpoint_lsn");
             assert_eq!(cref.branch_id, ns.branch_id, "branch_id must be own");
+            assert_eq!(cref.timeline_id, 1, "timeline_id must be 1");
         }
     }
 
@@ -606,9 +626,9 @@ mod tests {
         setup_express(&sim, &ns, &[tag], 0xFF);
 
         // First call — succeeds, removes .ckpt.
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
         let bytes_first = sim
-            .get_standard(&ns.delta_manifest_key(lsn))
+            .get_standard(&ns.delta_manifest_key(1, lsn))
             .unwrap()
             .unwrap();
 
@@ -617,9 +637,9 @@ mod tests {
         write_eviction_log(&ckpt_path, &[tag]);
 
         // Second call — must succeed and produce the same manifest content.
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
         let bytes_second = sim
-            .get_standard(&ns.delta_manifest_key(lsn))
+            .get_standard(&ns.delta_manifest_key(1, lsn))
             .unwrap()
             .unwrap();
 
@@ -644,7 +664,7 @@ mod tests {
         write_eviction_log(&log_path, &[make_tag(99)]);
         setup_express(&sim, &ns, &[make_tag(99)], 0x11);
 
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
         let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
         assert!(
@@ -666,11 +686,11 @@ mod tests {
         let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
         write_eviction_log(&log_path, &[]);
 
-        run_flush(&dir, &sim, &ns, lsn).unwrap();
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
         // No dirty chunks → no manifest should be written.
         assert!(
-            sim.get_standard(&ns.delta_manifest_key(lsn))
+            sim.get_standard(&ns.delta_manifest_key(1, lsn))
                 .unwrap()
                 .is_none(),
             "no delta manifest should be written when eviction log is empty"
@@ -707,7 +727,11 @@ mod tests {
             fork_number: 0,
             chunk_id: 0,
         };
-        let cref = ChunkRef { branch_id: 7, lsn };
+        let cref = ChunkRef {
+            branch_id: 7,
+            timeline_id: 1,
+            lsn,
+        };
         Manifest::new(lsn, 0, vec![(tag, cref)], HashMap::new(), &path).unwrap()
     }
 
@@ -719,9 +743,9 @@ mod tests {
         let lsn = Lsn::new(0x200);
         let manifest = make_manifest(dir.path(), lsn);
 
-        upload_delta_manifest(&sim, &ns, lsn, &manifest).unwrap();
+        upload_delta_manifest(&sim, &ns, 1, lsn, &manifest).unwrap();
 
-        let key = ns.delta_manifest_key(lsn);
+        let key = ns.delta_manifest_key(1, lsn);
         let bytes = sim.get_standard(&key).unwrap();
         assert!(bytes.is_some(), "delta manifest must be stored at {key}");
 
@@ -740,9 +764,9 @@ mod tests {
         let ns = ns();
         let lsn = Lsn::new(0x300);
 
-        upload_pg_state(&sim, &ns, lsn, dir.path()).unwrap();
+        upload_pg_state(&sim, &ns, 1, lsn, dir.path()).unwrap();
 
-        let key = ns.pg_state_key(lsn);
+        let key = ns.pg_state_key(1, lsn);
         let bytes = sim.get_standard(&key).unwrap();
         assert!(bytes.is_some(), "pg_state archive must exist at {key}");
         assert!(!bytes.unwrap().is_empty());
@@ -761,10 +785,13 @@ mod tests {
         let pg_xact = dir.path().join("pg_xact");
         fs::create_dir_all(&pg_xact).unwrap();
         fs::write(pg_xact.join("0000"), b"xact_segment").unwrap();
+        let pg_subtrans = dir.path().join("pg_subtrans");
+        fs::create_dir_all(&pg_subtrans).unwrap();
+        fs::write(pg_subtrans.join("0000"), b"subtrans_segment").unwrap();
 
-        upload_pg_state(&sim, &ns, lsn, dir.path()).unwrap();
+        upload_pg_state(&sim, &ns, 1, lsn, dir.path()).unwrap();
 
-        let bytes = sim.get_standard(&ns.pg_state_key(lsn)).unwrap().unwrap();
+        let bytes = sim.get_standard(&ns.pg_state_key(1, lsn)).unwrap().unwrap();
 
         let decompressed = zstd::decode_all(bytes.as_slice()).unwrap();
         let mut archive = tar::Archive::new(decompressed.as_slice());
@@ -781,6 +808,10 @@ mod tests {
         assert!(
             entry_names.iter().any(|n| n.contains("pg_xact")),
             "pg_xact segment must be in archive; found: {entry_names:?}"
+        );
+        assert!(
+            entry_names.iter().any(|n| n.contains("pg_subtrans")),
+            "pg_subtrans segment must be in archive; found: {entry_names:?}"
         );
     }
 }
