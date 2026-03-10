@@ -203,7 +203,7 @@ fn checkpoint_flush_inner(
 
     // Step 4 — three-step write for each dirty chunk.
     for chunk_key in &dirty_chunks {
-        let latest_key = ns.chunk_latest_key(chunk_key);
+        let latest_key = ns.chunk_latest_key(chunk_key, timeline);
         // Read data from express `latest` — populated by `flush_dirty_chunk`.
         // Fall back to zeros if the PUT failed for some reason (safe: WAL covers it).
         let chunk_data = sim
@@ -430,7 +430,7 @@ mod tests {
     ) -> Vec<u8> {
         let chunk_data = vec![fill; CHUNK_SIZE];
         for tag in tags {
-            sim.put_express_latest(ns, tag, &chunk_data).unwrap();
+            sim.put_express_latest(ns, tag, 1, &chunk_data).unwrap();
         }
         chunk_data
     }

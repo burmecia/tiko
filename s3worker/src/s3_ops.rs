@@ -73,7 +73,10 @@ fn try_fetch_chunk_from_s3_with(
     }
 
     // Level 1: express-bucket latest (own current checkpoint state).
-    let latest_key = ns.chunk_latest_key(tag);
+    let tl = ProjectCtx::try_get()
+        .map(|c| c.current_timeline_id())
+        .unwrap_or(1);
+    let latest_key = ns.chunk_latest_key(tag, tl);
     if let Ok(Some(data)) = sim.get_express(&latest_key) {
         return Some(data);
     }
@@ -451,7 +454,9 @@ pub fn cached_write_blocks(
     if !cache_is_available() {
         // initdb: chunk-level read-modify-write on SimStore express.
         let sim = SimStore::get();
-        let ns = ProjectCtx::get().ns();
+        let ctx = ProjectCtx::get();
+        let ns = ctx.ns();
+        let timeline = ctx.current_timeline_id();
         for i in 0..nblocks {
             let blkno = block_number + i;
             let chunk_tag = ChunkTag::from_block(rf, blkno);
@@ -460,7 +465,7 @@ pub fn cached_write_blocks(
             let buf = unsafe { std::slice::from_raw_parts(buffer_ptr.add(buf_offset), BLCKSZ) };
 
             // Read existing chunk from express (or use zeros for a new chunk).
-            let latest_key = ns.chunk_latest_key(&chunk_tag);
+            let latest_key = ns.chunk_latest_key(&chunk_tag, timeline);
             let mut chunk_data = match sim.get_express(&latest_key) {
                 Ok(Some(data)) if data.len() == CHUNK_SIZE => data,
                 _ => vec![0u8; CHUNK_SIZE],
@@ -658,7 +663,7 @@ mod tests {
 
         // Put chunk data in express latest; no backing file needed.
         let data = chunk_data(0xAB);
-        sim.put_express_latest(&ns, &tag, &data).unwrap();
+        sim.put_express_latest(&ns, &tag, 1, &data).unwrap();
 
         // Level-1 should hit.
         let result = try_fetch_chunk_from_s3_with(&sim, &ns, &tag);
@@ -747,7 +752,10 @@ mod tests {
         sim.put_standard(&versioned_key, &data).unwrap();
 
         // Ensure nothing in express (level-1 would miss).
-        assert_eq!(sim.get_express(&ns.chunk_latest_key(&tag)).unwrap(), None);
+        assert_eq!(
+            sim.get_express(&ns.chunk_latest_key(&tag, 1)).unwrap(),
+            None
+        );
 
         // Build a local manifest with the chunk entry.
         let manifest_path = dir.path().join("test_manifest.tikm");
@@ -833,7 +841,7 @@ mod tests {
 
         // Put data in express latest — it must NOT be returned in recovery mode.
         let data = chunk_data(0xEE);
-        sim.put_express_latest(&ns, &tag, &data).unwrap();
+        sim.put_express_latest(&ns, &tag, 1, &data).unwrap();
 
         // With recovery mode on and no versioned match for tag(500), the result
         // is None (recovery mode does not fall through to express latest).

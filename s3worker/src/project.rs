@@ -56,13 +56,14 @@ impl ProjectNamespace {
 
     // ── Express-bucket keys ───────────────────────────────────────────────
 
-    /// `{org}/{proj}/chunks/{chunk_path}/latest`
-    pub fn chunk_latest_key(&self, tag: &ChunkTag) -> String {
+    /// `{org}/{proj}/chunks/{chunk_path}/{tl:08X}/latest`
+    pub fn chunk_latest_key(&self, tag: &ChunkTag, timeline: u32) -> String {
         format!(
-            "{}/{}/chunks/{}/latest",
+            "{}/{}/chunks/{}/{:08X}/latest",
             self.org_id,
             self.project_id,
-            tag.to_path()
+            tag.to_path(),
+            timeline,
         )
     }
 
@@ -1167,7 +1168,7 @@ mod module7_tests {
         let branch_lsn = Lsn::new(0x100);
 
         // Express: a chunk latest
-        sim.put_express(&ns.chunk_latest_key(&tag(1)), b"hot-data")
+        sim.put_express(&ns.chunk_latest_key(&tag(1), 1), b"hot-data")
             .unwrap();
 
         // Standard PITR: a base manifest
@@ -1201,7 +1202,7 @@ mod module7_tests {
 
         // Express data removed
         assert_eq!(
-            sim.get_express(&ns.chunk_latest_key(&tag(1))).unwrap(),
+            sim.get_express(&ns.chunk_latest_key(&tag(1), 1)).unwrap(),
             None
         );
         // PITR data removed

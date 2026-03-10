@@ -820,7 +820,10 @@ impl CacheControl {
         ) {
             let mut chunk_data = vec![0u8; CHUNK_SIZE];
             self.read_blocks_from_slot(slot_index, 0, BLOCKS_PER_CHUNK, &mut chunk_data);
-            if sim.put_express_latest(ctx.ns(), &tag, &chunk_data).is_ok() {
+            if sim
+                .put_express_latest(ctx.ns(), &tag, ctx.current_timeline_id(), &chunk_data)
+                .is_ok()
+            {
                 // Clear dirty only after a successful PUT — if the PUT failed,
                 // the slot stays dirty so the next checkpoint retries.
                 meta.dirty_blocks.store(0, Ordering::Release);
@@ -1228,11 +1231,11 @@ mod tests {
         let tag = make_tag(42);
         let data = vec![0u8; CHUNK_SIZE];
 
-        sim.put_express_latest(&ns, &tag, &data).unwrap();
+        sim.put_express_latest(&ns, &tag, 1, &data).unwrap();
 
         // Express latest must exist.
         assert!(
-            sim.get_express(&ns.chunk_latest_key(&tag))
+            sim.get_express(&ns.chunk_latest_key(&tag, 1))
                 .unwrap()
                 .is_some()
         );

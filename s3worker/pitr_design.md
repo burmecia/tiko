@@ -266,8 +266,9 @@ location.
 // Normal mode (not recovery.signal)
 fn read_chunk(project: &ProjectCtx, key: &ChunkKey) -> Bytes {
     // Level 1: own express-bucket latest (written by this project after branch point)
-    if let Ok(data) = get(express, &format!("{}/{}/chunks/{key}/latest",
-                                            project.org_id, project.project_id))
+    if let Ok(data) = get(express, &format!("{}/{}/chunks/{key}/{:08X}/latest",
+                                            project.org_id, project.project_id,
+                                            project.current_timeline_id))
     {
         return data;
     }
@@ -300,8 +301,8 @@ recovery target LSN.
 Every project writes exclusively to its own `branch_id`. The parent's chunk
 namespace is never written by a child.
 
-- **Express-bucket** (hot `latest`, per-project):
-  `{org_id}/{project_id}/chunks/{key}/latest`
+- **Express-bucket** (hot `latest`, per-project, per-timeline):
+  `{org_id}/{project_id}/chunks/{key}/{tl:08X}/latest`
 - **Standard-bucket** (immutable PITR archive, org-level):
   `{org_id}/chunks/{branch_id}/{key}/{lsn_hex}`
 
@@ -473,7 +474,7 @@ and durability requirements, so they live in different S3 service types:
 
 | Bucket type | Contents | Why |
 |---|---|---|
-| **S3 Express One Zone** (Directory Bucket) | `{org}/{proj}/chunks/{key}/latest` | Single-digit ms GET on every cache miss; `RenameObject` available |
+| **S3 Express One Zone** (Directory Bucket) | `{org}/{proj}/chunks/{key}/{tl:08X}/latest` | Single-digit ms GET on every cache miss; `RenameObject` available |
 | **Standard S3** (multi-AZ) | `{org}/chunks/{branch_id}/{key}/{tl:08X}/{lsn_hex}`, `{org}/pitr/{proj}/deltas/{tl:08X}/…`, `{org}/pitr/{proj}/bases/{tl:08X}/…`, WAL | 11-9s durability for PITR archive; Intelligent-Tiering; rarely read |
 
 Express One Zone's single-AZ limitation is acceptable for `latest`: it is
@@ -488,7 +489,8 @@ the ground truth for recovery.
 {org_id}/{project_id}/
   chunks/
     {spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}/
-      latest              ← full 256 KB chunk data at current checkpoint LSN
+      {timeline:08X}/
+        latest            ← full 256 KB chunk data at current checkpoint LSN
                             atomically replaced by RenameObject each checkpoint
 
 ── standard-bucket (Standard S3, multi-AZ) ─────────────────────────────────
@@ -601,9 +603,9 @@ PUT  express-bucket/{org}/{proj}/chunks/{key}/.staging_{lsn_X_hex}   ← 256 KB
 COPY express-bucket/{org}/{proj}/chunks/{key}/.staging_{lsn_X_hex}
   →  standard-bucket/{org}/chunks/{branch_id}/{key}/{lsn_X_hex}
 
-// Step 3: Atomically replace latest in Express One Zone (per-project).
+// Step 3: Atomically replace latest in Express One Zone (per-project, per-timeline).
 Rename express-bucket/{org}/{proj}/chunks/{key}/.staging_{lsn_X_hex}
-    →  express-bucket/{org}/{proj}/chunks/{key}/latest
+    →  express-bucket/{org}/{proj}/chunks/{key}/{tl:08X}/latest
 ```
 
 Steps 1 → 2 → 3 are strictly sequential for a single chunk: the COPY
@@ -646,7 +648,7 @@ incorrect base data.
 When a dirty chunk is evicted, `flush_dirty_chunk()` is extended to:
 
 1. Write chunk data to express-bucket `latest` with a plain PUT
-   (`{org}/{proj}/chunks/{key}/latest`). No staging key, no standard-bucket
+   (`{org}/{proj}/chunks/{key}/{tl:08X}/latest`). No staging key, no standard-bucket
    copy — those happen at the next checkpoint.
 2. Append a fixed-size 20-byte record to `$PGDATA/tiko/eviction_log` **after**
    the PUT succeeds.

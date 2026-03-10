@@ -148,7 +148,7 @@ impl SimStore {
     ) -> io::Result<()> {
         let staging = ns.chunk_staging_key(key, checkpoint_lsn);
         let versioned = ns.chunk_versioned_key(key, ns.branch_id, timeline, checkpoint_lsn);
-        let latest = ns.chunk_latest_key(key);
+        let latest = ns.chunk_latest_key(key, timeline);
         self.put_express(&staging, data)?;
         self.copy_express_to_standard(&staging, &versioned)?;
         self.rename_express(&staging, &latest)?;
@@ -161,9 +161,10 @@ impl SimStore {
         &self,
         ns: &ProjectNamespace,
         key: &ChunkTag,
+        timeline: u32,
         data: &[u8],
     ) -> io::Result<()> {
-        self.put_express(&ns.chunk_latest_key(key), data)
+        self.put_express(&ns.chunk_latest_key(key, timeline), data)
     }
 }
 
@@ -291,10 +292,12 @@ mod tests {
         let tag = chunk_tag();
         let lsn = Lsn::new(0x100);
 
-        store.put_express_latest(&ns, &tag, b"chunk-data").unwrap();
+        store
+            .put_express_latest(&ns, &tag, 1, b"chunk-data")
+            .unwrap();
 
         // latest exists
-        let latest_key = ns.chunk_latest_key(&tag);
+        let latest_key = ns.chunk_latest_key(&tag, 1);
         assert_eq!(
             store.get_express(&latest_key).unwrap(),
             Some(b"chunk-data".to_vec())
@@ -324,7 +327,7 @@ mod tests {
 
         // latest in express
         assert_eq!(
-            store.get_express(&ns.chunk_latest_key(&tag)).unwrap(),
+            store.get_express(&ns.chunk_latest_key(&tag, 1)).unwrap(),
             Some(b"block-data".to_vec())
         );
         // versioned in standard
@@ -349,7 +352,7 @@ mod tests {
         let lsn = Lsn::new(0x300);
 
         // Simulate pre-existing latest
-        store.put_express_latest(&ns, &tag, b"old-data").unwrap();
+        store.put_express_latest(&ns, &tag, 1, b"old-data").unwrap();
 
         // Step 1 only: staging written
         let staging = ns.chunk_staging_key(&tag, lsn);
@@ -357,7 +360,7 @@ mod tests {
 
         // latest unchanged, no versioned object
         assert_eq!(
-            store.get_express(&ns.chunk_latest_key(&tag)).unwrap(),
+            store.get_express(&ns.chunk_latest_key(&tag, 1)).unwrap(),
             Some(b"old-data".to_vec())
         );
         assert_eq!(
@@ -375,7 +378,7 @@ mod tests {
         let tag = chunk_tag();
         let lsn = Lsn::new(0x400);
 
-        store.put_express_latest(&ns, &tag, b"old-data").unwrap();
+        store.put_express_latest(&ns, &tag, 1, b"old-data").unwrap();
 
         // Steps 1 + 2: staging + versioned written, rename not done
         let staging = ns.chunk_staging_key(&tag, lsn);
@@ -389,7 +392,7 @@ mod tests {
 
         // latest still old
         assert_eq!(
-            store.get_express(&ns.chunk_latest_key(&tag)).unwrap(),
+            store.get_express(&ns.chunk_latest_key(&tag, 1)).unwrap(),
             Some(b"old-data".to_vec())
         );
         // versioned is valid
@@ -408,8 +411,8 @@ mod tests {
         let ns = ProjectNamespace::new(1, 42, 7);
         let tag = chunk_tag();
         assert_eq!(
-            ns.chunk_latest_key(&tag),
-            "1/42/chunks/1663/5/1000.0/3/latest"
+            ns.chunk_latest_key(&tag, 1),
+            "1/42/chunks/1663/5/1000.0/3/00000001/latest"
         );
     }
 
