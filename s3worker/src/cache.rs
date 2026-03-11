@@ -117,7 +117,9 @@ pub struct ChunkTag {
 // write(2) with O_APPEND is atomic on local Linux/macOS filesystems
 // (kernel serialises concurrent appenders via the inode lock).
 // pwrite(2) must NOT be used: POSIX specifies that pwrite ignores O_APPEND.
-const _: () = assert!(std::mem::size_of::<ChunkTag>() == 20);
+/// Wire size of a serialised `ChunkTag` (5 × u32 LE).
+pub const CHUNK_TAG_SIZE: usize = 20;
+const _: () = assert!(std::mem::size_of::<ChunkTag>() == CHUNK_TAG_SIZE);
 
 impl ChunkTag {
     /// Construct a ChunkTag from a [`RelFork`] and a block number.

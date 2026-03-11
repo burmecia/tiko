@@ -37,20 +37,25 @@ use std::sync::Mutex;
 use pgsys::Lsn;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::{ChunkTag, RelFork};
+use crate::cache::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
 
 // ── TIKM constants ──
 
 const TIKM_MAGIC: [u8; 4] = *b"TIKM";
 const TIKM_VERSION: u32 = 1;
 /// Header size in bytes.
-const HEADER_SIZE: u64 = 32;
+const HEADER_SIZE: usize = 32;
 /// Entry size in bytes (ChunkTag[20] + ChunkRef[20]).
-const ENTRY_SIZE: u64 = 40;
+const ENTRY_SIZE: usize = crate::cache::CHUNK_TAG_SIZE + CHUNK_REF_SIZE;
 
 // ── ChunkRef ──
 
 /// Reference to a specific version of a chunk stored in S3.
+///
+/// Note: no `#[repr(C)]` and no `size_of` assert here — `ChunkRef` is never
+/// cast to raw bytes. Its in-memory size is 24 bytes (4-byte alignment padding
+/// between `timeline_id: u32` and `lsn: u64`), while the wire encoding is 20
+/// bytes. The wire size is enforced by `encode() -> [u8; 20]`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ChunkRef {
     /// Branch-scoped id: selects `{org}/chunks/{branch_id}/` in the standard bucket.
@@ -80,6 +85,12 @@ impl ChunkRef {
         }
     }
 }
+
+/// Wire size of a serialised `ChunkRef` (u64 + u32 + u64 LE, no padding).
+const CHUNK_REF_SIZE: usize = 20;
+// In-memory size is 24 (4-byte padding after timeline_id:u32 before lsn:u64); wire
+// encoding is 20 (explicit encode/decode, no padding). Catches accidental layout changes.
+const _: () = assert!(std::mem::size_of::<ChunkRef>() == 24);
 
 // ── ManifestInner ──
 
@@ -177,15 +188,19 @@ fn read_all_entries(inner: &ManifestInner) -> io::Result<Vec<(ChunkTag, ChunkRef
     if n == 0 {
         return Ok(Vec::new());
     }
-    let byte_len = n * ENTRY_SIZE as usize;
+    let byte_len = n * ENTRY_SIZE;
     let mut buf = vec![0u8; byte_len];
-    pread_exact(&inner.file, &mut buf, HEADER_SIZE)?;
+    pread_exact(&inner.file, &mut buf, HEADER_SIZE as _)?;
 
     let mut entries = Vec::with_capacity(n);
     for i in 0..n {
-        let off = i * ENTRY_SIZE as usize;
-        let tag = ChunkTag::decode(buf[off..off + 20].try_into().unwrap());
-        let cref = ChunkRef::decode(buf[off + 20..off + 40].try_into().unwrap());
+        let off = i * ENTRY_SIZE;
+        let tag = ChunkTag::decode(buf[off..off + CHUNK_TAG_SIZE].try_into().unwrap());
+        let cref = ChunkRef::decode(
+            buf[off + CHUNK_TAG_SIZE..off + ENTRY_SIZE]
+                .try_into()
+                .unwrap(),
+        );
         entries.push((tag, cref));
     }
     Ok(entries)
@@ -340,13 +355,14 @@ impl Manifest {
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let offset = HEADER_SIZE + mid * ENTRY_SIZE;
+            let offset = HEADER_SIZE as u64 + mid * ENTRY_SIZE as u64;
             pread_exact(&inner.file, &mut buf, offset)?;
 
-            let tag = ChunkTag::decode(buf[0..20].try_into().unwrap());
+            let tag = ChunkTag::decode(buf[0..CHUNK_TAG_SIZE].try_into().unwrap());
             match tag.cmp(key) {
                 Ordering::Equal => {
-                    let cref = ChunkRef::decode(buf[20..40].try_into().unwrap());
+                    let cref =
+                        ChunkRef::decode(buf[CHUNK_TAG_SIZE..ENTRY_SIZE].try_into().unwrap());
                     return Ok(Some(cref));
                 }
                 Ordering::Less => lo = mid + 1,
