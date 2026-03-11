@@ -20,3 +20,5 @@ cp ../tmp/postgresql.conf tt/
 ./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin/pg_ctl -D tt -l log.log start
 
 ./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin/psql -d postgres -f ./load_data.sql
+
+./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin/pg_ctl -D tt -l log.log stop
