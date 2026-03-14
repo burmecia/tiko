@@ -13,7 +13,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 pgsys = { path = "../pgsys" }
-s3worker = { path = "../s3worker" }
+worker = { path = "../worker" }
 store = { path = "../store" }
 tracing = { workspace = true }
 zstd = { workspace = true }

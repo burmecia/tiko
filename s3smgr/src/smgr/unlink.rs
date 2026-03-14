@@ -1,6 +1,6 @@
 use pgsys::{logging::pg_log_warning, smgr::*};
-use s3worker::cache::RelFork;
-use s3worker::s3_ops;
+use worker::cache::RelFork;
+use worker::s3_ops;
 
 /// Delete a relation's physical storage.
 ///

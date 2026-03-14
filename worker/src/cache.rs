@@ -20,8 +20,8 @@
 //!   divided into fixed 256 KB chunk slots. Slot N lives at byte offset
 //!   `N * CHUNK_SIZE`. Each chunk holds 32 contiguous 8 KB blocks.
 //! - **Metadata arrays**: slot metadata, hash table, and partition locks live
-//!   in PG shared memory as trailing arrays after `S3IoControl`.
-//! - **CacheControl**: embedded in `S3IoControl` in PG shared memory,
+//!   in PG shared memory as trailing arrays after `IoControl`.
+//! - **CacheControl**: embedded in `IoControl` in PG shared memory,
 //!   holding `num_slots` and `clock_hand`.
 //!
 //! # Write-Back Policy
@@ -33,7 +33,7 @@
 //! # Concurrency
 //!
 //! - Hash table partitions use `AtomicRWLock` (spin-based, in PG shared memory).
-//!   PG LWLocks cannot be used because Tokio threads in s3worker also access the
+//!   PG LWLocks cannot be used because Tokio threads in worker also access the
 //!   hash table (via `cached_read_blocks`/`cached_write_blocks` in `io_handler`),
 //!   and LWLocks require per-process state (`MyProc`) that isn't thread-safe.
 //! - Lookups hold a shared (read) lock. Insertions/evictions hold exclusive (write).
@@ -203,10 +203,10 @@ impl AtomicRWLock {
 
 // ── CacheControl ──
 
-/// Main cache control structure. Embedded in `S3IoControl` in PG shared memory.
+/// Main cache control structure. Embedded in `IoControl` in PG shared memory.
 ///
 /// The variable-size arrays (slot metadata, hash table, partition locks) follow
-/// `S3IoControl` as trailing arrays in the same shared memory allocation.
+/// `IoControl` as trailing arrays in the same shared memory allocation.
 /// Pointers to these arrays are stored here — valid in all processes because PG
 /// shared memory is mapped at the same virtual address (inherited via fork).
 #[repr(C)]
@@ -223,13 +223,13 @@ pub struct CacheControl {
 
 // Safety: CacheControl lives in PG shared memory. The raw pointers point into
 // the same shared memory region, mapped at identical virtual addresses in all
-// processes (inherited via fork). Tokio threads in s3worker also access these.
+// processes (inherited via fork). Tokio threads in worker also access these.
 unsafe impl Send for CacheControl {}
 unsafe impl Sync for CacheControl {}
 
 impl CacheControl {
     /// Initialize CacheControl fields and array pointers. Called once when
-    /// shared memory is first created (from `S3IoControl::init`).
+    /// shared memory is first created (from `IoControl::init`).
     pub fn init(
         &mut self,
         slots: *mut CacheSlotMeta,
@@ -551,12 +551,12 @@ impl CacheControl {
             let dirty = meta.dirty_blocks.load(Ordering::Acquire);
             if dirty != 0 {
                 self.flush_dirty_chunk(slot_index);
-                crate::io_queue::S3IoControl::get()
+                crate::io_queue::IoControl::get()
                     .stats
                     .dirty_evictions
                     .fetch_add(1, Ordering::Relaxed);
             }
-            crate::io_queue::S3IoControl::get()
+            crate::io_queue::IoControl::get()
                 .stats
                 .evictions
                 .fetch_add(1, Ordering::Relaxed);
@@ -821,7 +821,7 @@ impl CacheControl {
 
     /// Append a single chunk tag to the process-local eviction log.
     ///
-    /// Used by the initdb write path (`cached_write_blocks` without S3IoControl)
+    /// Used by the initdb write path (`cached_write_blocks` without IoControl)
     /// to ensure the shutdown checkpoint can discover and archive all chunks
     /// written during initdb, identical to what `flush_dirty_chunk` does on the
     /// normal (shmem-cache) path.

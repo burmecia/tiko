@@ -24,7 +24,7 @@ use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 
 use crate::{
     cache::{BLOCKS_PER_CHUNK, CHUNK_SIZE, CacheControl, ChunkTag, RelFork},
-    io_queue::S3IoControl,
+    io_queue::IoControl,
     project::{ProjectCtx, ProjectNamespace},
     recovery,
     sim_store::SimStore,
@@ -136,13 +136,13 @@ fn populate_cache_slot_from_s3(cache: &CacheControl, slot: u32, chunk_tag: &Chun
 ///
 /// Requires both conditions:
 /// - `is_under_postmaster()` — false during initdb (`--boot`/`--single`) where
-///   `MyProcNumber` is invalid and S3IoControl was never sized via
+///   `MyProcNumber` is invalid and IoControl was never sized via
 ///   `shmem_request_hook`.
-/// - `S3IoControl::is_initialized()` — false if the shmem startup hook has not
+/// - `IoControl::is_initialized()` — false if the shmem startup hook has not
 ///   yet run in this process (e.g. very early in backend startup).
 #[inline]
 fn cache_is_available() -> bool {
-    is_under_postmaster() && S3IoControl::is_initialized()
+    is_under_postmaster() && IoControl::is_initialized()
 }
 
 /// Map `std::io::Error` to a raw errno value.
@@ -259,7 +259,7 @@ pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
         return Ok(store);
     }
 
-    let cache_max = S3IoControl::get().cache.max_block_for_relation(rf);
+    let cache_max = IoControl::get().cache.max_block_for_relation(rf);
 
     Ok(store.max(cache_max))
 }
@@ -274,7 +274,7 @@ pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
 /// Falls back to only updating the nblocks key when the cache is unavailable.
 pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32> {
     if cache_is_available() {
-        S3IoControl::get().cache.invalidate_range(rf, nblocks);
+        IoControl::get().cache.invalidate_range(rf, nblocks);
     }
 
     let sim = SimStore::get();
@@ -312,7 +312,7 @@ pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32
 pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
     if cache_is_available() {
         // first_block=0 invalidates every chunk for this fork
-        S3IoControl::get().cache.invalidate_range(rf, 0);
+        IoControl::get().cache.invalidate_range(rf, 0);
     }
 
     let sim = SimStore::get();
@@ -366,7 +366,7 @@ pub fn cached_read_blocks(
         return Ok(nblocks);
     }
 
-    let control = S3IoControl::get();
+    let control = IoControl::get();
     let cache = &control.cache;
     let stats = &control.stats;
     stats
@@ -495,7 +495,7 @@ pub fn cached_write_blocks(
         return Ok(nblocks);
     }
 
-    let control = S3IoControl::get();
+    let control = IoControl::get();
     let cache = &control.cache;
     let stats = &control.stats;
     stats
@@ -572,7 +572,7 @@ pub fn warm_cache_blocks(
         return Ok(0);
     }
 
-    let control = S3IoControl::get();
+    let control = IoControl::get();
     let cache = &control.cache;
     let stats = &control.stats;
 

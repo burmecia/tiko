@@ -75,8 +75,8 @@ pub static RECOVERY_MODE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::ne
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{ChunkRef, Manifest};
     use crate::chunk::ChunkTag;
+    use crate::manifest::{ChunkRef, Manifest};
     use pgsys::Lsn;
     use std::collections::HashMap;
     use tempfile::TempDir;

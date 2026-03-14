@@ -1,14 +1,14 @@
 //! Shared async I/O pipeline for s3_readv / s3_writev.
 //!
 //! Both functions follow the same pattern:
-//!   claim slot → fill → publish → submit → wake s3worker → wait completion → read result → release
+//!   claim slot → fill → publish → submit → wake worker → wait completion → read result → release
 //!
 //! This module extracts that common logic into `submit_and_wait`.
 
 use std::sync::atomic::Ordering;
 
 use pgsys::{common::get_my_proc_number, latch::*, logging::*, smgr::*};
-use s3worker::io_queue::*;
+use worker::io_queue::*;
 
 /// POSIX ENOENT (No such file or directory) — constant to avoid libc dependency.
 const ENOENT: i32 = 2;
@@ -22,7 +22,7 @@ pub struct IoResult {
 
 /// Submit an I/O request through the async pipeline and block until completion.
 ///
-/// Returns `Some(IoResult)` on normal completion, or `None` if s3worker died
+/// Returns `Some(IoResult)` on normal completion, or `None` if worker died
 /// at any point during the pipeline (the caller should handle this — currently
 /// we just log and return, matching the pre-refactor behavior).
 ///
@@ -30,7 +30,7 @@ pub struct IoResult {
 /// Caller must ensure `reln` is a valid PG SMgrRelation pointer and
 /// `buffer_ptr` points to a valid PG buffer page.
 pub unsafe fn submit_and_wait(
-    op: S3IoOpKind,
+    op: IoOpKind,
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     blocknum: BlockNumber,
@@ -79,7 +79,7 @@ pub unsafe fn submit_and_wait(
 /// `pgaio_io_perform_synchronously`'s `START_CRIT_SECTION()`, where `elog(ERROR)`
 /// escalates to PANIC. Uses `pg_log_warning` for diagnostics instead.
 pub unsafe fn submit_and_wait_raw(
-    op: S3IoOpKind,
+    op: IoOpKind,
     spc_oid: Oid,
     db_oid: Oid,
     rel_number: RelFileNumber,
@@ -91,7 +91,7 @@ pub unsafe fn submit_and_wait_raw(
     label: &str,
 ) -> Result<IoResult, i32> {
     unsafe {
-        let control = S3IoControl::get();
+        let control = IoControl::get();
         let proc_num = get_my_proc_number();
         let pool = control.backend_pool(proc_num);
 
@@ -100,9 +100,9 @@ pub unsafe fn submit_and_wait_raw(
             if let Some(idx) = pool.try_claim() {
                 break idx;
             }
-            if !control.is_s3worker_alive() {
+            if !control.is_worker_alive() {
                 pg_log_warning(&format!(
-                    "{}({}): s3worker is not running, cannot process I/O",
+                    "{}({}): worker is not running, cannot process I/O",
                     label, proc_num
                 ));
                 return Err(ENOENT);
@@ -116,7 +116,7 @@ pub unsafe fn submit_and_wait_raw(
         let slot = pool.slot(slot_idx);
 
         // 2. Fill request fields via raw pointer (private to this backend, no races).
-        let slot_ptr = slot as *const S3IoSlot as *mut S3IoSlot;
+        let slot_ptr = slot as *const IoSlot as *mut IoSlot;
         (*slot_ptr).op = op;
         (*slot_ptr).spc_oid = spc_oid;
         (*slot_ptr).db_oid = db_oid;
@@ -135,10 +135,10 @@ pub unsafe fn submit_and_wait_raw(
 
         // 4. Push to MPSC submit queue.
         while !control.submit_queue.push(proc_num as u32, slot_idx as u8) {
-            if !control.is_s3worker_alive() {
+            if !control.is_worker_alive() {
                 pool.release(slot_idx);
                 pg_log_warning(&format!(
-                    "{}({}): s3worker died while waiting to submit",
+                    "{}({}): worker died while waiting to submit",
                     label, proc_num
                 ));
                 return Err(ENOENT);
@@ -155,10 +155,10 @@ pub unsafe fn submit_and_wait_raw(
             );
         }
 
-        // 5. Wake s3worker via SetLatch
-        let s3worker_latch = control.s3worker_latch.load(Ordering::Acquire) as *mut Latch;
-        if !s3worker_latch.is_null() {
-            SetLatch(s3worker_latch);
+        // 5. Wake worker via SetLatch
+        let worker_latch = control.worker_latch.load(Ordering::Acquire) as *mut Latch;
+        if !worker_latch.is_null() {
+            SetLatch(worker_latch);
         }
 
         pg_log_debug2(&format!(
@@ -172,10 +172,10 @@ pub unsafe fn submit_and_wait_raw(
             if slot.current_state() == SlotState::Completed {
                 break;
             }
-            if !control.is_s3worker_alive() {
+            if !control.is_worker_alive() {
                 pool.release(slot_idx);
                 pg_log_warning(&format!(
-                    "{}({}): s3worker died while waiting for I/O completion",
+                    "{}({}): worker died while waiting for I/O completion",
                     label, proc_num
                 ));
                 return Err(ENOENT);

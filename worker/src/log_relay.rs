@@ -5,7 +5,7 @@
 //! CurrentMemoryContext, etc.) that only exists on the main PG thread.
 //!
 //! Instead, Tokio tasks call [`relay_log`] which sends `(elevel, message)`
-//! pairs through a bounded channel.  The s3worker main loop drains the channel
+//! pairs through a bounded channel.  The tiko worker main loop drains the channel
 //! with [`drain`] on every iteration and forwards each message to `pg_log`.
 //!
 //! If the channel is full or not yet initialised the message falls back to
@@ -38,15 +38,15 @@ pub fn relay_log(elevel: i32, msg: impl Into<String>) {
         match tx.try_send((elevel, msg.clone())) {
             Ok(()) => return,
             Err(TrySendError::Full(_)) => {
-                eprintln!("s3worker: log_relay: channel full, dropping to stderr: {msg}");
+                eprintln!("tiko: log_relay: channel full, dropping to stderr: {msg}");
             }
             Err(TrySendError::Disconnected(_)) => {
-                eprintln!("{msg}");
+                eprintln!("tiko: log_relay: channel disconnected, dropping to stderr: {msg}");
             }
         }
     } else {
         // Channel not yet initialised (startup race).
-        eprintln!("{msg}");
+        eprintln!("tiko: log_relay: channel not initialised, dropping to stderr: {msg}");
     }
 }
 

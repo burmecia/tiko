@@ -56,7 +56,7 @@ pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, conf
     // state).  Use log_relay::relay_* instead — messages are queued and forwarded
     // to pg_log_* by the main PG thread each loop iteration.
     log_relay::relay_info(format!(
-        "s3worker: pitr_background_task started (project={}, interval={}s)",
+        "tiko: pitr_background_task started (project={}, interval={}s)",
         ns.project_id,
         config.materialization_interval.as_secs(),
     ));
@@ -72,7 +72,7 @@ pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, conf
         match materialize_base(&sim, &ns, timeline) {
             Ok(MaterializeResult::NoNewDeltas { base_lsn }) => {
                 log_relay::relay_info(format!(
-                    "s3worker: pitr: no new deltas since base {base_lsn} — skipping (project={})",
+                    "tiko: pitr: no new deltas since base {base_lsn} — skipping (project={})",
                     ns.project_id
                 ));
             }
@@ -82,7 +82,7 @@ pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, conf
                 delta_count,
             }) => {
                 log_relay::relay_info(format!(
-                    "s3worker: pitr: materialized new base at lsn={} \
+                    "tiko: pitr: materialized new base at lsn={} \
                      ({delta_count} delta(s) merged, prev_base={prev_base_lsn}, project={})",
                     new_lsn.to_hex(),
                     ns.project_id,
@@ -90,7 +90,7 @@ pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, conf
             }
             Err(e) => {
                 log_relay::relay_warning(format!(
-                    "s3worker: pitr: materialize_base failed (project={}): {e}",
+                    "tiko: pitr: materialize_base failed (project={}): {e}",
                     ns.project_id
                 ));
             }
@@ -174,9 +174,7 @@ pub fn materialize_base(
 
     // Step 3: nothing new to merge.
     if delta_lsns.is_empty() {
-        log_relay::relay_debug1(format!(
-            "s3worker: pitr: no new deltas since base {base_lsn}"
-        ));
+        log_relay::relay_debug1(format!("tiko: pitr: no new deltas since base {base_lsn}"));
         return Ok(MaterializeResult::NoNewDeltas { base_lsn });
     }
 
@@ -203,7 +201,7 @@ pub fn materialize_base(
     let new_lsn = *delta_lsns.last().unwrap(); // non-empty: checked above
     let delta_count = delta_lsns.len();
     log_relay::relay_debug1(format!(
-        "s3worker: pitr: uploading new base manifest at lsn={} ({} delta(s) merged, prev_base={})",
+        "tiko: pitr: uploading new base manifest at lsn={} ({} delta(s) merged, prev_base={})",
         new_lsn.to_hex(),
         delta_count,
         base_lsn,

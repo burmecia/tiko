@@ -20,8 +20,8 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use s3worker::project::{ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, ProjectNamespace};
-use s3worker::sim_store::SimStore;
+use store::project::{ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, ProjectNamespace};
+use store::sim_store::SimStore;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

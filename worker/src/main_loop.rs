@@ -1,6 +1,6 @@
-//! Main event loop for s3worker background process
+//! Main event loop for Tiko worker background process
 //!
-//! This module implements the core polling and event loop for the s3worker,
+//! This module implements the core polling and event loop for the Tiko worker,
 //! including signal handling, latch-based waiting, and request processing.
 //!
 //! The main loop pops entries from the MPSC submit queue and dispatches them
@@ -20,7 +20,7 @@ use pgsys::{
 
 use crate::dispatcher::Dispatcher;
 use crate::io_handler;
-use crate::io_queue::S3IoControl;
+use crate::io_queue::IoControl;
 use crate::log_relay;
 use crate::project::ProjectCtx;
 use crate::sim_store::SimStore;
@@ -51,22 +51,22 @@ fn setup_signal_handlers() {
         pgsys::bgworker::BackgroundWorkerUnblockSignals();
     }
 
-    pg_log_info("s3worker: signal handlers installed");
+    pg_log_info("tiko: signal handlers installed");
 }
 
-/// Wait event identifier for s3worker main loop
-static mut WAIT_EVENT_S3WORKER_MAIN: u32 = 0;
+/// Wait event identifier for Tiko worker main loop
+static mut WAIT_EVENT_TIKO_WORKER_MAIN: u32 = 0;
 
-/// Main event loop for s3worker
+/// Main event loop for worker
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
-    pg_log_info("s3worker: main loop starting");
+pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
+    pg_log_info("tiko: main loop starting");
 
     setup_signal_handlers();
 
     // Initialize wait event identifiers for this worker
     unsafe {
-        WAIT_EVENT_S3WORKER_MAIN = new_wait_event(c"S3WorkerMain".as_ptr());
+        WAIT_EVENT_TIKO_WORKER_MAIN = new_wait_event(c"TikoWorkerMain".as_ptr());
     }
 
     // Initialize the log relay channel before spawning any Tokio tasks so that
@@ -76,7 +76,7 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
     // Initialize Tokio runtime for async I/O
     if let Err(e) = crate::thread_pool::init_tokio_runtime() {
         pg_log_error(&format!(
-            "s3worker: failed to initialize Tokio runtime: {:?}",
+            "tiko: failed to initialize Tokio runtime: {:?}",
             e
         ));
         return;
@@ -97,21 +97,21 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
     thread_pool::spawn_pitr_task(&data_dir);
 
     // Get shared memory IO control structure
-    let io_control = S3IoControl::get();
+    let io_control = IoControl::get();
 
     // Store our PID and latch so backends can check liveness and wake us
     io_control
-        .s3worker_pid
+        .worker_pid
         .store(unsafe { MyProcPid } as u32, Ordering::Relaxed);
     io_control
-        .s3worker_latch
+        .worker_latch
         .store(unsafe { MyLatch } as u64, Ordering::Release);
 
     // Statistics
     let mut loop_count = 0u64;
     let mut requests_processed = 0u64;
 
-    pg_log_info("s3worker: initialized and entering main loop");
+    pg_log_info("tiko: initialized and entering main loop");
 
     // Main event loop
     while !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
@@ -132,7 +132,7 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
         // Periodic logging
         if loop_count % 4 == 0 {
             pg_log_debug2(&format!(
-                "s3worker: loop_count={}, requests={}",
+                "tiko: loop_count={}, requests={}",
                 loop_count, requests_processed
             ));
         }
@@ -148,13 +148,13 @@ pub extern "C-unwind" fn s3worker_main(_arg: *mut c_void) {
 
     io_control.stats.log_summary();
     pg_log_info(&format!(
-        "s3worker: shutting down (loops={}, requests={})",
+        "tiko: shutting down (loops={}, requests={})",
         loop_count, requests_processed
     ));
 
     // Clear latch and PID so backends detect shutdown
-    io_control.s3worker_latch.store(0, Ordering::Release);
-    io_control.s3worker_pid.store(0, Ordering::Release);
+    io_control.worker_latch.store(0, Ordering::Release);
+    io_control.worker_pid.store(0, Ordering::Release);
 
     thread_pool::shutdown_tokio_runtime();
 }
@@ -165,7 +165,9 @@ fn wait_for_work() {
     const TIMEOUT_MS: i64 = 1000;
 
     let latch = LatchGuard::current();
-    let rc = latch.wait(WAIT_FLAGS, TIMEOUT_MS, unsafe { WAIT_EVENT_S3WORKER_MAIN });
+    let rc = latch.wait(WAIT_FLAGS, TIMEOUT_MS, unsafe {
+        WAIT_EVENT_TIKO_WORKER_MAIN
+    });
 
     if (rc & WL_LATCH_SET) != 0 {
         latch.reset();

@@ -649,8 +649,8 @@ pub fn delete_branch(sim: &SimStore, branch_ns: &ProjectNamespace) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ChunkRef;
     use crate::chunk::ChunkTag;
+    use crate::manifest::ChunkRef;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -918,8 +918,8 @@ mod tests {
 #[cfg(test)]
 mod module7_tests {
     use super::*;
-    use crate::manifest::ChunkRef;
     use crate::chunk::ChunkTag;
+    use crate::manifest::ChunkRef;
     use std::collections::HashMap;
     use tempfile::TempDir;
 

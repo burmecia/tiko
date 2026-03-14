@@ -1,4 +1,4 @@
-//! I/O request processing for s3worker's Tokio runtime.
+//! I/O request processing for Tiko worker's Tokio runtime.
 //!
 //! This module receives dispatched I/O requests and performs the actual
 //! block-level I/O via `s3_ops::read_blocks` / `s3_ops::write_blocks`.
@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::cache::RelFork;
 use crate::dispatcher::IoWorkRequest;
-use crate::io_queue::{S3IoControl, S3IoOpKind};
+use crate::io_queue::{IoControl, IoOpKind};
 use crate::s3_ops;
 
 /// Main I/O worker loop — receives requests from the dispatcher channel
@@ -38,7 +38,7 @@ pub async fn io_worker_loop(mut rx: mpsc::Receiver<IoWorkRequest>) {
 /// Looks up the slot in shared memory, performs the I/O operation,
 /// writes results to the slot, marks it completed, and wakes the backend via SetLatch.
 async fn process_io_request(request: IoWorkRequest) {
-    let control = S3IoControl::get();
+    let control = IoControl::get();
     let pool = control.backend_pool(request.backend_id as i32);
     let slot = pool.slot(request.slot_index as usize);
 
@@ -51,21 +51,21 @@ async fn process_io_request(request: IoWorkRequest) {
 
     // Perform I/O based on operation type
     let (status, nblocks) = match slot.op {
-        S3IoOpKind::Read => {
+        IoOpKind::Read => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *mut u8;
             match s3_ops::cached_read_blocks(rf, slot.block_number, slot.nblocks, buffer_ptr) {
                 Ok(n) => (0u32, n),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
-        S3IoOpKind::Write => {
+        IoOpKind::Write => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *const u8;
             match s3_ops::cached_write_blocks(rf, slot.block_number, slot.nblocks, buffer_ptr) {
                 Ok(n) => (0u32, n),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
-        S3IoOpKind::Exists => {
+        IoOpKind::Exists => {
             if s3_ops::store_exists(rf) {
                 (0u32, 1)
             } else {
@@ -73,32 +73,32 @@ async fn process_io_request(request: IoWorkRequest) {
                 (0u32, 0)
             }
         }
-        S3IoOpKind::Create => match s3_ops::store_create(rf) {
+        IoOpKind::Create => match s3_ops::store_create(rf) {
             Ok(created) => (0u32, if created { 1 } else { 0 }),
             Err(errno) => (errno as u32, 0u32),
         },
-        S3IoOpKind::Nblocks => match s3_ops::cached_file_nblocks(rf) {
+        IoOpKind::Nblocks => match s3_ops::cached_file_nblocks(rf) {
             Ok(n) => (0u32, n),
             Err(errno) => (errno as u32, 0u32),
         },
-        S3IoOpKind::Prefetch => {
+        IoOpKind::Prefetch => {
             match s3_ops::warm_cache_blocks(rf, slot.block_number, slot.nblocks) {
                 Ok(n) => (0u32, n),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
-        S3IoOpKind::Truncate => {
+        IoOpKind::Truncate => {
             // Target nblocks is stored in block_number
             match s3_ops::cached_truncate_file(rf, slot.block_number) {
                 Ok(()) => (0u32, 0u32),
                 Err(errno) => (errno as u32, 0u32),
             }
         }
-        S3IoOpKind::Unlink => match s3_ops::cached_delete_file(rf) {
+        IoOpKind::Unlink => match s3_ops::cached_delete_file(rf) {
             Ok(()) => (0u32, 0u32),
             Err(errno) => (errno as u32, 0u32),
         },
-        S3IoOpKind::ZeroExtend => {
+        IoOpKind::ZeroExtend => {
             match s3_ops::cached_zeroextend(rf, slot.block_number, slot.nblocks) {
                 Ok(()) => (0u32, 0u32),
                 Err(errno) => (errno as u32, 0u32),

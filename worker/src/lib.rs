@@ -5,7 +5,7 @@ pub mod pitr_task;
 pub mod s3_ops;
 
 // Re-export the shared store modules so existing dependents (s3smgr, tikod)
-// can still reference them via `s3worker::manifest` etc.
+// can still reference them via `worker::manifest` etc.
 pub use store::{manifest, project, recovery, sim_store};
 
 mod dispatcher;
@@ -46,7 +46,7 @@ pub extern "C-unwind" fn Pg_magic_func() -> &'static PgMagicStruct {
                 arr
             },
         },
-        name: c"s3worker".as_ptr(),
+        name: c"tiko".as_ptr(),
         version: c"1.0".as_ptr(),
     };
     &MAGIC
@@ -64,13 +64,13 @@ pub extern "C-unwind" fn _PG_init() {
 
     // Create a background worker struct
     let mut worker: BackgroundWorker = unsafe { std::mem::zeroed() };
-    utils::copy_str_to_c(&mut worker.bgw_name, "s3 background worker");
-    utils::copy_str_to_c(&mut worker.bgw_type, "s3worker");
+    utils::copy_str_to_c(&mut worker.bgw_name, "Tiko background worker");
+    utils::copy_str_to_c(&mut worker.bgw_type, "tiko");
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
     worker.bgw_start_time = BgWorkerStart_PostmasterStart;
     worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
-    utils::copy_str_to_c(&mut worker.bgw_library_name, "libs3worker");
-    utils::copy_str_to_c(&mut worker.bgw_function_name, "s3worker_main");
+    utils::copy_str_to_c(&mut worker.bgw_library_name, "libworker");
+    utils::copy_str_to_c(&mut worker.bgw_function_name, "worker_main");
 
     unsafe {
         // Register the background worker

@@ -1,6 +1,6 @@
 use pgsys::{logging::pg_log_error, smgr::*};
-use s3worker::cache::RelFork;
-use s3worker::s3_ops;
+use worker::cache::RelFork;
+use worker::s3_ops;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_create(

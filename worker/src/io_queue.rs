@@ -7,7 +7,7 @@
 //! - **Per-backend slot pools**: Each backend owns a small pool of I/O slots (4 slots).
 //!   Claiming is a local bit-scan — zero contention, no CAS races.
 //! - **MPSC submit queue**: Backends push `(backend_id, slot_idx)` entries via `fetch_add`.
-//!   s3worker pops entries and dispatches to Tokio. Strict ordering, no advisory hints.
+//!   worker pops entries and dispatches to Tokio. Strict ordering, no advisory hints.
 //! - **SetLatch completion**: Tokio workers call `SetLatch` directly on the backend's latch
 //!   after marking a slot Completed. No harvest step, no main-thread scan.
 //!
@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | Free → Filling | Backend | Claim from own pool (bit clear) |
 //! | Filling → Submitted | Backend | `slot.publish()` (Release store) |
-//! | Submitted → InProgress | s3worker | `slot.try_start_processing()` (CAS) |
+//! | Submitted → InProgress | Tiko worker | `slot.try_start_processing()` (CAS) |
 //! | InProgress → Completed | Tokio | `slot.mark_completed()` + `SetLatch` |
 //! | Completed → Free | Backend | `slot.release()` + `pool.release()` |
 //!
@@ -35,12 +35,12 @@
 //! # Shared Memory Layout
 //!
 //! ```text
-//! S3IoControl (fixed size)
-//! ├── num_backend_pools, s3worker_pid, s3worker_latch
+//! IoControl (fixed size)
+//! ├── num_backend_pools, worker_pid, worker_latch
 //! ├── submit_queue (SubmitQueue)
 //! ├── stats (S3IoStats)
 //! └── cache (CacheControl)
-//! BackendSlotPool[0]  ← immediately after S3IoControl (aligned)
+//! BackendSlotPool[0]  ← immediately after IoControl (aligned)
 //! BackendSlotPool[1]
 //! ...
 //! BackendSlotPool[MaxBackends-1]
@@ -73,11 +73,11 @@ pub const SUBMIT_QUEUE_SIZE: usize = 1024; // power of 2
 
 // ── Shared memory pointer ──
 
-struct S3IoControlPtr(*mut S3IoControl);
-unsafe impl Send for S3IoControlPtr {}
-unsafe impl Sync for S3IoControlPtr {}
+struct IoControlPtr(*mut IoControl);
+unsafe impl Send for IoControlPtr {}
+unsafe impl Sync for IoControlPtr {}
 
-static S3_IO_CONTROL: OnceLock<S3IoControlPtr> = OnceLock::new();
+static IO_CONTROL: OnceLock<IoControlPtr> = OnceLock::new();
 
 // ── Slot state machine ──
 
@@ -110,19 +110,19 @@ impl From<u8> for SlotState {
 ///
 /// Used in two contexts:
 /// - **AIO path** (`s3_io_perform`): `Read` and `Write` are submitted through
-///   the shared-memory pipeline to s3worker. Buffers are always in shared memory
+///   the shared-memory pipeline to Tiko worker. Buffers are always in shared memory
 ///   (`BufferBlocks`), so cross-process pointer access is safe.
 /// - **Prefetch** (`s3_prefetch`): Submitted through the pipeline to warm the
-///   local cache from S3. No `buffer_ptr` needed (s3worker manages its own buffers).
+///   local cache from S3. No `buffer_ptr` needed (Tiko worker manages its own buffers).
 ///
 /// All other sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, etc.)
 /// call `s3_ops` directly in the backend process — they do **not** use the
 /// pipeline, because their buffers may be in backend-local memory (e.g.
 /// `PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local
-/// `PGIOAlignedBlock`) which s3worker cannot access.
+/// `PGIOAlignedBlock`) which Tiko worker cannot access.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum S3IoOpKind {
+pub enum IoOpKind {
     Invalid = 0,
     Read = 1,        // AIO pipeline + direct s3_ops
     Write = 2,       // AIO pipeline + direct s3_ops
@@ -136,7 +136,7 @@ pub enum S3IoOpKind {
     ZeroExtend = 10, // direct s3_ops only
 }
 
-// ── S3IoSlot ──
+// ── IoSlot ──
 
 /// A single I/O request slot in shared memory.
 ///
@@ -144,10 +144,10 @@ pub enum S3IoOpKind {
 /// Generation counter prevents stale Tokio completions from corrupting recycled slots
 /// (e.g. when a backend dies with InProgress slots and a new backend reuses the ProcNumber).
 #[repr(C, align(64))]
-pub struct S3IoSlot {
+pub struct IoSlot {
     // ── Slot lifecycle ──
     pub state: AtomicU8,
-    pub op: S3IoOpKind,
+    pub op: IoOpKind,
 
     // ── Request identity ──
     pub spc_oid: Oid,
@@ -180,14 +180,14 @@ pub struct S3IoSlot {
 }
 
 const _: () = assert!(
-    std::mem::size_of::<S3IoSlot>() == 64,
-    "S3IoSlot must be exactly 64 bytes"
+    std::mem::size_of::<IoSlot>() == 64,
+    "IoSlot must be exactly 64 bytes"
 );
 
-impl S3IoSlot {
+impl IoSlot {
     fn init(&mut self) {
         self.state.store(SlotState::Free as u8, Ordering::Relaxed);
-        self.op = S3IoOpKind::Invalid;
+        self.op = IoOpKind::Invalid;
         self.owner_proc.store(-1, Ordering::Relaxed);
         self.generation.store(0, Ordering::Relaxed);
         self.owner_latch.store(0, Ordering::Relaxed);
@@ -208,7 +208,7 @@ impl S3IoSlot {
     }
 
     /// Try to start processing (Submitted → InProgress).
-    /// Called by s3worker after popping from the submit queue.
+    /// Called by Tiko worker after popping from the submit queue.
     pub fn try_start_processing(&self) -> bool {
         self.state
             .compare_exchange(
@@ -236,12 +236,12 @@ impl S3IoSlot {
 
     /// Validate slot data before dispatching to Tokio.
     pub fn validate(&self) -> Result<(), u32> {
-        if self.op == S3IoOpKind::Invalid {
+        if self.op == IoOpKind::Invalid {
             return Err(libc::EINVAL as u32);
         }
 
         // Only Read and Write operations require a buffer
-        let needs_buffer = matches!(self.op, S3IoOpKind::Read | S3IoOpKind::Write);
+        let needs_buffer = matches!(self.op, IoOpKind::Read | IoOpKind::Write);
         if needs_buffer {
             let buffer_ptr = self.buffer_ptr.load(Ordering::Acquire);
             if buffer_ptr == 0 {
@@ -252,7 +252,7 @@ impl S3IoSlot {
         // Only operations that transfer blocks need nblocks validation
         let needs_nblocks = matches!(
             self.op,
-            S3IoOpKind::Read | S3IoOpKind::Write | S3IoOpKind::ZeroExtend | S3IoOpKind::Prefetch
+            IoOpKind::Read | IoOpKind::Write | IoOpKind::ZeroExtend | IoOpKind::Prefetch
         );
         if needs_nblocks && (self.nblocks == 0 || self.nblocks > 1024) {
             return Err(libc::EINVAL as u32);
@@ -283,7 +283,7 @@ impl S3IoSlot {
 /// Attached lazily when `s3_init()` calls `attach()` for that backend.
 #[repr(C)]
 pub struct BackendSlotPool {
-    pub slots: [S3IoSlot; SLOTS_PER_BACKEND],
+    pub slots: [IoSlot; SLOTS_PER_BACKEND],
     /// Bitmask of free slots. Bit N set = slot N is free.
     pub free_mask: AtomicU8,
     /// 1 if a backend has attached to this pool via s3_init()
@@ -355,14 +355,14 @@ impl BackendSlotPool {
     }
 
     /// Get a reference to a slot by index.
-    pub fn slot(&self, idx: usize) -> &S3IoSlot {
+    pub fn slot(&self, idx: usize) -> &IoSlot {
         &self.slots[idx]
     }
 }
 
 // ── SubmitQueue ──
 
-/// MPSC ring buffer for I/O submission. Backends push, s3worker pops.
+/// MPSC ring buffer for I/O submission. Backends push, Tiko worker pops.
 ///
 /// Entries are packed as `(backend_id: u16, slot_idx: u16)` into a u32.
 /// Zero is used as a sentinel (entry not yet written by producer).
@@ -372,7 +372,7 @@ pub struct SubmitQueue {
     head: AtomicU32,
     _pad_head: [u8; 60],
 
-    /// Consumer tail — only s3worker reads/writes
+    /// Consumer tail — only Tiko worker reads/writes
     tail: AtomicU32,
     _pad_tail: [u8; 60],
 
@@ -489,7 +489,7 @@ impl S3IoStats {
         };
 
         pgsys::logging::pg_log_debug1(&format!(
-            "s3worker cache stats: reads={} writes={} hits={} misses={} hit_rate={:.1}% evictions={} dirty_evictions={}",
+            "tiko cache stats: reads={} writes={} hits={} misses={} hit_rate={:.1}% evictions={} dirty_evictions={}",
             self.total_reads.load(Ordering::Relaxed),
             self.total_writes.load(Ordering::Relaxed),
             hits,
@@ -501,22 +501,22 @@ impl S3IoStats {
     }
 }
 
-// ── S3IoControl ──
+// ── IoControl ──
 
 /// Main control structure for I/O queues. Lives in PostgreSQL shared memory.
 ///
 /// Backend slot pools follow immediately after this struct in shared memory,
 /// accessed via `backend_pool()` pointer arithmetic.
 #[repr(C)]
-pub struct S3IoControl {
+pub struct IoControl {
     /// Number of backend pools (= MaxBackends at init time)
     pub num_backend_pools: u32,
 
-    /// s3worker's PID for liveness checks
-    pub s3worker_pid: AtomicU32,
+    /// Tiko worker's PID for liveness checks
+    pub worker_pid: AtomicU32,
 
-    /// s3worker's latch pointer. Backends call SetLatch to wake s3worker.
-    pub s3worker_latch: AtomicU64,
+    /// Tiko worker's latch pointer. Backends call SetLatch to wake Tiko worker.
+    pub worker_latch: AtomicU64,
 
     /// MPSC submission queue
     pub submit_queue: SubmitQueue,
@@ -528,11 +528,11 @@ pub struct S3IoControl {
     pub stats: S3IoStats,
 }
 
-impl S3IoControl {
+impl IoControl {
     fn init(&mut self, max_backends: usize) {
         self.num_backend_pools = max_backends as u32;
-        self.s3worker_pid.store(0, Ordering::Relaxed);
-        self.s3worker_latch.store(0, Ordering::Relaxed);
+        self.worker_pid.store(0, Ordering::Relaxed);
+        self.worker_latch.store(0, Ordering::Relaxed);
         self.submit_queue.init();
 
         // Initialize all backend pools
@@ -555,7 +555,7 @@ impl S3IoControl {
         self.stats.init();
     }
 
-    /// Byte offset from the start of S3IoControl to the first BackendSlotPool.
+    /// Byte offset from the start of IoControl to the first BackendSlotPool.
     /// Accounts for alignment requirements of BackendSlotPool.
     fn backend_pools_offset() -> usize {
         let base = std::mem::size_of::<Self>();
@@ -616,10 +616,10 @@ impl S3IoControl {
 
             let mut found: bool = false;
             let control = ShmemInitStruct(
-                c"S3IoControl".as_ptr() as _,
+                c"TikoIoControl".as_ptr() as _,
                 Self::shmem_size(max_backends),
                 &mut found,
-            ) as *mut S3IoControl;
+            ) as *mut IoControl;
 
             if !found {
                 (*control).init(max_backends);
@@ -627,28 +627,28 @@ impl S3IoControl {
 
             release_lwlock(lock);
 
-            S3_IO_CONTROL.get_or_init(|| S3IoControlPtr(control));
+            IO_CONTROL.get_or_init(|| IoControlPtr(control));
 
             &mut *control
         }
     }
 
     pub fn get() -> &'static Self {
-        S3_IO_CONTROL
+        IO_CONTROL
             .get()
             .map(|wrapper| unsafe { &*wrapper.0 })
-            .expect("S3IoControl::get() called before init_or_attach()")
+            .expect("IoControl::get() called before init_or_attach()")
     }
 
     /// Check if shared memory has been initialized (i.e. init_or_attach has been called).
     pub fn is_initialized() -> bool {
-        S3_IO_CONTROL.get().is_some()
+        IO_CONTROL.get().is_some()
     }
 
-    /// Check if s3worker is alive by sending signal 0 to its PID.
+    /// Check if Tiko worker is alive by sending signal 0 to its PID.
     /// Returns false if PID is 0 (not started/shut down) or process doesn't exist.
-    pub fn is_s3worker_alive(&self) -> bool {
-        let pid = self.s3worker_pid.load(Ordering::Acquire) as i32;
+    pub fn is_worker_alive(&self) -> bool {
+        let pid = self.worker_pid.load(Ordering::Acquire) as i32;
         if pid == 0 {
             return false;
         }
@@ -684,7 +684,7 @@ impl S3IoControl {
             // Transition Submitted → InProgress
             if !slot.try_start_processing() {
                 pg_log_warning(&format!(
-                    "s3worker: slot {}/{} not in Submitted state (state={:?}), skipping",
+                    "tiko: slot {}/{} not in Submitted state (state={:?}), skipping",
                     backend_id,
                     slot_idx,
                     slot.current_state()
@@ -698,7 +698,7 @@ impl S3IoControl {
             // Validate slot data
             if let Err(error_code) = slot.validate() {
                 pg_log_warning(&format!(
-                    "s3worker: invalid slot data at backend={} slot={} (error={})",
+                    "tiko: invalid slot data at backend={} slot={} (error={})",
                     backend_id, slot_idx, error_code
                 ));
                 slot.fail_with_error(error_code);
@@ -719,7 +719,7 @@ impl S3IoControl {
                 Ok(()) => {
                     dispatched_count += 1;
                     pg_log_debug2(&format!(
-                        "s3worker: dispatched backend={} slot={} op={:?} blk={} nblk={}",
+                        "tiko: dispatched backend={} slot={} op={:?} blk={} nblk={}",
                         backend_id, slot_idx, slot.op, slot.block_number, slot.nblocks
                     ));
                     // Clear entry and advance tail on success
@@ -732,7 +732,7 @@ impl S3IoControl {
                     slot.state
                         .store(SlotState::Submitted as u8, Ordering::Release);
                     pg_log_debug1(&format!(
-                        "s3worker: dispatcher full, reverted backend={} slot={}",
+                        "tiko: dispatcher full, reverted backend={} slot={}",
                         backend_id, slot_idx
                     ));
                     break;
@@ -740,7 +740,7 @@ impl S3IoControl {
                 Err(TrySendError::Closed(_)) => {
                     // Fatal — fail the slot so the backend doesn't hang forever
                     pg_log_warning(&format!(
-                        "s3worker: dispatcher disconnected, failing backend={} slot={}",
+                        "tiko: dispatcher disconnected, failing backend={} slot={}",
                         backend_id, slot_idx
                     ));
                     slot.fail_with_error(libc::EIO as u32);

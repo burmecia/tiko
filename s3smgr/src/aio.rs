@@ -1,9 +1,9 @@
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
-use s3worker::{cache::RelFork, io_queue::S3IoOpKind, s3_ops};
+use worker::{cache::RelFork, io_queue::IoOpKind, s3_ops};
 
 use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipeline};
 
-/// Common implementation for S3 AIO read/write.
+/// Common implementation for AIO read/write.
 ///
 /// Called from `pgaio_io_perform_synchronously()` inside `START_CRIT_SECTION()`.
 /// **MUST NOT** call `elog(ERROR)` / `pg_log_error` — that would PANIC.
@@ -16,7 +16,7 @@ use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipelin
 ///
 /// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
 unsafe fn s3_io_perform(
-    op: S3IoOpKind,
+    op: IoOpKind,
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
     spc_oid: Oid,
@@ -59,14 +59,14 @@ unsafe fn s3_io_perform(
                     fork_number,
                 };
                 match op {
-                    S3IoOpKind::Read => s3_ops::cached_read_blocks(
+                    IoOpKind::Read => s3_ops::cached_read_blocks(
                         rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *mut u8,
                     )
                     .map(|_| ()),
-                    S3IoOpKind::Write => s3_ops::cached_write_blocks(
+                    IoOpKind::Write => s3_ops::cached_write_blocks(
                         rf,
                         current_block,
                         entry_nblocks,
@@ -108,7 +108,7 @@ pub extern "C-unwind" fn s3_io_perform_read(
 ) -> isize {
     unsafe {
         s3_io_perform(
-            S3IoOpKind::Read,
+            IoOpKind::Read,
             iov,
             iov_length,
             spc_oid,
@@ -136,7 +136,7 @@ pub extern "C-unwind" fn s3_io_perform_write(
 ) -> isize {
     unsafe {
         s3_io_perform(
-            S3IoOpKind::Write,
+            IoOpKind::Write,
             iov,
             iov_length,
             spc_oid,

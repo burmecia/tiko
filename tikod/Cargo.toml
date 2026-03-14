@@ -8,5 +8,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-s3worker = { path = "../s3worker" }
+store = { path = "../store" }
+pgsys = { path = "../pgsys" }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8" }
+tar = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

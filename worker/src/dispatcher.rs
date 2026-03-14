@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 /// Work request sent from main thread to Tokio workers.
 ///
 /// Identifies a slot by its backend pool and slot index.
-/// The Tokio worker uses these to look up the actual S3IoSlot from S3IoControl.
+/// The Tokio worker uses these to look up the actual S3IoSlot from IoControl.
 ///
 /// `backend_id` is a ProcNumber (u32) — can be up to MAX_BACKENDS (262143).
 /// `slot_index` is 0..SLOTS_PER_BACKEND-1 (currently 0..3).
@@ -43,7 +43,7 @@ impl Dispatcher {
         let (work_sender, work_receiver) = mpsc::channel(work_queue_size);
 
         pg_log_debug2(&format!(
-            "s3worker: dispatcher created with work_queue_size={}",
+            "tiko: dispatcher created with work_queue_size={}",
             work_queue_size,
         ));
 

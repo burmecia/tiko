@@ -1,5 +1,5 @@
 use pgsys::smgr::*;
-use s3worker::io_queue::S3IoOpKind;
+use worker::io_queue::IoOpKind;
 
 use crate::{pipeline, use_pipeline};
 
@@ -20,7 +20,7 @@ pub extern "C-unwind" fn s3_prefetch(
 
     let result = unsafe {
         pipeline::submit_and_wait(
-            S3IoOpKind::Prefetch,
+            IoOpKind::Prefetch,
             reln,
             forknum,
             blocknum,

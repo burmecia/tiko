@@ -1,6 +1,6 @@
 use pgsys::{common::INVALID_BLOCK_NUMBER, logging::pg_log_error, smgr::*};
-use s3worker::cache::RelFork;
-use s3worker::s3_ops;
+use worker::cache::RelFork;
+use worker::s3_ops;
 
 /// Extend a relation fork with zero-filled blocks.
 ///

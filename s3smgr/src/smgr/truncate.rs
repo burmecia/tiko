@@ -1,6 +1,6 @@
 use pgsys::{common::in_recovery, logging::pg_log_error, smgr::*};
-use s3worker::cache::RelFork;
-use s3worker::s3_ops;
+use worker::cache::RelFork;
+use worker::s3_ops;
 
 /// Truncate a relation fork to the given number of blocks.
 ///

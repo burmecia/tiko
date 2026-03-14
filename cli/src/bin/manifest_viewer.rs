@@ -20,7 +20,7 @@
 //!
 //! ```bash
 //! # Build
-//! cargo build -p s3worker
+//! cargo build -p cli
 //!
 //! # Local TIKM file (auto-detected by TIKM magic bytes):
 //! ./target/debug/manifest_viewer /path/to/base_manifest.bin
@@ -42,8 +42,8 @@
 
 use std::path::{Path, PathBuf};
 
-use s3worker::manifest::Manifest;
-use s3worker::sim_store::SimStore;
+use store::manifest::Manifest;
+use store::sim_store::SimStore;
 
 // ── Argument parsing ─────────────────────────────────────────────────────────
 

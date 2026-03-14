@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Tokio runtime and thread pool management
 //!
-//! This module initializes and manages the Tokio async runtime used by s3worker.
+//! This module initializes and manages the Tokio async runtime used by Tiko worker.
 //! Configuration:
 //! - 4 worker threads for async I/O operations
 //! - 8 blocking threads for CPU-bound work (if needed)
@@ -28,16 +28,16 @@ pub fn pitr_sim_store() -> Option<&'static Arc<SimStore>> {
 /// - The runtime has not been initialised.
 /// - `ProjectCtx` is not yet loaded (env vars absent).
 ///
-/// Call this from `s3worker_main` after both `init_tokio_runtime` and
+/// Call this from `worker_main` after both `init_tokio_runtime` and
 /// `init_project_ctx` have completed.
 pub fn spawn_pitr_task(data_dir: &std::path::Path) {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
-        pg_log_warning("s3worker: spawn_pitr_task called before runtime init; skipping");
+        pg_log_warning("tiko: spawn_pitr_task called before runtime init; skipping");
         return;
     };
 
     let Some(ctx) = ProjectCtx::try_get() else {
-        pg_log_info("s3worker: ProjectCtx not initialised; skipping PITR background task");
+        pg_log_info("tiko: ProjectCtx not initialised; skipping PITR background task");
         return;
     };
 
@@ -48,7 +48,7 @@ pub fn spawn_pitr_task(data_dir: &std::path::Path) {
     let _ = PITR_SIM_STORE.set(Arc::clone(&sim));
 
     runtime.spawn(pitr_background_task(sim, ns, cfg));
-    pg_log_info("s3worker: PITR background task spawned");
+    pg_log_info("tiko: PITR background task spawned");
 }
 
 /// The global Tokio runtime handle stored safely using OnceLock
@@ -68,13 +68,13 @@ pub fn init_tokio_runtime() -> Result<(), Box<dyn std::error::Error>> {
         match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .max_blocking_threads(8)
-            .thread_name("s3worker-tokio")
+            .thread_name("worker-tokio")
             .enable_all()
             .build()
         {
             Ok(runtime) => {
                 let _ = TOKIO_RUNTIME.set(runtime);
-                pg_log_info("s3worker: Tokio runtime initialized (4 workers, 8 blocking)");
+                pg_log_info("tiko: Tokio runtime initialized (4 workers, 8 blocking)");
             }
             Err(e) => {
                 init_error = Some(Box::new(e));
@@ -114,7 +114,7 @@ where
 /// Note: With OnceLock, we cannot directly shutdown the runtime.
 /// The runtime will shutdown when the process exits.
 pub fn shutdown_tokio_runtime() {
-    pg_log_info("s3worker: Tokio runtime will shutdown with process termination");
+    pg_log_info("tiko: Tokio runtime will shutdown with process termination");
 }
 
 /// Configuration for the thread pool
@@ -143,14 +143,14 @@ pub fn init_tokio_runtime_with_config(
         match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.worker_threads)
             .max_blocking_threads(config.blocking_threads)
-            .thread_name("s3worker-tokio")
+            .thread_name("worker-tokio")
             .enable_all()
             .build()
         {
             Ok(runtime) => {
                 let _ = TOKIO_RUNTIME.set(runtime);
                 pg_log_info(&format!(
-                    "s3worker: Tokio runtime initialized ({} workers, {} blocking)",
+                    "tiko: Tokio runtime initialized ({} workers, {} blocking)",
                     config.worker_threads, config.blocking_threads
                 ));
             }

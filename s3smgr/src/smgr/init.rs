@@ -5,9 +5,9 @@ use pgsys::{
     logging::*,
     wait_events::new_wait_event,
 };
-use s3worker::io_queue::S3IoControl;
 use store::project::ProjectCtx;
 use store::sim_store::SimStore;
+use worker::io_queue::IoControl;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_init() {
@@ -27,7 +27,7 @@ pub extern "C-unwind" fn s3_init() {
     ProjectCtx::init_from_env(&data_dir);
 
     // Skip shared memory attachment in initdb (--boot) and single-user mode.
-    // In those modes MyProcNumber is invalid and the S3IoControl shmem block
+    // In those modes MyProcNumber is invalid and the IoControl shmem block
     // was never sized/initialised via shmem_request_hook.
     if !is_under_postmaster() {
         return;
@@ -37,7 +37,7 @@ pub extern "C-unwind" fn s3_init() {
         // Explicitly attach to shared memory in this backend process.
         // ShmemInitStruct looks up the existing block (found=true), no reinitialization.
         let total_procs = (MaxBackends + NUM_AUXILIARY_PROCS) as usize;
-        let control = S3IoControl::init_or_attach(total_procs);
+        let control = IoControl::init_or_attach(total_procs);
 
         // Attach this backend to its slot pool
         let proc_num = get_my_proc_number();

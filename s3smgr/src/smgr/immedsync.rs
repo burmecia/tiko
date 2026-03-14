@@ -1,5 +1,5 @@
 use pgsys::smgr::*;
-use s3worker::io_queue::S3IoControl;
+use worker::io_queue::IoControl;
 
 /// Immediately flush dirty cache chunks for a relation fork to backing files.
 ///
@@ -9,11 +9,11 @@ use s3worker::io_queue::S3IoControl;
 /// only the given relation fork.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_immedsync(reln: *mut SMgrRelationData, forknum: ForkNumber) {
-    if !S3IoControl::is_initialized() {
+    if !IoControl::is_initialized() {
         return;
     }
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
-    S3IoControl::get().cache.flush_dirty_chunks_for_relation(
+    IoControl::get().cache.flush_dirty_chunks_for_relation(
         loc.spc_oid,
         loc.db_oid,
         loc.rel_number,

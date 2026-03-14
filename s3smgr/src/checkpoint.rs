@@ -6,7 +6,7 @@
 //!
 //! # Six-step algorithm
 //!
-//! 0. **Guard**: returns early if `S3IoControl`, `SimStore`, or `ProjectCtx`
+//! 0. **Guard**: returns early if `IoControl`, `SimStore`, or `ProjectCtx`
 //!    are not yet initialised — nothing to flush or upload.
 //!
 //! 1. **Flush dirty chunks** (`flush_all_dirty_chunks`): every dirty cache
@@ -45,14 +45,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use pgsys::{Lsn, common::data_dir_path, logging::*};
-use s3worker::TIKO_DIR;
-use s3worker::cache::{CHUNK_SIZE, CacheControl};
-use s3worker::io_queue::S3IoControl;
-use s3worker::pitr_task::materialize_base;
 use store::chunk::{ChunkTag, RelFork};
 use store::manifest::{ChunkRef, Manifest};
 use store::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
 use store::sim_store::SimStore;
+use worker::TIKO_DIR;
+use worker::cache::{CHUNK_SIZE, CacheControl};
+use worker::io_queue::IoControl;
+use worker::pitr_task::materialize_base;
 
 // ── extern "C" entry point ────────────────────────────────────────────────────
 
@@ -60,7 +60,7 @@ use store::sim_store::SimStore;
 ///
 /// `checkpoint_lsn` is the `XLogRecPtr checkPointRedo` argument passed by PG.
 /// It is `0` (`InvalidXLogRecPtr`) during `--boot`/`--single` phases where
-/// `S3IoControl::is_initialized()` will also be false, so the early-return
+/// `IoControl::is_initialized()` will also be false, so the early-return
 /// guard handles both cases.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u64) {
@@ -79,14 +79,14 @@ pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u
     let timeline = timeline_id;
     let data_dir = data_dir_path();
 
-    if S3IoControl::is_initialized() {
+    if IoControl::is_initialized() {
         // Normal path (server running under postmaster): flush dirty shmem
         // cache chunks to express + eviction log before processing the log.
         pg_log_debug1(&format!(
             "s3_checkpoint_flush: step 1: flushing dirty cache chunks (lsn={})",
             lsn.to_hex()
         ));
-        S3IoControl::get().cache.flush_all_dirty_chunks();
+        IoControl::get().cache.flush_all_dirty_chunks();
     }
     // Initdb path: writes already went directly to express + eviction log
     // (via cached_write_blocks), so flush_all_dirty_chunks is not needed.
@@ -132,7 +132,7 @@ pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u
     // for root projects by running standard materialization over the delta just
     // produced by checkpoint_flush_inner above. Skipped for branch projects —
     // their initial base is created by the restore-from-parent process.
-    if !S3IoControl::is_initialized() && !ctx.is_branch() {
+    if !IoControl::is_initialized() && !ctx.is_branch() {
         match materialize_base(sim, ctx.ns(), timeline) {
             Ok(result) => {
                 pg_log_debug1(&format!(
@@ -170,7 +170,7 @@ struct CheckpointStats {
 /// Execute steps 2-6 of the checkpoint flush algorithm.
 ///
 /// Separated from the `extern "C"` wrapper so that unit tests can call it
-/// directly without needing `S3IoControl` or the real PG shared memory.
+/// directly without needing `IoControl` or the real PG shared memory.
 ///
 /// Returns `Ok(None)` when the dirty set is empty (no-op).
 fn checkpoint_flush_inner(
@@ -386,10 +386,10 @@ mod tests {
     use pgsys::Lsn;
     use std::fs;
     use std::io::Write;
+    use store::chunk::ChunkTag;
     use store::manifest::{ChunkRef, Manifest};
     use store::project::ProjectNamespace;
     use store::sim_store::SimStore;
-    use store::chunk::ChunkTag;
     use tempfile::TempDir;
 
     // ── Test helpers ──────────────────────────────────────────────────────

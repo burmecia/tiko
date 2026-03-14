@@ -1,6 +1,6 @@
 [package]
-name = "s3worker"
-description = "S3 background worker"
+name = "worker"
+description = "Tiko background worker"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -10,18 +10,6 @@ rust-version = { workspace = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "tiko_archive"
-path = "src/bin/tiko_archive.rs"
-
-[[bin]]
-name = "tiko_restore"
-path = "src/bin/tiko_restore.rs"
-
-[[bin]]
-name = "manifest_viewer"
-path = "src/bin/manifest_viewer.rs"
 
 [dependencies]
 pgsys = { path = "../pgsys" }
@@ -34,4 +22,4 @@ serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 zstd = { workspace = true }
 tar = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
