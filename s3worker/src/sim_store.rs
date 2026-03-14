@@ -179,16 +179,21 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
 
 fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     ensure_parent(path)?;
+    let compressed =
+        zstd::encode_all(data, 1).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let mut f = File::create(path)?;
-    f.write_all(data)
+    f.write_all(&compressed)
 }
 
 fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(data) => Ok(Some(data)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    let raw = match fs::read(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let data =
+        zstd::decode_all(raw.as_slice()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    Ok(Some(data))
 }
 
 fn remove_optional(path: &Path) -> io::Result<()> {
