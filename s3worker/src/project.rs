@@ -678,6 +678,7 @@ mod tests {
             current_timeline_id: 1,
             created_at: 1_000_000,
             status: "active".to_string(),
+            deleted_at: None,
         }
     }
 
@@ -696,6 +697,7 @@ mod tests {
             current_timeline_id: 1,
             created_at: 1_000_000,
             status: "active".to_string(),
+            deleted_at: None,
         }
     }
 
@@ -1208,6 +1210,7 @@ mod module7_tests {
             current_timeline_id: 1,
             created_at: 0,
             status: "active".to_string(),
+            deleted_at: None,
         };
         sim.put_standard(&ns.project_meta_key(), &serde_json::to_vec(&meta).unwrap())
             .unwrap();
