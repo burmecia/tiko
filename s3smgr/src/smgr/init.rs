@@ -6,8 +6,8 @@ use pgsys::{
     wait_events::new_wait_event,
 };
 use s3worker::io_queue::S3IoControl;
-use s3worker::project::ProjectCtx;
-use s3worker::sim_store::SimStore;
+use store::project::ProjectCtx;
+use store::sim_store::SimStore;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn s3_init() {

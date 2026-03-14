@@ -1,12 +1,12 @@
 // Module declarations
 pub mod cache;
 pub mod io_queue;
-pub mod manifest;
 pub mod pitr_task;
-pub mod project;
-pub mod recovery;
 pub mod s3_ops;
-pub mod sim_store;
+
+// Re-export the shared store modules so existing dependents (s3smgr, tikod)
+// can still reference them via `s3worker::manifest` etc.
+pub use store::{manifest, project, recovery, sim_store};
 
 mod dispatcher;
 mod io_handler;
@@ -22,8 +22,7 @@ use pgsys::{
 };
 use std::ffi::{c_char, c_int};
 
-/// Subdirectory name under `$PGDATA` for all Tiko data.
-pub const TIKO_DIR: &str = "tiko";
+pub use store::TIKO_DIR;
 
 // PostgreSQL extension magic function
 #[unsafe(no_mangle)]

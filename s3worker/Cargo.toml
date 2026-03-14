@@ -25,6 +25,7 @@ path = "src/bin/manifest_viewer.rs"
 
 [dependencies]
 pgsys = { path = "../pgsys" }
+store = { path = "../store" }
 libc = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

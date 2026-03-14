@@ -46,12 +46,13 @@ use std::path::{Path, PathBuf};
 
 use pgsys::{Lsn, common::data_dir_path, logging::*};
 use s3worker::TIKO_DIR;
-use s3worker::cache::{CHUNK_SIZE, CacheControl, ChunkTag, RelFork};
+use s3worker::cache::{CHUNK_SIZE, CacheControl};
 use s3worker::io_queue::S3IoControl;
-use s3worker::manifest::{ChunkRef, Manifest};
 use s3worker::pitr_task::materialize_base;
-use s3worker::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
-use s3worker::sim_store::SimStore;
+use store::chunk::{ChunkTag, RelFork};
+use store::manifest::{ChunkRef, Manifest};
+use store::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
+use store::sim_store::SimStore;
 
 // ── extern "C" entry point ────────────────────────────────────────────────────
 
@@ -383,12 +384,12 @@ fn build_pg_state_archive(pgdata: &Path) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use pgsys::Lsn;
-    use s3worker::cache::ChunkTag;
-    use s3worker::manifest::{ChunkRef, Manifest};
-    use s3worker::project::ProjectNamespace;
-    use s3worker::sim_store::SimStore;
     use std::fs;
     use std::io::Write;
+    use store::manifest::{ChunkRef, Manifest};
+    use store::project::ProjectNamespace;
+    use store::sim_store::SimStore;
+    use store::chunk::ChunkTag;
     use tempfile::TempDir;
 
     // ── Test helpers ──────────────────────────────────────────────────────

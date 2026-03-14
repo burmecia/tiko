@@ -2,7 +2,7 @@
 members = [
   "pgsys",
   "s3smgr",
-  "s3worker", "tikod",
+  "s3worker", "store", "tikod",
 ]
 resolver = "2"
 
