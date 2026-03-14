@@ -151,6 +151,16 @@ impl ProjectNamespace {
         format!("{}/metadata/{}/project.json", self.org_id, self.project_id)
     }
 
+    /// `{org}/metadata/org.json`
+    pub fn org_meta_key(&self) -> String {
+        format!("{}/metadata/org.json", self.org_id)
+    }
+
+    /// `{org}/metadata/` — prefix for listing all project metadata under an org.
+    pub fn org_metadata_prefix(&self) -> String {
+        format!("{}/metadata/", self.org_id)
+    }
+
     // ── List prefixes (for scanning) ──────────────────────────────────────
 
     /// `{org}/pitr/{proj}/deltas/` — all timelines (used by GC for cross-timeline scanning).
@@ -226,6 +236,11 @@ pub struct ProjectMeta {
     pub current_timeline_id: u32,
     pub created_at: i64,
     pub status: String,
+    /// Unix timestamp (seconds) set by tikod `delete_branch`; absent on live projects.
+    /// GC uses this to identify objects eligible for physical deletion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
 }
 
 fn default_timeline_id() -> u32 {
@@ -319,6 +334,7 @@ impl ProjectCtx {
             current_timeline_id: 1,
             created_at: 0,
             status: "active".to_string(),
+            deleted_at: None,
         };
         let local_path = Manifest::local_manifest_path(data_dir);
         let base_manifest = Manifest::empty(&local_path).expect("failed to create empty manifest");
@@ -530,6 +546,7 @@ pub fn ensure_root_project_meta(sim: &SimStore, ns: &ProjectNamespace) -> Result
         current_timeline_id: 1,
         created_at: now,
         status: "active".to_string(),
+        deleted_at: None,
     };
     sim.put_standard(&key, &serde_json::to_vec(&meta)?)?;
     Ok(())
@@ -575,6 +592,7 @@ pub fn create_branch(
         current_timeline_id: CHILD_TIMELINE,
         created_at: now,
         status: "active".to_string(),
+        deleted_at: None,
     };
 
     // Write project.json.
