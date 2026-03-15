@@ -10,7 +10,7 @@ use store::sim_store::SimStore;
 use worker::io_queue::IoControl;
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_init() {
+pub extern "C-unwind" fn tiko_init() {
     unsafe {
         // Initialize wait event identifiers for S3 I/O operations
         crate::WAIT_EVENT_S3_IO_READ = new_wait_event(c"S3IORead".as_ptr());
@@ -45,7 +45,7 @@ pub extern "C-unwind" fn s3_init() {
         pool.attach();
 
         pg_log_debug1(&format!(
-            "s3smgr.s3_init: backend {} pool attached",
+            "tiko.smgr.tiko_init: backend {} pool attached",
             proc_num
         ));
     }

@@ -8,7 +8,7 @@ use pgsys::smgr::*;
 /// fork), so there is no segment boundary — return the theoretical max.
 /// PG's `PG_IOV_MAX` and buffer manager logic cap the actual I/O size.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_maxcombine(
+pub extern "C-unwind" fn tiko_maxcombine(
     _reln: *mut SMgrRelationData,
     _forknum: ForkNumber,
     blocknum: BlockNumber,

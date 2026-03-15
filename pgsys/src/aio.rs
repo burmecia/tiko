@@ -39,9 +39,9 @@ unsafe extern "C" {
     /// Set a flag on the IO handle.
     pub fn pgaio_io_set_flag(ioh: *mut PgAioHandle, flag: c_int);
 
-    /// Stage the IO as PGAIO_OP_S3_READV. Only needs iovcnt (no fd/offset).
-    pub fn pgaio_io_start_s3_readv(ioh: *mut PgAioHandle, iovcnt: c_int);
+    /// Stage the IO as PGAIO_OP_TIKO_READV. Only needs iovcnt (no fd/offset).
+    pub fn pgaio_io_start_tiko_readv(ioh: *mut PgAioHandle, iovcnt: c_int);
 
-    /// Stage the IO as PGAIO_OP_S3_WRITEV. Only needs iovcnt (no fd/offset).
-    pub fn pgaio_io_start_s3_writev(ioh: *mut PgAioHandle, iovcnt: c_int);
+    /// Stage the IO as PGAIO_OP_TIKO_WRITEV. Only needs iovcnt (no fd/offset).
+    pub fn pgaio_io_start_tiko_writev(ioh: *mut PgAioHandle, iovcnt: c_int);
 }

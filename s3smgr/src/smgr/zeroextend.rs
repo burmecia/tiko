@@ -9,7 +9,7 @@ use worker::s3_ops;
 /// `ftruncate` to `(blocknum + nblocks) * BLCKSZ` zero-fills the
 /// extended region on POSIX.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_zeroextend(
+pub extern "C-unwind" fn tiko_zeroextend(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     blocknum: BlockNumber,
@@ -22,7 +22,7 @@ pub extern "C-unwind" fn s3_zeroextend(
     // Check for overflow: matches mdzeroextend's boundary check
     if (blocknum as u64) + (nblocks_u32 as u64) >= INVALID_BLOCK_NUMBER as u64 {
         pg_log_error(&format!(
-            "s3_zeroextend: cannot extend rel {}/{}/{} fork {} beyond block {} (requested {} + {})",
+            "tiko_zeroextend: cannot extend rel {}/{}/{} fork {} beyond block {} (requested {} + {})",
             loc.spc_oid,
             loc.db_oid,
             loc.rel_number,
@@ -45,7 +45,7 @@ pub extern "C-unwind" fn s3_zeroextend(
         nblocks_u32,
     ) {
         pg_log_error(&format!(
-            "s3_zeroextend: failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
+            "tiko_zeroextend: failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
             loc.spc_oid, loc.db_oid, loc.rel_number, forknum, blocknum, nblocks, errno
         ));
     }

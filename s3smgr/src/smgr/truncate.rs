@@ -8,7 +8,7 @@ use worker::s3_ops;
 /// descriptors, S3 uses a single file per fork — just `ftruncate` to
 /// `nblocks * BLCKSZ`.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_truncate(
+pub extern "C-unwind" fn tiko_truncate(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     old_blocks: BlockNumber,
@@ -21,7 +21,7 @@ pub extern "C-unwind" fn s3_truncate(
             return;
         }
         pg_log_error(&format!(
-            "s3_truncate: cannot truncate to {} blocks, only {} blocks now",
+            "tiko_truncate: cannot truncate to {} blocks, only {} blocks now",
             nblocks, old_blocks
         ));
         return;
@@ -42,7 +42,7 @@ pub extern "C-unwind" fn s3_truncate(
         nblocks,
     ) {
         pg_log_error(&format!(
-            "s3_truncate: failed for rel {}/{}/{} fork {} nblocks {}: errno {}",
+            "tiko_truncate: failed for rel {}/{}/{} fork {} nblocks {}: errno {}",
             loc.spc_oid, loc.db_oid, loc.rel_number, forknum, nblocks, errno
         ));
     }

@@ -3,7 +3,7 @@ use worker::cache::RelFork;
 use worker::s3_ops;
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_create(
+pub extern "C-unwind" fn tiko_create(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     is_redo: bool,
@@ -20,13 +20,13 @@ pub extern "C-unwind" fn s3_create(
         Ok(false) if is_redo => {} // exists, WAL replay — OK
         Ok(false) => {
             pg_log_error(&format!(
-                "s3_create: file already exists for rel {}/{}/{} fork {}",
+                "tiko_create: file already exists for rel {}/{}/{} fork {}",
                 loc.spc_oid, loc.db_oid, loc.rel_number, forknum
             ));
         }
         Err(errno) => {
             pg_log_error(&format!(
-                "s3_create: failed for rel {}/{}/{} fork {}: errno {}",
+                "tiko_create: failed for rel {}/{}/{} fork {}: errno {}",
                 loc.spc_oid, loc.db_oid, loc.rel_number, forknum, errno
             ));
         }

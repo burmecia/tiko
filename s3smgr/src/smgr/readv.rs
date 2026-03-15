@@ -8,7 +8,7 @@ use crate::buffers;
 const ENOENT: i32 = 2;
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_readv(
+pub extern "C-unwind" fn tiko_readv(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     blocknum: BlockNumber,
@@ -47,7 +47,7 @@ pub extern "C-unwind" fn s3_readv(
                 }
             } else {
                 pg_log_error(&format!(
-                    "s3_readv: read failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
+                    "tiko_readv: read failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
                     loc.spc_oid,
                     loc.db_oid,
                     loc.rel_number,

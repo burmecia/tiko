@@ -7,7 +7,7 @@ use pgsys::smgr::*;
 /// cache. S3 writes go via PUT which guarantees durability immediately;
 /// no OS page cache is involved.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_writeback(
+pub extern "C-unwind" fn tiko_writeback(
     _reln: *mut SMgrRelationData,
     _forknum: ForkNumber,
     _blocknum: BlockNumber,

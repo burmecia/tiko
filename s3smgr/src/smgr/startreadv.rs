@@ -3,7 +3,7 @@ use pgsys::{aio::*, common::get_my_proc_number, logging, smgr::*};
 use crate::buffers;
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_startreadv(
+pub extern "C-unwind" fn tiko_startreadv(
     ioh: *mut PgAioHandle,
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
@@ -15,7 +15,7 @@ pub extern "C-unwind" fn s3_startreadv(
         let loc = &(*reln).smgr_rlocator.locator;
         let proc_num = get_my_proc_number();
         logging::pg_log_debug2(&format!(
-            "s3_startreadv({}): rel {} fork {} block {} nblocks {}",
+            "tiko_startreadv({}): rel {} fork {} block {} nblocks {}",
             proc_num, loc.rel_number, forknum, blocknum, nblocks
         ));
 
@@ -38,9 +38,9 @@ pub extern "C-unwind" fn s3_startreadv(
         pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks as i32, false);
         pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
 
-        // 4. Stage as PGAIO_OP_S3_READV — returns immediately.
+        // 4. Stage as PGAIO_OP_TIKO_READV — returns immediately.
         //    During initdb the perform function handles I/O directly via s3_ops;
         //    under the postmaster, IO workers submit to the s3worker pipeline.
-        pgaio_io_start_s3_readv(ioh, iovcnt);
+        pgaio_io_start_tiko_readv(ioh, iovcnt);
     }
 }

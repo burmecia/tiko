@@ -3,7 +3,7 @@ use worker::cache::RelFork;
 use worker::s3_ops;
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_extend(
+pub extern "C-unwind" fn tiko_extend(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     blocknum: BlockNumber,
@@ -14,7 +14,7 @@ pub extern "C-unwind" fn s3_extend(
 
     if blocknum == INVALID_BLOCK_NUMBER {
         pg_log_error(&format!(
-            "s3_extend: cannot extend rel {}/{}/{} fork {} beyond {} blocks",
+            "tiko_extend: cannot extend rel {}/{}/{} fork {} beyond {} blocks",
             loc.spc_oid, loc.db_oid, loc.rel_number, forknum, INVALID_BLOCK_NUMBER
         ));
         return;
@@ -32,7 +32,7 @@ pub extern "C-unwind" fn s3_extend(
         buffer as *const u8,
     ) {
         pg_log_error(&format!(
-            "s3_extend: write failed for rel {}/{}/{} fork {} block {}: errno {}",
+            "tiko_extend: write failed for rel {}/{}/{} fork {} block {}: errno {}",
             loc.spc_oid, loc.db_oid, loc.rel_number, forknum, blocknum, errno
         ));
     }

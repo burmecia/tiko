@@ -8,7 +8,7 @@ use worker::io_queue::IoControl;
 /// normal checkpoint path (handled by `s3_checkpoint_flush`), this targets
 /// only the given relation fork.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_immedsync(reln: *mut SMgrRelationData, forknum: ForkNumber) {
+pub extern "C-unwind" fn tiko_immedsync(reln: *mut SMgrRelationData, forknum: ForkNumber) {
     if !IoControl::is_initialized() {
         return;
     }

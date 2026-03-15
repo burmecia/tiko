@@ -35,7 +35,7 @@
 //! # Crash safety
 //!
 //! If the process crashes between steps 2 and 6, `eviction_log.ckpt` will
-//! exist on the next start.  `s3_checkpoint_flush` detects this and
+//! exist on the next start.  `tiko_checkpoint_flush` detects this and
 //! re-processes the existing `.ckpt` file (idempotent because
 //! `three_step_write` is crash-safe and the delta manifest PUT is atomic).
 
@@ -63,7 +63,7 @@ use worker::pitr_task::materialize_base;
 /// `IoControl::is_initialized()` will also be false, so the early-return
 /// guard handles both cases.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u64) {
+pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u64) {
     // During --boot (BOOTSTRAP_PROCESSING), checkpoint_lsn is 0 and neither
     // SimStore nor ProjectCtx are initialised — nothing to do.
     if checkpoint_lsn == 0 {
@@ -83,7 +83,7 @@ pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u
         // Normal path (server running under postmaster): flush dirty shmem
         // cache chunks to express + eviction log before processing the log.
         pg_log_debug1(&format!(
-            "s3_checkpoint_flush: step 1: flushing dirty cache chunks (lsn={})",
+            "tiko_checkpoint_flush: step 1: flushing dirty cache chunks (lsn={})",
             lsn.to_hex()
         ));
         IoControl::get().cache.flush_all_dirty_chunks();
@@ -94,37 +94,37 @@ pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u
     // Steps 2-6: process eviction log → standard bucket → delta manifest.
     // Non-fatal: log and continue. WAL will cover any gap on recovery.
     pg_log_debug1(&format!(
-        "s3_checkpoint_flush: step 2-6: processing eviction log (lsn={})",
+        "tiko_checkpoint_flush: step 2-6: processing eviction log (lsn={})",
         lsn.to_hex()
     ));
     match checkpoint_flush_inner(sim, ctx.ns(), timeline, lsn, &data_dir) {
         Ok(None) => {
             pg_log_info(&format!(
-                "s3_checkpoint_flush: no dirty chunks — skipped (lsn={})",
+                "tiko_checkpoint_flush: no dirty chunks — skipped (lsn={})",
                 lsn.to_hex()
             ));
         }
         Ok(Some(stats)) => {
             if stats.crash_recovery {
                 pg_log_debug1(&format!(
-                    "s3_checkpoint_flush: step 2: crash recovery — re-processed existing .ckpt (lsn={})",
+                    "tiko_checkpoint_flush: step 2: crash recovery — re-processed existing .ckpt (lsn={})",
                     lsn.to_hex()
                 ));
             }
             pg_log_debug1(&format!(
-                "s3_checkpoint_flush: step 4-5: uploaded {} chunk(s) + delta manifest + pg_state (lsn={})",
+                "tiko_checkpoint_flush: step 4-5: uploaded {} chunk(s) + delta manifest + pg_state (lsn={})",
                 stats.dirty_chunks,
                 lsn.to_hex()
             ));
             pg_log_info(&format!(
-                "s3_checkpoint_flush: complete — {} chunk(s) uploaded, lsn={}, crash_recovery={}",
+                "tiko_checkpoint_flush: complete — {} chunk(s) uploaded, lsn={}, crash_recovery={}",
                 stats.dirty_chunks,
                 lsn.to_hex(),
                 stats.crash_recovery,
             ));
         }
         Err(e) => {
-            pg_log_warning(&format!("s3_checkpoint_flush: {e}"));
+            pg_log_warning(&format!("tiko_checkpoint_flush: {e}"));
         }
     }
 
@@ -136,12 +136,12 @@ pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u
         match materialize_base(sim, ctx.ns(), timeline) {
             Ok(result) => {
                 pg_log_debug1(&format!(
-                    "s3_checkpoint_flush: initial base materialization: {result:?}"
+                    "tiko_checkpoint_flush: initial base materialization: {result:?}"
                 ));
             }
             Err(e) => {
                 pg_log_warning(&format!(
-                    "s3_checkpoint_flush: initial base materialization failed: {e}"
+                    "tiko_checkpoint_flush: initial base materialization failed: {e}"
                 ));
             }
         }
@@ -150,7 +150,7 @@ pub extern "C-unwind" fn s3_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u
         // empty file on every restart.
         if let Err(e) = ensure_root_project_meta(sim, ctx.ns()) {
             pg_log_warning(&format!(
-                "s3_checkpoint_flush: ensure_root_project_meta failed: {e}"
+                "tiko_checkpoint_flush: ensure_root_project_meta failed: {e}"
             ));
         }
     }

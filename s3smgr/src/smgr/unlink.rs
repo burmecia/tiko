@@ -15,7 +15,7 @@ use worker::s3_ops;
 /// Errors are reported as WARNING (not ERROR), matching `mdunlink`'s
 /// convention — this is usually called outside a transaction.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_unlink(
+pub extern "C-unwind" fn tiko_unlink(
     rlocator: RelFileLocatorBackend,
     forknum: ForkNumber,
     _is_redo: bool,
@@ -39,7 +39,7 @@ fn unlink_fork(rlocator: &RelFileLocatorBackend, forknum: ForkNumber) {
         fork_number: forknum,
     }) {
         pg_log_warning(&format!(
-            "s3_unlink: could not remove rel {}/{}/{} fork {}: errno {}",
+            "tiko_unlink: could not remove rel {}/{}/{} fork {}: errno {}",
             loc.spc_oid, loc.db_oid, loc.rel_number, forknum, errno
         ));
     }

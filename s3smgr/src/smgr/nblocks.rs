@@ -8,7 +8,7 @@ use worker::s3_ops;
 /// the cache under the write-back policy, so we must also check the cache for
 /// blocks that have been written but not yet evicted to the S3-sim file.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_nblocks(
+pub extern "C-unwind" fn tiko_nblocks(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
 ) -> BlockNumber {
@@ -23,7 +23,7 @@ pub extern "C-unwind" fn s3_nblocks(
         Ok(n) => n,
         Err(errno) => {
             pg_log_error(&format!(
-                "s3_nblocks: failed for rel {}/{}/{} fork {}: errno {}",
+                "tiko_nblocks: failed for rel {}/{}/{} fork {}: errno {}",
                 loc.spc_oid, loc.db_oid, loc.rel_number, forknum, errno
             ));
             0

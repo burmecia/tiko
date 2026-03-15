@@ -15,7 +15,7 @@ use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipelin
 /// `s3_ops::read_blocks` / `write_blocks` calls instead.
 ///
 /// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
-unsafe fn s3_io_perform(
+unsafe fn tiko_io_perform(
     op: IoOpKind,
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
@@ -96,7 +96,7 @@ unsafe fn s3_io_perform(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_io_perform_read(
+pub extern "C-unwind" fn tiko_io_perform_read(
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
     spc_oid: Oid,
@@ -107,7 +107,7 @@ pub extern "C-unwind" fn s3_io_perform_read(
     nblocks: i32,
 ) -> isize {
     unsafe {
-        s3_io_perform(
+        tiko_io_perform(
             IoOpKind::Read,
             iov,
             iov_length,
@@ -118,13 +118,13 @@ pub extern "C-unwind" fn s3_io_perform_read(
             block_number,
             nblocks,
             WAIT_EVENT_S3_IO_READ,
-            "s3_io_perform_read",
+            "tiko_io_perform_read",
         )
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_io_perform_write(
+pub extern "C-unwind" fn tiko_io_perform_write(
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
     spc_oid: Oid,
@@ -135,7 +135,7 @@ pub extern "C-unwind" fn s3_io_perform_write(
     nblocks: i32,
 ) -> isize {
     unsafe {
-        s3_io_perform(
+        tiko_io_perform(
             IoOpKind::Write,
             iov,
             iov_length,
@@ -146,7 +146,7 @@ pub extern "C-unwind" fn s3_io_perform_write(
             block_number,
             nblocks,
             WAIT_EVENT_S3_IO_WRITE,
-            "s3_io_perform_write",
+            "tiko_io_perform_write",
         )
     }
 }

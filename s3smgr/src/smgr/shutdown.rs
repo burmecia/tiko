@@ -8,4 +8,4 @@
 /// during `PM_STOP_BACKENDS` or in the checkpointer after the shutdown checkpoint —
 /// the cache is already clean.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_shutdown() {}
+pub extern "C-unwind" fn tiko_shutdown() {}

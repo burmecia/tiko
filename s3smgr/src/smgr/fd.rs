@@ -7,7 +7,7 @@ use pgsys::{common::BLCKSZ, smgr::*};
 /// which bypass `smgrfd()` entirely (see smgr.c), so this should never
 /// be called in practice. Returns -1 (invalid fd) as a safety measure.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_fd(
+pub extern "C-unwind" fn tiko_fd(
     _reln: *mut SMgrRelationData,
     _forknum: ForkNumber,
     blocknum: BlockNumber,

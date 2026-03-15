@@ -8,7 +8,7 @@ use crate::{pipeline, use_pipeline};
 /// Submits a prefetch request through the pipeline to s3worker, which
 /// will warm the local cache by fetching blocks from S3.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_prefetch(
+pub extern "C-unwind" fn tiko_prefetch(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     blocknum: BlockNumber,

@@ -8,7 +8,7 @@ use crate::buffers;
 const ENOENT: i32 = 2;
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_writev(
+pub extern "C-unwind" fn tiko_writev(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
     blocknum: BlockNumber,
@@ -43,7 +43,7 @@ pub extern "C-unwind" fn s3_writev(
             // During recovery, silently tolerate ENOENT (no-op is correct)
             if !(in_recovery() && errno == ENOENT) {
                 pg_log_error(&format!(
-                    "s3_writev: write failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
+                    "tiko_writev: write failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
                     loc.spc_oid,
                     loc.db_oid,
                     loc.rel_number,
