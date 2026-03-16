@@ -45,12 +45,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use pgsys::{Lsn, common::data_dir_path, logging::*};
-use store::chunk::{ChunkTag, RelFork};
+use store::chunk::{CHUNK_SIZE, ChunkTag, RelFork};
 use store::manifest::{ChunkRef, Manifest};
 use store::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
 use store::sim_store::SimStore;
 use worker::TIKO_DIR;
-use worker::cache::{CHUNK_SIZE, CacheControl};
+use worker::cache::CacheControl;
 use worker::io_queue::IoControl;
 use worker::pitr_task::materialize_base;
 

@@ -237,9 +237,9 @@ pub fn materialize_base(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::ChunkTag;
     use crate::manifest::ChunkRef;
     use std::collections::HashMap;
+    use store::chunk::ChunkTag;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, SimStore) {

@@ -1,5 +1,5 @@
 use pgsys::{common::in_recovery, logging::pg_log_error, smgr::*};
-use worker::cache::RelFork;
+use store::chunk::RelFork;
 use worker::s3_ops;
 
 use crate::buffers;

@@ -1,5 +1,5 @@
 use pgsys::smgr::*;
-use worker::cache::RelFork;
+use store::chunk::RelFork;
 use worker::s3_ops;
 
 #[unsafe(no_mangle)]

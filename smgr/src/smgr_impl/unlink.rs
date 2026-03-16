@@ -1,5 +1,5 @@
 use pgsys::{logging::pg_log_warning, smgr::*};
-use worker::cache::RelFork;
+use store::chunk::RelFork;
 use worker::s3_ops;
 
 /// Delete a relation's physical storage.

@@ -20,15 +20,15 @@
 use std::io;
 use std::sync::atomic::Ordering;
 
-use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
-
 use crate::{
-    cache::{BLOCKS_PER_CHUNK, CHUNK_SIZE, CacheControl, ChunkTag, RelFork},
+    cache::CacheControl,
     io_queue::IoControl,
     project::{ProjectCtx, ProjectNamespace},
     recovery,
     sim_store::SimStore,
 };
+use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
+use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork};
 
 // ── S3 chunk fetch ────────────────────────────────────────────────────────────
 
@@ -614,7 +614,6 @@ pub fn warm_cache_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::ChunkTag;
     use crate::manifest::{ChunkRef, Manifest};
     use crate::project::ProjectNamespace;
     use crate::recovery;
@@ -622,6 +621,7 @@ mod tests {
     use pgsys::Lsn;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
+    use store::chunk::ChunkTag;
     use tempfile::TempDir;
 
     // All tests that touch RECOVERY_MODE must hold `recovery::RECOVERY_MODE_TEST_GUARD`

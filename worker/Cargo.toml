@@ -1,6 +1,6 @@
 [package]
 name = "worker"
-description = "Tiko background worker"
+description = "Tiko background worker run by PostgreSQL"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -9,6 +9,7 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 
 [lib]
+name = "worker"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

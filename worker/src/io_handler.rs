@@ -13,11 +13,11 @@
 //! This eliminates the harvest step — Tokio notifies backends directly.
 
 use std::sync::atomic::Ordering;
-
-use pgsys::latch::SetLatch;
 use tokio::sync::mpsc;
 
-use crate::cache::RelFork;
+use pgsys::latch::SetLatch;
+use store::chunk::RelFork;
+
 use crate::dispatcher::IoWorkRequest;
 use crate::io_queue::{IoControl, IoOpKind};
 use crate::s3_ops;

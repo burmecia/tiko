@@ -1,37 +1,13 @@
 //! Fundamental chunk and relation-fork types shared across the storage layer.
 
-use pgsys::common::{BlockNumber, ForkNumber, Oid, RelFileNumber};
+use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use serde::{Deserialize, Serialize};
 
 /// Number of blocks per chunk (32 blocks = 256 KB).
 pub const BLOCKS_PER_CHUNK: u32 = 32;
 
-/// Wire size of a serialised `ChunkTag` (5 × u32 LE).
-pub const CHUNK_TAG_SIZE: usize = 20;
-
-// ── RelFork ──
-
-/// Identifies a specific fork of a relation — the (spc, db, rel, fork) key
-/// that appears throughout the storage layer. A [`ChunkTag`] is a `RelFork`
-/// plus a `chunk_id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct RelFork {
-    pub spc_oid: Oid,
-    pub db_oid: Oid,
-    pub rel_number: RelFileNumber,
-    pub fork_number: ForkNumber,
-}
-
-impl From<ChunkTag> for RelFork {
-    fn from(tag: ChunkTag) -> Self {
-        RelFork {
-            spc_oid: tag.spc_oid,
-            db_oid: tag.db_oid,
-            rel_number: tag.rel_number,
-            fork_number: tag.fork_number,
-        }
-    }
-}
+/// Chunk size in bytes (32 × 8 KB = 256 KB).
+pub const CHUNK_SIZE: usize = BLOCKS_PER_CHUNK as usize * BLCKSZ;
 
 // ── ChunkTag ──
 
@@ -45,6 +21,9 @@ pub struct ChunkTag {
     pub fork_number: ForkNumber,
     pub chunk_id: u32, // = blkno / BLOCKS_PER_CHUNK
 }
+
+/// Wire size of a serialised `ChunkTag` (5 × u32 LE).
+pub const CHUNK_TAG_SIZE: usize = 20;
 
 const _: () = assert!(std::mem::size_of::<ChunkTag>() == CHUNK_TAG_SIZE);
 
@@ -122,6 +101,30 @@ impl ChunkTag {
             rel_number: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
             fork_number: i32::from_le_bytes(buf[12..16].try_into().unwrap()),
             chunk_id: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+        }
+    }
+}
+
+// ── RelFork ──
+
+/// Identifies a specific fork of a relation — the (spc, db, rel, fork) key
+/// that appears throughout the storage layer. A [`ChunkTag`] is a `RelFork`
+/// plus a `chunk_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RelFork {
+    pub spc_oid: Oid,
+    pub db_oid: Oid,
+    pub rel_number: RelFileNumber,
+    pub fork_number: ForkNumber,
+}
+
+impl From<ChunkTag> for RelFork {
+    fn from(tag: ChunkTag) -> Self {
+        RelFork {
+            spc_oid: tag.spc_oid,
+            db_oid: tag.db_oid,
+            rel_number: tag.rel_number,
+            fork_number: tag.fork_number,
         }
     }
 }

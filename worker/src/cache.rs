@@ -52,12 +52,9 @@ use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber, data_di
 use pgsys::logging::pg_log_debug1;
 
 // Re-export shared chunk types from the store crate.
-pub use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag, RelFork};
+use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork};
 
 // ── Constants ──
-
-/// Chunk size in bytes (32 × 8 KB = 256 KB).
-pub const CHUNK_SIZE: usize = BLOCKS_PER_CHUNK as usize * BLCKSZ;
 
 /// Number of 256 KB cache chunk slots. 1024 slots = 256 MB cache.
 pub const CACHE_NUM_SLOTS: u32 = 1024;
