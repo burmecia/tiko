@@ -1,3 +1,4 @@
+use engine::io_queue::IoControl;
 use pgsys::{
     common::{
         MaxBackends, NUM_AUXILIARY_PROCS, data_dir_path, get_my_proc_number, is_under_postmaster,
@@ -7,7 +8,6 @@ use pgsys::{
 };
 use store::project::ProjectCtx;
 use store::sim_store::SimStore;
-use worker::io_queue::IoControl;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_init() {

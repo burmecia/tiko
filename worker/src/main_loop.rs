@@ -18,13 +18,13 @@ use pgsys::{
     wait_events::new_wait_event,
 };
 
-use crate::dispatcher::Dispatcher;
 use crate::io_handler;
-use crate::io_queue::IoControl;
-use crate::log_relay;
-use crate::project::ProjectCtx;
-use crate::sim_store::SimStore;
 use crate::thread_pool;
+use engine::dispatcher::Dispatcher;
+use engine::io_queue::IoControl;
+use engine::log_relay;
+use store::project::ProjectCtx;
+use store::sim_store::SimStore;
 
 /// Global flags for managing worker lifecycle and configuration
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);

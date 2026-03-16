@@ -9,9 +9,9 @@
 use pgsys::logging::*;
 use std::sync::{Arc, Once, OnceLock};
 
-use crate::pitr_task::{PitrConfig, pitr_background_task};
-use crate::project::{ProjectCtx, ProjectNamespace};
-use crate::sim_store::SimStore;
+use engine::pitr_task::{PitrConfig, pitr_background_task};
+use store::project::{ProjectCtx, ProjectNamespace};
+use store::sim_store::SimStore;
 
 /// Arc<SimStore> shared with the PITR background task.
 /// Also accessible from Module 5's eviction path via `pitr_sim_store()`.

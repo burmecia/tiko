@@ -18,9 +18,9 @@ use tokio::sync::mpsc;
 use pgsys::latch::SetLatch;
 use store::chunk::RelFork;
 
-use crate::dispatcher::IoWorkRequest;
-use crate::io_queue::{IoControl, IoOpKind};
-use crate::s3_ops;
+use engine::dispatcher::IoWorkRequest;
+use engine::io_queue::{IoControl, IoOpKind};
+use engine::s3_ops;
 
 /// Main I/O worker loop — receives requests from the dispatcher channel
 /// and spawns a Tokio task for each request.

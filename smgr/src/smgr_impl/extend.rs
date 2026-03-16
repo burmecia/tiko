@@ -1,6 +1,6 @@
+use engine::s3_ops;
 use pgsys::{common::INVALID_BLOCK_NUMBER, logging::pg_log_error, smgr::*};
 use store::chunk::RelFork;
-use worker::s3_ops;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_extend(

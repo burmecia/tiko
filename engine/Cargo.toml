@@ -1,6 +1,6 @@
 [package]
-name = "worker"
-description = "Tiko background worker run by PostgreSQL"
+name = "engine"
+description = "Tiko I/O engine: shared-memory cache, IPC queue, block-level S3 ops"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -8,14 +8,9 @@ license = { workspace = true }
 repository = { workspace = true }
 rust-version = { workspace = true }
 
-[lib]
-name = "worker"
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 pgsys = { path = "../pgsys" }
 store = { path = "../store" }
-engine = { path = "../engine" }
 libc = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

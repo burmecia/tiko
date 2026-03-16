@@ -1,6 +1,6 @@
+use engine::s3_ops;
 use pgsys::{logging::pg_log_error, smgr::*};
 use store::chunk::RelFork;
-use worker::s3_ops;
 
 /// Get the number of blocks stored in a relation fork.
 ///

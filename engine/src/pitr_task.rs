@@ -13,9 +13,9 @@ use std::sync::Arc;
 use pgsys::Lsn;
 
 use crate::log_relay;
-use crate::manifest::Manifest;
-use crate::project::{ProjectCtx, ProjectNamespace};
-use crate::sim_store::SimStore;
+use store::manifest::Manifest;
+use store::project::{ProjectCtx, ProjectNamespace};
+use store::sim_store::SimStore;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -237,9 +237,9 @@ pub fn materialize_base(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ChunkRef;
     use std::collections::HashMap;
     use store::chunk::ChunkTag;
+    use store::manifest::ChunkRef;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, SimStore) {

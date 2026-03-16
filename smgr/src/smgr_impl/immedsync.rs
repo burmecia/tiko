@@ -1,5 +1,5 @@
+use engine::io_queue::IoControl;
 use pgsys::smgr::*;
-use worker::io_queue::IoControl;
 
 /// Immediately flush dirty cache chunks for a relation fork to backing files.
 ///

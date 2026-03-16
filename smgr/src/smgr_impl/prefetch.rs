@@ -1,5 +1,5 @@
+use engine::io_queue::IoOpKind;
 use pgsys::smgr::*;
-use worker::io_queue::IoOpKind;
 
 use crate::{pipeline, use_pipeline};
 

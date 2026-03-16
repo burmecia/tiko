@@ -1,16 +1,10 @@
-// Module declarations
-pub mod cache;
-pub mod io_queue;
-pub mod pitr_task;
-pub mod s3_ops;
+// Re-export engine modules (moved from worker to engine crate)
+pub use engine::{cache, dispatcher, io_queue, log_relay, pitr_task, s3_ops};
 
-// Re-export the shared store modules so existing dependents (s3smgr, tikod)
-// can still reference them via `worker::manifest` etc.
+// Re-export the shared store modules
 pub use store::{manifest, project, recovery, sim_store};
 
-mod dispatcher;
 mod io_handler;
-pub mod log_relay;
 mod main_loop;
 mod shmem;
 mod thread_pool;

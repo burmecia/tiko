@@ -662,7 +662,7 @@ impl IoControl {
     /// transitions Submitted → InProgress, validates, and dispatches.
     ///
     /// Returns the number of requests dispatched, or Err(()) on fatal error.
-    pub(crate) fn poll_submit_queue(&self, dispatcher: &Dispatcher) -> Result<u64, ()> {
+    pub fn poll_submit_queue(&self, dispatcher: &Dispatcher) -> Result<u64, ()> {
         let mut dispatched_count = 0u64;
         let head = self.submit_queue.head.load(Ordering::Acquire);
         let mut tail = self.submit_queue.tail.load(Ordering::Relaxed);

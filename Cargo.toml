@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "cli",
+  "engine",
   "smgr",
   "store",
   "tikod",

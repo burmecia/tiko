@@ -44,15 +44,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use engine::cache::CacheControl;
+use engine::io_queue::IoControl;
+use engine::pitr_task::materialize_base;
 use pgsys::{Lsn, common::data_dir_path, logging::*};
+use store::TIKO_DIR;
 use store::chunk::{CHUNK_SIZE, ChunkTag, RelFork};
 use store::manifest::{ChunkRef, Manifest};
 use store::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
 use store::sim_store::SimStore;
-use worker::TIKO_DIR;
-use worker::cache::CacheControl;
-use worker::io_queue::IoControl;
-use worker::pitr_task::materialize_base;
 
 // ── extern "C" entry point ────────────────────────────────────────────────────
 

@@ -260,7 +260,7 @@ impl CacheControl {
     // ── Cache data file ──
 
     fn cache_file_path() -> PathBuf {
-        data_dir_path().join(crate::TIKO_DIR).join("cache")
+        data_dir_path().join(store::TIKO_DIR).join("cache")
     }
 
     pub fn cache_file() -> &'static File {
@@ -691,8 +691,8 @@ impl CacheControl {
         // Express PUT + eviction log append.
         // Guard: only run when SimStore and ProjectCtx are initialised.
         if let (Some(sim), Some(ctx)) = (
-            crate::sim_store::SimStore::try_get(),
-            crate::project::ProjectCtx::try_get(),
+            store::sim_store::SimStore::try_get(),
+            store::project::ProjectCtx::try_get(),
         ) {
             let mut chunk_data = vec![0u8; CHUNK_SIZE];
             self.read_blocks_from_slot(slot_index, 0, BLOCKS_PER_CHUNK, &mut chunk_data);
@@ -813,7 +813,7 @@ impl CacheControl {
 
     /// Path of the eviction log file: `{data_dir}/tiko/eviction_log`.
     pub fn eviction_log_path(data_dir: &Path) -> PathBuf {
-        data_dir.join(crate::TIKO_DIR).join("eviction_log")
+        data_dir.join(store::TIKO_DIR).join("eviction_log")
     }
 
     /// Append a single chunk tag to the process-local eviction log.
@@ -973,11 +973,11 @@ impl CacheControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::ProjectNamespace;
-    use crate::sim_store::SimStore;
     use pgsys::Lsn;
     use std::collections::HashSet;
     use std::sync::Arc;
+    use store::project::ProjectNamespace;
+    use store::sim_store::SimStore;
     use tempfile::TempDir;
 
     fn make_tag(i: u32) -> ChunkTag {

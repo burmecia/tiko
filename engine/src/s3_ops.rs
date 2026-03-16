@@ -20,15 +20,14 @@
 use std::io;
 use std::sync::atomic::Ordering;
 
-use crate::{
-    cache::CacheControl,
-    io_queue::IoControl,
+use crate::{cache::CacheControl, io_queue::IoControl};
+use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
+use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork};
+use store::{
     project::{ProjectCtx, ProjectNamespace},
     recovery,
     sim_store::SimStore,
 };
-use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
-use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork};
 
 // ── S3 chunk fetch ────────────────────────────────────────────────────────────
 
@@ -614,14 +613,14 @@ pub fn warm_cache_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{ChunkRef, Manifest};
-    use crate::project::ProjectNamespace;
-    use crate::recovery;
-    use crate::sim_store::SimStore;
     use pgsys::Lsn;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use store::chunk::ChunkTag;
+    use store::manifest::{ChunkRef, Manifest};
+    use store::project::ProjectNamespace;
+    use store::recovery;
+    use store::sim_store::SimStore;
     use tempfile::TempDir;
 
     // All tests that touch RECOVERY_MODE must hold `recovery::RECOVERY_MODE_TEST_GUARD`
@@ -801,7 +800,7 @@ mod tests {
         let m = Manifest::new(lsn, 0, vec![(tag, chunk_ref)], HashMap::new(), &build_path).unwrap();
         let blob = m.to_bytes().unwrap();
 
-        let tiko_dir = dir.path().join(crate::TIKO_DIR);
+        let tiko_dir = dir.path().join(store::TIKO_DIR);
         std::fs::create_dir_all(&tiko_dir).unwrap();
         let manifest_path = tiko_dir.join("recovery_manifest.bin");
         std::fs::write(&manifest_path, &blob).unwrap();
