@@ -15,7 +15,7 @@ TIKO_PITR_INTERVAL_SECS="300"
 
 rm -rf tt log.log
 ./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin/initdb -D tt
-cp ../tmp/postgresql.conf tt/
+cp ./postgresql.conf.sample tt/postgresql.conf
 
 ./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin/pg_ctl -D tt -l log.log start
 

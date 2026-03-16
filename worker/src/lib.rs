@@ -63,7 +63,7 @@ pub extern "C-unwind" fn _PG_init() {
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
     worker.bgw_start_time = BgWorkerStart_PostmasterStart;
     worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
-    utils::copy_str_to_c(&mut worker.bgw_library_name, "libworker");
+    utils::copy_str_to_c(&mut worker.bgw_library_name, "libtikoworker");
     utils::copy_str_to_c(&mut worker.bgw_function_name, "worker_main");
 
     unsafe {

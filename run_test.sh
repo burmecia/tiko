@@ -47,13 +47,13 @@ if ! (cd worker && cargo build --release) >/dev/null; then
 fi
 
 # Copy the compiled library to the test directory for use in tests
-if [ -f "${TARGET_DIR}/release/libworker.dylib" ]; then
+if [ -f "${TARGET_DIR}/release/libtikoworker.dylib" ]; then
     echo "Copying Tiko Worker extension files ..."
-    cp "${TARGET_DIR}/release/libworker.dylib" "${TEST_DIR}/worker"
+    cp "${TARGET_DIR}/release/libtikoworker.dylib" "${TEST_DIR}/worker"
 fi
 
 echo "Running tests..."
-if ! (cd postgres/src/test/modules/test_tiko && make check PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libworker -c shared_buffers=256kB') >/dev/null; then
+if ! (cd postgres/src/test/modules/test_tiko && make check PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libtikoworker -c shared_buffers=256kB') >/dev/null; then
   echo "Test Tiko failed" >&2
   exit 1
 fi

@@ -9,7 +9,7 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 
 [lib]
-name = "worker"
+name = "tikoworker"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
