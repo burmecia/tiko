@@ -151,16 +151,6 @@ impl ProjectNamespace {
         format!("{}/metadata/{}/project.json", self.org_id, self.project_id)
     }
 
-    /// `{org}/metadata/org.json`
-    pub fn org_meta_key(&self) -> String {
-        format!("{}/metadata/org.json", self.org_id)
-    }
-
-    /// `{org}/metadata/` — prefix for listing all project metadata under an org.
-    pub fn org_metadata_prefix(&self) -> String {
-        format!("{}/metadata/", self.org_id)
-    }
-
     // ── List prefixes (for scanning) ──────────────────────────────────────
 
     /// `{org}/pitr/{proj}/deltas/` — all timelines (used by GC for cross-timeline scanning).

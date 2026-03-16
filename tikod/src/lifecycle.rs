@@ -90,8 +90,7 @@ pub fn delete_branch(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
 /// Scans `{org}/metadata/` in the standard bucket, loads every
 /// `*/project.json` found, and returns those without `deleted_at` set.
 pub fn list_projects(sim: &SimStore, org_id: u64) -> Result<Vec<ProjectMeta>> {
-    // Use a scratch namespace to get the org_metadata_prefix.
-    let prefix = ProjectNamespace::new(org_id, 0, 0).org_metadata_prefix();
+    let prefix = format!("{}/metadata/", org_id);
     let keys = sim.list_prefix_standard(&prefix)?;
 
     let mut result = Vec::new();

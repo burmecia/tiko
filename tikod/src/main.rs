@@ -1,4 +1,3 @@
-pub mod api;
 pub mod compute;
 pub mod gc;
 pub mod lease;
@@ -163,17 +162,6 @@ enum Command {
         #[arg(long)]
         branch: u64,
     },
-    /// Run tikod as a long-lived daemon (HTTP API + background tasks)
-    Serve {
-        #[arg(long, default_value = "0.0.0.0:9527")]
-        addr: String,
-        /// GC retention: max delta manifests to keep per project.
-        #[arg(long, default_value_t = 500)]
-        max_checkpoints: u64,
-        /// Unique identifier for this server (used in GC lease).
-        #[arg(long, default_value = "tikod-1")]
-        server_id: String,
-    },
 }
 
 fn main() {
@@ -181,14 +169,14 @@ fn main() {
     let sim = SimStore::new(std::path::Path::new("/usr/local/tiko/sim_store")); // TODO: configurable path
 
     match cli.command {
-        Command::CreateOrg { org } => match org::create_org(&sim, org) {
+        Command::CreateOrg { org } => match org::OrgMeta::create(&sim, org) {
             Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta).unwrap()),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         },
-        Command::DeleteOrg { org, force } => match org::delete_org(&sim, org, force) {
+        Command::DeleteOrg { org, force } => match org::OrgMeta::delete(&sim, org, force) {
             Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta).unwrap()),
             Err(e) => {
                 eprintln!("error: {e}");
@@ -333,65 +321,5 @@ fn main() {
         } => {
             eprintln!("TODO: materialize(org={org}, project={project}, branch={branch})");
         }
-        Command::Serve {
-            addr,
-            max_checkpoints,
-            server_id,
-        } => {
-            serve(addr, max_checkpoints, server_id);
-        }
     }
-}
-
-// ── serve implementation ───────────────────────────────────────────────────
-
-fn serve(addr: String, max_checkpoints: u64, server_id: String) {
-    use std::sync::Arc;
-    use std::time::Duration;
-    use store::sim_store::SimStore;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime");
-
-    rt.block_on(async move {
-        let sim = Arc::new(SimStore::new(std::path::Path::new(
-            "/usr/local/tiko/sim_store",
-        ))); // TODO: configurable path
-        let state = api::AppState {
-            sim: sim.clone(),
-            server_id: server_id.clone(),
-            max_checkpoints,
-        };
-
-        // Background GC loop: run every 5 minutes.
-        {
-            let sim_gc = sim.clone();
-            let sid = server_id.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(300));
-                loop {
-                    interval.tick().await;
-                    // GC is synchronous (file I/O); run on blocking thread pool.
-                    let sim2 = sim_gc.clone();
-                    let sid2 = sid.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        // Org IDs must be discovered from the store in a real
-                        // implementation.  For now, a no-op placeholder.
-                        let _ = (sim2, sid2, max_checkpoints);
-                    })
-                    .await;
-                }
-            });
-        }
-
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
-        eprintln!("tikod listening on {addr}");
-        axum::serve(listener, api::router(state))
-            .await
-            .expect("server error");
-    });
 }

@@ -131,14 +131,14 @@ pub fn enforce_retention_org(
     let _guard = GcLeaseGuard { sim, org_id };
 
     // ── Org-level soft-delete ─────────────────────────────────────────────────
-    if let Ok(org_meta) = org::get_org(sim, org_id) {
+    if let Ok(org_meta) = org::OrgMeta::get(sim, org_id) {
         if org_meta.deleted_at.is_some() {
             return enforce_org_delete(sim, org_id);
         }
     }
 
     // ── Per-project GC ────────────────────────────────────────────────────────
-    let prefix = ProjectNamespace::new(org_id, 0, 0).org_metadata_prefix();
+    let prefix = format!("{}/metadata/", org_id);
     let meta_keys = sim.list_prefix_standard(&prefix)?;
 
     for key in &meta_keys {
@@ -738,13 +738,13 @@ mod tests {
         let ns = root_ns();
 
         // Create org + project metadata.
-        crate::org::create_org(&sim, ns.org_id).unwrap();
+        crate::org::OrgMeta::create(&sim, ns.org_id).unwrap();
         write_delta(&sim, &ns, 1, Lsn::new(0x1000));
         sim.put_express(&format!("{}/{}/hot", ns.org_id, ns.project_id), b"x")
             .unwrap();
 
         // Soft-delete the org.
-        crate::org::delete_org(&sim, ns.org_id, false).unwrap();
+        crate::org::OrgMeta::delete(&sim, ns.org_id, false).unwrap();
 
         // GC should physically remove everything.
         enforce_retention_org(&sim, ns.org_id, "server-1", 500).unwrap();
@@ -770,7 +770,7 @@ mod tests {
         let ns = root_ns();
 
         // Set up a live org + soft-deleted branch.
-        crate::org::create_org(&sim, ns.org_id).unwrap();
+        crate::org::OrgMeta::create(&sim, ns.org_id).unwrap();
         store::project::ensure_root_project_meta(&sim, &ns).unwrap();
         write_delta(&sim, &ns, 1, Lsn::new(0x1000));
         // Write a versioned chunk for this branch.
