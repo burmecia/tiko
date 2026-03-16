@@ -21,15 +21,15 @@ TEST_DIR="${BASE_DIR}/postgres/src/test/modules/test_tiko"
 POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 EXTENSION_DIR="${POSTGRES_INSTALL}/share/postgresql/extension"
 
-echo "Building S3smgr..."
-if ! (cd s3smgr && cargo build --release) >/dev/null; then
-  echo "S3smgr build failed" >&2
+echo "Building Tiko smgr..."
+if ! (cd smgr && cargo build --release) >/dev/null; then
+  echo "Tiko smgr build failed" >&2
   exit 1
 fi
 
 echo "Verifying Rust library exists..."
-if [ ! -f "${TARGET_DIR}/release/libs3smgr.a" ]; then
-    echo "ERROR: Rust library libs3smgr.a not found!"
+if [ ! -f "${TARGET_DIR}/release/libtikosmgr.a" ]; then
+    echo "ERROR: Rust library libtikosmgr.a not found!"
     exit 1
 fi
 

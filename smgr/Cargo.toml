@@ -1,6 +1,6 @@
 [package]
-name = "s3smgr"
-description = "S3 storage manager, implements the PostgreSQL `smgr` interface"
+name = "smgr"
+description = "Tiko storage manager, implements the PostgreSQL `smgr` interface"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -9,6 +9,7 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 
 [lib]
+name = "tikosmgr"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
