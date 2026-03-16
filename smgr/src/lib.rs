@@ -2,7 +2,7 @@ mod aio;
 pub(crate) mod buffers;
 mod checkpoint;
 mod pipeline;
-mod smgr;
+mod smgr_impl;
 
 /// Wait event identifiers for S3 I/O operations, initialized in s3_init()
 pub(crate) static mut WAIT_EVENT_S3_IO_READ: u32 = 0;
