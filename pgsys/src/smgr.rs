@@ -1,7 +1,7 @@
 // pgsys/src/smgr.rs
 //! PostgreSQL Storage Manager (SMgr) FFI types and bindings
 
-pub use crate::common::*;
+use crate::common::*;
 
 // Corresponds to PostgreSQL's RelFileLocator struct
 #[repr(C)]

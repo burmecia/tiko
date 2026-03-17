@@ -1,5 +1,5 @@
 use engine::io_queue::IoControl;
-use pgsys::smgr::*;
+use pgsys::{common::ForkNumber, smgr::*};
 
 /// Immediately flush dirty cache chunks for a relation fork to backing files.
 ///

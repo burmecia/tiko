@@ -1,4 +1,7 @@
-use pgsys::{common::BLCKSZ, smgr::*};
+use pgsys::{
+    common::{BLCKSZ, BlockNumber, ForkNumber},
+    smgr::*,
+};
 
 /// Return a raw file descriptor and byte offset for a given block.
 ///

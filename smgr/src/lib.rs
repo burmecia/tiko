@@ -16,6 +16,6 @@ pub(crate) static mut WAIT_EVENT_S3_IO_WRITE: u32 = 0;
 /// back to direct `s3_ops` calls.
 pub(crate) fn use_pipeline() -> bool {
     use engine::io_queue::IoControl;
-    use pgsys::smgr::is_under_postmaster;
+    use pgsys::common::is_under_postmaster;
     is_under_postmaster() && IoControl::get().is_worker_alive()
 }

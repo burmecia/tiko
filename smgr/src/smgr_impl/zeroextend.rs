@@ -1,5 +1,9 @@
 use engine::s3_ops;
-use pgsys::{common::INVALID_BLOCK_NUMBER, logging::pg_log_error, smgr::*};
+use pgsys::{
+    common::{BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},
+    logging::pg_log_error,
+    smgr::*,
+};
 use store::chunk::RelFork;
 
 /// Extend a relation fork with zero-filled blocks.

@@ -8,7 +8,12 @@
 use std::sync::atomic::Ordering;
 
 use engine::io_queue::*;
-use pgsys::{common::get_my_proc_number, latch::*, logging::*, smgr::*};
+use pgsys::{
+    common::{BlockNumber, ForkNumber, Oid, RelFileNumber, get_my_proc_number},
+    latch::*,
+    logging::*,
+    smgr::*,
+};
 
 /// POSIX ENOENT (No such file or directory) — constant to avoid libc dependency.
 const ENOENT: i32 = 2;

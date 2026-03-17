@@ -1,5 +1,9 @@
 use engine::s3_ops;
-use pgsys::{logging::pg_log_warning, smgr::*};
+use pgsys::{
+    common::{ForkNumber, INVALID_FORK_NUMBER, MAX_FORKNUM},
+    logging::pg_log_warning,
+    smgr::*,
+};
 use store::chunk::RelFork;
 
 /// Delete a relation's physical storage.

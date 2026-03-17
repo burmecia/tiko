@@ -1,4 +1,9 @@
-use pgsys::{aio::*, common::get_my_proc_number, logging, smgr::*};
+use pgsys::{
+    aio::*,
+    common::{BlockNumber, ForkNumber, get_my_proc_number},
+    logging,
+    smgr::*,
+};
 
 use crate::buffers;
 

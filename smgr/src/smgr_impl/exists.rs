@@ -1,5 +1,5 @@
 use engine::s3_ops;
-use pgsys::smgr::*;
+use pgsys::{common::ForkNumber, smgr::*};
 use store::chunk::RelFork;
 
 #[unsafe(no_mangle)]

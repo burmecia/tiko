@@ -1,4 +1,4 @@
-use pgsys::smgr::*;
+use pgsys::{common::ForkNumber, smgr::*};
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_close(_reln: *mut SMgrRelationData, _forknum: ForkNumber) {

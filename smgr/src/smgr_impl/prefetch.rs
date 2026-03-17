@@ -1,5 +1,8 @@
 use engine::io_queue::IoOpKind;
-use pgsys::smgr::*;
+use pgsys::{
+    common::{BlockNumber, ForkNumber},
+    smgr::*,
+};
 
 use crate::{pipeline, use_pipeline};
 

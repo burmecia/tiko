@@ -1,4 +1,7 @@
-use pgsys::smgr::*;
+use pgsys::{
+    common::{BlockNumber, ForkNumber},
+    smgr::*,
+};
 
 /// Return the maximum number of blocks that can be combined in a single
 /// I/O starting at `blocknum`.

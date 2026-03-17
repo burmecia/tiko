@@ -1,4 +1,7 @@
-use pgsys::smgr::*;
+use pgsys::{
+    common::{BlockNumber, ForkNumber},
+    smgr::*,
+};
 
 /// Tell the kernel to write pages back to storage.
 ///

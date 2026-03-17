@@ -1,4 +1,4 @@
-use pgsys::smgr::*;
+use pgsys::{common::ForkNumber, smgr::*};
 
 /// Mark a whole relation fork as needing fsync.
 ///
