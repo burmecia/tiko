@@ -3,10 +3,10 @@ pub mod gc;
 pub mod lease;
 pub mod lifecycle;
 pub mod orchestrate;
-pub mod org;
 pub mod pitr;
 
 use clap::{Parser, Subcommand};
+use store::org::OrgMeta;
 use store::sim_store::SimStore;
 
 #[derive(Parser)]
@@ -169,14 +169,14 @@ fn main() {
     let sim = SimStore::new(std::path::Path::new("/usr/local/tiko/sim_store")); // TODO: configurable path
 
     match cli.command {
-        Command::CreateOrg { org } => match org::OrgMeta::create(&sim, org) {
+        Command::CreateOrg { org } => match OrgMeta::create(&sim, org) {
             Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta).unwrap()),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         },
-        Command::DeleteOrg { org, force } => match org::OrgMeta::delete(&sim, org, force) {
+        Command::DeleteOrg { org, force } => match OrgMeta::delete(&sim, org, force) {
             Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta).unwrap()),
             Err(e) => {
                 eprintln!("error: {e}");

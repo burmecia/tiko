@@ -31,10 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pgsys::Lsn;
 use store::manifest::Manifest;
+use store::org;
 use store::project::{ProjectMeta, ProjectNamespace};
 use store::sim_store::SimStore;
-
-use crate::org;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -738,13 +737,13 @@ mod tests {
         let ns = root_ns();
 
         // Create org + project metadata.
-        crate::org::OrgMeta::create(&sim, ns.org_id).unwrap();
+        store::org::OrgMeta::create(&sim, ns.org_id).unwrap();
         write_delta(&sim, &ns, 1, Lsn::new(0x1000));
         sim.put_express(&format!("{}/{}/hot", ns.org_id, ns.project_id), b"x")
             .unwrap();
 
         // Soft-delete the org.
-        crate::org::OrgMeta::delete(&sim, ns.org_id, false).unwrap();
+        store::org::OrgMeta::delete(&sim, ns.org_id, false).unwrap();
 
         // GC should physically remove everything.
         enforce_retention_org(&sim, ns.org_id, "server-1", 500).unwrap();
@@ -770,7 +769,7 @@ mod tests {
         let ns = root_ns();
 
         // Set up a live org + soft-deleted branch.
-        crate::org::OrgMeta::create(&sim, ns.org_id).unwrap();
+        store::org::OrgMeta::create(&sim, ns.org_id).unwrap();
         store::project::ensure_root_project_meta(&sim, &ns).unwrap();
         write_delta(&sim, &ns, 1, Lsn::new(0x1000));
         // Write a versioned chunk for this branch.

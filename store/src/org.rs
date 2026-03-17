@@ -8,8 +8,9 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use store::project::{ProjectNamespace, ensure_root_project_meta};
-use store::sim_store::SimStore;
+
+use crate::project::{ProjectNamespace, ensure_root_project_meta};
+use crate::sim_store::SimStore;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -118,6 +119,7 @@ impl OrgMeta {
 
 // ── Internal ──────────────────────────────────────────────────────────────────
 
+#[inline]
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

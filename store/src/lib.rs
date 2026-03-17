@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod manifest;
+pub mod org;
 pub mod project;
 pub mod recovery;
 pub mod sim_store;

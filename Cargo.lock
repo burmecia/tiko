@@ -204,6 +204,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "pgsys",
+ "serde",
+ "serde_json",
  "store",
  "tempfile",
 ]
