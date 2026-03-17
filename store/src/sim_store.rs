@@ -179,10 +179,14 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
 
 fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     ensure_parent(path)?;
-    let compressed =
-        zstd::encode_all(data, 1).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let mut f = File::create(path)?;
-    f.write_all(&compressed)
+    if is_json_file(path) {
+        f.write_all(data)
+    } else {
+        let compressed =
+            zstd::encode_all(data, 1).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        f.write_all(&compressed)
+    }
 }
 
 fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -191,9 +195,19 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let data =
-        zstd::decode_all(raw.as_slice()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(Some(data))
+    if is_json_file(path) {
+        Ok(Some(raw))
+    } else {
+        let data = zstd::decode_all(raw.as_slice())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(Some(data))
+    }
+}
+
+fn is_json_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
 fn remove_optional(path: &Path) -> io::Result<()> {
@@ -279,6 +293,20 @@ mod tests {
             store.get_standard("x/y/z").unwrap(),
             Some(b"world".to_vec())
         );
+    }
+
+    #[test]
+    fn put_get_json_standard_round_trip_without_compression() {
+        let (_dir, store) = setup();
+        let key = "1/metadata/42/project.json";
+        let payload = br#"{"project_id":42,"status":"active"}"#;
+
+        store.put_standard(key, payload).unwrap();
+
+        assert_eq!(store.get_standard(key).unwrap(), Some(payload.to_vec()));
+
+        let raw_on_disk = fs::read(store.standard_root.join(key)).unwrap();
+        assert_eq!(raw_on_disk, payload);
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub extern "C-unwind" fn tiko_init() {
     // Initialize SimStore unconditionally — needed for both initdb and normal run.
     SimStore::init(&data_dir);
 
-    // Try to initialize ProjectCtx from env vars (TIKO_ORG_ID/PROJECT_ID/BRANCH_ID).
+    // Try to initialize ProjectCtx from env vars (TIKO_ORG_ID/TIKO_PROJECT_ID/TIKO_BRANCH_ID).
     // This enables the initdb write path to reach SimStore express.
     ProjectCtx::init_from_env(&data_dir);
 

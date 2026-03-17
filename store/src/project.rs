@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use pgsys::Lsn;
+use pgsys::common::is_under_postmaster;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::{ChunkTag, RelFork};
@@ -278,8 +279,13 @@ impl ProjectCtx {
 
     /// Initialize the global `ProjectCtx` from environment variables.
     ///
-    /// Reads `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`. Panics if
-    /// any are absent or not valid u64s.
+    /// During normal run (`is_under_postmaster() == true`), reads
+    /// `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID` and panics if any
+    /// are absent or not valid u64s.
+    ///
+    /// During initdb/single-user startup (`is_under_postmaster() == false`),
+    /// uses `project_id=0` and `branch_id=0` regardless of env vars. For
+    /// `org_id`, uses `TIKO_ORG_ID` when present (must parse as u64), else `0`.
     ///
     /// If `project.json` exists in SimStore, loads the full `ProjectCtx`
     /// (namespace + base manifest). Otherwise falls back to `bootstrap`,
@@ -295,9 +301,25 @@ impl ProjectCtx {
                 .parse()
                 .unwrap_or_else(|_| panic!("Environment variable {name} must be a valid u64"))
         }
-        let org_id = read_u64(ENV_ORG_ID);
-        let project_id = read_u64(ENV_PROJECT_ID);
-        let branch_id = read_u64(ENV_BRANCH_ID);
+
+        let (org_id, project_id, branch_id) = if is_under_postmaster() {
+            (
+                read_u64(ENV_ORG_ID),
+                read_u64(ENV_PROJECT_ID),
+                read_u64(ENV_BRANCH_ID),
+            )
+        } else {
+            let org_id = std::env::var(ENV_ORG_ID)
+                .ok()
+                .map(|v| {
+                    v.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("Environment variable {ENV_ORG_ID} must be a valid u64")
+                    })
+                })
+                .unwrap_or(0);
+            (org_id, 0, 0)
+        };
+
         let sim = SimStore::get();
         let ns = ProjectNamespace::new(org_id, project_id, branch_id);
         // During initdb, project.json has not been written yet — fall back to
