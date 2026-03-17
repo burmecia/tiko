@@ -44,8 +44,9 @@ impl SimStore {
     ///
     /// Must be called once from `s3worker_main()` before `ProjectCtx::load()`.
     /// Subsequent calls are silently ignored (OnceLock semantics).
-    pub fn init(data_dir: &Path) {
-        let _ = SIM_STORE.set(SimStore::new(data_dir));
+    pub fn init(tiko_root_dir: &Path) -> &'static Self {
+        let _ = SIM_STORE.set(SimStore::new(tiko_root_dir));
+        Self::get()
     }
 
     /// Return the global `SimStore`.
@@ -63,8 +64,9 @@ impl SimStore {
         SIM_STORE.get()
     }
 
-    pub fn new(data_dir: &Path) -> Self {
-        let base = data_dir.join("tiko/sim");
+    /// Create a new `SimStore` instance with the given root directory.
+    pub fn new(tiko_root_dir: &Path) -> Self {
+        let base = tiko_root_dir.join("sim");
         SimStore {
             express_root: base.join("express"),
             standard_root: base.join("standard"),

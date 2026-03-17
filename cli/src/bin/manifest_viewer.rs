@@ -120,9 +120,9 @@ fn parse_args() -> Args {
 
 // ── SimStore helper ───────────────────────────────────────────────────────────
 
-fn sim_from_env() -> Result<SimStore, String> {
+fn sim_from_env() -> Result<&'static SimStore, String> {
     let pgdata = std::env::var("PGDATA").map_err(|_| "PGDATA is not set".to_string())?;
-    Ok(SimStore::new(Path::new(&pgdata)))
+    Ok(SimStore::init(Path::new(&pgdata)))
 }
 
 // ── TIKM magic detection ──────────────────────────────────────────────────────

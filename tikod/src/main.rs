@@ -166,7 +166,7 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-    let sim = SimStore::new(std::path::Path::new("/usr/local/tiko/sim_store")); // TODO: configurable path
+    let sim = SimStore::init(std::path::Path::new("/usr/local/tiko/sim_store")); // TODO: configurable path
 
     match cli.command {
         Command::CreateOrg { org } => match OrgMeta::create(&sim, org) {

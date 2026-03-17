@@ -68,9 +68,9 @@ fn main() {
 // ── Core helpers (also used by tests) ────────────────────────────────────────
 
 /// Build a `SimStore` from `$TIKO_ROOT_PATH`.
-fn sim_from_env() -> Result<SimStore, String> {
+fn sim_from_env() -> Result<&'static SimStore, String> {
     let root = std::env::var("TIKO_ROOT_PATH").map_err(|_| "TIKO_ROOT_PATH not set".to_string())?;
-    Ok(SimStore::new(Path::new(&root)))
+    Ok(SimStore::init(Path::new(&root)))
 }
 
 /// Build a `ProjectNamespace` from `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.

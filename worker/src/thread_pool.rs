@@ -7,30 +7,22 @@
 //! - 8 blocking threads for CPU-bound work (if needed)
 
 use pgsys::logging::*;
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Once, OnceLock};
 
 use engine::pitr_task::{PitrConfig, pitr_background_task};
 use store::project::{ProjectCtx, ProjectNamespace};
 use store::sim_store::SimStore;
-
-/// Arc<SimStore> shared with the PITR background task.
-/// Also accessible from Module 5's eviction path via `pitr_sim_store()`.
-static PITR_SIM_STORE: OnceLock<Arc<SimStore>> = OnceLock::new();
-
-/// Return the shared `Arc<SimStore>` used by the PITR task, if initialised.
-pub fn pitr_sim_store() -> Option<&'static Arc<SimStore>> {
-    PITR_SIM_STORE.get()
-}
 
 /// Spawn the PITR background task on the Tokio runtime.
 ///
 /// Does nothing if:
 /// - The runtime has not been initialised.
 /// - `ProjectCtx` is not yet loaded (env vars absent).
+/// - `SimStore` has not been initialised.
 ///
 /// Call this from `worker_main` after both `init_tokio_runtime` and
 /// `init_project_ctx` have completed.
-pub fn spawn_pitr_task(data_dir: &std::path::Path) {
+pub fn spawn_pitr_task() {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_pitr_task called before runtime init; skipping");
         return;
@@ -41,11 +33,13 @@ pub fn spawn_pitr_task(data_dir: &std::path::Path) {
         return;
     };
 
-    let ns: ProjectNamespace = ctx.ns().clone();
-    let sim = Arc::new(SimStore::new(data_dir));
-    let cfg = PitrConfig::from_env();
+    let Some(sim) = SimStore::try_get() else {
+        pg_log_warning("tiko: SimStore not initialised; skipping PITR background task");
+        return;
+    };
 
-    let _ = PITR_SIM_STORE.set(Arc::clone(&sim));
+    let ns: ProjectNamespace = ctx.ns().clone();
+    let cfg = PitrConfig::from_env();
 
     runtime.spawn(pitr_background_task(sim, ns, cfg));
     pg_log_info("tiko: PITR background task spawned");

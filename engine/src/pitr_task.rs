@@ -8,8 +8,6 @@
 //! GC (retention enforcement) is the control plane's responsibility and is
 //! intentionally absent from this task.
 
-use std::sync::Arc;
-
 use pgsys::Lsn;
 
 use crate::log_relay;
@@ -51,7 +49,11 @@ impl PitrConfig {
 /// Runs until the process exits.  Errors are non-fatal — logged to stderr and
 /// skipped.  A failed materialization only means the next recovery will replay
 /// more deltas; correctness is never compromised.
-pub async fn pitr_background_task(sim: Arc<SimStore>, ns: ProjectNamespace, config: PitrConfig) {
+pub async fn pitr_background_task(
+    sim: &'static SimStore,
+    ns: ProjectNamespace,
+    config: PitrConfig,
+) {
     // pg_log_* must not be called from a Tokio thread (requires PG process-local
     // state).  Use log_relay::relay_* instead — messages are queued and forwarded
     // to pg_log_* by the main PG thread each loop iteration.

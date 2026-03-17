@@ -42,7 +42,7 @@ fn main() {
         eprintln!("error: missing required '--sim-store <PATH>' (or set TIKO_SIM_STORE)");
         std::process::exit(2);
     };
-    let sim = SimStore::new(sim_store_path);
+    let sim = SimStore::init(sim_store_path);
 
     match cli.command {
         Command::CreateOrg { org } => match OrgMeta::create(&sim, org) {
