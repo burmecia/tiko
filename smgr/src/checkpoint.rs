@@ -180,16 +180,16 @@ fn checkpoint_flush_inner(
     data_dir: &Path,
 ) -> io::Result<Option<CheckpointStats>> {
     let log_path = CacheControl::eviction_log_path(data_dir);
-    let ckpt_path = log_path.with_extension("ckpt");
+    let ckpt_path = CacheControl::eviction_log_checkpoint_path(data_dir);
 
     // Step 2 — atomic snapshot.
     // If `.ckpt` already exists (crash recovery), re-process it.
+    // If neither file exists: no evictions occurred — dirty set will be
+    // empty and the function returns early after step 3.
     let crash_recovery = ckpt_path.exists();
     if !crash_recovery && log_path.exists() {
         fs::rename(&log_path, &ckpt_path)?;
     }
-    // If neither file exists: no evictions occurred — dirty set will be
-    // empty and the function returns early after step 3.
 
     // Step 3 — read + dedup.
     let records = CacheControl::read_eviction_log(&ckpt_path);
@@ -475,7 +475,7 @@ mod tests {
         let tag = make_tag(1);
 
         // Simulate step 1 output: eviction log has one entry.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = CacheControl::eviction_log_path(dir.path());
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xAA);
 
@@ -501,7 +501,7 @@ mod tests {
         let tag = make_tag(2);
 
         // Mid-interval: eviction_log written by `flush_dirty_chunk`.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = CacheControl::eviction_log_path(dir.path());
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xBB);
 
@@ -522,7 +522,7 @@ mod tests {
         let tag = make_tag(3);
 
         // Two log entries for the same chunk (evicted, re-dirtied, evicted again).
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = CacheControl::eviction_log_path(dir.path());
         write_eviction_log(&log_path, &[tag, tag]);
         setup_express(&sim, &ns, &[tag], 0xCC);
 
@@ -566,7 +566,7 @@ mod tests {
         let tag = make_tag(5);
 
         // Simulate crash: eviction_log.ckpt exists, eviction_log is absent.
-        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
+        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
         write_eviction_log(&ckpt_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xEE);
 
@@ -595,7 +595,7 @@ mod tests {
         let lsn = Lsn::new(0x6000);
         let tags: Vec<ChunkTag> = (10..15).map(make_tag).collect();
 
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = CacheControl::eviction_log_path(dir.path());
         write_eviction_log(&log_path, &tags);
         setup_express(&sim, &ns, &tags, 0xDD);
 
@@ -621,7 +621,7 @@ mod tests {
         let tag = make_tag(77);
 
         // Populate log and express.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = CacheControl::eviction_log_path(dir.path());
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xFF);
 
@@ -633,7 +633,7 @@ mod tests {
             .unwrap();
 
         // Simulate crash recovery: re-create .ckpt manually.
-        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
+        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
         write_eviction_log(&ckpt_path, &[tag]);
 
         // Second call — must succeed and produce the same manifest content.
@@ -660,13 +660,13 @@ mod tests {
         let ns = ns();
         let lsn = Lsn::new(0x8000);
 
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = CacheControl::eviction_log_path(dir.path());
         write_eviction_log(&log_path, &[make_tag(99)]);
         setup_express(&sim, &ns, &[make_tag(99)], 0x11);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
-        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
+        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
         assert!(
             !ckpt_path.exists(),
             "eviction_log.ckpt must not exist after success"
@@ -683,7 +683,7 @@ mod tests {
         let lsn = Lsn::new(0x9000);
 
         // Create an empty eviction log.
-        let log_path = dir.path().join("tiko").join("eviction_log");
+        let log_path = CacheControl::eviction_log_path(dir.path());
         write_eviction_log(&log_path, &[]);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -697,7 +697,7 @@ mod tests {
         );
 
         // eviction_log.ckpt should be cleaned up.
-        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
+        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
         assert!(
             !ckpt_path.exists(),
             "eviction_log.ckpt must be removed on no-op"

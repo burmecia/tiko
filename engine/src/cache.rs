@@ -48,11 +48,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
-use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber, data_dir_path};
+use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use pgsys::logging::pg_log_debug1;
 
-// Re-export shared chunk types from the store crate.
-use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork};
+use store::{
+    chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork},
+    tiko_root_path,
+};
 
 // ── Constants ──
 
@@ -811,9 +813,14 @@ impl CacheControl {
 
     // ── Eviction log ──────────────────────────────────────────────────────
 
-    /// Path of the eviction log file: `{data_dir}/tiko/eviction_log`.
-    pub fn eviction_log_path(data_dir: &Path) -> PathBuf {
-        data_dir.join("tiko").join("eviction_log")
+    /// Path of the eviction log file: `{tiko_root}/eviction_log`.
+    pub fn eviction_log_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("eviction_log")
+    }
+
+    /// Path of the eviction log checkpoint file: `{tiko_root}/eviction_log.ckpt`.
+    pub fn eviction_log_checkpoint_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("eviction_log.ckpt")
     }
 
     /// Append a single chunk tag to the process-local eviction log.
@@ -835,7 +842,7 @@ impl CacheControl {
     /// inode. A cached `OnceLock<File>` would still point at the renamed
     /// inode, so we open fresh on every eviction.
     fn open_eviction_log() -> File {
-        let path = Self::eviction_log_path(&data_dir_path());
+        let path = Self::eviction_log_path(&tiko_root_path());
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
