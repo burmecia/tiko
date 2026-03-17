@@ -260,7 +260,7 @@ impl CacheControl {
     // ── Cache data file ──
 
     fn cache_file_path() -> PathBuf {
-        data_dir_path().join(store::TIKO_DIR).join("cache")
+        store::tiko_root_path().join("cache")
     }
 
     pub fn cache_file() -> &'static File {
@@ -813,7 +813,7 @@ impl CacheControl {
 
     /// Path of the eviction log file: `{data_dir}/tiko/eviction_log`.
     pub fn eviction_log_path(data_dir: &Path) -> PathBuf {
-        data_dir.join(store::TIKO_DIR).join("eviction_log")
+        data_dir.join("tiko").join("eviction_log")
     }
 
     /// Append a single chunk tag to the process-local eviction log.

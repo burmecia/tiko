@@ -48,7 +48,6 @@ use engine::cache::CacheControl;
 use engine::io_queue::IoControl;
 use engine::pitr_task::materialize_base;
 use pgsys::{Lsn, common::data_dir_path, logging::*};
-use store::TIKO_DIR;
 use store::chunk::{CHUNK_SIZE, ChunkTag, RelFork};
 use store::manifest::{ChunkRef, Manifest};
 use store::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
@@ -280,7 +279,7 @@ fn dedup_by_chunk_tag(records: Vec<ChunkTag>) -> Vec<ChunkTag> {
 
 fn delta_tmp_path(data_dir: &Path, lsn: Lsn) -> PathBuf {
     data_dir
-        .join(TIKO_DIR)
+        .join("tiko")
         .join(format!("delta_{}.bin", lsn.to_hex()))
 }
 
@@ -459,7 +458,7 @@ mod tests {
             .get_standard(&ns.delta_manifest_key(timeline, lsn))
             .unwrap()
             .expect("delta manifest must exist");
-        let path = dir.path().join(TIKO_DIR).join("read_delta.tikm");
+        let path = dir.path().join("tiko").join("read_delta.tikm");
         Manifest::from_bytes(&bytes, &path).unwrap()
     }
 
@@ -476,7 +475,7 @@ mod tests {
         let tag = make_tag(1);
 
         // Simulate step 1 output: eviction log has one entry.
-        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
+        let log_path = dir.path().join("tiko").join("eviction_log");
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xAA);
 
@@ -502,7 +501,7 @@ mod tests {
         let tag = make_tag(2);
 
         // Mid-interval: eviction_log written by `flush_dirty_chunk`.
-        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
+        let log_path = dir.path().join("tiko").join("eviction_log");
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xBB);
 
@@ -523,7 +522,7 @@ mod tests {
         let tag = make_tag(3);
 
         // Two log entries for the same chunk (evicted, re-dirtied, evicted again).
-        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
+        let log_path = dir.path().join("tiko").join("eviction_log");
         write_eviction_log(&log_path, &[tag, tag]);
         setup_express(&sim, &ns, &[tag], 0xCC);
 
@@ -541,7 +540,7 @@ mod tests {
                 .get_standard(&ns.delta_manifest_key(1, lsn))
                 .unwrap()
                 .unwrap();
-            let path = dir.path().join(TIKO_DIR).join("count.tikm");
+            let path = dir.path().join("tiko").join("count.tikm");
             let m2 = Manifest::from_bytes(&bytes, &path).unwrap();
             let _ = m2.checkpoint_lsn();
             // entry_count is internal; verify via lookup
@@ -567,7 +566,7 @@ mod tests {
         let tag = make_tag(5);
 
         // Simulate crash: eviction_log.ckpt exists, eviction_log is absent.
-        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
+        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
         write_eviction_log(&ckpt_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xEE);
 
@@ -596,7 +595,7 @@ mod tests {
         let lsn = Lsn::new(0x6000);
         let tags: Vec<ChunkTag> = (10..15).map(make_tag).collect();
 
-        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
+        let log_path = dir.path().join("tiko").join("eviction_log");
         write_eviction_log(&log_path, &tags);
         setup_express(&sim, &ns, &tags, 0xDD);
 
@@ -622,7 +621,7 @@ mod tests {
         let tag = make_tag(77);
 
         // Populate log and express.
-        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
+        let log_path = dir.path().join("tiko").join("eviction_log");
         write_eviction_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xFF);
 
@@ -634,7 +633,7 @@ mod tests {
             .unwrap();
 
         // Simulate crash recovery: re-create .ckpt manually.
-        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
+        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
         write_eviction_log(&ckpt_path, &[tag]);
 
         // Second call — must succeed and produce the same manifest content.
@@ -645,8 +644,8 @@ mod tests {
             .unwrap();
 
         // Both manifests must decode to the same entries.
-        let p1 = dir.path().join(TIKO_DIR).join("cmp1.tikm");
-        let p2 = dir.path().join(TIKO_DIR).join("cmp2.tikm");
+        let p1 = dir.path().join("tiko").join("cmp1.tikm");
+        let p2 = dir.path().join("tiko").join("cmp2.tikm");
         let m1 = Manifest::from_bytes(&bytes_first, &p1).unwrap();
         let m2 = Manifest::from_bytes(&bytes_second, &p2).unwrap();
         assert_eq!(m1.lookup(&tag).unwrap(), m2.lookup(&tag).unwrap());
@@ -661,13 +660,13 @@ mod tests {
         let ns = ns();
         let lsn = Lsn::new(0x8000);
 
-        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
+        let log_path = dir.path().join("tiko").join("eviction_log");
         write_eviction_log(&log_path, &[make_tag(99)]);
         setup_express(&sim, &ns, &[make_tag(99)], 0x11);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
-        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
+        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
         assert!(
             !ckpt_path.exists(),
             "eviction_log.ckpt must not exist after success"
@@ -684,7 +683,7 @@ mod tests {
         let lsn = Lsn::new(0x9000);
 
         // Create an empty eviction log.
-        let log_path = dir.path().join(TIKO_DIR).join("eviction_log");
+        let log_path = dir.path().join("tiko").join("eviction_log");
         write_eviction_log(&log_path, &[]);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -698,7 +697,7 @@ mod tests {
         );
 
         // eviction_log.ckpt should be cleaned up.
-        let ckpt_path = dir.path().join(TIKO_DIR).join("eviction_log.ckpt");
+        let ckpt_path = dir.path().join("tiko").join("eviction_log.ckpt");
         assert!(
             !ckpt_path.exists(),
             "eviction_log.ckpt must be removed on no-op"

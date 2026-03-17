@@ -16,8 +16,6 @@ use pgsys::{
 };
 use std::ffi::{c_char, c_int};
 
-pub use store::TIKO_DIR;
-
 // PostgreSQL extension magic function
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn Pg_magic_func() -> &'static PgMagicStruct {

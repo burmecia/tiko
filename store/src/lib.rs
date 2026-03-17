@@ -9,9 +9,6 @@ pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag, RelFork};
 
 use std::path::PathBuf;
 
-/// Subdirectory name under `$PGDATA` for all Tiko data.
-pub const TIKO_DIR: &str = "tiko";
-
 pub fn tiko_root_path() -> PathBuf {
     if let Ok(p) = std::env::var("TIKO_ROOT_PATH") {
         PathBuf::from(p)
