@@ -53,6 +53,10 @@ impl ProjectNamespace {
         }
     }
 
+    /// Construct a `ProjectNamespace` from environment variables.
+    ///
+    /// Expects `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID` to be set and
+    /// parseable as u64s. Panics if any are missing or invalid.
     pub fn new_from_env() -> Self {
         fn read_u64(name: &str) -> u64 {
             std::env::var(name)
@@ -307,7 +311,7 @@ impl ProjectCtx {
     ///
     /// Silently ignored if `ProjectCtx` is already initialized (OnceLock).
     /// `SimStore::init()` must be called before this.
-    pub fn init_from_env(data_dir: &Path) {
+    pub fn init_from_env(root_dir: &Path) {
         let ns = if is_under_postmaster() {
             ProjectNamespace::new_from_env()
         } else {
@@ -327,8 +331,8 @@ impl ProjectCtx {
         // During initdb, project.json has not been written yet — fall back to
         // a namespace-only ctx with an empty manifest so writes are routed
         // correctly. The manifest is irrelevant during initdb (no reads).
-        let ctx = ProjectCtx::load(&ns, data_dir, sim)
-            .unwrap_or_else(|_| ProjectCtx::bootstrap(&ns, data_dir));
+        let ctx = ProjectCtx::load(&ns, root_dir, sim)
+            .unwrap_or_else(|_| ProjectCtx::bootstrap(&ns, root_dir));
         ProjectCtx::init(ctx);
     }
 
@@ -338,7 +342,7 @@ impl ProjectCtx {
     /// Sets the namespace so writes are routed to the correct SimStore paths.
     /// Uses an empty zero-entry manifest — level-2 reads are never needed
     /// before the first checkpoint writes a base manifest.
-    fn bootstrap(ns: &ProjectNamespace, data_dir: &Path) -> Self {
+    fn bootstrap(ns: &ProjectNamespace, root_dir: &Path) -> Self {
         let meta = ProjectMeta {
             ns: ns.clone(),
             parent_project_id: None,
@@ -350,7 +354,7 @@ impl ProjectCtx {
             status: "active".to_string(),
             deleted_at: None,
         };
-        let local_path = Manifest::local_manifest_path(data_dir);
+        let local_path = Manifest::local_manifest_path(root_dir);
         let base_manifest = Manifest::empty(&local_path).expect("failed to create empty manifest");
         ProjectCtx {
             meta,
@@ -359,7 +363,7 @@ impl ProjectCtx {
     }
 
     /// Load project.json from the sim store, download the latest base manifest,
-    /// write the local TIKM file under `{data_dir}/tiko/base_manifest.bin`,
+    /// write the local TIKM file under `{root_dir}/tiko/base_manifest.bin`,
     /// and return a `ProjectCtx`.
     ///
     /// `ns` is the bootstrap key constructed from env vars before
@@ -375,7 +379,7 @@ impl ProjectCtx {
     /// returns `true` so callers can skip root-only operations (e.g. base
     /// compaction after initdb). The initial base is written by the
     /// restore-from-parent process after initdb completes.
-    pub fn load(ns: &ProjectNamespace, data_dir: &Path, sim: &SimStore) -> Result<Self> {
+    pub fn load(ns: &ProjectNamespace, root_dir: &Path, sim: &SimStore) -> Result<Self> {
         // Step 1: fetch project.json
         let meta_key = ns.project_meta_key();
         let meta_bytes = sim
@@ -414,7 +418,7 @@ impl ProjectCtx {
             .collect();
         base_lsns.sort();
 
-        let local_path = Manifest::local_manifest_path(data_dir);
+        let local_path = Manifest::local_manifest_path(root_dir);
 
         // Step 4: download or construct the base manifest
         let base_manifest = if let Some(&latest_lsn) = base_lsns.last() {

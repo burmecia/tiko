@@ -117,7 +117,7 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
                 lsn.to_hex()
             ));
             pg_log_info(&format!(
-                "tiko_checkpoint_flush: complete — {} chunk(s) uploaded, lsn={}, crash_recovery={}",
+                "tiko_checkpoint_flush: complete {} chunk(s) uploaded, lsn={}, crash_recovery={}",
                 stats.dirty_chunks,
                 lsn.to_hex(),
                 stats.crash_recovery,
@@ -458,7 +458,7 @@ mod tests {
             .get_standard(&ns.delta_manifest_key(timeline, lsn))
             .unwrap()
             .expect("delta manifest must exist");
-        let path = dir.path().join("tiko").join("read_delta.tikm");
+        let path = dir.path().join("read_delta.tikm");
         Manifest::from_bytes(&bytes, &path).unwrap()
     }
 
@@ -540,7 +540,7 @@ mod tests {
                 .get_standard(&ns.delta_manifest_key(1, lsn))
                 .unwrap()
                 .unwrap();
-            let path = dir.path().join("tiko").join("count.tikm");
+            let path = dir.path().join("count.tikm");
             let m2 = Manifest::from_bytes(&bytes, &path).unwrap();
             let _ = m2.checkpoint_lsn();
             // entry_count is internal; verify via lookup
@@ -644,8 +644,8 @@ mod tests {
             .unwrap();
 
         // Both manifests must decode to the same entries.
-        let p1 = dir.path().join("tiko").join("cmp1.tikm");
-        let p2 = dir.path().join("tiko").join("cmp2.tikm");
+        let p1 = dir.path().join("cmp1.tikm");
+        let p2 = dir.path().join("cmp2.tikm");
         let m1 = Manifest::from_bytes(&bytes_first, &p1).unwrap();
         let m2 = Manifest::from_bytes(&bytes_second, &p2).unwrap();
         assert_eq!(m1.lookup(&tag).unwrap(), m2.lookup(&tag).unwrap());

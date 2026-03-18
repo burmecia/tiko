@@ -20,9 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use store::{
-    ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, project::ProjectNamespace, sim_store::SimStore,
-};
+use store::{project::ProjectNamespace, sim_store::SimStore};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -35,14 +33,7 @@ fn main() {
     let wal_filename = &args[2];
 
     let sim = SimStore::new_from_env();
-
-    let ns = match namespace_from_env() {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("tiko_archive: {e}");
-            exit(1);
-        }
-    };
+    let ns = ProjectNamespace::new_from_env();
 
     let timeline = match parse_timeline(wal_filename) {
         Some(t) => t,
@@ -56,19 +47,9 @@ fn main() {
         eprintln!("tiko_archive: upload failed: {e}");
         exit(1);
     }
-
-    exit(0);
 }
 
 // ── Core helpers (also used by tests) ────────────────────────────────────────
-
-/// Build a `ProjectNamespace` from `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.
-fn namespace_from_env() -> Result<ProjectNamespace, String> {
-    let org_id = read_u64(ENV_ORG_ID)?;
-    let project_id = read_u64(ENV_PROJECT_ID)?;
-    let branch_id = read_u64(ENV_BRANCH_ID)?;
-    Ok(ProjectNamespace::new(org_id, project_id, branch_id))
-}
 
 /// Extract the timeline number from a 24-character WAL segment name.
 ///
@@ -92,13 +73,6 @@ fn upload_wal_segment(
 ) -> std::io::Result<()> {
     let bytes = std::fs::read(path)?;
     sim.put_standard(&ns.wal_key(timeline, segment), &bytes)
-}
-
-fn read_u64(var: &str) -> Result<u64, String> {
-    std::env::var(var)
-        .map_err(|_| format!("{var} not set"))?
-        .parse::<u64>()
-        .map_err(|_| format!("{var} is not a valid u64"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

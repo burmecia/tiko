@@ -45,7 +45,7 @@ pub fn relay_log(elevel: i32, msg: impl Into<String>) {
             }
         }
     } else {
-        // Channel not yet initialised (startup race).
+        // Channel not yet initialised (startup race or in initdb).
         eprintln!("tiko: log_relay: channel not initialised, dropping to stderr: {msg}");
     }
 }

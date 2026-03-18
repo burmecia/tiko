@@ -63,3 +63,14 @@ make -j$(nproc)
 make install-strip
 
 alternative project names: Tiko
+
+# check WAL archive status
+SELECT * FROM pg_stat_archiver;
+
+# check WAL archive settings
+SELECT name, setting, unit 
+FROM pg_settings 
+WHERE name IN ('archive_mode', 'archive_command', 'archive_timeout');
+
+# force WAL archive to switch to a new segment, so that we can test archive_command with a known WAL file
+SELECT pg_switch_wal();
