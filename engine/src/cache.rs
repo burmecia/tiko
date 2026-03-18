@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     fn read_eviction_log_skips_partial_trailing_record() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("eviction_log");
+        let path = CacheControl::eviction_log_path(dir.path());
 
         // Write 2 complete records (40 bytes) + 10 bytes of a partial third record.
         let tag0 = make_tag(0);
@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn read_eviction_log_empty_file_returns_empty() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("eviction_log");
+        let path = CacheControl::eviction_log_path(dir.path());
         std::fs::write(&path, b"").unwrap();
         let records = CacheControl::read_eviction_log(&path);
         assert!(records.is_empty());
@@ -1042,7 +1042,7 @@ mod tests {
     #[test]
     fn read_eviction_log_exact_n_records() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("eviction_log");
+        let path = CacheControl::eviction_log_path(dir.path());
         let n = 8usize;
         let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
         let mut file = OpenOptions::new()
@@ -1064,7 +1064,7 @@ mod tests {
     #[test]
     fn concurrent_log_appends_produce_n_records_without_corruption() {
         let dir = TempDir::new().unwrap();
-        let path = Arc::new(dir.path().join("eviction_log"));
+        let path = Arc::new(CacheControl::eviction_log_path(dir.path()));
         let n = 16usize;
         let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
 

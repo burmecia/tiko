@@ -1,13 +1,10 @@
 use engine::io_queue::IoControl;
 use pgsys::{
-    common::{
-        MaxBackends, NUM_AUXILIARY_PROCS, data_dir_path, get_my_proc_number, is_under_postmaster,
-    },
+    common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number, is_under_postmaster},
     logging::*,
     wait_events::new_wait_event,
 };
-use store::project::ProjectCtx;
-use store::sim_store::SimStore;
+use store::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_init() {
@@ -17,14 +14,14 @@ pub extern "C-unwind" fn tiko_init() {
         crate::WAIT_EVENT_S3_IO_WRITE = new_wait_event(c"S3IOWrite".as_ptr());
     }
 
-    let data_dir = data_dir_path();
+    let root_dir = tiko_root_path();
 
     // Initialize SimStore unconditionally — needed for both initdb and normal run.
-    SimStore::init(&data_dir);
+    SimStore::init(&root_dir);
 
     // Try to initialize ProjectCtx from env vars (TIKO_ORG_ID/TIKO_PROJECT_ID/TIKO_BRANCH_ID).
     // This enables the initdb write path to reach SimStore express.
-    ProjectCtx::init_from_env(&data_dir);
+    ProjectCtx::init_from_env(&root_dir);
 
     // Skip shared memory attachment in initdb (--boot) and single-user mode.
     // In those modes MyProcNumber is invalid and the IoControl shmem block

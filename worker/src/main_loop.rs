@@ -10,21 +10,18 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use engine::{dispatcher::Dispatcher, io_queue::IoControl, log_relay};
 use pgsys::{
-    common::{MyProcPid, SIGHUP, SIGTERM, data_dir_path},
+    common::{MyProcPid, SIGHUP, SIGTERM},
     cshim::check_for_interrupts,
     latch::*,
     logging::*,
     wait_events::new_wait_event,
 };
+use store::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 
 use crate::io_handler;
 use crate::thread_pool;
-use engine::dispatcher::Dispatcher;
-use engine::io_queue::IoControl;
-use engine::log_relay;
-use store::project::ProjectCtx;
-use store::sim_store::SimStore;
 
 /// Global flags for managing worker lifecycle and configuration
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -89,9 +86,9 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
 
     // Initialize SimStore and ProjectCtx from the data directory and env vars
-    let data_dir = data_dir_path();
-    SimStore::init(&data_dir);
-    ProjectCtx::init_from_env(&data_dir);
+    let root_dir = tiko_root_path();
+    SimStore::init(&root_dir);
+    ProjectCtx::init_from_env(&root_dir);
 
     // Spawn the PITR background task now that the runtime and ProjectCtx are initialised.
     thread_pool::spawn_pitr_task();

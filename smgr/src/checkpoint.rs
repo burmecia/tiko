@@ -44,14 +44,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use engine::cache::CacheControl;
-use engine::io_queue::IoControl;
-use engine::pitr_task::materialize_base;
+use engine::{cache::CacheControl, io_queue::IoControl, pitr_task::materialize_base};
 use pgsys::{Lsn, common::data_dir_path, logging::*};
-use store::chunk::{CHUNK_SIZE, ChunkTag, RelFork};
-use store::manifest::{ChunkRef, Manifest};
-use store::project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta};
-use store::sim_store::SimStore;
+use store::{
+    chunk::{CHUNK_SIZE, ChunkTag, RelFork},
+    manifest::{ChunkRef, Manifest},
+    project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta},
+    sim_store::SimStore,
+    tiko_root_path,
+};
 
 // ── extern "C" entry point ────────────────────────────────────────────────────
 
@@ -76,7 +77,7 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
 
     let lsn = Lsn::new(checkpoint_lsn);
     let timeline = timeline_id;
-    let data_dir = data_dir_path();
+    let root_dir = tiko_root_path();
 
     if IoControl::is_initialized() {
         // Normal path (server running under postmaster): flush dirty shmem
@@ -96,7 +97,7 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
         "tiko_checkpoint_flush: step 2-6: processing eviction log (lsn={})",
         lsn.to_hex()
     ));
-    match checkpoint_flush_inner(sim, ctx.ns(), timeline, lsn, &data_dir) {
+    match checkpoint_flush_inner(sim, ctx.ns(), timeline, lsn, &root_dir, &data_dir_path()) {
         Ok(None) => {
             pg_log_info(&format!(
                 "tiko_checkpoint_flush: no dirty chunks — skipped (lsn={})",
@@ -177,10 +178,11 @@ fn checkpoint_flush_inner(
     ns: &ProjectNamespace,
     timeline: u32,
     checkpoint_lsn: Lsn,
-    data_dir: &Path,
+    root_dir: &Path,
+    pg_data_dir: &Path,
 ) -> io::Result<Option<CheckpointStats>> {
-    let log_path = CacheControl::eviction_log_path(data_dir);
-    let ckpt_path = CacheControl::eviction_log_checkpoint_path(data_dir);
+    let log_path = CacheControl::eviction_log_path(root_dir);
+    let ckpt_path = CacheControl::eviction_log_checkpoint_path(root_dir);
 
     // Step 2 — atomic snapshot.
     // If `.ckpt` already exists (crash recovery), re-process it.
@@ -244,7 +246,7 @@ fn checkpoint_flush_inner(
         });
     }
 
-    let tmp_delta_manifest_path = delta_tmp_path(data_dir, checkpoint_lsn);
+    let tmp_delta_manifest_path = delta_tmp_path(root_dir, checkpoint_lsn);
     let delta = Manifest::new(
         checkpoint_lsn,
         now_unix(),
@@ -253,7 +255,7 @@ fn checkpoint_flush_inner(
         &tmp_delta_manifest_path,
     )?;
     upload_delta_manifest(sim, ns, timeline, checkpoint_lsn, &delta)?;
-    upload_pg_state(sim, ns, timeline, checkpoint_lsn, data_dir)?;
+    upload_pg_state(sim, ns, timeline, checkpoint_lsn, pg_data_dir)?;
 
     // Step 6 — remove checkpoint snapshot and local build file.
     let _ = fs::remove_file(&ckpt_path); // silently ignore ENOENT
@@ -277,10 +279,8 @@ fn dedup_by_chunk_tag(records: Vec<ChunkTag>) -> Vec<ChunkTag> {
     set.into_iter().collect()
 }
 
-fn delta_tmp_path(data_dir: &Path, lsn: Lsn) -> PathBuf {
-    data_dir
-        .join("tiko")
-        .join(format!("delta_{}.bin", lsn.to_hex()))
+fn delta_tmp_path(root_dir: &Path, lsn: Lsn) -> PathBuf {
+    root_dir.join(format!("delta_{}.bin", lsn.to_hex()))
 }
 
 fn now_unix() -> i64 {
@@ -443,7 +443,7 @@ mod tests {
         lsn: Lsn,
         timeline: u32,
     ) -> io::Result<()> {
-        checkpoint_flush_inner(sim, ns, timeline, lsn, dir.path()).map(|_| ())
+        checkpoint_flush_inner(sim, ns, timeline, lsn, dir.path(), dir.path()).map(|_| ())
     }
 
     /// Deserialise the delta manifest from the standard sim for `lsn`.
