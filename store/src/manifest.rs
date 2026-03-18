@@ -336,8 +336,8 @@ impl Manifest {
     }
 
     /// Canonical local path for the base manifest TIKM file.
-    pub fn local_manifest_path(data_dir: &Path) -> PathBuf {
-        data_dir.join("tiko").join("base_manifest.bin")
+    pub fn local_manifest_path(root_dir: &Path) -> PathBuf {
+        root_dir.join("base_manifest.bin")
     }
 
     /// Binary search for `key` in the sorted on-disk TIKM file.

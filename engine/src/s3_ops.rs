@@ -800,7 +800,7 @@ mod tests {
         let m = Manifest::new(lsn, 0, vec![(tag, chunk_ref)], HashMap::new(), &build_path).unwrap();
         let blob = m.to_bytes().unwrap();
 
-        let tiko_dir = dir.path().join("tiko");
+        let tiko_dir = dir.path();
         std::fs::create_dir_all(&tiko_dir).unwrap();
         let manifest_path = tiko_dir.join("recovery_manifest.bin");
         std::fs::write(&manifest_path, &blob).unwrap();
