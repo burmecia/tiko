@@ -11,9 +11,12 @@
 use pgsys::Lsn;
 
 use crate::log_relay;
-use store::manifest::Manifest;
-use store::project::{ProjectCtx, ProjectNamespace};
-use store::sim_store::SimStore;
+use store::{
+    ENV_PITR_INTERVAL_SECS,
+    manifest::Manifest,
+    project::{ProjectCtx, ProjectNamespace},
+    sim_store::SimStore,
+};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -32,7 +35,7 @@ impl PitrConfig {
     /// Build config from environment.  Falls back to 3600s if the variable
     /// is absent or cannot be parsed.
     pub fn from_env() -> Self {
-        let secs = std::env::var("TIKO_PITR_INTERVAL_SECS")
+        let secs = std::env::var(ENV_PITR_INTERVAL_SECS)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3600);

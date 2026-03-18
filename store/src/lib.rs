@@ -17,6 +17,9 @@ pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";
 pub const ENV_PROJECT_ID: &str = "TIKO_PROJECT_ID";
 pub const ENV_BRANCH_ID: &str = "TIKO_BRANCH_ID";
 
+/// Environment variable for how often the PITR worker should materialize a new base manifest, in seconds (default: 3600).
+pub const ENV_PITR_INTERVAL_SECS: &str = "TIKO_PITR_INTERVAL_SECS";
+
 /// Get the root path for Tiko data, either from `TIKO_ROOT_PATH` or defaulting to `$PGDATA/tiko`.
 pub fn tiko_root_path() -> PathBuf {
     if let Ok(p) = std::env::var(ENV_TIKO_ROOT_PATH) {
