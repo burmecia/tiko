@@ -12,7 +12,7 @@
 //! Exits 0 on success; exits 1 on any error (PostgreSQL retries on non-zero exit).
 //!
 //! Required environment variables:
-//! - `TIKO_ROOT_PATH`   — root path for the sim store (replaces `PGDATA`)
+//! - `TIKO_ROOT_PATH`   — root path for the sim store
 //! - `TIKO_ORG_ID`      — organisation identifier (u64)
 //! - `TIKO_PROJECT_ID`  — project identifier (u64)
 //! - `TIKO_BRANCH_ID`   — branch identifier (u64)
@@ -20,8 +20,9 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use store::project::{ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, ProjectNamespace};
-use store::sim_store::SimStore;
+use store::{
+    ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, project::ProjectNamespace, sim_store::SimStore,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,13 +34,7 @@ fn main() {
     let wal_path = PathBuf::from(&args[1]);
     let wal_filename = &args[2];
 
-    let sim = match sim_from_env() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("tiko_archive: {e}");
-            exit(1);
-        }
-    };
+    let sim = SimStore::new_from_env();
 
     let ns = match namespace_from_env() {
         Ok(n) => n,
@@ -66,12 +61,6 @@ fn main() {
 }
 
 // ── Core helpers (also used by tests) ────────────────────────────────────────
-
-/// Build a `SimStore` from `$TIKO_ROOT_PATH`.
-fn sim_from_env() -> Result<&'static SimStore, String> {
-    let root = std::env::var("TIKO_ROOT_PATH").map_err(|_| "TIKO_ROOT_PATH not set".to_string())?;
-    Ok(SimStore::init(Path::new(&root)))
-}
 
 /// Build a `ProjectNamespace` from `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.
 fn namespace_from_env() -> Result<ProjectNamespace, String> {

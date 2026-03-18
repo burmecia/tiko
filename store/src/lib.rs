@@ -9,8 +9,17 @@ pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag, RelFork};
 
 use std::path::PathBuf;
 
+/// Environment variable for the Tiko root path (overrides default of `$PGDATA/tiko`).
+pub const ENV_TIKO_ROOT_PATH: &str = "TIKO_ROOT_PATH";
+
+// Environment variable names for project identity (org_id, project_id, branch_id).
+pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";
+pub const ENV_PROJECT_ID: &str = "TIKO_PROJECT_ID";
+pub const ENV_BRANCH_ID: &str = "TIKO_BRANCH_ID";
+
+/// Get the root path for Tiko data, either from `TIKO_ROOT_PATH` or defaulting to `$PGDATA/tiko`.
 pub fn tiko_root_path() -> PathBuf {
-    if let Ok(p) = std::env::var("TIKO_ROOT_PATH") {
+    if let Ok(p) = std::env::var(ENV_TIKO_ROOT_PATH) {
         PathBuf::from(p)
     } else {
         pgsys::common::data_dir_path().join("tiko")

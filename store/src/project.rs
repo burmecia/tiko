@@ -14,14 +14,12 @@ use pgsys::Lsn;
 use pgsys::common::is_under_postmaster;
 use serde::{Deserialize, Serialize};
 
-use crate::chunk::{ChunkTag, RelFork};
-use crate::manifest::{ChunkRef, Manifest};
-use crate::sim_store::SimStore;
-
-// Environment variable names for project identity (org_id, project_id, branch_id).
-pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";
-pub const ENV_PROJECT_ID: &str = "TIKO_PROJECT_ID";
-pub const ENV_BRANCH_ID: &str = "TIKO_BRANCH_ID";
+use crate::{
+    ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID,
+    chunk::{ChunkTag, RelFork},
+    manifest::{ChunkRef, Manifest},
+    sim_store::SimStore,
+};
 
 /// Global project context for the running s3worker process.
 static PROJECT_CTX: OnceLock<ProjectCtx> = OnceLock::new();
@@ -53,6 +51,21 @@ impl ProjectNamespace {
             project_id,
             branch_id,
         }
+    }
+
+    pub fn new_from_env() -> Self {
+        fn read_u64(name: &str) -> u64 {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("Environment variable {name} must be set"))
+                .parse()
+                .unwrap_or_else(|_| panic!("Environment variable {name} must be a valid u64"))
+        }
+
+        let org_id = read_u64(ENV_ORG_ID);
+        let project_id = read_u64(ENV_PROJECT_ID);
+        let branch_id = read_u64(ENV_BRANCH_ID);
+
+        ProjectNamespace::new(org_id, project_id, branch_id)
     }
 
     // ── Express-bucket keys ───────────────────────────────────────────────
@@ -295,33 +308,22 @@ impl ProjectCtx {
     /// Silently ignored if `ProjectCtx` is already initialized (OnceLock).
     /// `SimStore::init()` must be called before this.
     pub fn init_from_env(data_dir: &Path) {
-        fn read_u64(name: &str) -> u64 {
-            std::env::var(name)
-                .unwrap_or_else(|_| panic!("Environment variable {name} must be set"))
-                .parse()
-                .unwrap_or_else(|_| panic!("Environment variable {name} must be a valid u64"))
-        }
-
-        let (org_id, project_id, branch_id) = if is_under_postmaster() {
-            (
-                read_u64(ENV_ORG_ID),
-                read_u64(ENV_PROJECT_ID),
-                read_u64(ENV_BRANCH_ID),
-            )
+        let ns = if is_under_postmaster() {
+            ProjectNamespace::new_from_env()
         } else {
             let org_id = std::env::var(ENV_ORG_ID)
                 .ok()
                 .map(|v| {
                     v.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("Environment variable {ENV_ORG_ID} must be a valid u64")
+                        panic!("Environment variable {} must be a valid u64", ENV_ORG_ID)
                     })
                 })
                 .unwrap_or(0);
-            (org_id, 0, 0)
+            ProjectNamespace::new(org_id, 0, 0)
         };
 
         let sim = SimStore::get();
-        let ns = ProjectNamespace::new(org_id, project_id, branch_id);
+
         // During initdb, project.json has not been written yet — fall back to
         // a namespace-only ctx with an empty manifest so writes are routed
         // correctly. The manifest is irrelevant during initdb (no reads).

@@ -73,6 +73,16 @@ impl SimStore {
         }
     }
 
+    /// Create a new `SimStore` instance using the `TIKO_ROOT_PATH` environment variable.
+    ///
+    /// # Panics
+    /// Panics if `TIKO_ROOT_PATH` is not set.
+    pub fn new_from_env() -> Self {
+        let root = std::env::var(crate::ENV_TIKO_ROOT_PATH)
+            .expect("TIKO_ROOT_PATH environment variable is not set");
+        Self::new(Path::new(&root))
+    }
+
     // ── Primitive helpers ─────────────────────────────────────────────────
 
     pub fn put_express(&self, key: &str, data: &[u8]) -> io::Result<()> {
