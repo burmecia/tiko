@@ -32,6 +32,7 @@ pub(crate) static SIM_STORE: OnceLock<SimStore> = OnceLock::new();
 // ── SimStore ─────────────────────────────────────────────────────────────────
 
 /// Local-filesystem simulation of S3 Express + Standard buckets.
+#[derive(Debug)]
 pub struct SimStore {
     /// `{DataDir}/tiko/sim/express`
     express_root: PathBuf,

@@ -49,7 +49,7 @@ use pgsys::{Lsn, common::data_dir_path, logging::*};
 use store::{
     chunk::{CHUNK_SIZE, ChunkTag, RelFork},
     manifest::{ChunkRef, Manifest},
-    project::{ProjectCtx, ProjectNamespace, ensure_root_project_meta},
+    project::{ProjectCtx, ProjectNamespace},
     sim_store::SimStore,
     tiko_root_path,
 };
@@ -140,18 +140,10 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
                 ));
             }
             Err(e) => {
-                pg_log_warning(&format!(
+                pg_log_error(&format!(
                     "tiko_checkpoint_flush: initial base materialization failed: {e}"
                 ));
             }
-        }
-        // Write project.json so subsequent process starts use load() instead
-        // of bootstrap(), which would overwrite base_manifest.bin with an
-        // empty file on every restart.
-        if let Err(e) = ensure_root_project_meta(sim, ctx.ns()) {
-            pg_log_warning(&format!(
-                "tiko_checkpoint_flush: ensure_root_project_meta failed: {e}"
-            ));
         }
     }
 }

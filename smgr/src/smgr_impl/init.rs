@@ -4,7 +4,7 @@ use pgsys::{
     logging::*,
     wait_events::new_wait_event,
 };
-use store::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
+use store::{org::OrgMeta, project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_init() {
@@ -27,6 +27,9 @@ pub extern "C-unwind" fn tiko_init() {
     // In those modes MyProcNumber is invalid and the IoControl shmem block
     // was never sized/initialised via shmem_request_hook.
     if !is_under_postmaster() {
+        let org_id = ProjectCtx::get().meta.ns.org_id;
+        OrgMeta::ensure_org_meta(SimStore::get(), org_id)
+            .unwrap_or_else(|e| pg_log_error(&format!("tiko_init: ensure_org_meta failed: {e}")));
         return;
     }
 

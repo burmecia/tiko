@@ -65,6 +65,15 @@ impl OrgMeta {
         format!("{}/metadata/", self.org_id)
     }
 
+    pub fn ensure_org_meta(sim: &SimStore, org_id: u64) -> Result<()> {
+        let key = format!("{}/metadata/org.json", org_id);
+        if sim.get_standard(&key)?.is_none() {
+            // No org.json exists — create root org and project.
+            Self::create(sim, org_id)?;
+        }
+        Ok(())
+    }
+
     /// Create an org and its root project atomically.
     ///
     /// The root project always uses `project_id = 0` and `branch_id = 0`.
