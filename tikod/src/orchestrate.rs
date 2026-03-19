@@ -498,7 +498,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use store::manifest::Manifest;
-    use store::project::ensure_root_project_meta;
+    use store::project::ProjectMeta;
     use tempfile::TempDir;
 
     fn temp_sim() -> (SimStore, TempDir) {
@@ -633,7 +633,7 @@ mod tests {
     fn update_project_status_persists_status() {
         let (sim, _dir) = temp_sim();
         let ns = root_ns();
-        ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
 
         update_project_status(&sim, &ns, "stopped", None).unwrap();
 
@@ -649,7 +649,7 @@ mod tests {
     fn set_project_timeline_updates_timeline_id() {
         let (sim, _dir) = temp_sim();
         let ns = root_ns();
-        ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
 
         set_project_timeline(&sim, &ns, 3).unwrap();
 
@@ -670,7 +670,7 @@ mod tests {
     fn post_recovery_cleanup_uploads_manifest_as_new_base() {
         let (sim, _dir) = temp_sim();
         let ns = root_ns();
-        ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
 
         let pgdata = TempDir::new().unwrap();
         let target_lsn = Lsn::new(0x3000);
@@ -691,7 +691,7 @@ mod tests {
     fn post_recovery_cleanup_updates_current_timeline_id() {
         let (sim, _dir) = temp_sim();
         let ns = root_ns();
-        ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
 
         let pgdata = TempDir::new().unwrap();
         fs::write(pgdata.path().join("postgresql.conf"), "").unwrap();
@@ -708,7 +708,7 @@ mod tests {
     fn post_recovery_cleanup_removes_recovery_files() {
         let (sim, _dir) = temp_sim();
         let ns = root_ns();
-        ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
 
         let pgdata = TempDir::new().unwrap();
         let pgdata_path = pgdata.path();

@@ -132,7 +132,7 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use store::project::ensure_root_project_meta;
+    use store::project::ProjectMeta;
     use tempfile::TempDir;
 
     fn temp_sim() -> (SimStore, TempDir) {
@@ -169,7 +169,7 @@ mod tests {
         let child = child_ns();
 
         // Set up parent state: project.json + a base manifest at branch_lsn.
-        ensure_root_project_meta(&sim, &parent).unwrap();
+        ProjectMeta::ensure_root(&sim, &parent).unwrap();
         let branch_lsn = Lsn::new(0x3000);
         write_base_stub(&sim, &parent, 1, branch_lsn);
 
@@ -188,7 +188,7 @@ mod tests {
     fn delete_branch_sets_deleted_at_without_removing_objects() {
         let (sim, _dir) = temp_sim();
         let ns = root_ns();
-        ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
 
         delete_branch(&sim, &ns).unwrap();
 
@@ -212,9 +212,9 @@ mod tests {
         let ns_b = ProjectNamespace::new(5, 20, 1);
         let ns_c = ProjectNamespace::new(5, 30, 1);
 
-        ensure_root_project_meta(&sim, &ns_a).unwrap();
-        ensure_root_project_meta(&sim, &ns_b).unwrap();
-        ensure_root_project_meta(&sim, &ns_c).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns_a).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns_b).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns_c).unwrap();
 
         // Delete project B.
         delete_branch(&sim, &ns_b).unwrap();

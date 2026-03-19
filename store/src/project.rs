@@ -255,6 +255,75 @@ fn default_timeline_id() -> u32 {
     1
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl ProjectMeta {
+    /// Construct metadata for a root (non-branch) project.
+    pub fn new_root(ns: &ProjectNamespace) -> Self {
+        Self {
+            ns: ns.clone(),
+            parent_project_id: None,
+            parent_branch_id: None,
+            branch_checkpoint_lsn: None,
+            branch_timeline_id: None,
+            current_timeline_id: 1,
+            created_at: now_secs(),
+            status: "active".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// Construct metadata for a child branch forked from `parent_ns`.
+    pub fn new_branch(
+        child_ns: &ProjectNamespace,
+        parent_ns: &ProjectNamespace,
+        parent_timeline: u32,
+        branch_lsn: Lsn,
+    ) -> Self {
+        Self {
+            ns: child_ns.clone(),
+            parent_project_id: Some(parent_ns.project_id),
+            parent_branch_id: Some(parent_ns.branch_id),
+            branch_checkpoint_lsn: Some(branch_lsn),
+            branch_timeline_id: Some(parent_timeline),
+            current_timeline_id: 1,
+            created_at: now_secs(),
+            status: "active".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// Write `project.json` for a root project to SimStore.
+    pub fn create_root(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
+        let meta = Self::new_root(ns);
+        sim.put_standard(&ns.project_meta_key(), &serde_json::to_vec(&meta)?)?;
+        Ok(())
+    }
+
+    /// Write `project.json` for a root project to SimStore if it does not already exist.
+    ///
+    /// Called once after the initdb shutdown checkpoint so that subsequent
+    /// `init_from_env` calls use `load()` (which fetches the real base manifest
+    /// from SimStore) instead of falling back to `bootstrap()` (which overwrites
+    /// `base_manifest.bin` with an empty file on every process start).
+    ///
+    /// Idempotent: if `project.json` already exists it is left unchanged.
+    /// Only call for root projects (`parent_project_id: None`); branches write
+    /// their `project.json` via `create_branch`.
+    pub fn ensure_root(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
+        let key = ns.project_meta_key();
+        if sim.get_standard(&key)?.is_some() {
+            return Ok(());
+        }
+        Self::create_root(sim, ns)
+    }
+}
+
 // ── ProjectCtx ────────────────────────────────────────────────────────────────
 
 /// Runtime identity and level-2 chunk fallback manifest for the running project.
@@ -536,40 +605,6 @@ pub fn build_initial_manifest(
     Ok(base)
 }
 
-/// Write `project.json` for a root project to SimStore if it does not already exist.
-///
-/// Called once after the initdb shutdown checkpoint so that subsequent
-/// `init_from_env` calls use `load()` (which fetches the real base manifest
-/// from SimStore) instead of falling back to `bootstrap()` (which overwrites
-/// `base_manifest.bin` with an empty file on every process start).
-///
-/// Idempotent: if `project.json` already exists it is left unchanged.
-/// Only call for root projects (`parent_project_id: None`); branches write
-/// their `project.json` via `create_branch`.
-pub fn ensure_root_project_meta(sim: &SimStore, ns: &ProjectNamespace) -> Result<()> {
-    let key = ns.project_meta_key();
-    if sim.get_standard(&key)?.is_some() {
-        return Ok(());
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let meta = ProjectMeta {
-        ns: ns.clone(),
-        parent_project_id: None,
-        parent_branch_id: None,
-        branch_checkpoint_lsn: None,
-        branch_timeline_id: None,
-        current_timeline_id: 1,
-        created_at: now,
-        status: "active".to_string(),
-        deleted_at: None,
-    };
-    sim.put_standard(&key, &serde_json::to_vec(&meta)?)?;
-    Ok(())
-}
-
 /// Create a child branch at `branch_lsn` forked from `parent_ns`.
 ///
 /// Writes exactly two objects to the standard bucket:
@@ -597,21 +632,7 @@ pub fn create_branch(
         build_initial_manifest(sim, parent_ns, parent_timeline, branch_lsn, &local_path)?;
 
     // Construct child project metadata.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let meta = ProjectMeta {
-        ns: child_ns.clone(),
-        parent_project_id: Some(parent_ns.project_id),
-        parent_branch_id: Some(parent_ns.branch_id),
-        branch_checkpoint_lsn: Some(branch_lsn),
-        branch_timeline_id: Some(parent_timeline),
-        current_timeline_id: CHILD_TIMELINE,
-        created_at: now,
-        status: "active".to_string(),
-        deleted_at: None,
-    };
+    let meta = ProjectMeta::new_branch(child_ns, parent_ns, parent_timeline, branch_lsn);
 
     // Write project.json.
     sim.put_standard(&child_ns.project_meta_key(), &serde_json::to_vec(&meta)?)?;

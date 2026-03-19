@@ -454,7 +454,7 @@ mod tests {
     use std::collections::HashMap;
     use store::ChunkTag;
     use store::manifest::ChunkRef;
-    use store::project::ensure_root_project_meta;
+    use store::project::ProjectMeta;
     use tempfile::TempDir;
 
     fn temp_sim() -> (SimStore, TempDir) {
@@ -707,7 +707,7 @@ mod tests {
         let ns = root_ns();
 
         // Write 6 deltas so GC would normally run.
-        ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
         for lsn_val in [0x1000u64, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000] {
             write_delta(&sim, &ns, 1, Lsn::new(lsn_val));
         }
@@ -770,7 +770,7 @@ mod tests {
 
         // Set up a live org + soft-deleted branch.
         store::org::OrgMeta::create(&sim, ns.org_id).unwrap();
-        store::project::ensure_root_project_meta(&sim, &ns).unwrap();
+        ProjectMeta::ensure_root(&sim, &ns).unwrap();
         write_delta(&sim, &ns, 1, Lsn::new(0x1000));
         // Write a versioned chunk for this branch.
         let chunk_key = ns.chunk_versioned_key(&tag(0), ns.branch_id, 1, Lsn::new(0x1000));

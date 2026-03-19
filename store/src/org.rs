@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::project::{ProjectNamespace, ensure_root_project_meta};
+use crate::project::{ProjectMeta, ProjectNamespace};
 use crate::sim_store::SimStore;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ impl OrgMeta {
         sim.put_standard(&meta.meta_key(), &json)?;
 
         // Write root project.json (no parent fields — this is the origin project).
-        ensure_root_project_meta(sim, &ns)
+        ProjectMeta::create_root(sim, &ns)
             .map_err(|e| Error::Store(io::Error::other(e.to_string())))?;
 
         Ok(meta)
