@@ -47,9 +47,9 @@ pub fn run(sim: &SimStore, org_id: u64, template: &str) {
     }
 
     // ── 3. Copy SimStore data from template (org=0) → new org ─────────────────
-    // The template tarball includes `tiko/sim/{standard,express}/0/...` written
+    // The template tarball includes `store/sim/{standard,express}/0/...` written
     // by initdb running with TIKO_ORG_ID=0. Re-key all those objects to `{org}/`.
-    let tiko_sim = work.path().join("tiko").join("sim");
+    let tiko_sim = work.path().join("store").join("sim");
     sim.copy_org_data(
         &tiko_sim.join("standard"),
         &tiko_sim.join("express"),

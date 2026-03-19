@@ -55,9 +55,6 @@ enum Command_ {
         /// Directory containing the PostgreSQL binaries (initdb, postgres)
         #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         pg_bindir: PathBuf,
-        /// Output tarball path (e.g. template-18.tar.gz); basename is used as the SimStore key
-        #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
-        output: PathBuf,
     },
 }
 
@@ -87,8 +84,8 @@ fn main() {
                 force,
             );
         }
-        Command_::MakeTemplate { pg_bindir, output } => {
-            make_template::run(&pg_bindir, &output, cli.sim_store.as_deref());
+        Command_::MakeTemplate { pg_bindir } => {
+            make_template::run(&pg_bindir, cli.sim_store.as_deref());
         }
     }
 }

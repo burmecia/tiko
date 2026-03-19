@@ -1,20 +1,25 @@
+use pgsys::common::PG_VERSION_NUM;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use store::sim_store::SimStore;
 
-pub fn run(pg_bindir: &Path, output: &Path, sim_store: Option<&Path>) {
-    let work = tempfile::tempdir().unwrap_or_else(|e| {
+pub fn run(pg_bindir: &Path, sim_store: Option<&Path>) {
+    let temp_dir = tempfile::tempdir().unwrap_or_else(|e| {
         eprintln!("error: failed to create temp dir: {e}");
         std::process::exit(1);
     });
-    let tiko_root = work.path().join("tiko");
-    let pgdata = work.path().join("pgdata");
+    let output = temp_dir
+        .path()
+        .join(format!("template-{}.tar.gz", PG_VERSION_NUM));
+    let work = temp_dir.path().join("work");
+    let store_root = work.join("store");
+    let pgdata = work.join("pgdata");
 
     // ── 1. initdb ─────────────────────────────────────────────────────────────
     let status = Command::new(pg_bindir.join("initdb"))
         .args(["-D", pgdata.to_str().unwrap(), "--data-checksums"])
-        .env("TIKO_ROOT_PATH", tiko_root.to_str().unwrap())
+        .env("TIKO_ROOT_PATH", store_root.to_str().unwrap())
         .env("TIKO_ORG_ID", "0")
         .env("TIKO_PROJECT_ID", "0")
         .env("TIKO_BRANCH_ID", "0")
@@ -50,21 +55,13 @@ pub fn run(pg_bindir: &Path, output: &Path, sim_store: Option<&Path>) {
     strip_relation_files(&pgdata.join("base"), 2);
 
     // ── 5. Create tarball ─────────────────────────────────────────────────────
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).unwrap_or_else(|e| {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            });
-        }
-    }
     let status = Command::new("tar")
         .args([
             "-czf",
             output.to_str().unwrap(),
             "-C",
-            work.path().to_str().unwrap(),
-            ".",
+            work.to_str().unwrap(),
+            "./",
         ])
         .status()
         .unwrap_or_else(|e| {
@@ -76,10 +73,14 @@ pub fn run(pg_bindir: &Path, output: &Path, sim_store: Option<&Path>) {
         std::process::exit(1);
     }
 
-    let size = fs::metadata(output)
+    let size = fs::metadata(&output)
         .map(|m| format_size(m.len()))
         .unwrap_or_else(|_| "?".into());
-    println!("Created {} ({})", output.display(), size);
+    println!(
+        "Created {} ({})",
+        output.file_name().unwrap().to_str().unwrap(),
+        size
+    );
 
     // ── 6. Upload to SimStore ─────────────────────────────────────────────────
     if let Some(sim_path) = sim_store {
@@ -90,7 +91,7 @@ pub fn run(pg_bindir: &Path, output: &Path, sim_store: Option<&Path>) {
                 eprintln!("error: could not determine filename from output path");
                 std::process::exit(1);
             });
-        let data = fs::read(output).unwrap_or_else(|e| {
+        let data = fs::read(&output).unwrap_or_else(|e| {
             eprintln!("error: failed to read {}: {e}", output.display());
             std::process::exit(1);
         });
