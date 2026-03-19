@@ -130,6 +130,43 @@ impl SimStore {
         remove_optional(&self.standard_root.join(key))
     }
 
+    // ── Template helpers ──────────────────────────────────────────────────
+
+    fn template_key(&self, filename: &str) -> PathBuf {
+        self.standard_root.join("template").join(filename)
+    }
+
+    /// Store a PGDATA template tarball in the standard bucket at `template/{filename}`.
+    pub fn put_template(&self, filename: &str, data: &[u8]) -> io::Result<()> {
+        write_file(&self.template_key(filename), data)
+    }
+
+    /// Retrieve a PGDATA template tarball from the standard bucket.
+    /// Returns `None` if not found.
+    pub fn get_template(&self, filename: &str) -> io::Result<Option<Vec<u8>>> {
+        read_optional(&self.template_key(filename))
+    }
+
+    /// Copy all objects from `src_standard` and `src_express` into this SimStore,
+    /// rewriting the leading org component from `src_org_id` to `dst_org_id`.
+    ///
+    /// Files are copied at the raw filesystem level (preserving on-disk encoding)
+    /// rather than going through the put/get layer to avoid double-compression.
+    ///
+    /// Used by `create_org` to seed a new org from a template's embedded SimStore.
+    pub fn copy_org_data(
+        &self,
+        src_standard: &Path,
+        src_express: &Path,
+        src_org_id: u64,
+        dst_org_id: u64,
+    ) -> io::Result<()> {
+        let prefix = src_org_id.to_string();
+        copy_rekey(src_standard, &self.standard_root, &prefix, dst_org_id)?;
+        copy_rekey(src_express, &self.express_root, &prefix, dst_org_id)?;
+        Ok(())
+    }
+
     /// List all keys in the express bucket that start with `prefix`.
     /// Returns keys relative to the express root.
     pub fn list_prefix_express(&self, prefix: &str) -> io::Result<Vec<String>> {
@@ -239,6 +276,30 @@ fn list_under_prefix(root: &Path, prefix: &str) -> io::Result<Vec<String>> {
     collect_files(root, &base, &mut keys)?;
     keys.sort();
     Ok(keys)
+}
+
+/// Walk all files under `src_bucket/{src_org_prefix}/`, and copy each one to
+/// `dst_bucket/{dst_org_id}/{relative_path}` using raw `fs::copy` to preserve
+/// the on-disk encoding (zstd-compressed for non-JSON files).
+fn copy_rekey(
+    src_bucket: &Path,
+    dst_bucket: &Path,
+    src_org_prefix: &str,
+    dst_org_id: u64,
+) -> io::Result<()> {
+    let src_dir = src_bucket.join(src_org_prefix);
+    if !src_dir.exists() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    collect_files(&src_dir, &src_dir, &mut files)?;
+    for rel in files {
+        let src_path = src_dir.join(&rel);
+        let dst_path = dst_bucket.join(dst_org_id.to_string()).join(&rel);
+        ensure_parent(&dst_path)?;
+        fs::copy(&src_path, &dst_path)?;
+    }
+    Ok(())
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<()> {

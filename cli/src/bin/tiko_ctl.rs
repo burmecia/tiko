@@ -1,6 +1,12 @@
+#[path = "tiko_ctl/create_org.rs"]
+mod create_org;
+#[path = "tiko_ctl/delete_org.rs"]
+mod delete_org;
+#[path = "tiko_ctl/make_template.rs"]
+mod make_template;
+
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-use store::org::OrgMeta;
+use std::path::{Path, PathBuf};
 use store::sim_store::SimStore;
 
 #[derive(Parser)]
@@ -17,15 +23,22 @@ struct Cli {
     sim_store: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Command_,
 }
 
 #[derive(Subcommand)]
-enum Command {
-    /// Create an org (also creates the root project)
+enum Command_ {
+    /// Create an org (also creates the root project).
+    ///
+    /// Finds the named template in the SimStore, extracts it, copies the
+    /// embedded SimStore data into the org's namespace, then writes org.json
+    /// and project.json.
     CreateOrg {
         #[arg(long)]
         org: u64,
+        /// Template filename to seed the org from (e.g. template-18.tar.gz)
+        #[arg(long, value_name = "FILE")]
+        template: String,
     },
     /// Soft-delete an org
     DeleteOrg {
@@ -34,30 +47,48 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Create a PGDATA template tarball and store it in the SimStore standard bucket.
+    ///
+    /// Runs `initdb`, strips relation files and transactional state, tarballs the result,
+    /// and uploads it to `standard/template/<output-filename>`.
+    MakeTemplate {
+        /// Directory containing the PostgreSQL binaries (initdb, postgres)
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        pg_bindir: PathBuf,
+        /// Output tarball path (e.g. template-18.tar.gz); basename is used as the SimStore key
+        #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+        output: PathBuf,
+    },
+}
+
+fn require_sim(sim_store: Option<&Path>, op: &str) -> &'static SimStore {
+    let path = sim_store.unwrap_or_else(|| {
+        eprintln!("error: {op} requires '--sim-store <PATH>' (or TIKO_SIM_STORE)");
+        std::process::exit(2);
+    });
+    SimStore::init(path)
 }
 
 fn main() {
     let cli = Cli::parse();
-    let Some(sim_store_path) = cli.sim_store.as_deref() else {
-        eprintln!("error: missing required '--sim-store <PATH>' (or set TIKO_SIM_STORE)");
-        std::process::exit(2);
-    };
-    let sim = SimStore::init(sim_store_path);
 
     match cli.command {
-        Command::CreateOrg { org } => match OrgMeta::create(&sim, org) {
-            Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta).unwrap()),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        },
-        Command::DeleteOrg { org, force } => match OrgMeta::delete(&sim, org, force) {
-            Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta).unwrap()),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        },
+        Command_::CreateOrg { org, template } => {
+            create_org::run(
+                require_sim(cli.sim_store.as_deref(), "create-org"),
+                org,
+                &template,
+            );
+        }
+        Command_::DeleteOrg { org, force } => {
+            delete_org::run(
+                require_sim(cli.sim_store.as_deref(), "delete-org"),
+                org,
+                force,
+            );
+        }
+        Command_::MakeTemplate { pg_bindir, output } => {
+            make_template::run(&pg_bindir, &output, cli.sim_store.as_deref());
+        }
     }
 }
