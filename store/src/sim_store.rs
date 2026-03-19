@@ -230,7 +230,7 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
 fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     ensure_parent(path)?;
     let mut f = File::create(path)?;
-    if is_json_file(path) {
+    if skip_compression(path) {
         f.write_all(data)
     } else {
         let compressed =
@@ -245,7 +245,7 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    if is_json_file(path) {
+    if skip_compression(path) {
         Ok(Some(raw))
     } else {
         let data = zstd::decode_all(raw.as_slice())
@@ -254,7 +254,14 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn is_json_file(path: &Path) -> bool {
+/// Returns true for file types that should be stored as-is without zstd compression:
+/// - `.json` — human-readable metadata, small, already uncompressed
+/// - `.tar.zst` — already compressed archives
+fn skip_compression(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".tar.zst") {
+        return true;
+    }
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
