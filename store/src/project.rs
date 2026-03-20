@@ -322,6 +322,15 @@ impl ProjectMeta {
         }
         Self::create_root(sim, ns)
     }
+
+    pub fn load(sim: &SimStore, ns: &ProjectNamespace) -> Result<Self> {
+        let key = ns.project_meta_key();
+        let bytes = sim
+            .get_standard(&key)?
+            .ok_or_else(|| format!("project.json not found at key: {key}"))?;
+        let meta: Self = serde_json::from_slice(&bytes)?;
+        Ok(meta)
+    }
 }
 
 // ── ProjectCtx ────────────────────────────────────────────────────────────────
@@ -619,9 +628,6 @@ pub fn create_branch(
     child_ns: &ProjectNamespace,
     branch_lsn: Lsn,
 ) -> Result<()> {
-    // Child branch always starts on timeline 1.
-    const CHILD_TIMELINE: u32 = 1;
-
     // Build the initial manifest to a unique temp path.
     let local_path: PathBuf = std::env::temp_dir().join(format!(
         "tiko_branch_{}_{}.tikm",
@@ -639,7 +645,7 @@ pub fn create_branch(
 
     // Write manifest.bin — single atomic PUT; branch is valid after this.
     sim.put_standard(
-        &child_ns.base_manifest_key(CHILD_TIMELINE, branch_lsn),
+        &child_ns.base_manifest_key(meta.current_timeline_id, branch_lsn),
         &initial_manifest.to_bytes()?,
     )?;
 

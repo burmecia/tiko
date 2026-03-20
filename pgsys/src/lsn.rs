@@ -39,6 +39,23 @@ impl Lsn {
     pub fn to_pg_string(self) -> String {
         format!("{:X}/{:X}", (self.0 >> 32) as u32, self.0 as u32)
     }
+
+    /// Parse a PostgreSQL-style `X/Y` LSN string.
+    pub fn from_pg_string(s: &str) -> Result<Self, String> {
+        s.split_once('/')
+            .ok_or_else(|| format!("invalid LSN: {s}"))
+            .and_then(|(hi, lo)| {
+                let hi = u64::from_str_radix(hi, 16).map_err(|e| e.to_string())?;
+                let lo = u64::from_str_radix(lo, 16).map_err(|e| e.to_string())?;
+                Ok(Self((hi << 32) | lo))
+            })
+    }
+
+    /// Try parsing either PostgreSQL-style `X/Y` or hex format, with error messages for both.
+    pub fn parse_either(s: &str) -> Result<Self, String> {
+        Self::from_pg_string(s)
+            .or_else(|_| Self::from_hex(s).map_err(|e| format!("invalid LSN: {s}: {e}")))
+    }
 }
 
 impl From<u64> for Lsn {

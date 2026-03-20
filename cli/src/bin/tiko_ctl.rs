@@ -1,3 +1,5 @@
+#[path = "tiko_ctl/create_branch.rs"]
+mod create_branch;
 #[path = "tiko_ctl/create_org.rs"]
 mod create_org;
 #[path = "tiko_ctl/delete_org.rs"]
@@ -28,6 +30,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command_ {
+    /// Create a PGDATA template tarball and store it in the SimStore standard bucket.
+    ///
+    /// Runs `initdb`, strips relation files and transactional state, tarballs the result,
+    /// and uploads it to `standard/template/<output-filename>`.
+    MakeTemplate {
+        /// Directory containing the PostgreSQL binaries (initdb, postgres)
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        pg_bindir: PathBuf,
+    },
     /// Create an org (also creates the root project).
     ///
     /// Finds the named template in the SimStore, extracts it, copies the
@@ -47,14 +58,21 @@ enum Command_ {
         #[arg(long)]
         force: bool,
     },
-    /// Create a PGDATA template tarball and store it in the SimStore standard bucket.
-    ///
-    /// Runs `initdb`, strips relation files and transactional state, tarballs the result,
-    /// and uploads it to `standard/template/<output-filename>`.
-    MakeTemplate {
-        /// Directory containing the PostgreSQL binaries (initdb, postgres)
-        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
-        pg_bindir: PathBuf,
+    /// Create a branch forked from a parent project at a given LSN.
+    CreateBranch {
+        #[arg(long)]
+        org: u64,
+        #[arg(long)]
+        project: u64,
+        #[arg(long)]
+        branch: u64,
+        #[arg(long)]
+        parent_project: u64,
+        #[arg(long)]
+        parent_branch: u64,
+        /// Branch point LSN, e.g. "0/3000000"
+        #[arg(long)]
+        lsn: String,
     },
 }
 
@@ -70,6 +88,9 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Command_::MakeTemplate { pg_bindir } => {
+            make_template::run(&pg_bindir, cli.sim_store.as_deref());
+        }
         Command_::CreateOrg { org, template } => {
             create_org::run(
                 require_sim(cli.sim_store.as_deref(), "create-org"),
@@ -84,8 +105,23 @@ fn main() {
                 force,
             );
         }
-        Command_::MakeTemplate { pg_bindir } => {
-            make_template::run(&pg_bindir, cli.sim_store.as_deref());
+        Command_::CreateBranch {
+            org,
+            project,
+            branch,
+            parent_project,
+            parent_branch,
+            lsn,
+        } => {
+            create_branch::run(
+                require_sim(cli.sim_store.as_deref(), "create-branch"),
+                org,
+                project,
+                branch,
+                parent_project,
+                parent_branch,
+                &lsn,
+            );
         }
     }
 }
