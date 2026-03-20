@@ -28,6 +28,10 @@ pub static RECOVERY_MODE: AtomicBool = AtomicBool::new(false);
 /// Populated by `load_recovery_manifest`; queried via `lookup_recovery_chunk`.
 static RECOVERY_MANIFEST: OnceLock<Manifest> = OnceLock::new();
 
+const TIKO_CONF_FILE: &str = "postgresql.tiko.conf";
+const RECOVERY_CONF_BEGIN: &str = "# Tiko recovery settings — begin\n";
+const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -165,8 +169,8 @@ pub fn prepare_recovery(
     let manifest_bytes = base.to_bytes().map_err(Error::Store)?;
     fs::write(pgdata.join("recovery_manifest.bin"), &manifest_bytes)?;
 
-    // ── 3. postgresql.conf ────────────────────────────────────────────────────
-    write_recovery_conf(&pgdata.join("postgresql.conf"), target_lsn)?;
+    // ── 3. postgresql.tiko.conf ────────────────────────────────────────────────────
+    write_recovery_conf(&pgdata.join(TIKO_CONF_FILE), target_lsn)?;
 
     // ── 4. recovery.signal ────────────────────────────────────────────────────
     fs::write(pgdata.join("recovery.signal"), b"")?;
@@ -260,13 +264,10 @@ fn apply_deltas_up_to(
     Ok(())
 }
 
-const RECOVERY_CONF_BEGIN: &str = "# Tiko recovery settings — begin\n";
-const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
-
 /// Remove the recovery settings block previously written by `write_recovery_conf`.
 ///
 /// Strips the entire block delimited by the begin/end markers, leaving the
-/// rest of `postgresql.conf` untouched. A no-op if the markers are not present.
+/// rest of `postgresql.tiko.conf` untouched. A no-op if the markers are not present.
 pub fn remove_recovery_conf(conf_path: &Path) -> Result<()> {
     let existing = fs::read_to_string(conf_path).unwrap_or_default();
     let Some(start) = existing.find(RECOVERY_CONF_BEGIN) else {

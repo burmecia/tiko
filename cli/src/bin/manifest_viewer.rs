@@ -115,7 +115,10 @@ fn parse_args() -> Args {
         _ => usage(),
     };
 
-    Args { source, show_entries }
+    Args {
+        source,
+        show_entries,
+    }
 }
 
 // ── SimStore helper ───────────────────────────────────────────────────────────
