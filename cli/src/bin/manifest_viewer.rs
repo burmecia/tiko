@@ -9,7 +9,7 @@
 //! manifest_viewer <file>                   Auto-detect by magic bytes
 //! manifest_viewer --s3 <key>               Read from SimStore standard bucket ($PGDATA required)
 //! manifest_viewer --s3-express <key>       Read from SimStore express bucket ($PGDATA required)
-//! manifest_viewer --no-entries [...]       Suppress rel_nblocks and entries table; show summary only
+//! manifest_viewer --show-entries [...]     Also print rel_nblocks and entries table (default: summary only)
 //! ```
 //!
 //! Auto-detection: if the file begins with the `TIKM` magic it is opened as a
@@ -29,7 +29,7 @@
 //! ./target/debug/manifest_viewer /path/to/manifest.bin
 //!
 //! # Summary only — skip the per-entry table (useful for large manifests):
-//! ./target/debug/manifest_viewer --no-entries /path/to/base_manifest.bin
+//! ./target/debug/manifest_viewer --show-entries /path/to/base_manifest.bin
 //!
 //! # From SimStore standard bucket (holds base/delta manifests and WAL):
 //! PGDATA=/path/to/pgdata ./target/debug/manifest_viewer \
@@ -58,7 +58,7 @@ enum Source {
 
 struct Args {
     source: Source,
-    no_entries: bool,
+    show_entries: bool,
 }
 
 fn usage() -> ! {
@@ -69,14 +69,14 @@ fn usage() -> ! {
   manifest_viewer --s3-express <key>  (requires $PGDATA)
 
 Flags:
-  --no-entries   Print header summary only; skip rel_nblocks and entries table."
+  --show-entries   Print rel_nblocks and entries table in addition to the header summary."
     );
     std::process::exit(1);
 }
 
 fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let mut no_entries = false;
+    let mut show_entries = false; // false by default; opt-in with --show-entries
     let mut positional: Vec<String> = Vec::new();
     let mut s3_standard: Option<String> = None;
     let mut s3_express: Option<String> = None;
@@ -84,7 +84,7 @@ fn parse_args() -> Args {
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
-            "--no-entries" => no_entries = true,
+            "--show-entries" => show_entries = true,
             "--s3" => {
                 i += 1;
                 s3_standard = Some(raw.get(i).cloned().unwrap_or_else(|| {
@@ -115,7 +115,7 @@ fn parse_args() -> Args {
         _ => usage(),
     };
 
-    Args { source, no_entries }
+    Args { source, show_entries }
 }
 
 // ── SimStore helper ───────────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 // ── Display ───────────────────────────────────────────────────────────────────
 
-fn print_manifest(manifest: &Manifest, format_label: &str, no_entries: bool) {
+fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
     let lsn = manifest.checkpoint_lsn();
     let ts = manifest.timestamp();
     let entry_count = manifest.entries().map(|e| e.len()).unwrap_or(0);
@@ -197,7 +197,7 @@ fn print_manifest(manifest: &Manifest, format_label: &str, no_entries: bool) {
     println!("  timestamp:       {}  ({})", format_timestamp(ts), ts);
     println!("  entry_count:     {entry_count}");
 
-    if no_entries {
+    if !show_entries {
         return;
     }
 
@@ -266,13 +266,13 @@ fn run(args: &Args) -> Result<(), String> {
             if is_tikm(&data) {
                 let manifest =
                     Manifest::open(path).map_err(|e| format!("failed to open TIKM: {e}"))?;
-                print_manifest(&manifest, "local TIKM", args.no_entries);
+                print_manifest(&manifest, "local TIKM", args.show_entries);
             } else {
                 let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
                 let tmp_path = tmp.path().join("manifest.bin");
                 let manifest = Manifest::from_bytes(&data, &tmp_path)
                     .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
-                print_manifest(&manifest, "S3 wire format", args.no_entries);
+                print_manifest(&manifest, "S3 wire format", args.show_entries);
             }
         }
 
@@ -286,7 +286,7 @@ fn run(args: &Args) -> Result<(), String> {
             let tmp_path = tmp.path().join("manifest.bin");
             let manifest = Manifest::from_bytes(&data, &tmp_path)
                 .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
-            print_manifest(&manifest, "S3 standard bucket", args.no_entries);
+            print_manifest(&manifest, "S3 standard bucket", args.show_entries);
         }
 
         Source::S3Express(key) => {
@@ -299,7 +299,7 @@ fn run(args: &Args) -> Result<(), String> {
             let tmp_path = tmp.path().join("manifest.bin");
             let manifest = Manifest::from_bytes(&data, &tmp_path)
                 .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
-            print_manifest(&manifest, "S3 express bucket", args.no_entries);
+            print_manifest(&manifest, "S3 express bucket", args.show_entries);
         }
     }
 
