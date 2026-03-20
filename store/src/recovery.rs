@@ -9,13 +9,17 @@
 //! which is a msgpack+zstd blob (same wire format as S3 `manifest.bin`).
 //! It is written by the control plane before initiating PITR recovery.
 
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::chunk::ChunkTag;
 use crate::manifest::{ChunkRef, Manifest};
+use crate::project::ProjectNamespace;
+use crate::sim_store::SimStore;
+use pgsys::Lsn;
 
 /// Exposed as `pub(crate)` so tests in sibling modules can force the flag.
 pub static RECOVERY_MODE: AtomicBool = AtomicBool::new(false);
@@ -23,6 +27,37 @@ pub static RECOVERY_MODE: AtomicBool = AtomicBool::new(false);
 /// Recovery manifest: a Manifest loaded from `$PGDATA/tiko/recovery_manifest.bin`.
 /// Populated by `load_recovery_manifest`; queried via `lookup_recovery_chunk`.
 static RECOVERY_MANIFEST: OnceLock<Manifest> = OnceLock::new();
+
+// ── Error type ────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum Error {
+    Store(io::Error),
+    /// The requested `(timeline_id, lsn)` has no delta manifest.
+    TargetNotFound(String),
+    /// No base manifest exists with `base_lsn <= target_lsn`.
+    NoCheckpoint,
+    Other(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Store(e) => write!(f, "store error: {e}"),
+            Error::TargetNotFound(s) => write!(f, "target delta not found: {s}"),
+            Error::NoCheckpoint => write!(f, "no base manifest covers target_lsn"),
+            Error::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Store(e)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Load the recovery manifest from `path` (= `$PGDATA/tiko/recovery_manifest.bin`).
 ///
@@ -64,6 +99,180 @@ pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
         Some(m) => m.lookup(key),
         None => Ok(None),
     }
+}
+
+/// Prepare PGDATA for crash recovery to `(target_tl, target_lsn)`.
+///
+/// Steps:
+/// 1. Validate `deltas/{target_tl}/{target_lsn}/manifest.bin` exists.
+/// 2. Download and extract `pg_state.tar.zst` (pg_control, transaction logs,
+///    pg_filenode.map) into PGDATA.
+/// 3. Build `recovery_manifest.bin` — newest base with `base_lsn <= target_lsn`
+///    merged with all deltas in `(base_lsn, target_lsn]`.
+/// 4. Append recovery settings to `postgresql.conf`.
+/// 5. Touch `recovery.signal`.
+///
+/// `tiko_root` is the Tiko local root directory (`$TIKO_LOCAL_ROOT`) where Tiko
+/// files (manifest, temp archives) are written.  Pass a `TempDir` in tests.
+pub fn prepare_recovery(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    pgdata: &Path,
+    tiko_root: &Path,
+    target_tl: u32,
+    target_lsn: Lsn,
+) -> Result<()> {
+    // ── 0. Validate target ────────────────────────────────────────────────────
+    let delta_key = ns.delta_manifest_key(target_tl, target_lsn);
+    if sim
+        .get_standard(&delta_key)
+        .map_err(Error::Store)?
+        .is_none()
+    {
+        return Err(Error::TargetNotFound(delta_key));
+    }
+
+    fs::create_dir_all(tiko_root)?;
+
+    // ── 1. pg_state ───────────────────────────────────────────────────────────
+    let pg_state_key = ns.pg_state_key(target_tl, target_lsn);
+    let pg_state_bytes = sim
+        .get_standard(&pg_state_key)
+        .map_err(Error::Store)?
+        .ok_or_else(|| Error::Other(format!("pg_state not found: {pg_state_key}")))?;
+
+    let pg_state_tmp = tiko_root.join("pg_state.tar.zst");
+    fs::write(&pg_state_tmp, &pg_state_bytes)?;
+
+    let status = std::process::Command::new("tar")
+        .args([
+            "-xf",
+            &pg_state_tmp.to_string_lossy(),
+            "-C",
+            &pgdata.to_string_lossy(),
+        ])
+        .status()
+        .map_err(|e| Error::Other(format!("tar failed to spawn: {e}")))?;
+    if !status.success() {
+        return Err(Error::Other("pg_state tar extraction failed".into()));
+    }
+    let _ = fs::remove_file(&pg_state_tmp);
+
+    // ── 2. recovery_manifest.bin ──────────────────────────────────────────────
+    let manifest_path = Manifest::local_manifest_path(tiko_root);
+    let base = load_base_manifest(sim, ns, target_tl, target_lsn, &manifest_path)?;
+    apply_deltas_up_to(sim, ns, &base, tiko_root, target_tl, target_lsn)?;
+
+    // ── 3. postgresql.conf ────────────────────────────────────────────────────
+    write_recovery_conf(&pgdata.join("postgresql.conf"), target_lsn)?;
+
+    // ── 4. recovery.signal ────────────────────────────────────────────────────
+    fs::write(pgdata.join("recovery.signal"), b"")?;
+
+    Ok(())
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Load the newest base manifest with `base_lsn <= target_lsn` on `target_tl`.
+fn load_base_manifest(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    target_tl: u32,
+    target_lsn: Lsn,
+    manifest_path: &Path,
+) -> Result<Manifest> {
+    let prefix = ns.base_prefix_for_timeline(target_tl);
+    let keys = sim.list_prefix_standard(&prefix).map_err(Error::Store)?;
+
+    // After stripping prefix: "{lsn_hex}/manifest.bin"
+    let best_key = keys
+        .iter()
+        .filter_map(|k| {
+            let rel = k.strip_prefix(&prefix)?;
+            let lsn_hex = rel.split('/').next()?;
+            let lsn = Lsn::from_hex(lsn_hex).ok()?;
+            (lsn <= target_lsn).then_some((lsn, k))
+        })
+        .max_by_key(|(lsn, _)| *lsn)
+        .map(|(_, k)| k)
+        .ok_or(Error::NoCheckpoint)?;
+
+    let bytes = sim
+        .get_standard(best_key)
+        .map_err(Error::Store)?
+        .ok_or_else(|| Error::Other(format!("base manifest not found: {best_key}")))?;
+
+    Manifest::from_bytes(&bytes, manifest_path).map_err(Error::Store)
+}
+
+/// Apply all delta manifests with `base_lsn < lsn <= target_lsn` on `target_tl`.
+///
+/// Temp delta files are written under `work_dir` and removed after merging.
+fn apply_deltas_up_to(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    base: &Manifest,
+    work_dir: &Path,
+    target_tl: u32,
+    target_lsn: Lsn,
+) -> Result<()> {
+    let base_lsn = base.checkpoint_lsn();
+    let prefix = ns.delta_prefix_for_timeline(target_tl);
+    let mut keys = sim.list_prefix_standard(&prefix).map_err(Error::Store)?;
+    keys.sort();
+
+    let mut deltas: Vec<Manifest> = Vec::new();
+    let mut delta_paths: Vec<PathBuf> = Vec::new();
+
+    for key in &keys {
+        if !key.ends_with("/manifest.bin") {
+            continue;
+        }
+        let rel = key.strip_prefix(&prefix).unwrap_or(key.as_str());
+        let lsn_hex = rel.split('/').next().unwrap_or("");
+        let Ok(lsn) = Lsn::from_hex(lsn_hex) else {
+            continue;
+        };
+        if lsn <= base_lsn || lsn > target_lsn {
+            continue;
+        }
+        let bytes = sim
+            .get_standard(key)
+            .map_err(Error::Store)?
+            .ok_or_else(|| Error::Other(format!("delta manifest missing: {key}")))?;
+        let path = work_dir.join(format!("delta_{lsn_hex}.tikm"));
+        let m = Manifest::from_bytes(&bytes, &path).map_err(Error::Store)?;
+        delta_paths.push(path);
+        deltas.push(m);
+    }
+
+    if !deltas.is_empty() {
+        base.apply_deltas(&deltas).map_err(Error::Store)?;
+    }
+
+    for p in &delta_paths {
+        let _ = fs::remove_file(p);
+    }
+
+    Ok(())
+}
+
+/// Append tikod recovery settings to `postgresql.conf`.
+///
+/// The block is identified by a comment header so that
+/// `orchestrate::remove_recovery_conf_entries` can strip it cleanly.
+fn write_recovery_conf(conf_path: &Path, target_lsn: Lsn) -> Result<()> {
+    let snippet = format!(
+        "\n# tikod recovery settings — removed by post_recovery_cleanup\n\
+         restore_command = 'tiko_restore %f %p'\n\
+         recovery_target_lsn = '{}'\n\
+         recovery_target_action = 'shutdown'\n",
+        target_lsn.to_pg_string()
+    );
+    let existing = fs::read_to_string(conf_path).unwrap_or_default();
+    fs::write(conf_path, format!("{existing}{snippet}"))?;
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -6,6 +6,8 @@ mod create_org;
 mod delete_org;
 #[path = "tiko_ctl/make_template.rs"]
 mod make_template;
+#[path = "tiko_ctl/restore.rs"]
+mod restore;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -73,6 +75,23 @@ enum Command_ {
         /// Branch point LSN, e.g. "0/3000000"
         #[arg(long)]
         lsn: String,
+        /// Template filename to seed the base PGDATA from (e.g. template-18.tar.gz)
+        #[arg(long, value_name = "FILE")]
+        template: String,
+        /// Local directory to extract the branch PGDATA into
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        pg_data: PathBuf,
+    },
+    /// Create a branch forked from a parent project at a given LSN.
+    Restore {
+        #[arg(long)]
+        org: u64,
+        #[arg(long)]
+        project: u64,
+        #[arg(long)]
+        branch: u64,
+        #[arg(long)]
+        lsn: String,
     },
 }
 
@@ -112,6 +131,8 @@ fn main() {
             parent_project,
             parent_branch,
             lsn,
+            template,
+            pg_data,
         } => {
             create_branch::run(
                 require_sim(cli.sim_store.as_deref(), "create-branch"),
@@ -120,6 +141,22 @@ fn main() {
                 branch,
                 parent_project,
                 parent_branch,
+                &lsn,
+                &template,
+                &pg_data,
+            );
+        }
+        Command_::Restore {
+            org,
+            project,
+            branch,
+            lsn,
+        } => {
+            restore::run(
+                require_sim(cli.sim_store.as_deref(), "restore"),
+                org,
+                project,
+                branch,
                 &lsn,
             );
         }
