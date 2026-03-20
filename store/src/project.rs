@@ -7,7 +7,7 @@
 //! page cache beyond what the OS provides.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use pgsys::Lsn;
@@ -627,29 +627,14 @@ pub fn create_branch(
     parent_timeline: u32,
     child_ns: &ProjectNamespace,
     branch_lsn: Lsn,
-) -> Result<()> {
-    // Build the initial manifest to a unique temp path.
-    let local_path: PathBuf = std::env::temp_dir().join(format!(
-        "tiko_branch_{}_{}.tikm",
-        child_ns.branch_id,
-        branch_lsn.to_hex()
-    ));
-    let initial_manifest =
-        build_initial_manifest(sim, parent_ns, parent_timeline, branch_lsn, &local_path)?;
-
+) -> Result<ProjectMeta> {
     // Construct child project metadata.
     let meta = ProjectMeta::new_branch(child_ns, parent_ns, parent_timeline, branch_lsn);
 
     // Write project.json.
     sim.put_standard(&child_ns.project_meta_key(), &serde_json::to_vec(&meta)?)?;
 
-    // Write manifest.bin — single atomic PUT; branch is valid after this.
-    sim.put_standard(
-        &child_ns.base_manifest_key(meta.current_timeline_id, branch_lsn),
-        &initial_manifest.to_bytes()?,
-    )?;
-
-    Ok(())
+    Ok(meta)
 }
 
 /// Delete all sim objects for `branch_ns`.
@@ -1200,21 +1185,7 @@ mod module7_tests {
         assert_eq!(meta.parent_branch_id, Some(parent_ns.branch_id));
         assert_eq!(meta.branch_checkpoint_lsn, Some(branch_lsn));
 
-        // manifest.bin must exist and round-trip correctly
-        let manifest_bytes = sim
-            .get_standard(&child_ns.base_manifest_key(1, branch_lsn))
-            .unwrap()
-            .unwrap();
-        let tmp = dir.path().join("verify.tikm");
-        let m = Manifest::from_bytes(&manifest_bytes, &tmp).unwrap();
-        assert_eq!(
-            m.lookup(&tag(1)).unwrap(),
-            Some(cref(parent_ns.branch_id, branch_lsn))
-        );
-
         // Exactly 1 base manifest and 1 project.json in standard for the child
-        let base_keys = sim.list_prefix_standard(&child_ns.base_prefix()).unwrap();
-        assert_eq!(base_keys.len(), 1);
         let meta_keys = sim
             .list_prefix_standard(&format!(
                 "{}/metadata/{}/",

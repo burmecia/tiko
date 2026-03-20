@@ -33,7 +33,28 @@ pub fn run(pg_bindir: &Path, sim_store: Option<&Path>) {
         std::process::exit(1);
     }
 
-    // ── 2. Strip pg_control (restored from pg_state.tar.zst at recover time) ─
+    // ── 2. Create postgresql.tiko.conf and include it from postgresql.conf ──────
+    let tiko_conf = "\
+# Tiko storage manager settings\n\
+shared_preload_libraries = 'libtikoworker'\n\
+log_min_messages = debug1\n\
+";
+    fs::write(pgdata.join("postgresql.tiko.conf"), tiko_conf).unwrap_or_else(|e| {
+        eprintln!("error: failed to write postgresql.tiko.conf: {e}");
+        std::process::exit(1);
+    });
+
+    let mut pg_conf = fs::read_to_string(pgdata.join("postgresql.conf")).unwrap_or_else(|e| {
+        eprintln!("error: failed to read postgresql.conf: {e}");
+        std::process::exit(1);
+    });
+    pg_conf.push_str("\ninclude 'postgresql.tiko.conf'\n");
+    fs::write(pgdata.join("postgresql.conf"), &pg_conf).unwrap_or_else(|e| {
+        eprintln!("error: failed to write postgresql.conf: {e}");
+        std::process::exit(1);
+    });
+
+    // ── 3. Strip pg_control (restored from pg_state.tar.zst at recovery time) ─
     fs::remove_file(pgdata.join("global/pg_control")).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);

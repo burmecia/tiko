@@ -5,6 +5,7 @@ use std::process::Command;
 use pgsys::Lsn;
 use store::{
     project::{ProjectMeta, ProjectNamespace, create_branch},
+    recovery::prepare_recovery,
     sim_store::SimStore,
 };
 
@@ -21,7 +22,7 @@ pub fn run(
 ) {
     let ns = ProjectNamespace::new(org, project, branch);
     let parent_ns = ProjectNamespace::new(org, parent_project, parent_branch);
-    let branch_lsn = Lsn::parse_either(lsn).unwrap_or_else(|e| {
+    let target_lsn = Lsn::parse_either(lsn).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
@@ -32,12 +33,12 @@ pub fn run(
     });
 
     // Create the new branch in store
-    create_branch(
+    let child_meta = create_branch(
         sim,
         &parent_ns,
         parent_meta.current_timeline_id,
         &ns,
-        branch_lsn,
+        target_lsn,
     )
     .unwrap_or_else(|e| {
         eprintln!("error: failed to create branch: {e}");
@@ -77,53 +78,16 @@ pub fn run(
         std::process::exit(1);
     });
 
-    // ── Phase 2: overwrite with pg_state from parent checkpoint → pg_data ─────
-    let pg_state_key = parent_ns.pg_state_key(parent_meta.current_timeline_id, branch_lsn);
-    let pg_state_bytes = sim
-        .get_standard(&pg_state_key)
-        .unwrap_or_else(|e| {
-            eprintln!("error: failed to read pg_state from store: {e}");
-            std::process::exit(1);
-        })
-        .unwrap_or_else(|| {
-            eprintln!("error: pg_state not found at '{pg_state_key}'");
-            std::process::exit(1);
-        });
-
-    let pg_state_tmp = pg_data.join("pg_state.tar.zst");
-    fs::write(&pg_state_tmp, &pg_state_bytes).unwrap_or_else(|e| {
-        eprintln!("error: failed to write pg_state archive: {e}");
-        std::process::exit(1);
-    });
-    extract_tar(&pg_state_tmp, pg_data);
-    let _ = fs::remove_file(&pg_state_tmp);
-
-    // ── Write recovery_manifest.bin for the child branch ─────────────────────
-    let tiko_root = pg_data.join("tiko");
-    fs::create_dir_all(&tiko_root).unwrap_or_else(|e| {
-        eprintln!("error: failed to create tiko dir: {e}");
-        std::process::exit(1);
-    });
-
-    let child_meta = ProjectMeta::load(sim, &ns).unwrap_or_else(|e| {
-        eprintln!("error: failed to load child project meta: {e}");
-        std::process::exit(1);
-    });
-    let base_manifest_key = ns.base_manifest_key(child_meta.current_timeline_id, branch_lsn);
-    let manifest_bytes = sim
-        .get_standard(&base_manifest_key)
-        .unwrap_or_else(|e| {
-            eprintln!("error: failed to read base manifest: {e}");
-            std::process::exit(1);
-        })
-        .unwrap_or_else(|| {
-            eprintln!("error: base manifest not found at '{base_manifest_key}'");
-            std::process::exit(1);
-        });
-
-    let recovery_manifest_path = tiko_root.join("recovery_manifest.bin");
-    fs::write(&recovery_manifest_path, &manifest_bytes).unwrap_or_else(|e| {
-        eprintln!("error: failed to write recovery_manifest.bin: {e}");
+    // ── Phase 2: prepare for recovery ───────
+    prepare_recovery(
+        sim,
+        &parent_ns,
+        pg_data,
+        parent_meta.current_timeline_id,
+        target_lsn,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error: failed to prepare recovery in store: {e}");
         std::process::exit(1);
     });
 

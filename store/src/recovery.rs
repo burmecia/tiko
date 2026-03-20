@@ -107,18 +107,17 @@ pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
 /// 1. Validate `deltas/{target_tl}/{target_lsn}/manifest.bin` exists.
 /// 2. Download and extract `pg_state.tar.zst` (pg_control, transaction logs,
 ///    pg_filenode.map) into PGDATA.
-/// 3. Build `recovery_manifest.bin` — newest base with `base_lsn <= target_lsn`
-///    merged with all deltas in `(base_lsn, target_lsn]`.
+/// 3. Build and write `recovery_manifest.bin` into PGDATA — newest base with
+///    `base_lsn <= target_lsn` merged with all deltas in `(base_lsn, target_lsn]`.
 /// 4. Append recovery settings to `postgresql.conf`.
 /// 5. Touch `recovery.signal`.
 ///
-/// `tiko_root` is the Tiko local root directory (`$TIKO_LOCAL_ROOT`) where Tiko
-/// files (manifest, temp archives) are written.  Pass a `TempDir` in tests.
+/// Intermediate files (pg_state archive, manifest working files) are written to
+/// a temporary directory that is cleaned up automatically on return.
 pub fn prepare_recovery(
     sim: &SimStore,
     ns: &ProjectNamespace,
     pgdata: &Path,
-    tiko_root: &Path,
     target_tl: u32,
     target_lsn: Lsn,
 ) -> Result<()> {
@@ -132,7 +131,8 @@ pub fn prepare_recovery(
         return Err(Error::TargetNotFound(delta_key));
     }
 
-    fs::create_dir_all(tiko_root)?;
+    let work =
+        tempfile::tempdir().map_err(|e| Error::Other(format!("failed to create temp dir: {e}")))?;
 
     // ── 1. pg_state ───────────────────────────────────────────────────────────
     let pg_state_key = ns.pg_state_key(target_tl, target_lsn);
@@ -141,7 +141,7 @@ pub fn prepare_recovery(
         .map_err(Error::Store)?
         .ok_or_else(|| Error::Other(format!("pg_state not found: {pg_state_key}")))?;
 
-    let pg_state_tmp = tiko_root.join("pg_state.tar.zst");
+    let pg_state_tmp = work.path().join("pg_state.tar.zst");
     fs::write(&pg_state_tmp, &pg_state_bytes)?;
 
     let status = std::process::Command::new("tar")
@@ -156,12 +156,14 @@ pub fn prepare_recovery(
     if !status.success() {
         return Err(Error::Other("pg_state tar extraction failed".into()));
     }
-    let _ = fs::remove_file(&pg_state_tmp);
 
     // ── 2. recovery_manifest.bin ──────────────────────────────────────────────
-    let manifest_path = Manifest::local_manifest_path(tiko_root);
+    let manifest_path = Manifest::local_manifest_path(work.path());
     let base = load_base_manifest(sim, ns, target_tl, target_lsn, &manifest_path)?;
-    apply_deltas_up_to(sim, ns, &base, tiko_root, target_tl, target_lsn)?;
+    apply_deltas_up_to(sim, ns, &base, work.path(), target_tl, target_lsn)?;
+
+    let manifest_bytes = base.to_bytes().map_err(Error::Store)?;
+    fs::write(pgdata.join("recovery_manifest.bin"), &manifest_bytes)?;
 
     // ── 3. postgresql.conf ────────────────────────────────────────────────────
     write_recovery_conf(&pgdata.join("postgresql.conf"), target_lsn)?;
@@ -258,17 +260,41 @@ fn apply_deltas_up_to(
     Ok(())
 }
 
-/// Append tikod recovery settings to `postgresql.conf`.
+const RECOVERY_CONF_BEGIN: &str = "# Tiko recovery settings — begin\n";
+const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
+
+/// Remove the recovery settings block previously written by `write_recovery_conf`.
 ///
-/// The block is identified by a comment header so that
-/// `orchestrate::remove_recovery_conf_entries` can strip it cleanly.
-fn write_recovery_conf(conf_path: &Path, target_lsn: Lsn) -> Result<()> {
+/// Strips the entire block delimited by the begin/end markers, leaving the
+/// rest of `postgresql.conf` untouched. A no-op if the markers are not present.
+pub fn remove_recovery_conf(conf_path: &Path) -> Result<()> {
+    let existing = fs::read_to_string(conf_path).unwrap_or_default();
+    let Some(start) = existing.find(RECOVERY_CONF_BEGIN) else {
+        return Ok(());
+    };
+    let end_marker_offset = existing[start..]
+        .find(RECOVERY_CONF_END)
+        .map(|p| start + p + RECOVERY_CONF_END.len())
+        .unwrap_or(existing.len());
+    let cleaned = format!("{}{}", &existing[..start], &existing[end_marker_offset..]);
+    fs::write(conf_path, cleaned)?;
+    Ok(())
+}
+
+/// Append Tiko recovery settings to a PostgreSQL conf file.
+///
+/// The block is delimited by begin/end markers so that `remove_recovery_conf`
+/// can strip it cleanly even if further settings follow.
+pub fn write_recovery_conf(conf_path: &Path, target_lsn: Lsn) -> Result<()> {
     let snippet = format!(
-        "\n# tikod recovery settings — removed by post_recovery_cleanup\n\
+        "\n{}\
          restore_command = 'tiko_restore %f %p'\n\
          recovery_target_lsn = '{}'\n\
-         recovery_target_action = 'shutdown'\n",
-        target_lsn.to_pg_string()
+         recovery_target_action = 'shutdown'\n\
+         {}",
+        RECOVERY_CONF_BEGIN,
+        target_lsn.to_pg_string(),
+        RECOVERY_CONF_END,
     );
     let existing = fs::read_to_string(conf_path).unwrap_or_default();
     fs::write(conf_path, format!("{existing}{snippet}"))?;

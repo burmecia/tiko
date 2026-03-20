@@ -60,9 +60,10 @@ pub fn create_branch(
     parent_timeline: u32,
     child_ns: &ProjectNamespace,
     branch_lsn: Lsn,
-) -> Result<()> {
-    s3_create_branch(sim, parent_ns, parent_timeline, child_ns, branch_lsn)
-        .map_err(|e| Error::Project(e.to_string()))
+) -> Result<ProjectMeta> {
+    let child_meta = s3_create_branch(sim, parent_ns, parent_timeline, child_ns, branch_lsn)
+        .map_err(|e| Error::Project(e.to_string()))?;
+    Ok(child_meta)
 }
 
 /// Soft-delete a branch: set `deleted_at` in `project.json`.
