@@ -167,7 +167,10 @@ pub fn prepare_recovery(
     fs::copy(&manifest_path, Manifest::recovery_manifest_path(root_path)).map_err(Error::Store)?;
 
     // ── 3. postgresql.tiko.conf ────────────────────────────────────────────────────
-    write_recovery_conf(&pgdata.join(TIKO_CONF_FILE), target_lsn)?;
+    write_recovery_conf(
+        &pgdata.join(TIKO_CONF_FILE),
+        "/Users/bolu/supabase/tiko/target/debug/tiko_restore %f %p",
+    )?;
 
     // ── 4. recovery.signal ────────────────────────────────────────────────────
     fs::write(pgdata.join("recovery.signal"), b"")?;
@@ -283,16 +286,21 @@ pub fn remove_recovery_conf(conf_path: &Path) -> Result<()> {
 ///
 /// The block is delimited by begin/end markers so that `remove_recovery_conf`
 /// can strip it cleanly even if further settings follow.
-pub fn write_recovery_conf(conf_path: &Path, target_lsn: Lsn) -> Result<()> {
+///
+/// Uses `recovery_target = 'immediate'` so PostgreSQL stops as soon as a
+/// consistent recovery state is reached (right after the checkpoint record).
+/// This is correct for branching from a checkpoint — in particular it handles
+/// shutdown checkpoints, where `checkPoint.redo == ProcLastRecPtr` and the
+/// checkpoint record is consumed before the WAL replay loop starts, so any
+/// `recovery_target_lsn` pointing at the checkpoint would never be reached.
+pub fn write_recovery_conf(conf_path: &Path, restore_command: &str) -> Result<()> {
     let snippet = format!(
         "\n{}\
-         restore_command = 'tiko_restore %f %p'\n\
-         recovery_target_lsn = '{}'\n\
+         restore_command = '{}'\n\
+         recovery_target = 'immediate'\n\
          recovery_target_action = 'shutdown'\n\
          {}",
-        RECOVERY_CONF_BEGIN,
-        target_lsn.to_pg_string(),
-        RECOVERY_CONF_END,
+        RECOVERY_CONF_BEGIN, restore_command, RECOVERY_CONF_END,
     );
     let existing = fs::read_to_string(conf_path).unwrap_or_default();
     fs::write(conf_path, format!("{existing}{snippet}"))?;
@@ -367,7 +375,7 @@ mod tests {
         // Write a TIKM file as the recovery manifest.
         let tiko_dir = dir.path();
         std::fs::create_dir_all(&tiko_dir).unwrap();
-        let manifest_path = tiko_dir.join("recovery_manifest.bin");
+        let manifest_path = Manifest::recovery_manifest_path(tiko_dir);
         let m = Manifest::new(
             Lsn::new(0x1000),
             0,

@@ -174,7 +174,7 @@ pub fn prepare_recovery(
     apply_deltas_up_to(sim, ns, &base, tiko_root, target_tl, target_lsn)?;
 
     // ── 3. postgresql.conf ────────────────────────────────────────────────────
-    write_recovery_conf(&pgdata.join("postgresql.conf"), target_lsn)?;
+    write_recovery_conf(&pgdata.join("postgresql.conf"), "tiko_restore %f %p")?;
 
     // ── 4. recovery.signal ────────────────────────────────────────────────────
     fs::write(pgdata.join("recovery.signal"), b"")?;
@@ -270,15 +270,15 @@ fn apply_deltas_up_to(
 
 /// Append tikod recovery settings to `postgresql.conf`.
 ///
-/// The block is identified by a comment header so that
-/// `orchestrate::remove_recovery_conf_entries` can strip it cleanly.
-fn write_recovery_conf(conf_path: &Path, target_lsn: Lsn) -> Result<()> {
+/// Uses `recovery_target = 'immediate'` so PG promotes as soon as a consistent
+/// state is reached — correct for branching from a shutdown checkpoint where
+/// there is no WAL to replay past the checkpoint.
+fn write_recovery_conf(conf_path: &Path, restore_command: &str) -> Result<()> {
     let snippet = format!(
         "\n# tikod recovery settings — removed by post_recovery_cleanup\n\
-         restore_command = 'tiko_restore %f %p'\n\
-         recovery_target_lsn = '{}'\n\
-         recovery_target_action = 'shutdown'\n",
-        target_lsn.to_pg_string()
+         restore_command = '{restore_command}'\n\
+         recovery_target = 'immediate'\n\
+         recovery_target_action = 'promote'\n"
     );
     let existing = fs::read_to_string(conf_path).unwrap_or_default();
     fs::write(conf_path, format!("{existing}{snippet}"))?;
@@ -438,8 +438,8 @@ mod tests {
         // postgresql.conf must contain the recovery block.
         let conf = fs::read_to_string(pgdata_path.join("postgresql.conf")).unwrap();
         assert!(
-            conf.contains("recovery_target_lsn"),
-            "recovery_target_lsn missing from conf"
+            conf.contains("recovery_target = 'immediate'"),
+            "recovery_target = 'immediate' missing from conf"
         );
         assert!(
             conf.contains("restore_command"),
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_recovery_writes_recovery_target_lsn_into_conf() {
+    fn prepare_recovery_writes_recovery_target_immediate_into_conf() {
         let (sim, _dir) = temp_sim();
         let ns = root_ns();
         let pgdata = TempDir::new().unwrap();
@@ -492,10 +492,9 @@ mod tests {
         prepare_recovery(&sim, &ns, pgdata_path, pgdata_path, 1, target_lsn).unwrap();
 
         let conf = fs::read_to_string(pgdata_path.join("postgresql.conf")).unwrap();
-        // LSN 0x3000000 = 0/3000000 in PG notation.
         assert!(
-            conf.contains("recovery_target_lsn = '0/3000000'"),
-            "conf must contain correct LSN: {conf}"
+            conf.contains("recovery_target = 'immediate'"),
+            "conf must contain recovery_target = 'immediate': {conf}"
         );
     }
 }

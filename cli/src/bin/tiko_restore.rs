@@ -45,6 +45,12 @@ fn main() {
     let wal_filename = &args[1];
     let dest_path = PathBuf::from(&args[2]);
 
+    eprintln!(
+        "tiko_restore: segment={} dest={}",
+        wal_filename,
+        dest_path.display()
+    );
+
     let sim = match sim_from_env() {
         Ok(s) => s,
         Err(e) => {
@@ -72,10 +78,16 @@ fn main() {
         wal_filename,
         &dest_path,
     ) {
-        Ok(true) => std::process::exit(0),
-        Ok(false) => std::process::exit(1),
+        Ok(true) => {
+            eprintln!("tiko_restore: ok segment={wal_filename}");
+            std::process::exit(0);
+        }
+        Ok(false) => {
+            eprintln!("tiko_restore: not found segment={wal_filename}");
+            std::process::exit(1);
+        }
         Err(e) => {
-            eprintln!("tiko_restore: {e}");
+            eprintln!("tiko_restore: error segment={wal_filename}: {e}");
             std::process::exit(1);
         }
     }

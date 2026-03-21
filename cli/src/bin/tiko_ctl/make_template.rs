@@ -60,9 +60,11 @@ log_min_messages = debug1\n\
         std::process::exit(1);
     });
 
-    // ── 3. Strip WAL and transactional state contents (keep directories) ──────
+    // ── 3. Strip transactional state contents (keep directories) ─────────────
+    // pg_wal is intentionally kept: the initial WAL segment written by initdb
+    // must be present so that branches created from this template can start PG
+    // without needing a restore_command to fetch the very first segment.
     for dir in [
-        "pg_wal",
         "pg_xact",
         "pg_commit_ts",
         "pg_multixact/members",
@@ -153,7 +155,7 @@ fn strip_relation_files(dir: &Path, depth: usize) {
             let path = entry.path();
             if path.is_file() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name != "pg_filenode.map" && name != "pg_internal.init" {
+                if name != "pg_filenode.map" && name != "pg_internal.init" && name != "PG_VERSION" {
                     let _ = fs::remove_file(&path);
                 }
             }
