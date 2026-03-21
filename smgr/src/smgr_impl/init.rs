@@ -23,6 +23,14 @@ pub extern "C-unwind" fn tiko_init() {
     // This enables the initdb write path to reach SimStore express.
     ProjectCtx::init_from_env(&root_dir);
 
+    // If a recovery manifest exists, load it into memory and set RECOVERY_MODE=true.
+    let recovery_manifest = store::manifest::Manifest::recovery_manifest_path(&root_dir);
+    if recovery_manifest.exists() {
+        if let Err(e) = store::recovery::load_recovery_manifest(&recovery_manifest) {
+            pg_log_error(&format!("tiko_init: failed to load recovery manifest: {e}"));
+        }
+    }
+
     // Skip shared memory attachment in initdb (--boot) and single-user mode.
     // In those modes MyProcNumber is invalid and the IoControl shmem block
     // was never sized/initialised via shmem_request_hook.
