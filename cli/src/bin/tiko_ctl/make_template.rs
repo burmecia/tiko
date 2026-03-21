@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 use store::sim_store::SimStore;
 
-pub fn run(pg_bindir: &Path, sim_store: Option<&Path>) {
+pub fn run(pg_bindir: &Path, tiko_root: Option<&Path>) {
     let temp_dir = tempfile::tempdir().unwrap_or_else(|e| {
         eprintln!("error: failed to create temp dir: {e}");
         std::process::exit(1);
@@ -104,7 +104,7 @@ log_min_messages = debug1\n\
     );
 
     // ── 6. Upload to SimStore ─────────────────────────────────────────────────
-    if let Some(sim_path) = sim_store {
+    if let Some(root) = tiko_root {
         let filename = output
             .file_name()
             .and_then(|n| n.to_str())
@@ -116,7 +116,7 @@ log_min_messages = debug1\n\
             eprintln!("error: failed to read {}: {e}", output.display());
             std::process::exit(1);
         });
-        let sim = SimStore::init(sim_path);
+        let sim = SimStore::init(root);
         sim.put_template(filename, &data).unwrap_or_else(|e| {
             eprintln!("error: SimStore upload failed: {e}");
             std::process::exit(1);

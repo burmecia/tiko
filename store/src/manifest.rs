@@ -340,6 +340,11 @@ impl Manifest {
         root_dir.join("base_manifest.bin")
     }
 
+    /// Canonical local path for the recovery manifest TIKM file.
+    pub fn recovery_manifest_path(root_dir: &Path) -> PathBuf {
+        root_dir.join("recovery_manifest.bin")
+    }
+
     /// Binary search for `key` in the sorted on-disk TIKM file.
     /// Returns `Ok(Some(ChunkRef))` on hit, `Ok(None)` on miss.
     pub fn lookup(&self, key: &ChunkTag) -> io::Result<Option<ChunkRef>> {

@@ -6,7 +6,7 @@
 //! to serve reads from the versioned standard-bucket objects.
 //!
 //! The recovery manifest is loaded from `$PGDATA/tiko/recovery_manifest.bin`,
-//! which is a msgpack+zstd blob (same wire format as S3 `manifest.bin`).
+//! which is a TIKM binary file (see `manifest.rs` for the format).
 //! It is written by the control plane before initiating PITR recovery.
 
 use std::fs;
@@ -65,20 +65,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Load the recovery manifest from `path` (= `$PGDATA/tiko/recovery_manifest.bin`).
 ///
-/// Reads the msgpack+zstd blob at `path`, converts it to a local TIKM file at
-/// `{path.parent()}/recovery_manifest_local.bin`, stores it in
-/// `RECOVERY_MANIFEST`, and sets `RECOVERY_MODE = true`.
+/// Opens the TIKM file at `path`, stores it in `RECOVERY_MANIFEST`, and sets
+/// `RECOVERY_MODE = true`.
 ///
-/// Returns an error if the file cannot be read or the blob is malformed.
+/// Returns an error if the file cannot be read or is not a valid TIKM file.
 /// If the manifest was already loaded (OnceLock already set), the set is
 /// silently ignored but `RECOVERY_MODE` is still set to true.
 pub fn load_recovery_manifest(path: &Path) -> io::Result<()> {
-    let bytes = std::fs::read(path)?;
-    let local_path = path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("recovery_manifest_local.bin");
-    let manifest = Manifest::from_bytes(&bytes, &local_path)?;
+    let manifest = Manifest::open(path)?;
     // OnceLock::set fails silently if already populated — acceptable for recovery.
     let _ = RECOVERY_MANIFEST.set(manifest);
     RECOVERY_MODE.store(true, Ordering::Release);
@@ -121,7 +115,8 @@ pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
 pub fn prepare_recovery(
     sim: &SimStore,
     ns: &ProjectNamespace,
-    pgdata: &Path,
+    pgdata: &Path,    // target PGDATA directory to prepare for recovery
+    root_path: &Path, // root path for recovery_manifest.bin files
     target_tl: u32,
     target_lsn: Lsn,
 ) -> Result<()> {
@@ -166,8 +161,10 @@ pub fn prepare_recovery(
     let base = load_base_manifest(sim, ns, target_tl, target_lsn, &manifest_path)?;
     apply_deltas_up_to(sim, ns, &base, work.path(), target_tl, target_lsn)?;
 
-    let manifest_bytes = base.to_bytes().map_err(Error::Store)?;
-    fs::write(pgdata.join("recovery_manifest.bin"), &manifest_bytes)?;
+    // Copy the merged TIKM file directly — no need to round-trip through the
+    // S3 wire format (zstd+msgpack). Place it in the tiko root directory.
+    fs::create_dir_all(root_path)?;
+    fs::copy(&manifest_path, Manifest::recovery_manifest_path(root_path)).map_err(Error::Store)?;
 
     // ── 3. postgresql.tiko.conf ────────────────────────────────────────────────────
     write_recovery_conf(&pgdata.join(TIKO_CONF_FILE), target_lsn)?;
@@ -368,33 +365,27 @@ mod tests {
             lsn: Lsn::new(0x1000),
         };
 
-        // Build the msgpack+zstd blob.
-        let build_path = dir.path().join("build.tikm");
+        // Write a TIKM file as the recovery manifest.
+        let tiko_dir = dir.path();
+        std::fs::create_dir_all(&tiko_dir).unwrap();
+        let manifest_path = tiko_dir.join("recovery_manifest.bin");
         let m = Manifest::new(
             Lsn::new(0x1000),
             0,
             vec![(known_tag, known_ref)],
             HashMap::new(),
-            &build_path,
+            &manifest_path,
         )
         .unwrap();
-        let blob = m.to_bytes().unwrap();
-
-        // Write the blob as the recovery manifest file.
-        let tiko_dir = dir.path();
-        std::fs::create_dir_all(&tiko_dir).unwrap();
-        let manifest_path = tiko_dir.join("recovery_manifest.bin");
-        std::fs::write(&manifest_path, &blob).unwrap();
 
         // Attempt to load (may be a no-op if OnceLock already set by a parallel test).
         // load_recovery_manifest sets RECOVERY_MODE=true; clear it afterwards.
         let _ = load_recovery_manifest(&manifest_path);
 
-        // Test the logic directly on a local Manifest instance to avoid
+        // Test the logic directly on the Manifest instance to avoid
         // OnceLock contention between parallel tests.
-        let local = Manifest::from_bytes(&blob, &dir.path().join("local.tikm")).unwrap();
-        assert_eq!(local.lookup(&known_tag).unwrap(), Some(known_ref));
-        assert_eq!(local.lookup(&tag(999)).unwrap(), None);
+        assert_eq!(m.lookup(&known_tag).unwrap(), Some(known_ref));
+        assert_eq!(m.lookup(&tag(999)).unwrap(), None);
 
         // Restore RECOVERY_MODE so subsequent tests inside the guard see false.
         clear_recovery_mode();

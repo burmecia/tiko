@@ -16,15 +16,15 @@ use store::sim_store::SimStore;
 #[derive(Parser)]
 #[command(name = "tiko_ctl", about = "Tiko control CLI tools")]
 struct Cli {
-    /// Path to SimStore root directory
+    /// Path to the Tiko root directory (sets TIKO_ROOT_PATH)
     #[arg(
         long,
         global = true,
         value_name = "PATH",
         value_hint = clap::ValueHint::DirPath,
-        env = "TIKO_SIM_STORE"
+        env = "TIKO_ROOT_PATH"
     )]
-    sim_store: Option<PathBuf>,
+    tiko_root: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command_,
@@ -95,9 +95,9 @@ enum Command_ {
     },
 }
 
-fn require_sim(sim_store: Option<&Path>, op: &str) -> &'static SimStore {
-    let path = sim_store.unwrap_or_else(|| {
-        eprintln!("error: {op} requires '--sim-store <PATH>' (or TIKO_SIM_STORE)");
+fn require_sim(tiko_root: Option<&Path>, op: &str) -> &'static SimStore {
+    let path = tiko_root.unwrap_or_else(|| {
+        eprintln!("error: {op} requires '--tiko-root <PATH>' (or TIKO_ROOT_PATH)");
         std::process::exit(2);
     });
     SimStore::init(path)
@@ -108,18 +108,18 @@ fn main() {
 
     match cli.command {
         Command_::MakeTemplate { pg_bindir } => {
-            make_template::run(&pg_bindir, cli.sim_store.as_deref());
+            make_template::run(&pg_bindir, cli.tiko_root.as_deref());
         }
         Command_::CreateOrg { org, template } => {
             create_org::run(
-                require_sim(cli.sim_store.as_deref(), "create-org"),
+                require_sim(cli.tiko_root.as_deref(), "create-org"),
                 org,
                 &template,
             );
         }
         Command_::DeleteOrg { org, force } => {
             delete_org::run(
-                require_sim(cli.sim_store.as_deref(), "delete-org"),
+                require_sim(cli.tiko_root.as_deref(), "delete-org"),
                 org,
                 force,
             );
@@ -134,8 +134,12 @@ fn main() {
             template,
             pg_data,
         } => {
+            let tiko_root = cli.tiko_root.as_deref().unwrap_or_else(|| {
+                eprintln!("error: create-branch requires '--tiko-root <PATH>' (or TIKO_ROOT_PATH)");
+                std::process::exit(2);
+            });
             create_branch::run(
-                require_sim(cli.sim_store.as_deref(), "create-branch"),
+                require_sim(Some(tiko_root), "create-branch"),
                 org,
                 project,
                 branch,
@@ -144,6 +148,7 @@ fn main() {
                 &lsn,
                 &template,
                 &pg_data,
+                tiko_root,
             );
         }
         Command_::Restore {
@@ -153,7 +158,7 @@ fn main() {
             lsn,
         } => {
             restore::run(
-                require_sim(cli.sim_store.as_deref(), "restore"),
+                require_sim(cli.tiko_root.as_deref(), "restore"),
                 org,
                 project,
                 branch,

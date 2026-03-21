@@ -19,6 +19,7 @@ pub fn run(
     lsn: &str,
     template: &str,
     pg_data: &Path,
+    tiko_root: &Path,
 ) {
     let ns = ProjectNamespace::new(org, project, branch);
     let parent_ns = ProjectNamespace::new(org, parent_project, parent_branch);
@@ -83,6 +84,7 @@ pub fn run(
         sim,
         &parent_ns,
         pg_data,
+        tiko_root,
         parent_meta.current_timeline_id,
         target_lsn,
     )
