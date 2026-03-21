@@ -623,9 +623,8 @@ mod tests {
     use store::sim_store::SimStore;
     use tempfile::TempDir;
 
-    // All tests that touch RECOVERY_MODE must hold `recovery::RECOVERY_MODE_TEST_GUARD`
-    // (defined in recovery.rs as pub(crate)). Using that shared guard ensures
-    // recovery::tests and s3_ops::tests are serialised against each other.
+    /// Serialises tests in this module that read or write `RECOVERY_MODE`.
+    static RECOVERY_MODE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn ns() -> ProjectNamespace {
         ProjectNamespace::new(1001, 2001, 7)
@@ -649,7 +648,7 @@ mod tests {
 
     #[test]
     fn level1_express_hit_returns_correct_data() {
-        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+        let _guard = RECOVERY_MODE_TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
@@ -671,7 +670,7 @@ mod tests {
 
     #[test]
     fn level1_miss_returns_none_when_express_empty() {
-        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+        let _guard = RECOVERY_MODE_TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
@@ -725,7 +724,7 @@ mod tests {
 
     #[test]
     fn level2_branch_fallback_correct_versioned_key_format() {
-        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+        let _guard = RECOVERY_MODE_TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Test that the level-2 key format is correct by checking the key
@@ -780,7 +779,7 @@ mod tests {
 
     #[test]
     fn recovery_mode_fetches_versioned_chunk_from_standard_sim() {
-        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+        let _guard = RECOVERY_MODE_TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
@@ -827,7 +826,7 @@ mod tests {
 
     #[test]
     fn recovery_mode_does_not_fall_through_to_express() {
-        let _guard = recovery::RECOVERY_MODE_TEST_GUARD
+        let _guard = RECOVERY_MODE_TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();

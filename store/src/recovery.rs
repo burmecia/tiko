@@ -301,10 +301,6 @@ pub fn write_recovery_conf(conf_path: &Path, target_lsn: Lsn) -> Result<()> {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// Serialises all tests across crates that read or write `RECOVERY_MODE`.
-/// Must be held by any test that touches the flag to avoid flaky results.
-pub static RECOVERY_MODE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +309,9 @@ mod tests {
     use pgsys::Lsn;
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    /// Serialises tests in this module that read or write `RECOVERY_MODE`.
+    static RECOVERY_MODE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn tag(rel: u32) -> ChunkTag {
         ChunkTag {
