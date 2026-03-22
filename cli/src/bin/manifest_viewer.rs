@@ -13,8 +13,8 @@
 //! ```
 //!
 //! Auto-detection: if the file begins with the `TIKM` magic it is opened as a
-//! local TIKM file; otherwise the raw bytes are treated as the S3 wire format
-//! (`zstd(msgpack(...))`).
+//! local TIKM file; if it begins with the zstd magic it is decompressed first
+//! (SimStore compresses on disk); otherwise the raw bytes are decoded as msgpack.
 //!
 //! # Examples
 //!
@@ -198,29 +198,12 @@ fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
     println!("  format:          {format_label}");
     println!("  checkpoint_lsn:  {lsn}");
     println!("  timestamp:       {}  ({})", format_timestamp(ts), ts);
+    let rel_nblocks = manifest.rel_nblocks();
     println!("  entry_count:     {entry_count}");
+    println!("  nblocks_count:   {}", rel_nblocks.len());
 
     if !show_entries {
         return;
-    }
-
-    let rel_nblocks = manifest.rel_nblocks();
-    if !rel_nblocks.is_empty() {
-        println!();
-        println!("rel_nblocks:");
-        let mut pairs: Vec<_> = rel_nblocks.iter().collect();
-        pairs.sort_by_key(|(rf, _)| *rf);
-        for (rf, nblocks) in pairs {
-            let fork = fork_name(rf.fork_number);
-            println!(
-                "  {}/{}/{}.{}  →  {} blocks",
-                rf.spc_oid, rf.db_oid, rf.rel_number, fork, nblocks
-            );
-        }
-    } else if format_label.contains("S3") {
-        // S3 format can legitimately have an empty rel_nblocks map.
-        println!();
-        println!("rel_nblocks:     (empty)");
     }
 
     let entries = match manifest.entries() {
@@ -230,6 +213,23 @@ fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
             return;
         }
     };
+
+    if !rel_nblocks.is_empty() {
+        println!();
+        println!("rel_nblocks:");
+        let mut pairs: Vec<_> = rel_nblocks.iter().collect();
+        pairs.sort_by_key(|(rf, _)| *rf);
+        for (rf, nblocks) in pairs {
+            println!(
+                "  {}/{}/{}.{}  →  {} blocks",
+                rf.spc_oid,
+                rf.db_oid,
+                rf.rel_number,
+                fork_name(rf.fork_number),
+                nblocks
+            );
+        }
+    }
 
     if entries.is_empty() {
         println!();
@@ -271,9 +271,18 @@ fn run(args: &Args) -> Result<(), String> {
                     Manifest::open(path).map_err(|e| format!("failed to open TIKM: {e}"))?;
                 print_manifest(&manifest, "local TIKM", args.show_entries);
             } else {
+                // SimStore compresses non-JSON files with zstd on disk.
+                // Decompress before passing to from_bytes() which expects plain msgpack.
+                const ZSTD_MAGIC: &[u8; 4] = &[0x28, 0xB5, 0x2F, 0xFD];
+                let msgpack = if data.starts_with(ZSTD_MAGIC) {
+                    zstd::decode_all(data.as_slice())
+                        .map_err(|e| format!("failed to decompress S3 wire format: {e}"))?
+                } else {
+                    data
+                };
                 let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
                 let tmp_path = tmp.path().join("manifest.bin");
-                let manifest = Manifest::from_bytes(&data, &tmp_path)
+                let manifest = Manifest::from_bytes(&msgpack, &tmp_path)
                     .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
                 print_manifest(&manifest, "S3 wire format", args.show_entries);
             }
