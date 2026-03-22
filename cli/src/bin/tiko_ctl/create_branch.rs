@@ -122,34 +122,6 @@ pub fn run(
                 std::process::exit(1);
             });
 
-        // Copy nblocks express keys from parent to child.
-        // `cached_file_nblocks` reads from `{org}/{project_id}/chunks/{tag}/nblocks`
-        // in the express bucket. A new branch has no express data, so without
-        // this copy every relation appears to have 0 blocks and pg_authid is empty.
-        let parent_chunks_prefix = format!("{}/{}/chunks/", parent_ns.org_id, parent_ns.project_id);
-        let child_chunks_prefix = format!("{}/{}/chunks/", ns.org_id, ns.project_id);
-        let nblocks_keys = sim
-            .list_prefix_express(&parent_chunks_prefix)
-            .unwrap_or_else(|e| {
-                eprintln!("error: failed to list parent nblocks keys: {e}");
-                std::process::exit(1);
-            });
-        for key in &nblocks_keys {
-            if key.ends_with("/nblocks") {
-                if let Ok(Some(bytes)) = sim.get_express(key) {
-                    let child_key = format!(
-                        "{}{}",
-                        child_chunks_prefix,
-                        &key[parent_chunks_prefix.len()..]
-                    );
-                    sim.put_express(&child_key, &bytes).unwrap_or_else(|e| {
-                        eprintln!("error: failed to copy nblocks key {key}: {e}");
-                        std::process::exit(1);
-                    });
-                }
-            }
-        }
-
         // Extract the checkpoint's pg_state.tar.zst (pg_control, pg_xact, …)
         // into pgdata so PostgreSQL starts with a consistent control file.
         let pg_state_key = parent_ns.pg_state_key(parent_meta.current_timeline_id, chosen_lsn);

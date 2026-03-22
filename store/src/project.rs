@@ -533,6 +533,12 @@ impl ProjectCtx {
     pub fn base_manifest_lookup(&self, key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
         self.base_manifest.lookup(key)
     }
+
+    /// Level-3 nblocks lookup: returns the block count recorded in the base
+    /// manifest for this relation fork, or `None` if not present.
+    pub fn base_manifest_lookup_nblocks(&self, rf: RelFork) -> Option<u32> {
+        self.base_manifest.lookup_nblocks(rf)
+    }
 }
 
 // ── Module 7: Branch Creation ─────────────────────────────────────────────────

@@ -154,10 +154,19 @@ fn io_err_to_errno(e: &io::Error) -> i32 {
 /// Read the live block count for a relation fork from the express nblocks key.
 /// Returns 0 if the key doesn't exist.
 fn store_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> BlockNumber {
+    store_nblocks_opt(sim, ns, rf).unwrap_or(0)
+}
+
+/// Like `store_nblocks` but returns `None` when the key is absent, allowing
+/// callers to distinguish "key missing" from "key present with value 0".
+fn store_nblocks_opt(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> Option<BlockNumber> {
     let key = ns.rel_nblocks_key(rf);
     match sim.get_express(&key) {
-        Ok(Some(bytes)) if bytes.len() >= 4 => u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-        _ => 0,
+        Ok(Some(bytes)) if bytes.len() >= 4 => {
+            Some(u32::from_le_bytes(bytes[0..4].try_into().unwrap()))
+        }
+        Ok(None) => None,
+        _ => Some(0),
     }
 }
 
@@ -239,17 +248,28 @@ fn parse_chunk_id_from_key(key: &str, prefix: &str) -> Option<u32> {
 
 // ── Cache-aware wrappers ──────────────────────────────────────────────────────
 
-/// Cache-aware block count. Returns `max(store_nblocks, cache_max)`.
+/// Cache-aware block count. Three-level read:
 ///
-/// With the write-back cache, `cached_write_blocks` does not update the
-/// SimStore nblocks key immediately — dirty blocks stay in the cache until
-/// eviction. So `store_nblocks` alone would return a stale (smaller) count
-/// for relations that have been extended but not yet evicted.
+/// 1. **Express nblocks key** — `{org}/{proj}/chunks/{tag}/nblocks` in the
+///    express bucket. The authoritative live counter updated by every extend,
+///    truncate, and create.
+/// 2. **Base manifest `rel_nblocks`** — consulted only when the express key is
+///    *absent* (key not found, not value 0). This covers fresh branches that
+///    inherit relation sizes from a parent manifest before any write has
+///    created the express key in the child's namespace.
+/// 3. **Cache max** — `max` of the above with the highest block number held in
+///    the shared-memory cache. Needed because the write-back policy keeps
+///    dirty extended blocks in the cache without immediately updating the
+///    express key.
 ///
-/// Falls back to `store_nblocks` alone when the cache is unavailable (initdb).
+/// Falls back to levels 1 + 2 alone when the cache is unavailable (initdb).
 pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
     let store = if let (Some(sim), Some(ctx)) = (SimStore::try_get(), ProjectCtx::try_get()) {
-        store_nblocks(sim, ctx.ns(), rf)
+        match store_nblocks_opt(sim, ctx.ns(), rf) {
+            Some(n) => n,
+            // Express key absent: fall back to base manifest snapshot.
+            None => ctx.base_manifest_lookup_nblocks(rf).unwrap_or(0),
+        }
     } else {
         0
     };
