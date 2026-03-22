@@ -1,7 +1,7 @@
 //! Manifest types and file-backed merge logic for PITR.
 //!
 //! `Manifest` is the unified type for both base and delta manifests. It is:
-//! - **Stored on S3** as `manifest.bin` — a `zstd(msgpack(...))` blob.
+//! - **Stored on S3** as `manifest.bin` — a `msgpack(...)` blob (SimStore applies zstd).
 //! - **Cached locally** as a fixed-size sorted binary file (TIKM format) that
 //!   enables O(log N) binary search via direct `pread` calls (no in-memory
 //!   page cache — the block cache in `cache.rs` covers the hot path).
@@ -29,7 +29,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -277,40 +277,35 @@ impl Manifest {
         })
     }
 
-    /// Deserialize from the S3 wire format (`zstd(msgpack(...))`).
+    /// Deserialize from the S3 wire format (`msgpack(...)`).
     /// Writes the decoded entries to a local TIKM file at `path`.
     ///
     /// Wire format: 4-tuple `(lsn, timestamp, chunks, rel_nblocks)`.
     pub fn from_bytes(data: &[u8], path: &Path) -> io::Result<Self> {
-        let msgpack =
-            zstd::decode_all(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
         let (checkpoint_lsn, timestamp, chunks, rel_nblocks): (
             Lsn,
             i64,
             Vec<(ChunkTag, ChunkRef)>,
             HashMap<RelFork, u32>,
-        ) = rmp_serde::from_slice(&msgpack)
+        ) = rmp_serde::from_slice(data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Self::new(checkpoint_lsn, timestamp, chunks, rel_nblocks, path)
     }
 
-    /// Serialize to the S3 wire format (`zstd(msgpack(...))`).
+    /// Serialize to the S3 wire format (`msgpack(...)`).
     ///
     /// Format: 4-tuple `(checkpoint_lsn, timestamp, chunks, rel_nblocks)`.
     pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         let entries = read_all_entries(&inner)?;
-        let msgpack = rmp_serde::to_vec(&(
+        rmp_serde::to_vec(&(
             inner.checkpoint_lsn,
             inner.timestamp,
             &entries,
             &inner.rel_nblocks,
         ))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let compressed = zstd::encode_all(Cursor::new(&msgpack), 3)?;
-        Ok(compressed)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Return the checkpoint LSN recorded in the manifest header.
