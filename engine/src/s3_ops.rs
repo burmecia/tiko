@@ -152,14 +152,11 @@ fn io_err_to_errno(e: &io::Error) -> i32 {
 // ── SimStore-backed relation metadata ─────────────────────────────────────────
 
 /// Read the live block count for a relation fork from the express nblocks key.
-/// Returns 0 if the key doesn't exist.
-fn store_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> BlockNumber {
-    store_nblocks_opt(sim, ns, rf).unwrap_or(0)
-}
-
-/// Like `store_nblocks` but returns `None` when the key is absent, allowing
-/// callers to distinguish "key missing" from "key present with value 0".
-fn store_nblocks_opt(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> Option<BlockNumber> {
+///
+/// Returns `Some(n)` when the key exists (including `Some(0)` for a relation
+/// truncated to zero), and `None` when the key is absent. Callers that need a
+/// plain integer should fall back to the base manifest or 0 themselves.
+fn store_get_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> Option<BlockNumber> {
     let key = ns.rel_nblocks_key(rf);
     match sim.get_express(&key) {
         Ok(Some(bytes)) if bytes.len() >= 4 => {
@@ -215,9 +212,13 @@ pub fn store_create(rf: RelFork) -> Result<bool, i32> {
 /// cache returns zeros for non-existent blocks, and SimStore returns None.
 pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) -> Result<(), i32> {
     let sim = SimStore::get();
-    let ns = ProjectCtx::get().ns();
+    let ctx = ProjectCtx::get();
+    let ns = ctx.ns();
     let new_nblocks = blkno + nblocks;
-    let current = store_nblocks(sim, ns, rf);
+    let current = match store_get_nblocks(sim, ns, rf) {
+        Some(n) => n,
+        None => ctx.base_manifest_lookup_nblocks(rf).unwrap_or(0),
+    };
     if new_nblocks > current {
         store_set_nblocks(sim, ns, rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
     }
@@ -265,7 +266,7 @@ fn parse_chunk_id_from_key(key: &str, prefix: &str) -> Option<u32> {
 /// Falls back to levels 1 + 2 alone when the cache is unavailable (initdb).
 pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
     let store = if let (Some(sim), Some(ctx)) = (SimStore::try_get(), ProjectCtx::try_get()) {
-        match store_nblocks_opt(sim, ctx.ns(), rf) {
+        match store_get_nblocks(sim, ctx.ns(), rf) {
             Some(n) => n,
             // Express key absent: fall back to base manifest snapshot.
             None => ctx.base_manifest_lookup_nblocks(rf).unwrap_or(0),
@@ -506,7 +507,10 @@ pub fn cached_write_blocks(
 
         // Update nblocks if we extended the relation.
         let new_nblocks = block_number + nblocks;
-        let current = store_nblocks(sim, ns, rf);
+        let current = match store_get_nblocks(sim, ns, rf) {
+            Some(n) => n,
+            None => ctx.base_manifest_lookup_nblocks(rf).unwrap_or(0),
+        };
         if new_nblocks > current {
             store_set_nblocks(sim, ns, rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
         }
