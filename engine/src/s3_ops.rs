@@ -178,12 +178,19 @@ fn store_set_nblocks(
     sim.put_express(&key, &n.to_le_bytes())
 }
 
-/// Check whether a relation fork exists (nblocks key is present in express).
+/// Check whether a relation fork exists.
+///
+/// Primary: nblocks key present in the express bucket.
+/// Fallback: base manifest `rel_nblocks` — covers inherited relations on a
+/// fresh branch before any write has created the express key.
 pub fn store_exists(rf: RelFork) -> bool {
     let sim = SimStore::get();
-    let ns = ProjectCtx::get().ns();
-    let key = ns.rel_nblocks_key(rf);
-    matches!(sim.get_express(&key), Ok(Some(_)))
+    let ctx = ProjectCtx::get();
+    let key = ctx.ns().rel_nblocks_key(rf);
+    if matches!(sim.get_express(&key), Ok(Some(_))) {
+        return true;
+    }
+    ctx.base_manifest_lookup_nblocks(rf).is_some()
 }
 
 /// Create a relation fork. Writes nblocks=0 to the express nblocks key.
@@ -194,15 +201,20 @@ pub fn store_exists(rf: RelFork) -> bool {
 /// - `Err(errno)` on I/O failure
 pub fn store_create(rf: RelFork) -> Result<bool, i32> {
     let sim = SimStore::get();
-    let ns = ProjectCtx::get().ns();
+    let ctx = ProjectCtx::get();
+    let ns = ctx.ns();
     let key = ns.rel_nblocks_key(rf);
     match sim.get_express(&key) {
-        Ok(Some(_)) => Ok(false), // already exists
-        _ => {
-            store_set_nblocks(sim, ns, rf, 0).map_err(|e| io_err_to_errno(&e))?;
-            Ok(true)
-        }
+        Ok(Some(_)) => return Ok(false), // already exists in express
+        _ => {}
     }
+    // Defensive: don't overwrite an inherited relation whose nblocks lives
+    // only in the base manifest (express key absent on a fresh branch).
+    if ctx.base_manifest_lookup_nblocks(rf).is_some() {
+        return Ok(false);
+    }
+    store_set_nblocks(sim, ns, rf, 0).map_err(|e| io_err_to_errno(&e))?;
+    Ok(true)
 }
 
 /// Extend a relation fork's block count. Only updates the nblocks metadata key

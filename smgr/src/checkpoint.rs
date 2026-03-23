@@ -223,19 +223,26 @@ fn checkpoint_flush_inner(
 
     // Collect nblocks for every relation that had dirty chunks.
     // Key: RelFork → nblocks.
+    //
+    // Only insert when the express nblocks key is present with a valid value.
+    // If the key is absent (Ok(None)), skip — the relation is inherited from a
+    // parent branch and its authoritative nblocks lives in the base manifest.
+    // Inserting 0 here would corrupt the base manifest when apply_deltas runs
+    // (it unconditionally overwrites rel_nblocks entries).
     let mut rel_nblocks: HashMap<RelFork, u32> = HashMap::new();
     for key in &dirty_chunks {
         let rf = key.rel_fork();
         // Only query once per relation (dedup across chunks of the same fork).
-        rel_nblocks.entry(rf).or_insert_with(|| {
-            let nblocks_key = ns.rel_nblocks_key(rf);
-            match sim.get_express(&nblocks_key) {
-                Ok(Some(bytes)) if bytes.len() >= 4 => {
-                    u32::from_le_bytes(bytes[0..4].try_into().unwrap())
-                }
-                _ => 0,
+        if rel_nblocks.contains_key(&rf) {
+            continue;
+        }
+        let nblocks_key = ns.rel_nblocks_key(rf);
+        if let Ok(Some(bytes)) = sim.get_express(&nblocks_key) {
+            if bytes.len() >= 4 {
+                rel_nblocks.insert(rf, u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
             }
-        });
+        }
+        // Key absent (Ok(None)) or error: skip — don't insert 0.
     }
 
     let tmp_delta_manifest_path = delta_tmp_path(root_dir, checkpoint_lsn);
