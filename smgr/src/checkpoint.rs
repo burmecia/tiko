@@ -180,18 +180,28 @@ fn checkpoint_flush_inner(
     // If `.ckpt` already exists (crash recovery), re-process it.
     // If neither file exists: no evictions occurred — dirty set will be
     // empty and the function returns early after step 3.
-    let crash_recovery = ckpt_path.exists();
-    if !crash_recovery && log_path.exists() {
+    let nblocks_log_path = CacheControl::nblocks_log_path(root_dir);
+    let nblocks_ckpt_path = CacheControl::nblocks_log_checkpoint_path(root_dir);
+
+    let crash_recovery = ckpt_path.exists() || nblocks_ckpt_path.exists();
+    if !ckpt_path.exists() && log_path.exists() {
         fs::rename(&log_path, &ckpt_path)?;
+    }
+    if !nblocks_ckpt_path.exists() && nblocks_log_path.exists() {
+        fs::rename(&nblocks_log_path, &nblocks_ckpt_path)?;
     }
 
     // Step 3 — read + dedup.
     let records = CacheControl::read_eviction_log(&ckpt_path);
     let dirty_chunks = dedup_by_chunk_tag(records);
 
+    let nblocks_records = CacheControl::read_nblocks_log(&nblocks_ckpt_path);
+    let changed_rel_forks: HashSet<RelFork> = nblocks_records.into_iter().collect();
+
     // Nothing changed this interval — skip S3 writes and manifest entirely.
-    if dirty_chunks.is_empty() {
+    if dirty_chunks.is_empty() && changed_rel_forks.is_empty() {
         let _ = fs::remove_file(&ckpt_path);
+        let _ = fs::remove_file(&nblocks_ckpt_path);
         return Ok(None);
     }
 
@@ -221,25 +231,23 @@ fn checkpoint_flush_inner(
         })
         .collect();
 
-    // Collect nblocks for every relation that had dirty chunks.
-    // Key: RelFork → nblocks.
+    // Collect nblocks for every relation that had dirty chunks or an nblocks
+    // change this interval.  Key: RelFork → nblocks.
     //
     // Only insert when the express nblocks key is present with a valid value.
     // If the key is absent (Ok(None)), skip — the relation is inherited from a
     // parent branch and its authoritative nblocks lives in the base manifest.
     // Inserting 0 here would corrupt the base manifest when apply_deltas runs
     // (it unconditionally overwrites rel_nblocks entries).
+    let mut all_rel_forks: HashSet<RelFork> = dirty_chunks.iter().map(|c| c.rel_fork()).collect();
+    all_rel_forks.extend(changed_rel_forks);
+
     let mut rel_nblocks: HashMap<RelFork, u32> = HashMap::new();
-    for key in &dirty_chunks {
-        let rf = key.rel_fork();
-        // Only query once per relation (dedup across chunks of the same fork).
-        if rel_nblocks.contains_key(&rf) {
-            continue;
-        }
-        let nblocks_key = ns.rel_nblocks_key(rf);
+    for rf in &all_rel_forks {
+        let nblocks_key = ns.rel_nblocks_key(*rf);
         if let Ok(Some(bytes)) = sim.get_express(&nblocks_key) {
             if bytes.len() >= 4 {
-                rel_nblocks.insert(rf, u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
+                rel_nblocks.insert(*rf, u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
             }
         }
         // Key absent (Ok(None)) or error: skip — don't insert 0.
@@ -256,8 +264,9 @@ fn checkpoint_flush_inner(
     upload_delta_manifest(sim, ns, timeline, checkpoint_lsn, &delta)?;
     upload_pg_state(sim, ns, timeline, checkpoint_lsn, pg_data_dir)?;
 
-    // Step 6 — remove checkpoint snapshot and local build file.
+    // Step 6 — remove checkpoint snapshots and local build file.
     let _ = fs::remove_file(&ckpt_path); // silently ignore ENOENT
+    let _ = fs::remove_file(&nblocks_ckpt_path);
     let _ = fs::remove_file(&tmp_delta_manifest_path); // remove local build file
 
     Ok(Some(CheckpointStats {
@@ -700,6 +709,113 @@ mod tests {
         assert!(
             !ckpt_path.exists(),
             "eviction_log.ckpt must be removed on no-op"
+        );
+    }
+
+    // ── Scenario: nblocks changes with no dirty chunks → manifest still written
+
+    fn write_nblocks_log(path: &Path, rel_forks: &[RelFork]) {
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        for rf in rel_forks {
+            file.write_all(&rf.encode()).unwrap();
+        }
+    }
+
+    #[test]
+    fn nblocks_change_only_produces_delta_manifest_with_rel_nblocks() {
+        let dir = TempDir::new().unwrap();
+        let sim = SimStore::new(dir.path());
+        let ns = ns();
+        let lsn = Lsn::new(0xa000);
+
+        // No dirty chunks — eviction log absent.
+        // Only the nblocks log has an entry (e.g. a truncation was performed).
+        let rf = RelFork {
+            spc_oid: 1,
+            db_oid: 1,
+            rel_number: 42,
+            fork_number: 0,
+        };
+        let nblocks_log_path = CacheControl::nblocks_log_path(dir.path());
+        write_nblocks_log(&nblocks_log_path, &[rf]);
+
+        // Populate the express nblocks key so the checkpoint can read it.
+        let nblocks_key = ns.rel_nblocks_key(rf);
+        sim.put_express(&nblocks_key, &10u32.to_le_bytes()).unwrap();
+
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
+
+        // A delta manifest must have been written despite no dirty chunks.
+        let bytes = sim
+            .get_standard(&ns.delta_manifest_key(1, lsn))
+            .unwrap()
+            .expect("delta manifest must be written when only nblocks changed");
+        let path = dir.path().join("nb_only.tikm");
+        let m = Manifest::from_bytes(&bytes, &path).unwrap();
+
+        // rel_nblocks must carry the correct value.
+        assert_eq!(
+            m.lookup_nblocks(rf),
+            Some(10),
+            "rel_nblocks must reflect the express key value"
+        );
+
+        // nblocks_log.ckpt must be cleaned up.
+        let nblocks_ckpt_path = CacheControl::nblocks_log_checkpoint_path(dir.path());
+        assert!(
+            !nblocks_ckpt_path.exists(),
+            "nblocks_log.ckpt must be removed on success"
+        );
+    }
+
+    #[test]
+    fn nblocks_change_and_dirty_chunk_both_appear_in_manifest() {
+        let dir = TempDir::new().unwrap();
+        let sim = SimStore::new(dir.path());
+        let ns = ns();
+        let lsn = Lsn::new(0xb000);
+
+        // One dirty chunk for relation 1, and an nblocks-only change for relation 2.
+        let tag = make_tag(1);
+        let log_path = CacheControl::eviction_log_path(dir.path());
+        write_eviction_log(&log_path, &[tag]);
+        setup_express(&sim, &ns, &[tag], 0x55);
+
+        let rf2 = RelFork {
+            spc_oid: 2,
+            db_oid: 2,
+            rel_number: 2,
+            fork_number: 0,
+        };
+        let nblocks_log_path = CacheControl::nblocks_log_path(dir.path());
+        write_nblocks_log(&nblocks_log_path, &[rf2]);
+        sim.put_express(&ns.rel_nblocks_key(rf2), &7u32.to_le_bytes())
+            .unwrap();
+
+        run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
+
+        let bytes = sim
+            .get_standard(&ns.delta_manifest_key(1, lsn))
+            .unwrap()
+            .expect("delta manifest must exist");
+        let path = dir.path().join("mixed.tikm");
+        let m = Manifest::from_bytes(&bytes, &path).unwrap();
+
+        assert!(
+            m.lookup(&tag).unwrap().is_some(),
+            "dirty chunk must be in manifest"
+        );
+        assert_eq!(
+            m.lookup_nblocks(rf2),
+            Some(7),
+            "nblocks-only relation must appear"
         );
     }
 

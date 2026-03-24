@@ -128,3 +128,28 @@ impl From<ChunkTag> for RelFork {
         }
     }
 }
+
+/// Wire size of a serialised `RelFork` (4 × 4-byte LE fields).
+pub const REL_FORK_SIZE: usize = 16;
+
+impl RelFork {
+    /// Encode into the 16-byte on-disk representation (all fields LE).
+    pub fn encode(&self) -> [u8; REL_FORK_SIZE] {
+        let mut buf = [0u8; REL_FORK_SIZE];
+        buf[0..4].copy_from_slice(&self.spc_oid.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.db_oid.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.rel_number.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.fork_number.to_le_bytes());
+        buf
+    }
+
+    /// Decode from the 16-byte on-disk representation.
+    pub fn decode(buf: &[u8; REL_FORK_SIZE]) -> Self {
+        RelFork {
+            spc_oid: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            db_oid: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            rel_number: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            fork_number: i32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        }
+    }
+}

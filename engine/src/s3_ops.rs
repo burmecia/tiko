@@ -175,7 +175,9 @@ fn store_set_nblocks(
     n: BlockNumber,
 ) -> io::Result<()> {
     let key = ns.rel_nblocks_key(rf);
-    sim.put_express(&key, &n.to_le_bytes())
+    sim.put_express(&key, &n.to_le_bytes())?;
+    CacheControl::append_rel_fork_to_nblocks_log(&rf);
+    Ok(())
 }
 
 /// Check whether a relation fork exists.

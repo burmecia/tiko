@@ -874,6 +874,70 @@ impl CacheControl {
         records
     }
 
+    // ── nblocks log ───────────────────────────────────────────────────────
+
+    /// Path of the nblocks log file: `{tiko_root}/nblocks_log`.
+    pub fn nblocks_log_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("nblocks_log")
+    }
+
+    /// Path of the nblocks log checkpoint file: `{tiko_root}/nblocks_log.ckpt`.
+    pub fn nblocks_log_checkpoint_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("nblocks_log.ckpt")
+    }
+
+    /// Open (or create) the nblocks log for appending.
+    ///
+    /// Same rationale as `open_eviction_log`: open fresh each time so that
+    /// the checkpoint rename-to-.ckpt snapshot does not leave us pointing at
+    /// the old inode.
+    fn open_nblocks_log() -> File {
+        let path = Self::nblocks_log_path(&tiko_root_path());
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("failed to open nblocks log")
+    }
+
+    /// Append a `RelFork` to the nblocks log.
+    ///
+    /// Called from `store_set_nblocks` whenever a relation's block count is
+    /// updated in the express nblocks key.  The checkpoint picks this up and
+    /// includes the relation in `rel_nblocks` even when no chunk was dirty.
+    pub fn append_rel_fork_to_nblocks_log(rf: &RelFork) {
+        let log = Self::open_nblocks_log();
+        let _ = (&log).write_all(&rf.encode());
+    }
+
+    /// Read all complete `RelFork` records from an nblocks log file.
+    ///
+    /// Records are densely packed 16-byte entries. Any incomplete trailing
+    /// record is silently skipped. Returns an empty `Vec` if the file does
+    /// not exist.
+    pub fn read_nblocks_log(path: &Path) -> Vec<RelFork> {
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(_) => return Vec::new(),
+        };
+        let n = data.len() / store::chunk::REL_FORK_SIZE;
+        (0..n)
+            .map(|i| {
+                let start = i * store::chunk::REL_FORK_SIZE;
+                let buf: &[u8; store::chunk::REL_FORK_SIZE] = data
+                    [start..start + store::chunk::REL_FORK_SIZE]
+                    .try_into()
+                    .unwrap();
+                RelFork::decode(buf)
+            })
+            .collect()
+    }
+
     /// Flush all dirty chunks belonging to a specific relation fork.
     ///
     /// Called from `s3_immedsync()` when PostgreSQL requests an immediate
