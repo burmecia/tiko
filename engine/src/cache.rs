@@ -52,7 +52,7 @@ use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use pgsys::logging::pg_log_debug1;
 
 use store::{
-    chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork},
+    chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, NBLOCKS_RECORD_SIZE, NblocksRecord, RelFork},
     tiko_root_path,
 };
 
@@ -158,11 +158,18 @@ pub struct AtomicRWLock {
 }
 
 impl AtomicRWLock {
-    fn init(&self) {
+    /// Construct a new unlocked `AtomicRWLock` (for tests and stack allocation).
+    pub fn new_unlocked() -> Self {
+        AtomicRWLock {
+            state: AtomicI32::new(0),
+        }
+    }
+
+    pub(crate) fn init(&self) {
         self.state.store(0, Ordering::Relaxed);
     }
 
-    fn read_lock(&self) {
+    pub(crate) fn read_lock(&self) {
         loop {
             let state = self.state.load(Ordering::Relaxed);
             if state >= 0 {
@@ -178,11 +185,11 @@ impl AtomicRWLock {
         }
     }
 
-    fn read_unlock(&self) {
+    pub(crate) fn read_unlock(&self) {
         self.state.fetch_sub(1, Ordering::Release);
     }
 
-    fn write_lock(&self) {
+    pub(crate) fn write_lock(&self) {
         loop {
             if self
                 .state
@@ -195,7 +202,7 @@ impl AtomicRWLock {
         }
     }
 
-    fn write_unlock(&self) {
+    pub(crate) fn write_unlock(&self) {
         self.state.store(0, Ordering::Release);
     }
 }
@@ -705,7 +712,7 @@ impl CacheControl {
                 // Clear dirty only after a successful PUT — if the PUT failed,
                 // the slot stays dirty so the next checkpoint retries.
                 meta.dirty_blocks.store(0, Ordering::Release);
-                let log = Self::open_eviction_log();
+                let log = Self::open_chunk_log();
                 let _ = (&log).write_all(&tag.encode());
             }
         }
@@ -811,38 +818,40 @@ impl CacheControl {
         ));
     }
 
-    // ── Eviction log ──────────────────────────────────────────────────────
+    // ── Chunk log (renamed from eviction log) ─────────────────────────────
+    //
+    // Records every ChunkTag flushed to express (both mid-interval evictions
+    // and the end-of-checkpoint flush).  At checkpoint time the file is
+    // atomically snapshotted to `chunk_log.ckpt` and consumed.
 
-    /// Path of the eviction log file: `{tiko_root}/eviction_log`.
-    pub fn eviction_log_path(tiko_root: &Path) -> PathBuf {
-        tiko_root.join("eviction_log")
+    /// Path of the chunk log file: `{tiko_root}/chunk_log`.
+    pub fn chunk_log_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("chunk_log")
     }
 
-    /// Path of the eviction log checkpoint file: `{tiko_root}/eviction_log.ckpt`.
-    pub fn eviction_log_checkpoint_path(tiko_root: &Path) -> PathBuf {
-        tiko_root.join("eviction_log.ckpt")
+    /// Path of the chunk log checkpoint file: `{tiko_root}/chunk_log.ckpt`.
+    pub fn chunk_log_checkpoint_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("chunk_log.ckpt")
     }
 
-    /// Append a single chunk tag to the process-local eviction log.
+    /// Append a single `ChunkTag` to the process-local chunk log.
     ///
     /// Used by the initdb write path (`cached_write_blocks` without IoControl)
     /// to ensure the shutdown checkpoint can discover and archive all chunks
     /// written during initdb, identical to what `flush_dirty_chunk` does on the
     /// normal (shmem-cache) path.
-    pub fn append_chunk_tag_to_eviction_log(tag: &ChunkTag) {
-        let log = Self::open_eviction_log();
+    pub fn append_to_chunk_log(tag: &ChunkTag) {
+        let log = Self::open_chunk_log();
         let _ = (&log).write_all(&tag.encode());
     }
 
-    /// Open (or create) the eviction log for appending.
+    /// Open (or create) the chunk log for appending.
     ///
     /// Each call opens a fresh `File` with `O_APPEND`. This is intentional:
-    /// the checkpoint flush renames `eviction_log` → `eviction_log.ckpt` to
-    /// take an atomic snapshot; subsequent evictions must write to a fresh
-    /// inode. A cached `OnceLock<File>` would still point at the renamed
-    /// inode, so we open fresh on every eviction.
-    fn open_eviction_log() -> File {
-        let path = Self::eviction_log_path(&tiko_root_path());
+    /// the checkpoint flush renames `chunk_log` → `chunk_log.ckpt` to take an
+    /// atomic snapshot; subsequent evictions must write to a fresh inode.
+    fn open_chunk_log() -> File {
+        let path = Self::chunk_log_path(&tiko_root_path());
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -851,15 +860,15 @@ impl CacheControl {
             .create(true)
             .append(true)
             .open(&path)
-            .expect("failed to open eviction log")
+            .expect("failed to open chunk log")
     }
 
-    /// Read all complete `ChunkTag` records from an eviction log file.
+    /// Read all complete `ChunkTag` records from a chunk log file.
     ///
     /// Records are densely packed 20-byte entries. Any incomplete trailing
     /// record (caused by a crash mid-write) is silently skipped. Returns an
     /// empty `Vec` if the file does not exist.
-    pub fn read_eviction_log(path: &Path) -> Vec<ChunkTag> {
+    pub fn read_chunk_log(path: &Path) -> Vec<ChunkTag> {
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -875,6 +884,12 @@ impl CacheControl {
     }
 
     // ── nblocks log ───────────────────────────────────────────────────────
+    //
+    // Records NblocksRecord entries (RelFork + nblocks value, 20 bytes each)
+    // whenever a relation's block count is set via `set_nblocks` on the initdb
+    // path, or drained from the NblocksTable at checkpoint time.  At checkpoint
+    // time the file is snapshotted to `nblocks_log.ckpt` and consumed via
+    // last-write-wins dedup to populate `rel_nblocks` in the delta manifest.
 
     /// Path of the nblocks log file: `{tiko_root}/nblocks_log`.
     pub fn nblocks_log_path(tiko_root: &Path) -> PathBuf {
@@ -888,9 +903,9 @@ impl CacheControl {
 
     /// Open (or create) the nblocks log for appending.
     ///
-    /// Same rationale as `open_eviction_log`: open fresh each time so that
-    /// the checkpoint rename-to-.ckpt snapshot does not leave us pointing at
-    /// the old inode.
+    /// Same rationale as `open_chunk_log`: open fresh each time so that the
+    /// checkpoint rename-to-.ckpt snapshot does not leave us pointing at the
+    /// old inode.
     fn open_nblocks_log() -> File {
         let path = Self::nblocks_log_path(&tiko_root_path());
         if let Some(parent) = path.parent() {
@@ -904,36 +919,36 @@ impl CacheControl {
             .expect("failed to open nblocks log")
     }
 
-    /// Append a `RelFork` to the nblocks log.
+    /// Append a `NblocksRecord` (RelFork + nblocks value) to the nblocks log.
     ///
-    /// Called from `store_set_nblocks` whenever a relation's block count is
-    /// updated in the express nblocks key.  The checkpoint picks this up and
-    /// includes the relation in `rel_nblocks` even when no chunk was dirty.
-    pub fn append_rel_fork_to_nblocks_log(rf: &RelFork) {
+    /// Called from `set_nblocks` (initdb path) or `flush_all_dirty_nblocks`
+    /// (checkpoint path) whenever a relation's block count is committed to
+    /// express.  The checkpoint reads these records (last-write-wins per
+    /// RelFork) to build `rel_nblocks` in the delta manifest.
+    pub fn append_to_nblocks_log(rf: &RelFork, nblocks: u32) {
+        let rec = NblocksRecord { rf: *rf, nblocks };
         let log = Self::open_nblocks_log();
-        let _ = (&log).write_all(&rf.encode());
+        let _ = (&log).write_all(&rec.encode());
     }
 
-    /// Read all complete `RelFork` records from an nblocks log file.
+    /// Read all complete `NblocksRecord` entries from an nblocks log file.
     ///
-    /// Records are densely packed 16-byte entries. Any incomplete trailing
-    /// record is silently skipped. Returns an empty `Vec` if the file does
+    /// Records are densely packed 20-byte entries.  Any incomplete trailing
+    /// record is silently skipped.  Returns an empty `Vec` if the file does
     /// not exist.
-    pub fn read_nblocks_log(path: &Path) -> Vec<RelFork> {
+    pub fn read_nblocks_log(path: &Path) -> Vec<NblocksRecord> {
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(_) => return Vec::new(),
         };
-        let n = data.len() / store::chunk::REL_FORK_SIZE;
+        let n = data.len() / NBLOCKS_RECORD_SIZE;
         (0..n)
             .map(|i| {
-                let start = i * store::chunk::REL_FORK_SIZE;
-                let buf: &[u8; store::chunk::REL_FORK_SIZE] = data
-                    [start..start + store::chunk::REL_FORK_SIZE]
-                    .try_into()
-                    .unwrap();
-                RelFork::decode(buf)
+                let start = i * NBLOCKS_RECORD_SIZE;
+                let buf: &[u8; NBLOCKS_RECORD_SIZE] =
+                    data[start..start + NBLOCKS_RECORD_SIZE].try_into().unwrap();
+                NblocksRecord::decode(buf)
             })
             .collect()
     }
@@ -1061,19 +1076,19 @@ mod tests {
         }
     }
 
-    // ── read_eviction_log ─────────────────────────────────────────────────
+    // ── read_chunk_log ─────────────────────────────────────────────────
 
     #[test]
-    fn read_eviction_log_missing_file_returns_empty() {
+    fn read_chunk_log_missing_file_returns_empty() {
         let dir = TempDir::new().unwrap();
-        let records = CacheControl::read_eviction_log(&dir.path().join("no_such_log"));
+        let records = CacheControl::read_chunk_log(&dir.path().join("no_such_log"));
         assert!(records.is_empty());
     }
 
     #[test]
-    fn read_eviction_log_skips_partial_trailing_record() {
+    fn read_chunk_log_skips_partial_trailing_record() {
         let dir = TempDir::new().unwrap();
-        let path = CacheControl::eviction_log_path(dir.path());
+        let path = CacheControl::chunk_log_path(dir.path());
 
         // Write 2 complete records (40 bytes) + 10 bytes of a partial third record.
         let tag0 = make_tag(0);
@@ -1088,25 +1103,25 @@ mod tests {
         file.write_all(&[0xAB; 10]).unwrap(); // partial record
         drop(file);
 
-        let records = CacheControl::read_eviction_log(&path);
+        let records = CacheControl::read_chunk_log(&path);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0], tag0);
         assert_eq!(records[1], tag1);
     }
 
     #[test]
-    fn read_eviction_log_empty_file_returns_empty() {
+    fn read_chunk_log_empty_file_returns_empty() {
         let dir = TempDir::new().unwrap();
-        let path = CacheControl::eviction_log_path(dir.path());
+        let path = CacheControl::chunk_log_path(dir.path());
         std::fs::write(&path, b"").unwrap();
-        let records = CacheControl::read_eviction_log(&path);
+        let records = CacheControl::read_chunk_log(&path);
         assert!(records.is_empty());
     }
 
     #[test]
-    fn read_eviction_log_exact_n_records() {
+    fn read_chunk_log_exact_n_records() {
         let dir = TempDir::new().unwrap();
-        let path = CacheControl::eviction_log_path(dir.path());
+        let path = CacheControl::chunk_log_path(dir.path());
         let n = 8usize;
         let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
         let mut file = OpenOptions::new()
@@ -1119,7 +1134,7 @@ mod tests {
         }
         drop(file);
 
-        let records = CacheControl::read_eviction_log(&path);
+        let records = CacheControl::read_chunk_log(&path);
         assert_eq!(records, tags);
     }
 
@@ -1128,7 +1143,7 @@ mod tests {
     #[test]
     fn concurrent_log_appends_produce_n_records_without_corruption() {
         let dir = TempDir::new().unwrap();
-        let path = Arc::new(CacheControl::eviction_log_path(dir.path()));
+        let path = Arc::new(CacheControl::chunk_log_path(dir.path()));
         let n = 16usize;
         let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
 
@@ -1153,7 +1168,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        let records = CacheControl::read_eviction_log(&path);
+        let records = CacheControl::read_chunk_log(&path);
         assert_eq!(
             records.len(),
             n,

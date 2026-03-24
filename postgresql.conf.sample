@@ -885,7 +885,7 @@ default_text_search_config = 'pg_catalog.english'
 log_min_messages=debug1
 shared_preload_libraries=libtikoworker
 shared_buffers=256kB
-
+log_statement=all
 
 # - Tiko WAL archiving -
 archive_mode = on		# enables archiving; off, on, or always

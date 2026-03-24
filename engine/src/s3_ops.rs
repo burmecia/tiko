@@ -167,25 +167,42 @@ fn store_get_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> Opti
     }
 }
 
-/// Write the live block count for a relation fork to the express nblocks key.
-fn store_set_nblocks(
+/// Write the live block count for a relation fork.
+///
+/// **Normal path** (IoControl available): write-back to the shared-memory
+/// NblocksTable only.  Express is written at checkpoint time by
+/// `flush_all_dirty_nblocks`.
+///
+/// **Initdb / single-user path** (IoControl not available): write directly to
+/// express and append a `NblocksRecord` to the nblocks log so that the
+/// shutdown checkpoint can build the initial manifest.
+fn set_nblocks(
     sim: &SimStore,
     ns: &ProjectNamespace,
     rf: RelFork,
     n: BlockNumber,
 ) -> io::Result<()> {
-    let key = ns.rel_nblocks_key(rf);
-    sim.put_express(&key, &n.to_le_bytes())?;
-    CacheControl::append_rel_fork_to_nblocks_log(&rf);
+    if IoControl::is_initialized() {
+        IoControl::get().nblocks.set(rf, n);
+    } else {
+        let key = ns.rel_nblocks_key(rf);
+        sim.put_express(&key, &n.to_le_bytes())?;
+        CacheControl::append_to_nblocks_log(&rf, n);
+    }
     Ok(())
 }
 
 /// Check whether a relation fork exists.
 ///
-/// Primary: nblocks key present in the express bucket.
-/// Fallback: base manifest `rel_nblocks` — covers inherited relations on a
-/// fresh branch before any write has created the express key.
+/// Level 0: NblocksTable (write-back shmem) — covers relations created or
+///   extended since the last checkpoint, whose express key hasn't been written yet.
+/// Level 1: express nblocks key — the durable record written at checkpoint.
+/// Level 2: base manifest — covers inherited relations on a fresh branch.
 pub fn store_exists(rf: RelFork) -> bool {
+    // Level 0: NblocksTable (write-back).
+    if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
+        return true;
+    }
     let sim = SimStore::get();
     let ctx = ProjectCtx::get();
     let key = ctx.ns().rel_nblocks_key(rf);
@@ -202,6 +219,11 @@ pub fn store_exists(rf: RelFork) -> bool {
 /// - `Ok(true)` if a new fork was created
 /// - `Err(errno)` on I/O failure
 pub fn store_create(rf: RelFork) -> Result<bool, i32> {
+    // NblocksTable (write-back): relation may exist only in shared memory,
+    // with no express key yet (express is written only at checkpoint).
+    if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
+        return Ok(false);
+    }
     let sim = SimStore::get();
     let ctx = ProjectCtx::get();
     let ns = ctx.ns();
@@ -215,7 +237,7 @@ pub fn store_create(rf: RelFork) -> Result<bool, i32> {
     if ctx.base_manifest_lookup_nblocks(rf).is_some() {
         return Ok(false);
     }
-    store_set_nblocks(sim, ns, rf, 0).map_err(|e| io_err_to_errno(&e))?;
+    set_nblocks(sim, ns, rf, 0).map_err(|e| io_err_to_errno(&e))?;
     Ok(true)
 }
 
@@ -225,16 +247,15 @@ pub fn store_create(rf: RelFork) -> Result<bool, i32> {
 /// Actual chunk data for extended-but-never-written blocks is implicitly zero:
 /// cache returns zeros for non-existent blocks, and SimStore returns None.
 pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) -> Result<(), i32> {
-    let sim = SimStore::get();
-    let ctx = ProjectCtx::get();
-    let ns = ctx.ns();
     let new_nblocks = blkno + nblocks;
-    let current = match store_get_nblocks(sim, ns, rf) {
-        Some(n) => n,
-        None => ctx.base_manifest_lookup_nblocks(rf).unwrap_or(0),
-    };
+    // Use cached_file_nblocks for the three-level read (NblocksTable → express →
+    // base manifest) so we never undercount when NblocksTable has a value not yet
+    // flushed to express.
+    let current = cached_file_nblocks(rf)?;
     if new_nblocks > current {
-        store_set_nblocks(sim, ns, rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
+        let sim = SimStore::get();
+        let ctx = ProjectCtx::get();
+        set_nblocks(sim, ctx.ns(), rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
     }
     Ok(())
 }
@@ -265,23 +286,35 @@ fn parse_chunk_id_from_key(key: &str, prefix: &str) -> Option<u32> {
 
 /// Cache-aware block count. Three-level read:
 ///
-/// 1. **Express nblocks key** — `{org}/{proj}/chunks/{tag}/nblocks` in the
-///    express bucket. The authoritative live counter updated by every extend,
-///    truncate, and create.
-/// 2. **Base manifest `rel_nblocks`** — consulted only when the express key is
-///    *absent* (key not found, not value 0). This covers fresh branches that
+/// 1. **NblocksTable** (shared-memory write-back cache) — O(1), no I/O.
+///    Updated by every extend, truncate, and create via `set_nblocks`.
+/// 2. **Express nblocks key** — cold miss: relation not yet seen this server
+///    lifetime.  Populates the NblocksTable (clean, not dirty) for future
+///    calls.
+/// 3. **Base manifest `rel_nblocks`** — consulted only when the express key
+///    is *absent* (key not found, not value 0). Covers fresh branches that
 ///    inherit relation sizes from a parent manifest before any write has
 ///    created the express key in the child's namespace.
-/// 3. **Cache max** — `max` of the above with the highest block number held in
-///    the shared-memory cache. Needed because the write-back policy keeps
-///    dirty extended blocks in the cache without immediately updating the
-///    express key.
 ///
-/// Falls back to levels 1 + 2 alone when the cache is unavailable (initdb).
+/// Falls back to levels 2 + 3 alone when IoControl is unavailable (initdb).
 pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
-    let store = if let (Some(sim), Some(ctx)) = (SimStore::try_get(), ProjectCtx::try_get()) {
+    // Level 1: NblocksTable (shared memory) — fastest path.
+    if IoControl::is_initialized() {
+        if let Some(n) = IoControl::get().nblocks.get(rf) {
+            return Ok(n);
+        }
+    }
+
+    // Level 2 + 3: cold miss — read from express / base manifest.
+    let n = if let (Some(sim), Some(ctx)) = (SimStore::try_get(), ProjectCtx::try_get()) {
         match store_get_nblocks(sim, ctx.ns(), rf) {
-            Some(n) => n,
+            Some(n) => {
+                // Populate NblocksTable (clean) so next call is O(1).
+                if IoControl::is_initialized() {
+                    IoControl::get().nblocks.set_clean(rf, n);
+                }
+                n
+            }
             // Express key absent: fall back to base manifest snapshot.
             None => ctx.base_manifest_lookup_nblocks(rf).unwrap_or(0),
         }
@@ -289,13 +322,7 @@ pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
         0
     };
 
-    if !cache_is_available() {
-        return Ok(store);
-    }
-
-    let cache_max = IoControl::get().cache.max_block_for_relation(rf);
-
-    Ok(store.max(cache_max))
+    Ok(n)
 }
 
 /// Cache-aware truncate. Invalidates cache blocks at or beyond `nblocks`,
@@ -331,7 +358,7 @@ pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32
     }
 
     // Update the nblocks key.
-    store_set_nblocks(sim, ns, rf, nblocks).map_err(|e| io_err_to_errno(&e))
+    set_nblocks(sim, ns, rf, nblocks).map_err(|e| io_err_to_errno(&e))
 }
 
 /// Cache-aware delete. Invalidates ALL cache blocks for the relation fork,
@@ -347,6 +374,10 @@ pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
     if cache_is_available() {
         // first_block=0 invalidates every chunk for this fork
         IoControl::get().cache.invalidate_range(rf, 0);
+    }
+    if IoControl::is_initialized() {
+        // Remove nblocks entry so stale values are not served after drop.
+        IoControl::get().nblocks.remove(rf);
     }
 
     let sim = SimStore::get();
@@ -516,7 +547,7 @@ pub fn cached_write_blocks(
             // Log the chunk so the shutdown checkpoint can archive it and
             // build the initial delta/base manifests — mirrors what flush_dirty_chunk
             // does on the normal shmem-cache path.
-            CacheControl::append_chunk_tag_to_eviction_log(&chunk_tag);
+            CacheControl::append_to_chunk_log(&chunk_tag);
         }
 
         // Update nblocks if we extended the relation.
@@ -526,7 +557,7 @@ pub fn cached_write_blocks(
             None => ctx.base_manifest_lookup_nblocks(rf).unwrap_or(0),
         };
         if new_nblocks > current {
-            store_set_nblocks(sim, ns, rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
+            set_nblocks(sim, ns, rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
         }
 
         return Ok(nblocks);
@@ -583,7 +614,17 @@ pub fn cached_write_blocks(
         cache.unpin(slot);
     }
 
-    // NO write-through — dirty blocks flushed on eviction
+    // Update nblocks if this write extends the relation (e.g. tiko_extend).
+    // Uses cached_file_nblocks for the three-level read so we never undercount
+    // when NblocksTable has a value not yet flushed to express.
+    let new_nblocks = block_number + nblocks;
+    let current = cached_file_nblocks(rf)?;
+    if new_nblocks > current {
+        let sim = SimStore::get();
+        let ctx = ProjectCtx::get();
+        set_nblocks(sim, ctx.ns(), rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
+    }
+
     Ok(nblocks)
 }
 

@@ -105,6 +105,42 @@ impl ChunkTag {
     }
 }
 
+// ── NblocksRecord ──
+
+/// A 20-byte log record pairing a [`RelFork`] with its current block count.
+///
+/// Written to the nblocks log whenever a relation's size changes. Symmetric
+/// with [`ChunkTag`] (also 20 bytes). Last-write-wins dedup at checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NblocksRecord {
+    pub rf: RelFork,
+    pub nblocks: u32,
+}
+
+/// Wire size of a serialised `NblocksRecord` (16-byte `RelFork` + 4-byte `nblocks`).
+pub const NBLOCKS_RECORD_SIZE: usize = 20;
+
+impl NblocksRecord {
+    /// Encode into the 20-byte on-disk representation.
+    pub fn encode(&self) -> [u8; NBLOCKS_RECORD_SIZE] {
+        let mut buf = [0u8; NBLOCKS_RECORD_SIZE];
+        buf[0..REL_FORK_SIZE].copy_from_slice(&self.rf.encode());
+        buf[REL_FORK_SIZE..NBLOCKS_RECORD_SIZE].copy_from_slice(&self.nblocks.to_le_bytes());
+        buf
+    }
+
+    /// Decode from the 20-byte on-disk representation.
+    pub fn decode(buf: &[u8; NBLOCKS_RECORD_SIZE]) -> Self {
+        let rf_buf: &[u8; REL_FORK_SIZE] = buf[0..REL_FORK_SIZE].try_into().unwrap();
+        let nblocks =
+            u32::from_le_bytes(buf[REL_FORK_SIZE..NBLOCKS_RECORD_SIZE].try_into().unwrap());
+        NblocksRecord {
+            rf: RelFork::decode(rf_buf),
+            nblocks,
+        }
+    }
+}
+
 // ── RelFork ──
 
 /// Identifies a specific fork of a relation — the (spc, db, rel, fork) key

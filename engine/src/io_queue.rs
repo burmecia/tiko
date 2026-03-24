@@ -39,7 +39,8 @@
 //! ├── num_backend_pools, worker_pid, worker_latch
 //! ├── submit_queue (SubmitQueue)
 //! ├── stats (S3IoStats)
-//! └── cache (CacheControl)
+//! ├── cache (CacheControl)
+//! └── nblocks (NblocksControl)
 //! BackendSlotPool[0]  ← immediately after IoControl (aligned)
 //! BackendSlotPool[1]
 //! ...
@@ -47,6 +48,8 @@
 //! CacheSlotMeta[0..1024]      ← cache chunk slot metadata (~36 KB)
 //! CacheHashEntry[0..2048]     ← cache hash table (~52 KB)
 //! AtomicRWLock[0..128]        ← cache partition locks (512 bytes)
+//! NblocksEntry[0..4096]       ← nblocks hash table (~96 KB)
+//! AtomicRWLock[0..64]         ← nblocks partition locks (256 bytes)
 //! ```
 
 use pgsys::{
@@ -65,6 +68,9 @@ use crate::cache::{
     CacheHashEntry, CacheSlotMeta,
 };
 use crate::dispatcher::{Dispatcher, IoWorkRequest};
+use crate::nblocks_table::{
+    NBLOCKS_NUM_ENTRIES, NBLOCKS_NUM_PARTITIONS, NblocksControl, NblocksEntry,
+};
 
 // ── Constants ──
 
@@ -526,6 +532,9 @@ pub struct IoControl {
 
     /// I/O statistics
     pub stats: S3IoStats,
+
+    /// Write-back nblocks hash table (relation fork → live block count)
+    pub nblocks: NblocksControl,
 }
 
 impl IoControl {
@@ -553,6 +562,14 @@ impl IoControl {
         }
 
         self.stats.init();
+
+        // Initialize nblocks table + its arrays in shared memory
+        unsafe {
+            let base = self as *mut Self as *mut u8;
+            let entries = base.add(Self::nblocks_entries_offset(max_backends)) as *mut NblocksEntry;
+            let nlocks = base.add(Self::nblocks_locks_offset(max_backends)) as *mut AtomicRWLock;
+            self.nblocks.init(entries, nlocks);
+        }
     }
 
     /// Byte offset from the start of IoControl to the first BackendSlotPool.
@@ -587,10 +604,26 @@ impl IoControl {
         (after_hash + align - 1) & !(align - 1)
     }
 
-    /// Total shared memory size for the control structure + backend pools + cache arrays.
+    /// Byte offset to the nblocks entries array (after cache partition locks).
+    fn nblocks_entries_offset(max_backends: usize) -> usize {
+        let after_cache_locks = Self::cache_locks_offset(max_backends)
+            + CACHE_NUM_PARTITIONS as usize * std::mem::size_of::<AtomicRWLock>();
+        let align = std::mem::align_of::<NblocksEntry>();
+        (after_cache_locks + align - 1) & !(align - 1)
+    }
+
+    /// Byte offset to the nblocks partition locks array (after nblocks entries).
+    fn nblocks_locks_offset(max_backends: usize) -> usize {
+        let after_entries = Self::nblocks_entries_offset(max_backends)
+            + NBLOCKS_NUM_ENTRIES as usize * std::mem::size_of::<NblocksEntry>();
+        let align = std::mem::align_of::<AtomicRWLock>();
+        (after_entries + align - 1) & !(align - 1)
+    }
+
+    /// Total shared memory size for the control structure + backend pools + all arrays.
     pub fn shmem_size(max_backends: usize) -> usize {
-        Self::cache_locks_offset(max_backends)
-            + CACHE_NUM_PARTITIONS as usize * std::mem::size_of::<AtomicRWLock>()
+        Self::nblocks_locks_offset(max_backends)
+            + NBLOCKS_NUM_PARTITIONS as usize * std::mem::size_of::<AtomicRWLock>()
     }
 
     /// Get the backend slot pool for a given proc number.
@@ -718,7 +751,7 @@ impl IoControl {
             match dispatcher.send_work(request) {
                 Ok(()) => {
                     dispatched_count += 1;
-                    pg_log_debug2(&format!(
+                    pg_log_debug3(&format!(
                         "tiko: dispatched backend={} slot={} op={:?} blk={} nblk={}",
                         backend_id, slot_idx, slot.op, slot.block_number, slot.nblocks
                     ));

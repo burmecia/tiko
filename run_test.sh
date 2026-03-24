@@ -35,10 +35,10 @@ fi
 
 echo "Building PostgreSQL..."
 rm -f postgres/src/backend/postgres
-#if ! (cd postgres && make && make install) >/dev/null; then
-#  echo "Postgres build/install failed" >&2
-#  exit 1
-#fi
+# if ! (cd postgres && make && make install) >/dev/null; then
+#   echo "Postgres build/install failed" >&2
+#   exit 1
+# fi
 
 echo "Building Tiko Worker..."
 if ! (cd worker && cargo build --release) >/dev/null; then

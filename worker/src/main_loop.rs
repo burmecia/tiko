@@ -128,7 +128,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
 
         // Periodic logging
         if loop_count % 4 == 0 {
-            pg_log_debug2(&format!(
+            pg_log_debug3(&format!(
                 "tiko: loop_count={}, requests={}",
                 loop_count, requests_processed
             ));

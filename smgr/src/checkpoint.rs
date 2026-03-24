@@ -11,16 +11,19 @@
 //!
 //! 1. **Flush dirty chunks** (`flush_all_dirty_chunks`): every dirty cache
 //!    slot is PUT to the express-bucket `latest` object and its `ChunkTag`
-//!    appended to the eviction log.
-//!    After this step the eviction log contains ALL chunks touched during this
-//!    checkpoint interval (both mid-interval evictions and those just flushed).
+//!    appended to the chunk log.
+//!    **Flush dirty nblocks** (`flush_all_dirty_nblocks`): every dirty entry
+//!    in the NblocksTable is PUT to the express nblocks key and a
+//!    `NblocksRecord` appended to the nblocks log.
+//!    After step 1 both logs contain all changes during this checkpoint
+//!    interval (both mid-interval and just-flushed).
 //!
-//! 2. **Rename snapshot** (`eviction_log` → `eviction_log.ckpt`): atomic
-//!    snapshot of the log.  New evictions after this point write to a fresh
-//!    inode.
+//! 2. **Rename snapshot** (`chunk_log` → `chunk_log.ckpt`,
+//!    `nblocks_log` → `nblocks_log.ckpt`): atomic snapshots of both logs.
+//!    New writes after this point go to fresh inodes.
 //!
-//! 3. **Read + dedup** eviction log. If the dirty set is empty, remove
-//!    `eviction_log.ckpt` and return — nothing to upload.
+//! 3. **Read + dedup** chunk log. If the dirty set is empty AND the nblocks
+//!    log is empty, remove `.ckpt` files and return — nothing to upload.
 //!
 //! 4. **Three-step write** each dirty chunk to S3 (staging → versioned copy
 //!    in standard-bucket → atomic rename to `latest` in express-bucket),
@@ -30,14 +33,15 @@
 //!    `branch_id`), upload it and a tar+zstd `pg_state` archive to the
 //!    standard bucket.
 //!
-//! 6. **Remove `eviction_log.ckpt`** to mark the checkpoint as complete.
+//! 6. **Remove `chunk_log.ckpt`** and **`nblocks_log.ckpt`** to mark the
+//!    checkpoint as complete.
 //!
 //! # Crash safety
 //!
-//! If the process crashes between steps 2 and 6, `eviction_log.ckpt` will
-//! exist on the next start.  `tiko_checkpoint_flush` detects this and
-//! re-processes the existing `.ckpt` file (idempotent because
-//! `three_step_write` is crash-safe and the delta manifest PUT is atomic).
+//! If the process crashes between steps 2 and 6, `chunk_log.ckpt` will exist
+//! on the next start.  `tiko_checkpoint_flush` detects this and re-processes
+//! the existing `.ckpt` file (idempotent because `three_step_write` is
+//! crash-safe and the delta manifest PUT is atomic).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -53,6 +57,30 @@ use store::{
     sim_store::SimStore,
     tiko_root_path,
 };
+
+// ── flush_all_dirty_nblocks ────────────────────────────────────────────────────
+
+/// Drain the NblocksTable, writing each dirty entry to the express nblocks key
+/// and appending a `NblocksRecord` to the nblocks log.
+///
+/// Returns a `HashMap` of `RelFork → nblocks` covering all entries drained this
+/// call (same data that was appended to the log), so the caller can seed
+/// `rel_nblocks` without reading back the log immediately.
+///
+/// This is step 1b of the checkpoint algorithm and is called before the log
+/// snapshot (step 2) so that all nblocks changes from this interval are present
+/// in the nblocks log before it is atomically snapshotted.
+fn flush_all_dirty_nblocks(sim: &SimStore, ns: &ProjectNamespace) -> HashMap<RelFork, u32> {
+    let mut rel_nblocks = HashMap::new();
+    IoControl::get().nblocks.drain_dirty(|rf, n| {
+        // Write to express for persistence across restarts.
+        let _ = sim.put_express(&ns.rel_nblocks_key(rf), &n.to_le_bytes());
+        // Append to nblocks_log so checkpoint_flush_inner can include it.
+        CacheControl::append_to_nblocks_log(&rf, n);
+        rel_nblocks.insert(rf, n);
+    });
+    rel_nblocks
+}
 
 // ── extern "C" entry point ────────────────────────────────────────────────────
 
@@ -80,21 +108,27 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
     let root_dir = tiko_root_path();
 
     if IoControl::is_initialized() {
-        // Normal path (server running under postmaster): flush dirty shmem
-        // cache chunks to express + eviction log before processing the log.
+        // Normal path (server running under postmaster):
+        // 1a. Flush dirty shmem cache chunks → express + chunk log.
         pg_log_debug1(&format!(
-            "tiko_checkpoint_flush: step 1: flushing dirty cache chunks (lsn={})",
+            "tiko_checkpoint_flush: step 1a: flushing dirty cache chunks (lsn={})",
             lsn.to_hex()
         ));
         IoControl::get().cache.flush_all_dirty_chunks();
+        // 1b. Drain dirty NblocksTable entries → express + nblocks log.
+        pg_log_debug1(&format!(
+            "tiko_checkpoint_flush: step 1b: flushing dirty nblocks (lsn={})",
+            lsn.to_hex()
+        ));
+        flush_all_dirty_nblocks(sim, ctx.ns());
     }
-    // Initdb path: writes already went directly to express + eviction log
-    // (via cached_write_blocks), so flush_all_dirty_chunks is not needed.
+    // Initdb path: writes already went directly to express + chunk log / nblocks
+    // log (via cached_write_blocks / set_nblocks), so no flush needed.
 
-    // Steps 2-6: process eviction log → standard bucket → delta manifest.
+    // Steps 2-6: process chunk log → standard bucket → delta manifest.
     // Non-fatal: log and continue. WAL will cover any gap on recovery.
     pg_log_debug1(&format!(
-        "tiko_checkpoint_flush: step 2-6: processing eviction log (lsn={})",
+        "tiko_checkpoint_flush: step 2-6: processing chunk log (lsn={})",
         lsn.to_hex()
     ));
     match checkpoint_flush_inner(sim, ctx.ns(), timeline, lsn, &root_dir, &data_dir_path()) {
@@ -173,13 +207,13 @@ fn checkpoint_flush_inner(
     root_dir: &Path,
     pg_data_dir: &Path,
 ) -> io::Result<Option<CheckpointStats>> {
-    let log_path = CacheControl::eviction_log_path(root_dir);
-    let ckpt_path = CacheControl::eviction_log_checkpoint_path(root_dir);
+    let log_path = CacheControl::chunk_log_path(root_dir);
+    let ckpt_path = CacheControl::chunk_log_checkpoint_path(root_dir);
 
-    // Step 2 — atomic snapshot.
+    // Step 2 — atomic snapshot of both logs.
     // If `.ckpt` already exists (crash recovery), re-process it.
-    // If neither file exists: no evictions occurred — dirty set will be
-    // empty and the function returns early after step 3.
+    // If neither file exists: no writes occurred — dirty set will be empty
+    // and the function returns early after step 3.
     let nblocks_log_path = CacheControl::nblocks_log_path(root_dir);
     let nblocks_ckpt_path = CacheControl::nblocks_log_checkpoint_path(root_dir);
 
@@ -192,14 +226,19 @@ fn checkpoint_flush_inner(
     }
 
     // Step 3 — read + dedup.
-    let records = CacheControl::read_eviction_log(&ckpt_path);
+    let records = CacheControl::read_chunk_log(&ckpt_path);
     let dirty_chunks = dedup_by_chunk_tag(records);
 
+    // Read nblocks log: last-write-wins per RelFork (iterate in order, later
+    // entry for the same RelFork overwrites earlier one).
     let nblocks_records = CacheControl::read_nblocks_log(&nblocks_ckpt_path);
-    let changed_rel_forks: HashSet<RelFork> = nblocks_records.into_iter().collect();
+    let mut nblocks_from_log: HashMap<RelFork, u32> = HashMap::new();
+    for rec in nblocks_records {
+        nblocks_from_log.insert(rec.rf, rec.nblocks);
+    }
 
     // Nothing changed this interval — skip S3 writes and manifest entirely.
-    if dirty_chunks.is_empty() && changed_rel_forks.is_empty() {
+    if dirty_chunks.is_empty() && nblocks_from_log.is_empty() {
         let _ = fs::remove_file(&ckpt_path);
         let _ = fs::remove_file(&nblocks_ckpt_path);
         return Ok(None);
@@ -231,26 +270,31 @@ fn checkpoint_flush_inner(
         })
         .collect();
 
-    // Collect nblocks for every relation that had dirty chunks or an nblocks
-    // change this interval.  Key: RelFork → nblocks.
+    // Collect rel_nblocks for every relation that had dirty chunks or an nblocks
+    // change this interval.
     //
-    // Only insert when the express nblocks key is present with a valid value.
-    // If the key is absent (Ok(None)), skip — the relation is inherited from a
-    // parent branch and its authoritative nblocks lives in the base manifest.
-    // Inserting 0 here would corrupt the base manifest when apply_deltas runs
-    // (it unconditionally overwrites rel_nblocks entries).
-    let mut all_rel_forks: HashSet<RelFork> = dirty_chunks.iter().map(|c| c.rel_fork()).collect();
-    all_rel_forks.extend(changed_rel_forks);
+    // Primary source: values from the nblocks log (last-write-wins).  These
+    // are the actual nblocks at the time of the last `set_nblocks` call, so no
+    // express re-read is needed for these RelForks.
+    //
+    // For dirty-chunk RelForks whose fork is NOT in the nblocks log (write to
+    // an existing block — no size change), fall back to the express nblocks key.
+    // If the express key is absent (Ok(None)), skip — the relation is inherited
+    // from a parent branch and its authoritative nblocks lives in the base
+    // manifest.  Inserting 0 would corrupt the base manifest.
+    let mut rel_nblocks: HashMap<RelFork, u32> = nblocks_from_log;
 
-    let mut rel_nblocks: HashMap<RelFork, u32> = HashMap::new();
-    for rf in &all_rel_forks {
-        let nblocks_key = ns.rel_nblocks_key(*rf);
+    for chunk_key in &dirty_chunks {
+        let rf = chunk_key.rel_fork();
+        if rel_nblocks.contains_key(&rf) {
+            continue;
+        }
+        let nblocks_key = ns.rel_nblocks_key(rf);
         if let Ok(Some(bytes)) = sim.get_express(&nblocks_key) {
             if bytes.len() >= 4 {
-                rel_nblocks.insert(*rf, u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
+                rel_nblocks.insert(rf, u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
             }
         }
-        // Key absent (Ok(None)) or error: skip — don't insert 0.
     }
 
     let tmp_delta_manifest_path = delta_tmp_path(root_dir, checkpoint_lsn);
@@ -277,7 +321,7 @@ fn checkpoint_flush_inner(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Deduplicate `ChunkTag` records from the eviction log.
+/// Deduplicate `ChunkTag` records from the chunk log.
 ///
 /// A chunk evicted multiple times during the interval should only be uploaded
 /// once (the latest data is already in express `latest`). Order is not
@@ -415,7 +459,7 @@ mod tests {
         }
     }
 
-    fn write_eviction_log(path: &Path, tags: &[ChunkTag]) {
+    fn write_chunk_log(path: &Path, tags: &[ChunkTag]) {
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir).unwrap();
         let mut file = fs::OpenOptions::new()
@@ -471,7 +515,7 @@ mod tests {
     }
 
     // ── Scenario 1: chunk dirtied, still in cache → flush_all_dirty_chunks ──
-    // Simulate: the eviction log was written by flush_all_dirty_chunks (step 1).
+    // Simulate: the chunk log was written by flush_all_dirty_chunks (step 1).
     // We pre-populate the log directly (tests cannot run the real cache).
 
     #[test]
@@ -482,9 +526,9 @@ mod tests {
         let lsn = Lsn::new(0x1000);
         let tag = make_tag(1);
 
-        // Simulate step 1 output: eviction log has one entry.
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &[tag]);
+        // Simulate step 1 output: chunk log has one entry.
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xAA);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -501,16 +545,16 @@ mod tests {
     // ── Scenario 2: chunk evicted mid-interval, log has entry ─────────────
 
     #[test]
-    fn scenario2_mid_interval_eviction_log_entry_in_manifest() {
+    fn scenario2_mid_interval_chunk_log_entry_in_manifest() {
         let dir = TempDir::new().unwrap();
         let sim = SimStore::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x2000);
         let tag = make_tag(2);
 
-        // Mid-interval: eviction_log written by `flush_dirty_chunk`.
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &[tag]);
+        // Mid-interval: chunk_log written by `flush_dirty_chunk`.
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xBB);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -530,8 +574,8 @@ mod tests {
         let tag = make_tag(3);
 
         // Two log entries for the same chunk (evicted, re-dirtied, evicted again).
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &[tag, tag]);
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &[tag, tag]);
         setup_express(&sim, &ns, &[tag], 0xCC);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -573,9 +617,9 @@ mod tests {
         let lsn = Lsn::new(0x5000);
         let tag = make_tag(5);
 
-        // Simulate crash: eviction_log.ckpt exists, eviction_log is absent.
-        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
-        write_eviction_log(&ckpt_path, &[tag]);
+        // Simulate crash: chunk_log.ckpt exists, chunk_log is absent.
+        let ckpt_path = CacheControl::chunk_log_checkpoint_path(dir.path());
+        write_chunk_log(&ckpt_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xEE);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -589,7 +633,7 @@ mod tests {
         // .ckpt must be cleaned up.
         assert!(
             !ckpt_path.exists(),
-            "eviction_log.ckpt must be removed on success"
+            "chunk_log.ckpt must be removed on success"
         );
     }
 
@@ -603,8 +647,8 @@ mod tests {
         let lsn = Lsn::new(0x6000);
         let tags: Vec<ChunkTag> = (10..15).map(make_tag).collect();
 
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &tags);
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &tags);
         setup_express(&sim, &ns, &tags, 0xDD);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -629,8 +673,8 @@ mod tests {
         let tag = make_tag(77);
 
         // Populate log and express.
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &[tag]);
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0xFF);
 
         // First call — succeeds, removes .ckpt.
@@ -641,8 +685,8 @@ mod tests {
             .unwrap();
 
         // Simulate crash recovery: re-create .ckpt manually.
-        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
-        write_eviction_log(&ckpt_path, &[tag]);
+        let ckpt_path = CacheControl::chunk_log_checkpoint_path(dir.path());
+        write_chunk_log(&ckpt_path, &[tag]);
 
         // Second call — must succeed and produce the same manifest content.
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -659,40 +703,40 @@ mod tests {
         assert_eq!(m1.lookup(&tag).unwrap(), m2.lookup(&tag).unwrap());
     }
 
-    // ── eviction_log.ckpt is removed on success ───────────────────────────
+    // ── chunk_log.ckpt is removed on success ───────────────────────────
 
     #[test]
-    fn eviction_log_ckpt_removed_on_success() {
+    fn chunk_log_ckpt_removed_on_success() {
         let dir = TempDir::new().unwrap();
         let sim = SimStore::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x8000);
 
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &[make_tag(99)]);
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &[make_tag(99)]);
         setup_express(&sim, &ns, &[make_tag(99)], 0x11);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
-        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
+        let ckpt_path = CacheControl::chunk_log_checkpoint_path(dir.path());
         assert!(
             !ckpt_path.exists(),
-            "eviction_log.ckpt must not exist after success"
+            "chunk_log.ckpt must not exist after success"
         );
     }
 
-    // ── Empty eviction log → no delta manifest written (no-op) ──────────
+    // ── Empty chunk log → no delta manifest written (no-op) ─────────────
 
     #[test]
-    fn empty_eviction_log_produces_no_delta_manifest() {
+    fn empty_chunk_log_produces_no_delta_manifest() {
         let dir = TempDir::new().unwrap();
         let sim = SimStore::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x9000);
 
-        // Create an empty eviction log.
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &[]);
+        // Create an empty chunk log.
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &[]);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -701,20 +745,21 @@ mod tests {
             sim.get_standard(&ns.delta_manifest_key(1, lsn))
                 .unwrap()
                 .is_none(),
-            "no delta manifest should be written when eviction log is empty"
+            "no delta manifest should be written when chunk log is empty"
         );
 
-        // eviction_log.ckpt should be cleaned up.
-        let ckpt_path = CacheControl::eviction_log_checkpoint_path(dir.path());
+        // chunk_log.ckpt should be cleaned up.
+        let ckpt_path = CacheControl::chunk_log_checkpoint_path(dir.path());
         assert!(
             !ckpt_path.exists(),
-            "eviction_log.ckpt must be removed on no-op"
+            "chunk_log.ckpt must be removed on no-op"
         );
     }
 
     // ── Scenario: nblocks changes with no dirty chunks → manifest still written
 
-    fn write_nblocks_log(path: &Path, rel_forks: &[RelFork]) {
+    fn write_nblocks_log(path: &Path, entries: &[(RelFork, u32)]) {
+        use store::chunk::NblocksRecord;
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir).unwrap();
         let mut file = fs::OpenOptions::new()
@@ -723,8 +768,9 @@ mod tests {
             .truncate(true)
             .open(path)
             .unwrap();
-        for rf in rel_forks {
-            file.write_all(&rf.encode()).unwrap();
+        for &(rf, nblocks) in entries {
+            let rec = NblocksRecord { rf, nblocks };
+            file.write_all(&rec.encode()).unwrap();
         }
     }
 
@@ -735,8 +781,9 @@ mod tests {
         let ns = ns();
         let lsn = Lsn::new(0xa000);
 
-        // No dirty chunks — eviction log absent.
+        // No dirty chunks — chunk log absent.
         // Only the nblocks log has an entry (e.g. a truncation was performed).
+        // Values are carried directly in the log records (last-write-wins).
         let rf = RelFork {
             spc_oid: 1,
             db_oid: 1,
@@ -744,11 +791,7 @@ mod tests {
             fork_number: 0,
         };
         let nblocks_log_path = CacheControl::nblocks_log_path(dir.path());
-        write_nblocks_log(&nblocks_log_path, &[rf]);
-
-        // Populate the express nblocks key so the checkpoint can read it.
-        let nblocks_key = ns.rel_nblocks_key(rf);
-        sim.put_express(&nblocks_key, &10u32.to_le_bytes()).unwrap();
+        write_nblocks_log(&nblocks_log_path, &[(rf, 10)]);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -760,11 +803,11 @@ mod tests {
         let path = dir.path().join("nb_only.tikm");
         let m = Manifest::from_bytes(&bytes, &path).unwrap();
 
-        // rel_nblocks must carry the correct value.
+        // rel_nblocks must carry the value from the log record.
         assert_eq!(
             m.lookup_nblocks(rf),
             Some(10),
-            "rel_nblocks must reflect the express key value"
+            "rel_nblocks must reflect the nblocks log value"
         );
 
         // nblocks_log.ckpt must be cleaned up.
@@ -784,9 +827,13 @@ mod tests {
 
         // One dirty chunk for relation 1, and an nblocks-only change for relation 2.
         let tag = make_tag(1);
-        let log_path = CacheControl::eviction_log_path(dir.path());
-        write_eviction_log(&log_path, &[tag]);
+        let log_path = CacheControl::chunk_log_path(dir.path());
+        write_chunk_log(&log_path, &[tag]);
         setup_express(&sim, &ns, &[tag], 0x55);
+        // Also write express nblocks for tag's relation (dirty-chunk fallback path).
+        let rf1 = tag.rel_fork();
+        sim.put_express(&ns.rel_nblocks_key(rf1), &5u32.to_le_bytes())
+            .unwrap();
 
         let rf2 = RelFork {
             spc_oid: 2,
@@ -795,9 +842,8 @@ mod tests {
             fork_number: 0,
         };
         let nblocks_log_path = CacheControl::nblocks_log_path(dir.path());
-        write_nblocks_log(&nblocks_log_path, &[rf2]);
-        sim.put_express(&ns.rel_nblocks_key(rf2), &7u32.to_le_bytes())
-            .unwrap();
+        // Value comes from the log record — no express key needed for rf2.
+        write_nblocks_log(&nblocks_log_path, &[(rf2, 7)]);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
