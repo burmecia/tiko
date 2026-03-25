@@ -546,8 +546,9 @@ pub fn cached_write_blocks(
 
             // Log the chunk so the shutdown checkpoint can archive it and
             // build the initial delta/base manifests — mirrors what flush_dirty_chunk
-            // does on the normal shmem-cache path.
-            CacheControl::append_to_chunk_log(&chunk_tag);
+            // does on the normal shmem-cache path. Embed the data so the
+            // checkpoint does not need to re-read express `latest`.
+            CacheControl::append_to_chunk_log(&chunk_tag, &chunk_data);
         }
 
         // Update nblocks if we extended the relation.

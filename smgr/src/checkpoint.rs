@@ -10,8 +10,9 @@
 //!    are not yet initialised — nothing to flush or upload.
 //!
 //! 1. **Flush dirty chunks** (`flush_all_dirty_chunks`): every dirty cache
-//!    slot is PUT to the express-bucket `latest` object and its `ChunkTag`
-//!    appended to the chunk log.
+//!    slot is PUT to the express-bucket `latest` object.  The chunk data is
+//!    also written — zstd-compressed — into each log record alongside the
+//!    `ChunkTag` (format: `tag[20] | compressed_len[4 LE] | data[N]`).
 //!    **Flush dirty nblocks** (`flush_all_dirty_nblocks`): every dirty entry
 //!    in the NblocksTable is PUT to the express nblocks key and a
 //!    `NblocksRecord` appended to the nblocks log.
@@ -22,15 +23,22 @@
 //!    `nblocks_log` → `nblocks_log.ckpt`): atomic snapshots of both logs.
 //!    New writes after this point go to fresh inodes.
 //!
-//! 3. **Read + dedup** chunk log. If the dirty set is empty AND the nblocks
-//!    log is empty, remove `.ckpt` files and return — nothing to upload.
+//! 3. **Read + dedup** chunk log (last-write-wins per `ChunkTag`).  If the
+//!    dirty set is empty AND the nblocks log is empty, remove `.ckpt` files
+//!    and return — nothing to upload.
 //!
-//! 4. **Three-step write** each dirty chunk to S3 (staging → versioned copy
-//!    in standard-bucket → atomic rename to `latest` in express-bucket),
-//!    all keyed by `checkpoint_lsn`.
+//! 3.5. **Capture `pg_state`**: build the tar+zstd archive of `pg_control`,
+//!    `pg_xact`, etc. into memory **before** any S3 uploads, so the archive
+//!    reflects the filesystem state at checkpoint time rather than after
+//!    potentially slow chunk writes.
+//!
+//! 4. **Write each dirty chunk** to the standard bucket at its versioned key
+//!    (keyed by `checkpoint_lsn`).  Data comes from the chunk log — no
+//!    express re-read — eliminating the race where a concurrent eviction
+//!    replaces `latest` after step 1 completes.
 //!
 //! 5. **Build delta manifest** (dirty chunks → `ChunkRef`s with own
-//!    `branch_id`), upload it and a tar+zstd `pg_state` archive to the
+//!    `branch_id`), upload it and the pre-built `pg_state` archive to the
 //!    standard bucket.
 //!
 //! 6. **Remove `chunk_log.ckpt`** and **`nblocks_log.ckpt`** to mark the
@@ -40,10 +48,10 @@
 //!
 //! If the process crashes between steps 2 and 6, `chunk_log.ckpt` will exist
 //! on the next start.  `tiko_checkpoint_flush` detects this and re-processes
-//! the existing `.ckpt` file (idempotent because `three_step_write` is
-//! crash-safe and the delta manifest PUT is atomic).
+//! the existing `.ckpt` file (idempotent because the standard-bucket PUT and
+//! the delta manifest PUT are both atomic).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,7 +59,7 @@ use std::path::{Path, PathBuf};
 use engine::{cache::CacheControl, io_queue::IoControl, pitr_task::materialize_base};
 use pgsys::{Lsn, common::data_dir_path, logging::*};
 use store::{
-    chunk::{CHUNK_SIZE, ChunkTag, RelFork},
+    chunk::{ChunkTag, RelFork},
     manifest::{ChunkRef, Manifest},
     project::{ProjectCtx, ProjectNamespace},
     sim_store::SimStore,
@@ -225,9 +233,10 @@ fn checkpoint_flush_inner(
         fs::rename(&nblocks_log_path, &nblocks_ckpt_path)?;
     }
 
-    // Step 3 — read + dedup.
+    // Step 3 — read + dedup (last-write-wins).  The log now carries the chunk
+    // data alongside each tag, so we never need to re-read express `latest`.
     let records = CacheControl::read_chunk_log(&ckpt_path);
-    let dirty_chunks = dedup_by_chunk_tag(records);
+    let dirty_chunk_data = dedup_chunk_log(records);
 
     // Read nblocks log: last-write-wins per RelFork (iterate in order, later
     // entry for the same RelFork overwrites earlier one).
@@ -238,26 +247,33 @@ fn checkpoint_flush_inner(
     }
 
     // Nothing changed this interval — skip S3 writes and manifest entirely.
-    if dirty_chunks.is_empty() && nblocks_from_log.is_empty() {
+    if dirty_chunk_data.is_empty() && nblocks_from_log.is_empty() {
         let _ = fs::remove_file(&ckpt_path);
         let _ = fs::remove_file(&nblocks_ckpt_path);
         return Ok(None);
     }
 
-    // Step 4 — three-step write for each dirty chunk.
-    for chunk_key in &dirty_chunks {
-        let latest_key = ns.chunk_latest_key(chunk_key, timeline);
-        // Read data from express `latest` — populated by `flush_dirty_chunk`.
-        // Fall back to zeros if the PUT failed for some reason (safe: WAL covers it).
-        let chunk_data = sim
-            .get_express(&latest_key)?
-            .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]);
-        sim.three_step_write(ns, chunk_key, timeline, checkpoint_lsn, &chunk_data)?;
+    // Capture pg_state archive bytes NOW — before any S3 uploads — so the
+    // archive reflects pg_control / pg_xact / etc. at the start of the
+    // checkpoint rather than after potentially long chunk S3 writes.
+    let pg_state_bytes = build_pg_state_archive(pg_data_dir)?;
+    
+    // Step 4 — write each dirty chunk to the standard bucket.
+    //
+    // Data comes directly from the chunk log (captured under the exclusive pin
+    // in flush_dirty_chunk), so this is immune to the race where a concurrent
+    // eviction replaces express `latest` after step 1a completes.
+    // express `latest` is left untouched — it was already set correctly in
+    // step 1a and any post-step-2 eviction writes remain valid.
+    for (chunk_key, chunk_data) in &dirty_chunk_data {
+        let versioned_key =
+            ns.chunk_versioned_key(chunk_key, ns.branch_id, timeline, checkpoint_lsn);
+        sim.put_standard(&versioned_key, chunk_data)?;
     }
 
     // Step 5 — delta manifest + pg_state.
-    let delta_entries: Vec<(ChunkTag, ChunkRef)> = dirty_chunks
-        .iter()
+    let delta_entries: Vec<(ChunkTag, ChunkRef)> = dirty_chunk_data
+        .keys()
         .map(|key| {
             (
                 *key,
@@ -284,7 +300,7 @@ fn checkpoint_flush_inner(
     // manifest.  Inserting 0 would corrupt the base manifest.
     let mut rel_nblocks: HashMap<RelFork, u32> = nblocks_from_log;
 
-    for chunk_key in &dirty_chunks {
+    for chunk_key in dirty_chunk_data.keys() {
         let rf = chunk_key.rel_fork();
         if rel_nblocks.contains_key(&rf) {
             continue;
@@ -306,7 +322,7 @@ fn checkpoint_flush_inner(
         &tmp_delta_manifest_path,
     )?;
     upload_delta_manifest(sim, ns, timeline, checkpoint_lsn, &delta)?;
-    upload_pg_state(sim, ns, timeline, checkpoint_lsn, pg_data_dir)?;
+    upload_pg_state(sim, ns, timeline, checkpoint_lsn, &pg_state_bytes)?;
 
     // Step 6 — remove checkpoint snapshots and local build file.
     let _ = fs::remove_file(&ckpt_path); // silently ignore ENOENT
@@ -314,21 +330,26 @@ fn checkpoint_flush_inner(
     let _ = fs::remove_file(&tmp_delta_manifest_path); // remove local build file
 
     Ok(Some(CheckpointStats {
-        dirty_chunks: dirty_chunks.len(),
+        dirty_chunks: dirty_chunk_data.len(),
         crash_recovery,
     }))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Deduplicate `ChunkTag` records from the chunk log.
+/// Deduplicate chunk log records by tag using last-write-wins semantics.
 ///
-/// A chunk evicted multiple times during the interval should only be uploaded
-/// once (the latest data is already in express `latest`). Order is not
-/// significant.
-fn dedup_by_chunk_tag(records: Vec<ChunkTag>) -> Vec<ChunkTag> {
-    let set: HashSet<ChunkTag> = records.into_iter().collect();
-    set.into_iter().collect()
+/// A chunk evicted multiple times during a checkpoint interval has multiple log
+/// entries. The *last* entry carries the most recent data (each eviction writes
+/// current cache contents), so iterating in order and overwriting earlier
+/// entries gives us the correct data for the versioned S3 upload. Returns a
+/// `HashMap<ChunkTag, Vec<u8>>` of decompressed chunk data.
+fn dedup_chunk_log(records: Vec<(ChunkTag, Vec<u8>)>) -> HashMap<ChunkTag, Vec<u8>> {
+    let mut map = HashMap::new();
+    for (tag, data) in records {
+        map.insert(tag, data); // later entry overwrites earlier = last-write-wins
+    }
+    map
 }
 
 fn delta_tmp_path(root_dir: &Path, lsn: Lsn) -> PathBuf {
@@ -357,29 +378,20 @@ fn upload_delta_manifest(
     sim.put_standard(&ns.delta_manifest_key(timeline, checkpoint_lsn), &bytes)
 }
 
-/// Build a tar+zstd archive of the critical PG state files and PUT it at
+/// Upload a pre-built tar+zstd archive of critical PG state files at
 /// `{org}/pitr/{proj}/deltas/{lsn_hex}/pg_state.tar.zst` in the standard bucket.
 ///
-/// Included paths (relative to `pgdata`):
-/// - `global/pg_control`
-/// - `pg_xact/**`
-/// - `pg_multixact/members/**`
-/// - `pg_multixact/offsets/**`
-/// - `pg_subtrans/**`
-/// - `global/pg_filenode.map`
-///
-/// Missing files or directories are silently skipped — this is intentional for
-/// test environments where PG state files may not exist. In production the
-/// checkpointer always runs inside a live PostgreSQL data directory.
+/// The caller is responsible for building the archive bytes early (before S3
+/// chunk uploads) via `build_pg_state_archive` so the archive captures the
+/// filesystem state at checkpoint initiation rather than after slow uploads.
 fn upload_pg_state(
     sim: &SimStore,
     ns: &ProjectNamespace,
     timeline: u32,
     checkpoint_lsn: Lsn,
-    pgdata: &Path,
+    compressed: &[u8],
 ) -> io::Result<()> {
-    let compressed = build_pg_state_archive(pgdata)?;
-    sim.put_standard(&ns.pg_state_key(timeline, checkpoint_lsn), &compressed)
+    sim.put_standard(&ns.pg_state_key(timeline, checkpoint_lsn), compressed)
 }
 
 /// Build the in-memory tar+zstd archive.  Returns compressed bytes.
@@ -437,7 +449,7 @@ mod tests {
     use pgsys::Lsn;
     use std::fs;
     use std::io::Write;
-    use store::chunk::ChunkTag;
+    use store::chunk::{CHUNK_SIZE, ChunkTag};
     use store::manifest::{ChunkRef, Manifest};
     use store::project::ProjectNamespace;
     use store::sim_store::SimStore;
@@ -459,7 +471,14 @@ mod tests {
         }
     }
 
+    /// Write chunk log entries in the current wire format:
+    /// `[tag: 20 | compressed_len: 4 LE | compressed_data: N]` per entry.
+    /// Each entry gets `CHUNK_SIZE` bytes of `fill` as its chunk data.
     fn write_chunk_log(path: &Path, tags: &[ChunkTag]) {
+        write_chunk_log_with_fill(path, tags, 0x00);
+    }
+
+    fn write_chunk_log_with_fill(path: &Path, tags: &[ChunkTag], fill: u8) {
         let dir = path.parent().unwrap();
         fs::create_dir_all(dir).unwrap();
         let mut file = fs::OpenOptions::new()
@@ -468,23 +487,14 @@ mod tests {
             .truncate(true)
             .open(path)
             .unwrap();
+        let chunk_data = vec![fill; CHUNK_SIZE];
+        let compressed = zstd::encode_all(chunk_data.as_slice(), 1).unwrap();
+        let compressed_len = compressed.len() as u32;
         for tag in tags {
             file.write_all(&tag.encode()).unwrap();
+            file.write_all(&compressed_len.to_le_bytes()).unwrap();
+            file.write_all(&compressed).unwrap();
         }
-    }
-
-    /// Set up a SimStore and pre-populate express `latest` for each tag.
-    fn setup_express(
-        sim: &SimStore,
-        ns: &ProjectNamespace,
-        tags: &[ChunkTag],
-        fill: u8,
-    ) -> Vec<u8> {
-        let chunk_data = vec![fill; CHUNK_SIZE];
-        for tag in tags {
-            sim.put_express_latest(ns, tag, 1, &chunk_data).unwrap();
-        }
-        chunk_data
     }
 
     // Run `checkpoint_flush_inner` with a fresh tempdir.
@@ -529,7 +539,6 @@ mod tests {
         // Simulate step 1 output: chunk log has one entry.
         let log_path = CacheControl::chunk_log_path(dir.path());
         write_chunk_log(&log_path, &[tag]);
-        setup_express(&sim, &ns, &[tag], 0xAA);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -555,7 +564,6 @@ mod tests {
         // Mid-interval: chunk_log written by `flush_dirty_chunk`.
         let log_path = CacheControl::chunk_log_path(dir.path());
         write_chunk_log(&log_path, &[tag]);
-        setup_express(&sim, &ns, &[tag], 0xBB);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -576,7 +584,6 @@ mod tests {
         // Two log entries for the same chunk (evicted, re-dirtied, evicted again).
         let log_path = CacheControl::chunk_log_path(dir.path());
         write_chunk_log(&log_path, &[tag, tag]);
-        setup_express(&sim, &ns, &[tag], 0xCC);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -620,7 +627,6 @@ mod tests {
         // Simulate crash: chunk_log.ckpt exists, chunk_log is absent.
         let ckpt_path = CacheControl::chunk_log_checkpoint_path(dir.path());
         write_chunk_log(&ckpt_path, &[tag]);
-        setup_express(&sim, &ns, &[tag], 0xEE);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -649,7 +655,6 @@ mod tests {
 
         let log_path = CacheControl::chunk_log_path(dir.path());
         write_chunk_log(&log_path, &tags);
-        setup_express(&sim, &ns, &tags, 0xDD);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -675,7 +680,6 @@ mod tests {
         // Populate log and express.
         let log_path = CacheControl::chunk_log_path(dir.path());
         write_chunk_log(&log_path, &[tag]);
-        setup_express(&sim, &ns, &[tag], 0xFF);
 
         // First call — succeeds, removes .ckpt.
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
@@ -714,7 +718,6 @@ mod tests {
 
         let log_path = CacheControl::chunk_log_path(dir.path());
         write_chunk_log(&log_path, &[make_tag(99)]);
-        setup_express(&sim, &ns, &[make_tag(99)], 0x11);
 
         run_flush(&dir, &sim, &ns, lsn, 1).unwrap();
 
@@ -829,7 +832,6 @@ mod tests {
         let tag = make_tag(1);
         let log_path = CacheControl::chunk_log_path(dir.path());
         write_chunk_log(&log_path, &[tag]);
-        setup_express(&sim, &ns, &[tag], 0x55);
         // Also write express nblocks for tag's relation (dirty-chunk fallback path).
         let rf1 = tag.rel_fork();
         sim.put_express(&ns.rel_nblocks_key(rf1), &5u32.to_le_bytes())
@@ -865,16 +867,21 @@ mod tests {
         );
     }
 
-    // ── dedup_by_chunk_tag unit test ──────────────────────────────────────
+    // ── dedup_chunk_log unit test ─────────────────────────────────────────
 
     #[test]
     fn dedup_removes_duplicates_keeps_all_unique() {
         let t1 = make_tag(1);
         let t2 = make_tag(2);
-        let records = vec![t1, t2, t1, t2, t2];
-        let mut result = dedup_by_chunk_tag(records);
-        result.sort(); // HashSet order is non-deterministic
-        assert_eq!(result, vec![t1, t2]);
+        // t1 appears twice with different data — last write must win.
+        let d1_first = vec![0xAAu8; CHUNK_SIZE];
+        let d1_last = vec![0xBBu8; CHUNK_SIZE];
+        let d2 = vec![0xCCu8; CHUNK_SIZE];
+        let records = vec![(t1, d1_first), (t2, d2.clone()), (t1, d1_last.clone())];
+        let result = dedup_chunk_log(records);
+        assert_eq!(result.len(), 2, "exactly two unique tags");
+        assert_eq!(result[&t1], d1_last, "last-write-wins for t1");
+        assert_eq!(result[&t2], d2, "t2 data unchanged");
     }
 
     // ── upload_delta_manifest ─────────────────────────────────────────────
@@ -925,12 +932,13 @@ mod tests {
         let ns = ns();
         let lsn = Lsn::new(0x300);
 
-        upload_pg_state(&sim, &ns, 1, lsn, dir.path()).unwrap();
+        let bytes = build_pg_state_archive(dir.path()).unwrap();
+        upload_pg_state(&sim, &ns, 1, lsn, &bytes).unwrap();
 
         let key = ns.pg_state_key(1, lsn);
-        let bytes = sim.get_standard(&key).unwrap();
-        assert!(bytes.is_some(), "pg_state archive must exist at {key}");
-        assert!(!bytes.unwrap().is_empty());
+        let stored = sim.get_standard(&key).unwrap();
+        assert!(stored.is_some(), "pg_state archive must exist at {key}");
+        assert!(!stored.unwrap().is_empty());
     }
 
     #[test]
@@ -950,11 +958,12 @@ mod tests {
         fs::create_dir_all(&pg_subtrans).unwrap();
         fs::write(pg_subtrans.join("0000"), b"subtrans_segment").unwrap();
 
-        upload_pg_state(&sim, &ns, 1, lsn, dir.path()).unwrap();
+        let bytes = build_pg_state_archive(dir.path()).unwrap();
+        upload_pg_state(&sim, &ns, 1, lsn, &bytes).unwrap();
 
-        let bytes = sim.get_standard(&ns.pg_state_key(1, lsn)).unwrap().unwrap();
+        let stored = sim.get_standard(&ns.pg_state_key(1, lsn)).unwrap().unwrap();
 
-        let decompressed = zstd::decode_all(bytes.as_slice()).unwrap();
+        let decompressed = zstd::decode_all(stored.as_slice()).unwrap();
         let mut archive = tar::Archive::new(decompressed.as_slice());
         let entry_names: Vec<String> = archive
             .entries()
