@@ -199,8 +199,10 @@ fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
     println!("  checkpoint_lsn:  {lsn}");
     println!("  timestamp:       {}  ({})", format_timestamp(ts), ts);
     let fork_nblocks = manifest.fork_nblocks();
+    let deleted_forks = manifest.deleted_forks();
     println!("  entry_count:     {entry_count}");
     println!("  nblocks_count:   {}", fork_nblocks.len());
+    println!("  deleted_forks:   {}", deleted_forks.len());
 
     if !show_entries {
         return;
@@ -227,6 +229,22 @@ fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
                 rf.rel_number,
                 fork_name(rf.fork_number),
                 nblocks
+            );
+        }
+    }
+
+    if !deleted_forks.is_empty() {
+        println!();
+        println!("deleted_forks:");
+        let mut forks = deleted_forks.clone();
+        forks.sort();
+        for rf in &forks {
+            println!(
+                "  {}/{}/{}.{}",
+                rf.spc_oid,
+                rf.db_oid,
+                rf.rel_number,
+                fork_name(rf.fork_number),
             );
         }
     }

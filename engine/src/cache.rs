@@ -46,13 +46,14 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use pgsys::logging::pg_log_debug1;
 
+use crate::io_queue::IoControl;
 use store::{
-    chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, NBLOCKS_RECORD_SIZE, NblocksRecord, RelFork},
+    chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkLogEntry, ChunkTag, RelFork},
     tiko_root_path,
 };
 
@@ -712,10 +713,11 @@ impl CacheControl {
                 // Clear dirty only after a successful PUT — if the PUT failed,
                 // the slot stays dirty so the next checkpoint retries.
                 meta.dirty_blocks.store(0, Ordering::Release);
-                // Embed the chunk data in the log so the checkpoint can use it
-                // directly without re-reading express `latest` (which may have
-                // been replaced by a newer eviction after this pin is released).
-                Self::append_to_chunk_log(&tag, &chunk_data);
+                // Write sidecar BEFORE the log entry so that if the process
+                // crashes between the two writes, the log has no orphaned entry.
+                let seq = Self::next_sidecar_seq();
+                Self::write_sidecar(&tag, seq, &chunk_data);
+                Self::append_to_cache_log(&ChunkLogEntry::ChunkDirty { tag, seq });
             }
         }
     }
@@ -820,52 +822,86 @@ impl CacheControl {
         ));
     }
 
-    // ── Chunk log (renamed from eviction log) ─────────────────────────────
+    // ── Unified cache_log ─────────────────────────────────────────────────
     //
-    // Records every ChunkTag flushed to express (both mid-interval evictions
-    // and the end-of-checkpoint flush).  At checkpoint time the file is
-    // atomically snapshotted to `chunk_log.ckpt` and consumed.
+    // Single append-only log file that replaces the old chunk_log + nblocks_log.
+    // Three entry types — ChunkDirty, NblocksSet, ForkDeleted — are defined in
+    // `store::chunk::ChunkLogEntry`.  At checkpoint time the file is atomically
+    // snapshotted to `cache_log.ckpt` and consumed.
+    //
+    // Chunk data is stored in sidecar files under `dirty_chunks/` (one file per
+    // flush event, named `{tag}-{seq}` for TOCTOU safety).
 
-    /// Path of the chunk log file: `{tiko_root}/chunk_log`.
-    pub fn chunk_log_path(tiko_root: &Path) -> PathBuf {
-        tiko_root.join("chunk_log")
+    /// Path of the cache log file: `{tiko_root}/cache_log`.
+    pub fn cache_log_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("cache_log")
     }
 
-    /// Path of the chunk log checkpoint file: `{tiko_root}/chunk_log.ckpt`.
-    pub fn chunk_log_checkpoint_path(tiko_root: &Path) -> PathBuf {
-        tiko_root.join("chunk_log.ckpt")
+    /// Path of the cache log checkpoint snapshot: `{tiko_root}/cache_log.ckpt`.
+    pub fn cache_log_checkpoint_path(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("cache_log.ckpt")
     }
 
-    /// Append a single chunk record to the process-local chunk log.
+    /// Directory for sidecar chunk data files: `{tiko_root}/dirty_chunks/`.
+    fn dirty_chunks_dir(tiko_root: &Path) -> PathBuf {
+        tiko_root.join("dirty_chunks")
+    }
+
+    /// Path of a sidecar file for a given `(tag, seq)` pair.
+    pub fn sidecar_path(tiko_root: &Path, tag: &ChunkTag, seq: u64) -> PathBuf {
+        Self::dirty_chunks_dir(tiko_root).join(format!(
+            "{}-{}-{}-{}-{}-{}",
+            tag.spc_oid, tag.db_oid, tag.rel_number, tag.fork_number, tag.chunk_id, seq
+        ))
+    }
+
+    /// Allocate the next globally-unique sidecar sequence number.
     ///
-    /// Record format: `[tag: 20 bytes | compressed_len: 4 bytes LE | compressed_data: N bytes]`.
-    /// Embedding the chunk data (zstd-compressed) at write time ensures the
-    /// checkpoint can use it directly without re-reading express `latest`,
-    /// eliminating the race where a post-flush eviction overwrites it.
-    ///
-    /// Used by both `flush_dirty_chunk` (normal path) and the initdb write path
-    /// (`cached_write_blocks` without IoControl).
-    pub fn append_to_chunk_log(tag: &ChunkTag, data: &[u8]) {
-        let compressed = zstd::encode_all(data, 1).expect("chunk log: zstd compress failed");
-        let compressed_len = compressed.len() as u32;
-        // Assemble into one buffer so the entire record is written with a
-        // single O_APPEND write(2) syscall — guaranteeing atomicity even when
-        // multiple backend processes evict chunks concurrently.
-        let mut record = Vec::with_capacity(24 + compressed.len());
-        record.extend_from_slice(&tag.encode());
-        record.extend_from_slice(&compressed_len.to_le_bytes());
-        record.extend_from_slice(&compressed);
-        let log = Self::open_chunk_log();
-        let _ = (&log).write_all(&record);
+    /// Uses `IoControl.sidecar_seq` when shared memory is initialised (normal
+    /// operation), or a process-local counter for the initdb path.
+    pub fn next_sidecar_seq() -> u64 {
+        if IoControl::is_initialized() {
+            IoControl::get().sidecar_seq.fetch_add(1, Ordering::Relaxed)
+        } else {
+            static LOCAL_SEQ: AtomicU64 = AtomicU64::new(0);
+            LOCAL_SEQ.fetch_add(1, Ordering::Relaxed)
+        }
     }
 
-    /// Open (or create) the chunk log for appending.
+    /// Write zstd-compressed chunk data to a sidecar file.
+    ///
+    /// **Must be called before `append_to_cache_log`** so that if the process
+    /// crashes between the two writes, the log has no entry for the missing
+    /// sidecar (orphaned sidecar, not a missing sidecar).
+    ///
+    /// Creates `dirty_chunks/` lazily.
+    pub fn write_sidecar(tag: &ChunkTag, seq: u64, data: &[u8]) {
+        let root = tiko_root_path();
+        let dir = Self::dirty_chunks_dir(&root);
+        let _ = fs::create_dir_all(&dir);
+        let path = Self::sidecar_path(&root, tag, seq);
+        let compressed = zstd::encode_all(data, 1).expect("sidecar: zstd compress failed");
+        let _ = fs::write(&path, &compressed);
+    }
+
+    /// Read a sidecar file.  Returns the raw compressed bytes, or `None` if
+    /// the file does not exist.
+    pub fn read_sidecar(tiko_root: &Path, tag: &ChunkTag, seq: u64) -> Option<Vec<u8>> {
+        let path = Self::sidecar_path(tiko_root, tag, seq);
+        match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => None,
+        }
+    }
+
+    /// Open (or create) the cache log for appending.
     ///
     /// Each call opens a fresh `File` with `O_APPEND`. This is intentional:
-    /// the checkpoint flush renames `chunk_log` → `chunk_log.ckpt` to take an
-    /// atomic snapshot; subsequent evictions must write to a fresh inode.
-    fn open_chunk_log() -> File {
-        let path = Self::chunk_log_path(&tiko_root_path());
+    /// the checkpoint renames `cache_log → cache_log.ckpt`; subsequent writes
+    /// must go to a fresh inode.
+    fn open_cache_log() -> File {
+        let path = Self::cache_log_path(&tiko_root_path());
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -874,117 +910,45 @@ impl CacheControl {
             .create(true)
             .append(true)
             .open(&path)
-            .expect("failed to open chunk log")
+            .expect("failed to open cache log")
     }
 
-    /// Read all complete chunk records from a chunk log file.
+    /// Append a [`ChunkLogEntry`] to the cache log.
     ///
-    /// Record format: `[tag: 20 bytes | compressed_len: 4 bytes LE | compressed_data: N bytes]`.
+    /// All entries encode to ≤29 bytes, well within the 512-byte atomicity
+    /// guarantee of `write(2)` with `O_APPEND` on Linux/macOS — so concurrent
+    /// appends from multiple backends are safe.
+    pub fn append_to_cache_log(entry: &ChunkLogEntry) {
+        let encoded = entry.encode();
+        let log = Self::open_cache_log();
+        let _ = (&log).write_all(&encoded);
+    }
+
+    /// Parse all complete [`ChunkLogEntry`] records from a cache log file.
     ///
-    /// Records are parsed sequentially. Any incomplete trailing record (caused
-    /// by a crash mid-write) is silently skipped. Returns an empty `Vec` if the
-    /// file does not exist. The returned `Vec<u8>` per record is the
-    /// **decompressed** chunk data (CHUNK_SIZE bytes).
-    ///
-    /// Order is preserved — callers that need last-write-wins semantics (e.g.
-    /// `dedup_chunk_log`) must iterate in order and overwrite earlier entries
-    /// for the same tag.
-    pub fn read_chunk_log(path: &Path) -> Vec<(ChunkTag, Vec<u8>)> {
+    /// Entries are decoded sequentially.  Any incomplete trailing record
+    /// (crash mid-write) is silently dropped.  Returns an empty `Vec` if the
+    /// file does not exist.  Order is preserved — callers that need
+    /// last-write-wins semantics (e.g. `checkpoint_flush_inner`) must iterate
+    /// in order and let later entries for the same key overwrite earlier ones.
+    pub fn read_cache_log(path: &Path) -> Vec<ChunkLogEntry> {
         let raw = match fs::read(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(_) => return Vec::new(),
         };
-        let mut records = Vec::new();
+        let mut entries = Vec::new();
         let mut pos = 0;
-        // Each record: tag(20) + compressed_len(4) + compressed_data(compressed_len).
-        while pos + 24 <= raw.len() {
-            let tag_buf: &[u8; 20] = raw[pos..pos + 20].try_into().unwrap();
-            let tag = ChunkTag::decode(tag_buf);
-            let compressed_len =
-                u32::from_le_bytes(raw[pos + 20..pos + 24].try_into().unwrap()) as usize;
-            if pos + 24 + compressed_len > raw.len() {
-                // Incomplete record — crash mid-write, skip.
-                break;
+        while pos < raw.len() {
+            match ChunkLogEntry::decode(&raw, pos) {
+                Some((entry, consumed)) => {
+                    entries.push(entry);
+                    pos += consumed;
+                }
+                None => break, // Incomplete or unknown record — stop.
             }
-            let compressed_data = &raw[pos + 24..pos + 24 + compressed_len];
-            match zstd::decode_all(compressed_data) {
-                Ok(data) => records.push((tag, data)),
-                Err(_) => break, // Corrupted record — stop here.
-            }
-            pos += 24 + compressed_len;
         }
-        records
-    }
-
-    // ── nblocks log ───────────────────────────────────────────────────────
-    //
-    // Records NblocksRecord entries (RelFork + nblocks value, 20 bytes each)
-    // whenever a relation's block count is set via `set_nblocks` on the initdb
-    // path, or drained from the NblocksTable at checkpoint time.  At checkpoint
-    // time the file is snapshotted to `nblocks_log.ckpt` and consumed via
-    // last-write-wins dedup to populate `fork_nblocks` in the delta manifest.
-
-    /// Path of the nblocks log file: `{tiko_root}/nblocks_log`.
-    pub fn nblocks_log_path(tiko_root: &Path) -> PathBuf {
-        tiko_root.join("nblocks_log")
-    }
-
-    /// Path of the nblocks log checkpoint file: `{tiko_root}/nblocks_log.ckpt`.
-    pub fn nblocks_log_checkpoint_path(tiko_root: &Path) -> PathBuf {
-        tiko_root.join("nblocks_log.ckpt")
-    }
-
-    /// Open (or create) the nblocks log for appending.
-    ///
-    /// Same rationale as `open_chunk_log`: open fresh each time so that the
-    /// checkpoint rename-to-.ckpt snapshot does not leave us pointing at the
-    /// old inode.
-    fn open_nblocks_log() -> File {
-        let path = Self::nblocks_log_path(&tiko_root_path());
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("failed to open nblocks log")
-    }
-
-    /// Append a `NblocksRecord` (RelFork + nblocks value) to the nblocks log.
-    ///
-    /// Called from `set_nblocks` (initdb path) or `flush_all_dirty_nblocks`
-    /// (checkpoint path) whenever a relation's block count is committed to
-    /// express.  The checkpoint reads these records (last-write-wins per
-    /// RelFork) to build `fork_nblocks` in the delta manifest.
-    pub fn append_to_nblocks_log(rf: &RelFork, nblocks: u32) {
-        let rec = NblocksRecord { rf: *rf, nblocks };
-        let log = Self::open_nblocks_log();
-        let _ = (&log).write_all(&rec.encode());
-    }
-
-    /// Read all complete `NblocksRecord` entries from an nblocks log file.
-    ///
-    /// Records are densely packed 20-byte entries.  Any incomplete trailing
-    /// record is silently skipped.  Returns an empty `Vec` if the file does
-    /// not exist.
-    pub fn read_nblocks_log(path: &Path) -> Vec<NblocksRecord> {
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-            Err(_) => return Vec::new(),
-        };
-        let n = data.len() / NBLOCKS_RECORD_SIZE;
-        (0..n)
-            .map(|i| {
-                let start = i * NBLOCKS_RECORD_SIZE;
-                let buf: &[u8; NBLOCKS_RECORD_SIZE] =
-                    data[start..start + NBLOCKS_RECORD_SIZE].try_into().unwrap();
-                NblocksRecord::decode(buf)
-            })
-            .collect()
+        entries
     }
 
     /// Flush all dirty chunks belonging to a specific relation fork.
@@ -1110,118 +1074,114 @@ mod tests {
         }
     }
 
-    // ── read_chunk_log ─────────────────────────────────────────────────
+    // ── read_cache_log ─────────────────────────────────────────────────
 
     #[test]
-    fn read_chunk_log_missing_file_returns_empty() {
+    fn read_cache_log_missing_file_returns_empty() {
         let dir = TempDir::new().unwrap();
-        let records = CacheControl::read_chunk_log(&dir.path().join("no_such_log"));
-        assert!(records.is_empty());
+        let entries = CacheControl::read_cache_log(&dir.path().join("no_such_log"));
+        assert!(entries.is_empty());
     }
 
     #[test]
-    fn read_chunk_log_skips_partial_trailing_record() {
+    fn read_cache_log_skips_partial_trailing_record() {
         let dir = TempDir::new().unwrap();
-        let path = CacheControl::chunk_log_path(dir.path());
+        let path = CacheControl::cache_log_path(dir.path());
 
-        // Write 2 complete records + a partial third (truncated header).
+        // Write 2 complete ChunkDirty records + a partial third (truncated).
         let tag0 = make_tag(0);
         let tag1 = make_tag(1);
-        let chunk_data = vec![0u8; CHUNK_SIZE];
-        let compressed = zstd::encode_all(chunk_data.as_slice(), 1).unwrap();
-        let len_bytes = (compressed.len() as u32).to_le_bytes();
+        let e0 = ChunkLogEntry::ChunkDirty { tag: tag0, seq: 0 };
+        let e1 = ChunkLogEntry::ChunkDirty { tag: tag1, seq: 1 };
 
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .open(&path)
             .unwrap();
-        for tag in &[tag0, tag1] {
-            let mut rec = Vec::new();
-            rec.extend_from_slice(&tag.encode());
-            rec.extend_from_slice(&len_bytes);
-            rec.extend_from_slice(&compressed);
-            file.write_all(&rec).unwrap();
-        }
-        file.write_all(&[0xAB; 10]).unwrap(); // partial record — incomplete header
+        file.write_all(&e0.encode()).unwrap();
+        file.write_all(&e1.encode()).unwrap();
+        file.write_all(&[0x01; 10]).unwrap(); // partial ChunkDirty — only 10 of 29 bytes
         drop(file);
 
-        let records = CacheControl::read_chunk_log(&path);
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].0, tag0);
-        assert_eq!(records[1].0, tag1);
+        let entries = CacheControl::read_cache_log(&path);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], e0);
+        assert_eq!(entries[1], e1);
     }
 
     #[test]
-    fn read_chunk_log_empty_file_returns_empty() {
+    fn read_cache_log_empty_file_returns_empty() {
         let dir = TempDir::new().unwrap();
-        let path = CacheControl::chunk_log_path(dir.path());
+        let path = CacheControl::cache_log_path(dir.path());
         std::fs::write(&path, b"").unwrap();
-        let records = CacheControl::read_chunk_log(&path);
-        assert!(records.is_empty());
+        let entries = CacheControl::read_cache_log(&path);
+        assert!(entries.is_empty());
     }
 
     #[test]
-    fn read_chunk_log_exact_n_records() {
+    fn read_cache_log_all_three_variants() {
+        use store::chunk::RelFork;
         let dir = TempDir::new().unwrap();
-        let path = CacheControl::chunk_log_path(dir.path());
-        let n = 8usize;
-        let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
-        let chunk_data = vec![0u8; CHUNK_SIZE];
-        let compressed = zstd::encode_all(chunk_data.as_slice(), 1).unwrap();
-        let len_bytes = (compressed.len() as u32).to_le_bytes();
+        let path = CacheControl::cache_log_path(dir.path());
+
+        let rf = RelFork {
+            spc_oid: 1,
+            db_oid: 2,
+            rel_number: 3,
+            fork_number: 0,
+        };
+        let entries_in = vec![
+            ChunkLogEntry::ChunkDirty {
+                tag: make_tag(5),
+                seq: 42,
+            },
+            ChunkLogEntry::NblocksSet { rf, n: 100 },
+            ChunkLogEntry::ForkDeleted { rf },
+        ];
 
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .open(&path)
             .unwrap();
-        for tag in &tags {
-            let mut rec = Vec::new();
-            rec.extend_from_slice(&tag.encode());
-            rec.extend_from_slice(&len_bytes);
-            rec.extend_from_slice(&compressed);
-            file.write_all(&rec).unwrap();
+        for e in &entries_in {
+            file.write_all(&e.encode()).unwrap();
         }
         drop(file);
 
-        let records = CacheControl::read_chunk_log(&path);
-        // Check tags only — data is identical dummy data
-        let got_tags: Vec<ChunkTag> = records.into_iter().map(|(t, _)| t).collect();
-        assert_eq!(got_tags, tags);
+        let entries_out = CacheControl::read_cache_log(&path);
+        assert_eq!(entries_out, entries_in);
     }
 
     // ── Concurrent O_APPEND writes ────────────────────────────────────────
 
     #[test]
-    fn concurrent_log_appends_produce_n_records_without_corruption() {
+    fn concurrent_cache_log_appends_produce_n_records_without_corruption() {
         let dir = TempDir::new().unwrap();
-        let path = Arc::new(CacheControl::chunk_log_path(dir.path()));
+        let path = Arc::new(CacheControl::cache_log_path(dir.path()));
         let n = 16usize;
         let tags: Vec<ChunkTag> = (0..n as u32).map(make_tag).collect();
-        let chunk_data = vec![0u8; CHUNK_SIZE];
-        let compressed = Arc::new(zstd::encode_all(chunk_data.as_slice(), 1).unwrap());
 
         let handles: Vec<_> = tags
             .iter()
-            .map(|tag| {
+            .enumerate()
+            .map(|(seq, tag)| {
                 let tag = *tag;
                 let p = Arc::clone(&path);
-                let c = Arc::clone(&compressed);
                 std::thread::spawn(move || {
-                    // Assemble the full record and issue a single write_all so
-                    // the O_APPEND write is one atomic syscall.
-                    let mut rec = Vec::with_capacity(24 + c.len());
-                    rec.extend_from_slice(&tag.encode());
-                    rec.extend_from_slice(&(c.len() as u32).to_le_bytes());
-                    rec.extend_from_slice(&c);
+                    let entry = ChunkLogEntry::ChunkDirty {
+                        tag,
+                        seq: seq as u64,
+                    };
+                    let encoded = entry.encode();
                     let file = OpenOptions::new()
                         .write(true)
                         .create(true)
                         .append(true)
                         .open(&*p)
                         .unwrap();
-                    (&file).write_all(&rec).unwrap();
+                    (&file).write_all(&encoded).unwrap();
                 })
             })
             .collect();
@@ -1230,18 +1190,20 @@ mod tests {
             h.join().unwrap();
         }
 
-        let records = CacheControl::read_chunk_log(&path);
+        let entries = CacheControl::read_cache_log(&path);
         assert_eq!(
-            records.len(),
+            entries.len(),
             n,
             "expected {n} records, got {}",
-            records.len()
+            entries.len()
         );
 
         // Every tag must be one of the original tags (no corruption).
         let tag_set: HashSet<ChunkTag> = tags.into_iter().collect();
-        for (tag, _data) in &records {
-            assert!(tag_set.contains(tag), "unexpected tag: {tag:?}");
+        for entry in &entries {
+            if let ChunkLogEntry::ChunkDirty { tag, .. } = entry {
+                assert!(tag_set.contains(tag), "unexpected tag: {tag:?}");
+            }
         }
     }
 

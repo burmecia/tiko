@@ -535,6 +535,11 @@ pub struct IoControl {
 
     /// Write-back nblocks hash table (relation fork → live block count)
     pub nblocks: NblocksControl,
+
+    /// Global monotonic counter for cache dirty chunk sidecar file uniqueness.
+    /// Each call to `CacheControl::next_sidecar_seq()` does fetch_add(1, Relaxed).
+    /// Uniqueness (not ordering) is the only requirement.
+    pub sidecar_seq: AtomicU64,
 }
 
 impl IoControl {
@@ -570,6 +575,8 @@ impl IoControl {
             let nlocks = base.add(Self::nblocks_locks_offset(max_backends)) as *mut AtomicRWLock;
             self.nblocks.init(entries, nlocks);
         }
+
+        self.sidecar_seq.store(0, Ordering::Relaxed);
     }
 
     /// Byte offset from the start of IoControl to the first BackendSlotPool.

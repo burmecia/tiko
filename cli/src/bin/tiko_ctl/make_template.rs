@@ -33,7 +33,21 @@ pub fn run(pg_bindir: &Path, tiko_root: Option<&Path>) {
         std::process::exit(1);
     }
 
-    // ── 2. Create postgresql.tiko.conf and include it from postgresql.conf ──────
+    // ── 2. Remove transient store artefacts left by initdb ────────────────────
+    // dirty_chunks/ holds sidecar files written during initdb. The checkpoint
+    // that runs at the end of initdb deletes the referenced sidecars, but
+    // intermediate sidecars for the same chunk (one per block write) are
+    // cleaned up during log parse. Any remaining files are safe to drop here
+    // because the checkpoint has already uploaded the data to the SimStore.
+    let dirty_chunks_dir = store_root.join("dirty_chunks");
+    if dirty_chunks_dir.exists() {
+        fs::remove_dir_all(&dirty_chunks_dir).unwrap_or_else(|e| {
+            eprintln!("error: failed to remove dirty_chunks: {e}");
+            std::process::exit(1);
+        });
+    }
+
+    // ── 3. Create postgresql.tiko.conf and include it from postgresql.conf ──────
     let tiko_conf = "\
 # Tiko storage manager settings\n\
 shared_preload_libraries = 'libtikoworker'\n\
@@ -54,13 +68,13 @@ log_min_messages = debug1\n\
         std::process::exit(1);
     });
 
-    // ── 3. Strip pg_control (restored from pg_state.tar.zst at recovery time) ─
+    // ── 4. Strip pg_control (restored from pg_state.tar.zst at recovery time) ─
     fs::remove_file(pgdata.join("global/pg_control")).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
 
-    // ── 3. Strip transactional state contents (keep directories) ─────────────
+    // ── 5. Strip transactional state contents (keep directories) ─────────────
     // pg_wal is intentionally kept: the initial WAL segment written by initdb
     // must be present so that branches created from this template can start PG
     // without needing a restore_command to fetch the very first segment.
@@ -73,11 +87,11 @@ log_min_messages = debug1\n\
         remove_dir_contents(&pgdata.join(dir));
     }
 
-    // ── 4. Strip relation files; keep pg_filenode.map and pg_internal.init ────
+    // ── 6. Strip relation files; keep pg_filenode.map and pg_internal.init ────
     strip_relation_files(&pgdata.join("global"), 1);
     strip_relation_files(&pgdata.join("base"), 2);
 
-    // ── 5. Create tarball ─────────────────────────────────────────────────────
+    // ── 7. Create tarball ─────────────────────────────────────────────────────
     let status = Command::new("tar")
         .args([
             "-czf",
@@ -105,7 +119,7 @@ log_min_messages = debug1\n\
         size
     );
 
-    // ── 6. Upload to SimStore ─────────────────────────────────────────────────
+    // ── 8. Upload to SimStore ─────────────────────────────────────────────────
     if let Some(root) = tiko_root {
         let filename = output
             .file_name()

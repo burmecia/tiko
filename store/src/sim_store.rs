@@ -256,10 +256,10 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 
 /// Returns true for file types that should be stored as-is without zstd compression:
 /// - `.json` — human-readable metadata, small, already uncompressed
-/// - `.tar.zst` — already compressed archives
+/// - `.zst` — already compressed archives
 fn skip_compression(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name.ends_with(".tar.zst") {
+    if name.ends_with(".zst") {
         return true;
     }
     path.extension()

@@ -53,27 +53,38 @@ stop_db() {
     $PG_BIN_DIR/pg_ctl -D tt -l log.log stop > /dev/null 2>&1
 }
 
+restart_db() {
+    stop_db
+    start_db
+}
+
 rm -rf tt && rm -rf ~/.tiko/* && truncate -s 0 log.log
 cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko make-template --pg-bindir $PG_BIN_DIR
-cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko create-org --org 456 --template template-180001.tar.gz 
+cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko create-org --org 456 --template template-180001.tar.gz
 cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko create-branch --org 456 --project 42 --branch 1 --parent-project 0 --parent-branch 0  --template template-180001.tar.gz --lsn 000000000201F770 --pg-data ./tt
 
 start_db
 $PG_BIN_DIR/psql -d postgres -c "create table tt(a int);insert into tt values(123);insert into tt values(456);"
-stop_db
-start_db
+restart_db
 test_row_count "tt" 2
 
 $PG_BIN_DIR/psql -d postgres -c "insert into tt values (789);" 
-stop_db
-start_db
+restart_db
 test_row_count "tt" 3
 
-stop_db
-start_db
+restart_db
 $PG_BIN_DIR/psql -d postgres -c "delete from tt where a = 789;"
+restart_db
 test_row_count "tt" 2
-stop_db
-start_db
+restart_db
 test_row_count "tt" 2
+
+$PG_BIN_DIR/psql -d postgres -c "drop table tt;"
+restart_db
+# Table no longer exists — psql should error; verify by expecting failure.
+if $PG_BIN_DIR/psql -t -A -c "SELECT COUNT(*) FROM tt;" -d postgres > /dev/null 2>&1; then
+    echo "✗ Table tt still exists after DROP"
+else
+    echo "✓ Table tt correctly absent after DROP and restart"
+fi
 stop_db

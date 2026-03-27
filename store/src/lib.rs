@@ -5,7 +5,7 @@ pub mod project;
 pub mod recovery;
 pub mod sim_store;
 
-pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag, RelFork};
+pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkLogEntry, ChunkTag, RelFork};
 
 use std::path::PathBuf;
 

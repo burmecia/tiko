@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{cache::CacheControl, io_queue::IoControl};
 use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
-use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, NBLOCKS_DELETED, RelFork};
+use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkLogEntry, ChunkTag, RelFork};
 use store::{
     project::{ProjectCtx, ProjectNamespace},
     recovery,
@@ -174,7 +174,7 @@ fn store_get_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> Opti
 /// `flush_all_dirty_nblocks`.
 ///
 /// **Initdb / single-user path** (IoControl not available): write directly to
-/// express and append a `NblocksRecord` to the nblocks log so that the
+/// express and append a `NblocksSet` entry to the cache log so that the
 /// shutdown checkpoint can build the initial manifest.
 fn set_nblocks(
     sim: &SimStore,
@@ -187,7 +187,7 @@ fn set_nblocks(
     } else {
         let key = ns.rel_nblocks_key(rf);
         sim.put_express(&key, &n.to_le_bytes())?;
-        CacheControl::append_to_nblocks_log(&rf, n);
+        CacheControl::append_to_cache_log(&ChunkLogEntry::NblocksSet { rf, n });
     }
     Ok(())
 }
@@ -391,9 +391,9 @@ pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
     sim.delete_express(&nblocks_key)
         .map_err(|e| io_err_to_errno(&e))?;
 
-    // Append a tombstone sentinel to the nblocks log so the next checkpoint
+    // Append a ForkDeleted entry to the cache log so the next checkpoint
     // records this fork in `deleted_forks` of the delta manifest.
-    CacheControl::append_to_nblocks_log(&rf, NBLOCKS_DELETED);
+    CacheControl::append_to_cache_log(&ChunkLogEntry::ForkDeleted { rf });
 
     Ok(())
 }
@@ -552,9 +552,13 @@ pub fn cached_write_blocks(
 
             // Log the chunk so the shutdown checkpoint can archive it and
             // build the initial delta/base manifests — mirrors what flush_dirty_chunk
-            // does on the normal shmem-cache path. Embed the data so the
-            // checkpoint does not need to re-read express `latest`.
-            CacheControl::append_to_chunk_log(&chunk_tag, &chunk_data);
+            // does on the normal shmem-cache path. Sidecar written before log entry.
+            let seq = CacheControl::next_sidecar_seq();
+            CacheControl::write_sidecar(&chunk_tag, seq, &chunk_data);
+            CacheControl::append_to_cache_log(&ChunkLogEntry::ChunkDirty {
+                tag: chunk_tag,
+                seq,
+            });
         }
 
         // Update nblocks if we extended the relation.
