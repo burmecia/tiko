@@ -313,7 +313,7 @@ mod tests {
     ) {
         let tmp_dir = TempDir::new().unwrap();
         let tmp = tmp_dir.path().join("manifest.tikm");
-        let m = Manifest::new(lsn, timestamp, vec![], HashMap::new(), &tmp).unwrap();
+        let m = Manifest::new(lsn, timestamp, vec![], HashMap::new(), vec![], &tmp).unwrap();
         let bytes = m.to_bytes().unwrap();
         sim.put_standard(&ns.delta_manifest_key(tl, lsn), &bytes)
             .unwrap();
@@ -322,7 +322,7 @@ mod tests {
     fn write_base_manifest(sim: &SimStore, ns: &ProjectNamespace, tl: u32, lsn: Lsn) {
         let tmp_dir = TempDir::new().unwrap();
         let tmp = tmp_dir.path().join("manifest.tikm");
-        let m = Manifest::new(lsn, 0, vec![], HashMap::new(), &tmp).unwrap();
+        let m = Manifest::new(lsn, 0, vec![], HashMap::new(), vec![], &tmp).unwrap();
         let bytes = m.to_bytes().unwrap();
         sim.put_standard(&ns.base_manifest_key(tl, lsn), &bytes)
             .unwrap();

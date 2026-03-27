@@ -27,7 +27,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
@@ -106,6 +106,9 @@ struct ManifestInner {
     /// Relation block counts: (spc_oid, db_oid, rel_number, fork_number) → nblocks.
     /// Carried in the msgpack wire format only; not stored in the TIKM binary.
     rel_nblocks: HashMap<RelFork, u32>,
+    /// Relation forks dropped during this checkpoint interval.
+    /// Carried in the msgpack wire format only; always empty in a base manifest.
+    deleted_forks: Vec<RelFork>,
 }
 
 // ── Manifest ──
@@ -217,7 +220,7 @@ impl Manifest {
     /// Create a zero-entry manifest at `Lsn::INVALID` (used as a bootstrap
     /// starting point before the first real base exists).
     pub fn empty(path: &Path) -> io::Result<Self> {
-        Self::new(Lsn::INVALID, 0, vec![], HashMap::new(), path)
+        Self::new(Lsn::INVALID, 0, vec![], HashMap::new(), vec![], path)
     }
 
     pub fn new(
@@ -225,6 +228,7 @@ impl Manifest {
         timestamp: i64,
         mut chunks: Vec<(ChunkTag, ChunkRef)>,
         rel_nblocks: HashMap<RelFork, u32>,
+        deleted_forks: Vec<RelFork>,
         path: &Path,
     ) -> io::Result<Self> {
         chunks.sort_unstable_by_key(|(tag, _)| *tag);
@@ -237,6 +241,7 @@ impl Manifest {
                 file,
                 entry_count: chunks.len() as u64,
                 rel_nblocks,
+                deleted_forks,
             }),
         })
     }
@@ -273,6 +278,7 @@ impl Manifest {
                 file,
                 entry_count,
                 rel_nblocks: HashMap::new(),
+                deleted_forks: vec![],
             }),
         })
     }
@@ -282,15 +288,23 @@ impl Manifest {
     ///
     /// Wire format: 4-tuple `(lsn, timestamp, chunks, rel_nblocks)`.
     pub fn from_bytes(data: &[u8], path: &Path) -> io::Result<Self> {
-        let (checkpoint_lsn, timestamp, chunks, rel_nblocks): (
+        let (checkpoint_lsn, timestamp, chunks, rel_nblocks, deleted_forks): (
             Lsn,
             i64,
             Vec<(ChunkTag, ChunkRef)>,
             HashMap<RelFork, u32>,
+            Vec<RelFork>,
         ) = rmp_serde::from_slice(data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Self::new(checkpoint_lsn, timestamp, chunks, rel_nblocks, path)
+        Self::new(
+            checkpoint_lsn,
+            timestamp,
+            chunks,
+            rel_nblocks,
+            deleted_forks,
+            path,
+        )
     }
 
     /// Serialize to the S3 wire format (`msgpack(...)`).
@@ -304,6 +318,7 @@ impl Manifest {
             inner.timestamp,
             &entries,
             &inner.rel_nblocks,
+            &inner.deleted_forks,
         ))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
@@ -403,6 +418,7 @@ impl Manifest {
         let mut last_ts = inner.timestamp;
         // Start with self's rel_nblocks; delta wins per relation key.
         let mut merged_nblocks: HashMap<RelFork, u32> = inner.rel_nblocks.clone();
+        let mut deleted_set: HashSet<RelFork> = HashSet::new();
 
         for delta in deltas {
             let delta_inner = delta.inner.lock().unwrap();
@@ -415,6 +431,9 @@ impl Manifest {
             // Delta's nblocks win over base's nblocks.
             for (&k, &v) in &delta_inner.rel_nblocks {
                 merged_nblocks.insert(k, v);
+            }
+            for &rf in &delta_inner.deleted_forks {
+                deleted_set.insert(rf);
             }
             // delta_inner lock released here
         }
@@ -463,6 +482,12 @@ impl Manifest {
             di += 1;
         }
 
+        // Purge tombstoned forks from the merged output and nblocks map.
+        if !deleted_set.is_empty() {
+            output.retain(|(tag, _)| !deleted_set.contains(&tag.rel_fork()));
+            merged_nblocks.retain(|rf, _| !deleted_set.contains(rf));
+        }
+
         // Write to a tmp path then atomically rename over the live path.
         let tmp_path = PathBuf::from(format!("{}.tmp", inner.path.display()));
         write_tikm(&tmp_path, last_lsn, last_ts, &output)?;
@@ -474,6 +499,7 @@ impl Manifest {
         inner.checkpoint_lsn = last_lsn;
         inner.timestamp = last_ts;
         inner.rel_nblocks = merged_nblocks;
+        inner.deleted_forks = vec![];
 
         Ok(())
     }
@@ -484,6 +510,12 @@ impl Manifest {
     /// or a relation that wasn't touched since the last checkpoint).
     pub fn lookup_nblocks(&self, rf: RelFork) -> Option<u32> {
         self.inner.lock().unwrap().rel_nblocks.get(&rf).copied()
+    }
+
+    /// Return the list of relation forks deleted during this checkpoint interval.
+    /// Always empty in a base manifest (tombstones are consumed by `apply_deltas`).
+    pub fn deleted_forks(&self) -> Vec<RelFork> {
+        self.inner.lock().unwrap().deleted_forks.clone()
     }
 }
 
@@ -555,6 +587,7 @@ mod tests {
             42,
             vec![(k2, cref(2, 0x100)), (k1, cref(1, 0x100))],
             HashMap::new(),
+            vec![],
             &path,
         )
         .unwrap();
@@ -579,6 +612,7 @@ mod tests {
             0,
             vec![(k3, cref(1, 1)), (k1, cref(1, 1)), (k2, cref(1, 1))],
             HashMap::new(),
+            vec![],
             &path,
         )
         .unwrap();
@@ -606,7 +640,15 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let k = chunk(1663, 5, 42, 0, 7);
         let r = cref(99, 0x300);
-        let m = Manifest::new(Lsn::new(0x300), 0, vec![(k, r)], HashMap::new(), &path).unwrap();
+        let m = Manifest::new(
+            Lsn::new(0x300),
+            0,
+            vec![(k, r)],
+            HashMap::new(),
+            vec![],
+            &path,
+        )
+        .unwrap();
         assert_eq!(m.lookup(&k).unwrap(), Some(r));
     }
 
@@ -616,8 +658,15 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let k = chunk(1663, 5, 1, 0, 0);
         let absent = chunk(1663, 5, 999, 0, 0);
-        let m =
-            Manifest::new(Lsn::new(1), 0, vec![(k, cref(1, 1))], HashMap::new(), &path).unwrap();
+        let m = Manifest::new(
+            Lsn::new(1),
+            0,
+            vec![(k, cref(1, 1))],
+            HashMap::new(),
+            vec![],
+            &path,
+        )
+        .unwrap();
         assert_eq!(m.lookup(&absent).unwrap(), None);
     }
 
@@ -625,7 +674,7 @@ mod tests {
     fn lookup_empty_manifest_returns_none() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("m.tikm");
-        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), &path).unwrap();
+        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), vec![], &path).unwrap();
         assert_eq!(m.lookup(&chunk(1663, 5, 1, 0, 0)).unwrap(), None);
     }
 
@@ -635,7 +684,7 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let keys: Vec<ChunkTag> = (0..20).map(|i| chunk(1663, 5, i, 0, 0)).collect();
         let chunks: Vec<_> = keys.iter().map(|k| (*k, cref(1, 100))).collect();
-        let m = Manifest::new(Lsn::new(100), 0, chunks, HashMap::new(), &path).unwrap();
+        let m = Manifest::new(Lsn::new(100), 0, chunks, HashMap::new(), vec![], &path).unwrap();
 
         assert!(
             m.lookup(&keys[0]).unwrap().is_some(),
@@ -664,6 +713,7 @@ mod tests {
             999,
             vec![(k, cref(5, 0x200))],
             HashMap::new(),
+            vec![],
             &path,
         )
         .unwrap();
@@ -698,6 +748,7 @@ mod tests {
             1234,
             vec![(k1, cref(7, 0x400)), (k2, cref(8, 0x300))],
             HashMap::new(),
+            vec![],
             &path,
         )
         .unwrap();
@@ -717,7 +768,7 @@ mod tests {
         let path = tmp.path().join("m.tikm");
         let path2 = tmp.path().join("m2.tikm");
 
-        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), &path).unwrap();
+        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), vec![], &path).unwrap();
         let wire = m.to_bytes().unwrap();
         let m2 = Manifest::from_bytes(&wire, &path2).unwrap();
 
@@ -748,6 +799,7 @@ mod tests {
                 (k_c, cref(1, 0x100)),
             ],
             HashMap::new(),
+            vec![],
             &base_path,
         )
         .unwrap();
@@ -758,6 +810,7 @@ mod tests {
             2,
             vec![(k_a, cref(2, 0x200))],
             HashMap::new(),
+            vec![],
             &d1_path,
         )
         .unwrap();
@@ -767,6 +820,7 @@ mod tests {
             3,
             vec![(k_b, cref(3, 0x300)), (k_c, cref(3, 0x300))],
             HashMap::new(),
+            vec![],
             &d2_path,
         )
         .unwrap();
@@ -776,6 +830,7 @@ mod tests {
             4,
             vec![(k_a, cref(4, 0x400))],
             HashMap::new(),
+            vec![],
             &d3_path,
         )
         .unwrap();
@@ -798,6 +853,7 @@ mod tests {
             10,
             vec![(k, cref(1, 0x100))],
             HashMap::new(),
+            vec![],
             &path,
         )
         .unwrap();
@@ -826,6 +882,7 @@ mod tests {
             1,
             vec![(k, cref(1, 0x100))],
             HashMap::new(),
+            vec![],
             &base_path,
         )
         .unwrap();
@@ -834,6 +891,7 @@ mod tests {
             2,
             vec![(k, cref(2, 0x200))],
             HashMap::new(),
+            vec![],
             &d_path,
         )
         .unwrap();
@@ -847,6 +905,7 @@ mod tests {
             2,
             vec![(k, cref(2, 0x200))],
             HashMap::new(),
+            vec![],
             &d_path,
         )
         .unwrap();
@@ -872,6 +931,7 @@ mod tests {
             1,
             vec![(k, cref(10, 0x300))],
             HashMap::new(),
+            vec![],
             &base_path,
         )
         .unwrap();
@@ -881,6 +941,7 @@ mod tests {
             2,
             vec![(k, cref(99, 0x300))],
             HashMap::new(),
+            vec![],
             &d_path,
         )
         .unwrap();
@@ -907,6 +968,7 @@ mod tests {
             1,
             vec![(k, cref(1, 0x100))],
             HashMap::new(),
+            vec![],
             &base_path,
         )
         .unwrap();
@@ -915,6 +977,7 @@ mod tests {
             2,
             vec![(k, cref(22, 0x200))],
             HashMap::new(),
+            vec![],
             &d_path,
         )
         .unwrap();
@@ -937,6 +1000,7 @@ mod tests {
             3,
             vec![(k, cref(10, 0x300))],
             HashMap::new(),
+            vec![],
             &base_path,
         )
         .unwrap();
@@ -945,6 +1009,7 @@ mod tests {
             2,
             vec![(k, cref(99, 0x200))],
             HashMap::new(),
+            vec![],
             &d_path,
         )
         .unwrap();
@@ -974,5 +1039,79 @@ mod tests {
             Lsn::from_hex("FFFFFFFFFFFFFFFF").unwrap(),
             Lsn::new(u64::MAX)
         );
+    }
+
+    // ── tombstone tests ──
+
+    #[test]
+    fn apply_deltas_tombstone_removes_chunks() {
+        let tmp = tempdir().unwrap();
+        let base_path = tmp.path().join("base.tikm");
+        let d_path = tmp.path().join("d.tikm");
+
+        let rf = RelFork {
+            spc_oid: 1663,
+            db_oid: 5,
+            rel_number: 42,
+            fork_number: 0,
+        };
+        let k = chunk(1663, 5, 42, 0, 0);
+        let base = Manifest::new(
+            Lsn::new(0x100),
+            1,
+            vec![(k, cref(1, 0x100))],
+            HashMap::new(),
+            vec![],
+            &base_path,
+        )
+        .unwrap();
+
+        // Delta carries a tombstone for the fork; no chunk entries.
+        let delta = Manifest::new(
+            Lsn::new(0x200),
+            2,
+            vec![],
+            HashMap::new(),
+            vec![rf],
+            &d_path,
+        )
+        .unwrap();
+
+        base.apply_deltas(&[delta]).unwrap();
+
+        // The chunk belonging to the deleted fork must be purged from the base.
+        assert_eq!(base.lookup(&k).unwrap(), None);
+    }
+
+    #[test]
+    fn apply_deltas_tombstone_removes_nblocks() {
+        let tmp = tempdir().unwrap();
+        let base_path = tmp.path().join("base.tikm");
+        let d_path = tmp.path().join("d.tikm");
+
+        let rf = RelFork {
+            spc_oid: 1663,
+            db_oid: 5,
+            rel_number: 99,
+            fork_number: 0,
+        };
+        let mut nb = HashMap::new();
+        nb.insert(rf, 10u32);
+        let base = Manifest::new(Lsn::new(0x100), 1, vec![], nb, vec![], &base_path).unwrap();
+
+        let delta = Manifest::new(
+            Lsn::new(0x200),
+            2,
+            vec![],
+            HashMap::new(),
+            vec![rf],
+            &d_path,
+        )
+        .unwrap();
+
+        base.apply_deltas(&[delta]).unwrap();
+
+        // The nblocks entry for the deleted fork must be removed.
+        assert_eq!(base.lookup_nblocks(rf), None);
     }
 }

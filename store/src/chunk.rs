@@ -120,6 +120,11 @@ pub struct NblocksRecord {
 /// Wire size of a serialised `NblocksRecord` (16-byte `RelFork` + 4-byte `nblocks`).
 pub const NBLOCKS_RECORD_SIZE: usize = 20;
 
+/// Sentinel value written to the nblocks log by `cached_delete_file` to record
+/// that a relation fork was dropped. Detected at checkpoint time to populate
+/// `deleted_forks` in the delta manifest.
+pub const NBLOCKS_DELETED: u32 = u32::MAX;
+
 impl NblocksRecord {
     /// Encode into the 20-byte on-disk representation.
     pub fn encode(&self) -> [u8; NBLOCKS_RECORD_SIZE] {

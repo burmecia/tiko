@@ -156,7 +156,7 @@ mod tests {
         use store::manifest::Manifest;
         let tmp =
             std::env::temp_dir().join(format!("test_base_{}_{}.tikm", ns.branch_id, lsn.to_hex()));
-        let m = Manifest::new(lsn, 0, vec![], HashMap::new(), &tmp).unwrap();
+        let m = Manifest::new(lsn, 0, vec![], HashMap::new(), vec![], &tmp).unwrap();
         let bytes = m.to_bytes().unwrap();
         sim.put_standard(&ns.base_manifest_key(tl, lsn), &bytes)
             .unwrap();

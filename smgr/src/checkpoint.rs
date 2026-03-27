@@ -51,7 +51,7 @@
 //! the existing `.ckpt` file (idempotent because the standard-bucket PUT and
 //! the delta manifest PUT are both atomic).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use engine::{cache::CacheControl, io_queue::IoControl, pitr_task::materialize_base};
 use pgsys::{Lsn, common::data_dir_path, logging::*};
 use store::{
-    chunk::{ChunkTag, RelFork},
+    chunk::{ChunkTag, NBLOCKS_DELETED, RelFork},
     manifest::{ChunkRef, Manifest},
     project::{ProjectCtx, ProjectNamespace},
     sim_store::SimStore,
@@ -242,12 +242,19 @@ fn checkpoint_flush_inner(
     // entry for the same RelFork overwrites earlier one).
     let nblocks_records = CacheControl::read_nblocks_log(&nblocks_ckpt_path);
     let mut nblocks_from_log: HashMap<RelFork, u32> = HashMap::new();
+    let mut deleted_forks_set: HashSet<RelFork> = HashSet::new();
     for rec in nblocks_records {
-        nblocks_from_log.insert(rec.rf, rec.nblocks);
+        if rec.nblocks == NBLOCKS_DELETED {
+            deleted_forks_set.insert(rec.rf);
+        } else {
+            nblocks_from_log.insert(rec.rf, rec.nblocks);
+        }
     }
+    // A fork that was written and later deleted in the same interval: remove it.
+    nblocks_from_log.retain(|rf, _| !deleted_forks_set.contains(rf));
 
     // Nothing changed this interval — skip S3 writes and manifest entirely.
-    if dirty_chunk_data.is_empty() && nblocks_from_log.is_empty() {
+    if dirty_chunk_data.is_empty() && nblocks_from_log.is_empty() && deleted_forks_set.is_empty() {
         let _ = fs::remove_file(&ckpt_path);
         let _ = fs::remove_file(&nblocks_ckpt_path);
         return Ok(None);
@@ -257,7 +264,7 @@ fn checkpoint_flush_inner(
     // archive reflects pg_control / pg_xact / etc. at the start of the
     // checkpoint rather than after potentially long chunk S3 writes.
     let pg_state_bytes = build_pg_state_archive(pg_data_dir)?;
-    
+
     // Step 4 — write each dirty chunk to the standard bucket.
     //
     // Data comes directly from the chunk log (captured under the exclusive pin
@@ -274,6 +281,7 @@ fn checkpoint_flush_inner(
     // Step 5 — delta manifest + pg_state.
     let delta_entries: Vec<(ChunkTag, ChunkRef)> = dirty_chunk_data
         .keys()
+        .filter(|key| !deleted_forks_set.contains(&key.rel_fork()))
         .map(|key| {
             (
                 *key,
@@ -319,6 +327,7 @@ fn checkpoint_flush_inner(
         now_unix(),
         delta_entries,
         rel_nblocks,
+        deleted_forks_set.into_iter().collect(),
         &tmp_delta_manifest_path,
     )?;
     upload_delta_manifest(sim, ns, timeline, checkpoint_lsn, &delta)?;
@@ -900,7 +909,7 @@ mod tests {
             timeline_id: 1,
             lsn,
         };
-        Manifest::new(lsn, 0, vec![(tag, cref)], HashMap::new(), &path).unwrap()
+        Manifest::new(lsn, 0, vec![(tag, cref)], HashMap::new(), vec![], &path).unwrap()
     }
 
     #[test]

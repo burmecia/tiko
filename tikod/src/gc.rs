@@ -480,7 +480,7 @@ mod tests {
     ) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("m.tikm");
-        let m = Manifest::new(lsn, 0, chunks.to_vec(), HashMap::new(), &path).unwrap();
+        let m = Manifest::new(lsn, 0, chunks.to_vec(), HashMap::new(), vec![], &path).unwrap();
         let bytes = m.to_bytes().unwrap();
         sim.put_standard(&ns.delta_manifest_key(tl, lsn), &bytes)
             .unwrap();
@@ -499,7 +499,7 @@ mod tests {
     ) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("m.tikm");
-        let m = Manifest::new(lsn, 0, chunks.to_vec(), HashMap::new(), &path).unwrap();
+        let m = Manifest::new(lsn, 0, chunks.to_vec(), HashMap::new(), vec![], &path).unwrap();
         let bytes = m.to_bytes().unwrap();
         sim.put_standard(&ns.base_manifest_key(tl, lsn), &bytes)
             .unwrap();

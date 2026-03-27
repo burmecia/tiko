@@ -381,6 +381,7 @@ mod tests {
             0,
             vec![(known_tag, known_ref)],
             HashMap::new(),
+            vec![],
             &manifest_path,
         )
         .unwrap();

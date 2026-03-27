@@ -663,7 +663,7 @@ mod tests {
 
     fn write_local_manifest(tiko_root: &Path, lsn: Lsn) {
         let manifest_path = Manifest::local_manifest_path(tiko_root);
-        Manifest::new(lsn, 0, vec![], HashMap::new(), &manifest_path).unwrap();
+        Manifest::new(lsn, 0, vec![], HashMap::new(), vec![], &manifest_path).unwrap();
     }
 
     #[test]

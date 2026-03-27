@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{cache::CacheControl, io_queue::IoControl};
 use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
-use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, RelFork};
+use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkTag, NBLOCKS_DELETED, RelFork};
 use store::{
     project::{ProjectCtx, ProjectNamespace},
     recovery,
@@ -389,7 +389,13 @@ pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
     // Remove the nblocks key.
     let nblocks_key = ns.rel_nblocks_key(rf);
     sim.delete_express(&nblocks_key)
-        .map_err(|e| io_err_to_errno(&e))
+        .map_err(|e| io_err_to_errno(&e))?;
+
+    // Append a tombstone sentinel to the nblocks log so the next checkpoint
+    // records this fork in `deleted_forks` of the delta manifest.
+    CacheControl::append_to_nblocks_log(&rf, NBLOCKS_DELETED);
+
+    Ok(())
 }
 
 /// Cache-aware read. Checks the local cache before fetching from SimStore.
@@ -842,6 +848,7 @@ mod tests {
             0,
             vec![(tag, chunk_ref)],
             HashMap::new(),
+            vec![],
             &manifest_path,
         )
         .unwrap();
@@ -876,7 +883,15 @@ mod tests {
 
         // Build and write the recovery manifest blob.
         let build_path = dir.path().join("build.tikm");
-        let m = Manifest::new(lsn, 0, vec![(tag, chunk_ref)], HashMap::new(), &build_path).unwrap();
+        let m = Manifest::new(
+            lsn,
+            0,
+            vec![(tag, chunk_ref)],
+            HashMap::new(),
+            vec![],
+            &build_path,
+        )
+        .unwrap();
         let blob = m.to_bytes().unwrap();
 
         let tiko_dir = dir.path();

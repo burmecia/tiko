@@ -748,7 +748,7 @@ mod tests {
         chunks: Vec<(ChunkTag, ChunkRef)>,
         tmp_path: &Path,
     ) -> Vec<u8> {
-        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), tmp_path).unwrap();
+        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), vec![], tmp_path).unwrap();
         m.to_bytes().unwrap()
     }
 
@@ -1002,7 +1002,7 @@ mod module7_tests {
         chunks: Vec<(ChunkTag, ChunkRef)>,
         tmp_path: &Path,
     ) {
-        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), tmp_path).unwrap();
+        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), vec![], tmp_path).unwrap();
         let bytes = m.to_bytes().unwrap();
         sim.put_standard(key, &bytes).unwrap();
     }
