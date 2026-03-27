@@ -103,9 +103,9 @@ struct ManifestInner {
     file: File,
     /// Total number of 36-byte entries in the current file.
     entry_count: u64,
-    /// Relation block counts: (spc_oid, db_oid, rel_number, fork_number) → nblocks.
+    /// Block count per relation fork: `RelFork → nblocks`.
     /// Carried in the msgpack wire format only; not stored in the TIKM binary.
-    rel_nblocks: HashMap<RelFork, u32>,
+    fork_nblocks: HashMap<RelFork, u32>,
     /// Relation forks dropped during this checkpoint interval.
     /// Carried in the msgpack wire format only; always empty in a base manifest.
     deleted_forks: Vec<RelFork>,
@@ -215,7 +215,7 @@ impl Manifest {
     /// Construct a `Manifest` from an arbitrary list of chunks, writing the
     /// TIKM file at `path`. `chunks` need not be pre-sorted.
     ///
-    /// `rel_nblocks` is carried in the msgpack wire format (`to_bytes`) but not
+    /// `fork_nblocks` is carried in the msgpack wire format (`to_bytes`) but not
     /// in the local TIKM binary. Pass `HashMap::new()` when nblocks are unknown.
     /// Create a zero-entry manifest at `Lsn::INVALID` (used as a bootstrap
     /// starting point before the first real base exists).
@@ -227,7 +227,7 @@ impl Manifest {
         checkpoint_lsn: Lsn,
         timestamp: i64,
         mut chunks: Vec<(ChunkTag, ChunkRef)>,
-        rel_nblocks: HashMap<RelFork, u32>,
+        fork_nblocks: HashMap<RelFork, u32>,
         deleted_forks: Vec<RelFork>,
         path: &Path,
     ) -> io::Result<Self> {
@@ -240,7 +240,7 @@ impl Manifest {
                 path: path.to_path_buf(),
                 file,
                 entry_count: chunks.len() as u64,
-                rel_nblocks,
+                fork_nblocks,
                 deleted_forks,
             }),
         })
@@ -277,7 +277,7 @@ impl Manifest {
                 path: path.to_path_buf(),
                 file,
                 entry_count,
-                rel_nblocks: HashMap::new(),
+                fork_nblocks: HashMap::new(),
                 deleted_forks: vec![],
             }),
         })
@@ -286,9 +286,9 @@ impl Manifest {
     /// Deserialize from the S3 wire format (`msgpack(...)`).
     /// Writes the decoded entries to a local TIKM file at `path`.
     ///
-    /// Wire format: 4-tuple `(lsn, timestamp, chunks, rel_nblocks)`.
+    /// Wire format: 5-tuple `(lsn, timestamp, chunks, fork_nblocks, deleted_forks)`.
     pub fn from_bytes(data: &[u8], path: &Path) -> io::Result<Self> {
-        let (checkpoint_lsn, timestamp, chunks, rel_nblocks, deleted_forks): (
+        let (checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks): (
             Lsn,
             i64,
             Vec<(ChunkTag, ChunkRef)>,
@@ -301,7 +301,7 @@ impl Manifest {
             checkpoint_lsn,
             timestamp,
             chunks,
-            rel_nblocks,
+            fork_nblocks,
             deleted_forks,
             path,
         )
@@ -309,7 +309,7 @@ impl Manifest {
 
     /// Serialize to the S3 wire format (`msgpack(...)`).
     ///
-    /// Format: 4-tuple `(checkpoint_lsn, timestamp, chunks, rel_nblocks)`.
+    /// Format: 5-tuple `(checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks)`.
     pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         let entries = read_all_entries(&inner)?;
@@ -317,7 +317,7 @@ impl Manifest {
             inner.checkpoint_lsn,
             inner.timestamp,
             &entries,
-            &inner.rel_nblocks,
+            &inner.fork_nblocks,
             &inner.deleted_forks,
         ))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -339,10 +339,10 @@ impl Manifest {
         read_all_entries(&inner)
     }
 
-    /// Return the `rel_nblocks` map (populated from the S3 wire format only;
+    /// Return the `fork_nblocks` map (populated from the S3 wire format only;
     /// empty when opened from a local TIKM file via [`Manifest::open`]).
-    pub fn rel_nblocks(&self) -> HashMap<RelFork, u32> {
-        self.inner.lock().unwrap().rel_nblocks.clone()
+    pub fn fork_nblocks(&self) -> HashMap<RelFork, u32> {
+        self.inner.lock().unwrap().fork_nblocks.clone()
     }
 
     /// Canonical local path for the base manifest TIKM file.
@@ -416,8 +416,8 @@ impl Manifest {
         let mut combined_delta: Vec<(ChunkTag, ChunkRef)> = Vec::new();
         let mut last_lsn = inner.checkpoint_lsn;
         let mut last_ts = inner.timestamp;
-        // Start with self's rel_nblocks; delta wins per relation key.
-        let mut merged_nblocks: HashMap<RelFork, u32> = inner.rel_nblocks.clone();
+        // Start with self's fork_nblocks; delta wins per fork key.
+        let mut merged_nblocks: HashMap<RelFork, u32> = inner.fork_nblocks.clone();
         let mut deleted_set: HashSet<RelFork> = HashSet::new();
 
         for delta in deltas {
@@ -429,7 +429,7 @@ impl Manifest {
             }
             combined_delta.extend(entries);
             // Delta's nblocks win over base's nblocks.
-            for (&k, &v) in &delta_inner.rel_nblocks {
+            for (&k, &v) in &delta_inner.fork_nblocks {
                 merged_nblocks.insert(k, v);
             }
             for &rf in &delta_inner.deleted_forks {
@@ -498,7 +498,7 @@ impl Manifest {
         inner.entry_count = output.len() as u64;
         inner.checkpoint_lsn = last_lsn;
         inner.timestamp = last_ts;
-        inner.rel_nblocks = merged_nblocks;
+        inner.fork_nblocks = merged_nblocks;
         inner.deleted_forks = vec![];
 
         Ok(())
@@ -509,7 +509,7 @@ impl Manifest {
     /// Returns `None` if no nblocks entry was recorded (e.g. legacy manifest
     /// or a relation that wasn't touched since the last checkpoint).
     pub fn lookup_nblocks(&self, rf: RelFork) -> Option<u32> {
-        self.inner.lock().unwrap().rel_nblocks.get(&rf).copied()
+        self.inner.lock().unwrap().fork_nblocks.get(&rf).copied()
     }
 
     /// Return the list of relation forks deleted during this checkpoint interval.

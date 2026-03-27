@@ -73,21 +73,21 @@ use store::{
 ///
 /// Returns a `HashMap` of `RelFork → nblocks` covering all entries drained this
 /// call (same data that was appended to the log), so the caller can seed
-/// `rel_nblocks` without reading back the log immediately.
+/// `fork_nblocks` without reading back the log immediately.
 ///
 /// This is step 1b of the checkpoint algorithm and is called before the log
 /// snapshot (step 2) so that all nblocks changes from this interval are present
 /// in the nblocks log before it is atomically snapshotted.
 fn flush_all_dirty_nblocks(sim: &SimStore, ns: &ProjectNamespace) -> HashMap<RelFork, u32> {
-    let mut rel_nblocks = HashMap::new();
+    let mut fork_nblocks = HashMap::new();
     IoControl::get().nblocks.drain_dirty(|rf, n| {
         // Write to express for persistence across restarts.
         let _ = sim.put_express(&ns.rel_nblocks_key(rf), &n.to_le_bytes());
         // Append to nblocks_log so checkpoint_flush_inner can include it.
         CacheControl::append_to_nblocks_log(&rf, n);
-        rel_nblocks.insert(rf, n);
+        fork_nblocks.insert(rf, n);
     });
-    rel_nblocks
+    fork_nblocks
 }
 
 // ── extern "C" entry point ────────────────────────────────────────────────────
@@ -294,7 +294,7 @@ fn checkpoint_flush_inner(
         })
         .collect();
 
-    // Collect rel_nblocks for every relation that had dirty chunks or an nblocks
+    // Collect fork_nblocks for every fork that had dirty chunks or an nblocks
     // change this interval.
     //
     // Primary source: values from the nblocks log (last-write-wins).  These
@@ -306,17 +306,17 @@ fn checkpoint_flush_inner(
     // If the express key is absent (Ok(None)), skip — the relation is inherited
     // from a parent branch and its authoritative nblocks lives in the base
     // manifest.  Inserting 0 would corrupt the base manifest.
-    let mut rel_nblocks: HashMap<RelFork, u32> = nblocks_from_log;
+    let mut fork_nblocks: HashMap<RelFork, u32> = nblocks_from_log;
 
     for chunk_key in dirty_chunk_data.keys() {
         let rf = chunk_key.rel_fork();
-        if rel_nblocks.contains_key(&rf) {
+        if fork_nblocks.contains_key(&rf) {
             continue;
         }
         let nblocks_key = ns.rel_nblocks_key(rf);
         if let Ok(Some(bytes)) = sim.get_express(&nblocks_key) {
             if bytes.len() >= 4 {
-                rel_nblocks.insert(rf, u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
+                fork_nblocks.insert(rf, u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
             }
         }
     }
@@ -326,7 +326,7 @@ fn checkpoint_flush_inner(
         checkpoint_lsn,
         now_unix(),
         delta_entries,
-        rel_nblocks,
+        fork_nblocks,
         deleted_forks_set.into_iter().collect(),
         &tmp_delta_manifest_path,
     )?;
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn nblocks_change_only_produces_delta_manifest_with_rel_nblocks() {
+    fn nblocks_change_only_produces_delta_manifest_with_fork_nblocks() {
         let dir = TempDir::new().unwrap();
         let sim = SimStore::new(dir.path());
         let ns = ns();
@@ -815,11 +815,11 @@ mod tests {
         let path = dir.path().join("nb_only.tikm");
         let m = Manifest::from_bytes(&bytes, &path).unwrap();
 
-        // rel_nblocks must carry the value from the log record.
+        // fork_nblocks must carry the value from the log record.
         assert_eq!(
             m.lookup_nblocks(rf),
             Some(10),
-            "rel_nblocks must reflect the nblocks log value"
+            "fork_nblocks must reflect the nblocks log value"
         );
 
         // nblocks_log.ckpt must be cleaned up.

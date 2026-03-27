@@ -9,7 +9,7 @@
 //! manifest_viewer <file>                   Auto-detect by magic bytes
 //! manifest_viewer --s3 <key>               Read from SimStore standard bucket ($PGDATA required)
 //! manifest_viewer --s3-express <key>       Read from SimStore express bucket ($PGDATA required)
-//! manifest_viewer --show-entries [...]     Also print rel_nblocks and entries table (default: summary only)
+//! manifest_viewer --show-entries [...]     Also print fork_nblocks and entries table (default: summary only)
 //! ```
 //!
 //! Auto-detection: if the file begins with the `TIKM` magic it is opened as a
@@ -69,7 +69,7 @@ fn usage() -> ! {
   manifest_viewer --s3-express <key>  (requires $PGDATA)
 
 Flags:
-  --show-entries   Print rel_nblocks and entries table in addition to the header summary."
+  --show-entries   Print fork_nblocks and entries table in addition to the header summary."
     );
     std::process::exit(1);
 }
@@ -198,9 +198,9 @@ fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
     println!("  format:          {format_label}");
     println!("  checkpoint_lsn:  {lsn}");
     println!("  timestamp:       {}  ({})", format_timestamp(ts), ts);
-    let rel_nblocks = manifest.rel_nblocks();
+    let fork_nblocks = manifest.fork_nblocks();
     println!("  entry_count:     {entry_count}");
-    println!("  nblocks_count:   {}", rel_nblocks.len());
+    println!("  nblocks_count:   {}", fork_nblocks.len());
 
     if !show_entries {
         return;
@@ -214,10 +214,10 @@ fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
         }
     };
 
-    if !rel_nblocks.is_empty() {
+    if !fork_nblocks.is_empty() {
         println!();
-        println!("rel_nblocks:");
-        let mut pairs: Vec<_> = rel_nblocks.iter().collect();
+        println!("fork_nblocks:");
+        let mut pairs: Vec<_> = fork_nblocks.iter().collect();
         pairs.sort_by_key(|(rf, _)| *rf);
         for (rf, nblocks) in pairs {
             println!(

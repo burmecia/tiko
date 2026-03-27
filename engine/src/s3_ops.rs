@@ -291,7 +291,7 @@ fn parse_chunk_id_from_key(key: &str, prefix: &str) -> Option<u32> {
 /// 2. **Express nblocks key** — cold miss: relation not yet seen this server
 ///    lifetime.  Populates the NblocksTable (clean, not dirty) for future
 ///    calls.
-/// 3. **Base manifest `rel_nblocks`** — consulted only when the express key
+/// 3. **Base manifest `fork_nblocks`** — consulted only when the express key
 ///    is *absent* (key not found, not value 0). Covers fresh branches that
 ///    inherit relation sizes from a parent manifest before any write has
 ///    created the express key in the child's namespace.

@@ -923,7 +923,7 @@ impl CacheControl {
     // whenever a relation's block count is set via `set_nblocks` on the initdb
     // path, or drained from the NblocksTable at checkpoint time.  At checkpoint
     // time the file is snapshotted to `nblocks_log.ckpt` and consumed via
-    // last-write-wins dedup to populate `rel_nblocks` in the delta manifest.
+    // last-write-wins dedup to populate `fork_nblocks` in the delta manifest.
 
     /// Path of the nblocks log file: `{tiko_root}/nblocks_log`.
     pub fn nblocks_log_path(tiko_root: &Path) -> PathBuf {
@@ -958,7 +958,7 @@ impl CacheControl {
     /// Called from `set_nblocks` (initdb path) or `flush_all_dirty_nblocks`
     /// (checkpoint path) whenever a relation's block count is committed to
     /// express.  The checkpoint reads these records (last-write-wins per
-    /// RelFork) to build `rel_nblocks` in the delta manifest.
+    /// RelFork) to build `fork_nblocks` in the delta manifest.
     pub fn append_to_nblocks_log(rf: &RelFork, nblocks: u32) {
         let rec = NblocksRecord { rf: *rf, nblocks };
         let log = Self::open_nblocks_log();
