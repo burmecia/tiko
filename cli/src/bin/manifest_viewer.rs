@@ -189,13 +189,24 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 // ── Display ───────────────────────────────────────────────────────────────────
 
-fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool) {
+fn format_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB ({bytes} B)", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.2} MiB ({bytes} B)", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn print_manifest(manifest: &Manifest, format_label: &str, show_entries: bool, file_size: usize) {
     let lsn = manifest.checkpoint_lsn();
     let ts = manifest.timestamp();
     let entry_count = manifest.entries().map(|e| e.len()).unwrap_or(0);
 
     println!("Manifest");
     println!("  format:          {format_label}");
+    println!("  file_size:       {}", format_size(file_size));
     println!("  checkpoint_lsn:  {lsn}");
     println!("  timestamp:       {}  ({})", format_timestamp(ts), ts);
     let fork_nblocks = manifest.fork_nblocks();
@@ -284,10 +295,11 @@ fn run(args: &Args) -> Result<(), String> {
             let data =
                 std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
+            let file_size = data.len();
             if is_tikm(&data) {
                 let manifest =
                     Manifest::open(path).map_err(|e| format!("failed to open TIKM: {e}"))?;
-                print_manifest(&manifest, "local TIKM", args.show_entries);
+                print_manifest(&manifest, "local TIKM", args.show_entries, file_size);
             } else {
                 // SimStore compresses non-JSON files with zstd on disk.
                 // Decompress before passing to from_bytes() which expects plain msgpack.
@@ -302,7 +314,7 @@ fn run(args: &Args) -> Result<(), String> {
                 let tmp_path = tmp.path().join("manifest.bin");
                 let manifest = Manifest::from_bytes(&msgpack, &tmp_path)
                     .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
-                print_manifest(&manifest, "S3 wire format", args.show_entries);
+                print_manifest(&manifest, "S3 wire format", args.show_entries, file_size);
             }
         }
 
@@ -312,11 +324,17 @@ fn run(args: &Args) -> Result<(), String> {
                 .get_standard(key)
                 .map_err(|e| format!("SimStore error: {e}"))?
                 .ok_or_else(|| format!("key not found in standard bucket: {key}"))?;
+            let file_size = data.len();
             let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
             let tmp_path = tmp.path().join("manifest.bin");
             let manifest = Manifest::from_bytes(&data, &tmp_path)
                 .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
-            print_manifest(&manifest, "S3 standard bucket", args.show_entries);
+            print_manifest(
+                &manifest,
+                "S3 standard bucket",
+                args.show_entries,
+                file_size,
+            );
         }
 
         Source::S3Express(key) => {
@@ -325,11 +343,12 @@ fn run(args: &Args) -> Result<(), String> {
                 .get_express(key)
                 .map_err(|e| format!("SimStore error: {e}"))?
                 .ok_or_else(|| format!("key not found in express bucket: {key}"))?;
+            let file_size = data.len();
             let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
             let tmp_path = tmp.path().join("manifest.bin");
             let manifest = Manifest::from_bytes(&data, &tmp_path)
                 .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
-            print_manifest(&manifest, "S3 express bucket", args.show_entries);
+            print_manifest(&manifest, "S3 express bucket", args.show_entries, file_size);
         }
     }
 

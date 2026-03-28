@@ -135,7 +135,7 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
     match checkpoint_flush_inner(sim, ctx.ns(), timeline, lsn, &root_dir, &data_dir_path()) {
         Ok(None) => {
             pg_log_info(&format!(
-                "tiko_checkpoint_flush: no dirty chunks — skipped (lsn={})",
+                "tiko_checkpoint_flush: nothing to upload (no dirty chunks, no nblocks updates, no fork deletions) — skipped (lsn={})",
                 lsn.to_hex()
             ));
         }
