@@ -10,8 +10,11 @@ use pgsys::logging::*;
 use std::sync::{Once, OnceLock};
 
 use engine::pitr_task::{PitrConfig, pitr_background_task};
-use store::project::{ProjectCtx, ProjectNamespace};
-use store::sim_store::SimStore;
+use engine::wal_streaming::{WalStreamConfig, wal_streaming_task};
+use store::{
+    project::{ProjectCtx, ProjectNamespace},
+    sim_store::SimStore,
+};
 
 /// Spawn the PITR background task on the Tokio runtime.
 ///
@@ -43,6 +46,30 @@ pub fn spawn_pitr_task() {
 
     runtime.spawn(pitr_background_task(sim, ns, cfg));
     pg_log_info("tiko: PITR background task spawned");
+}
+
+/// Spawn the WAL streaming task on the Tokio runtime.
+///
+/// Does nothing if the runtime, `ProjectCtx`, or `SimStore` are not yet initialised.
+pub fn spawn_wal_streaming_task() {
+    let Some(runtime) = TOKIO_RUNTIME.get() else {
+        pg_log_warning("tiko: spawn_wal_streaming_task called before runtime init; skipping");
+        return;
+    };
+
+    let Some(ctx) = ProjectCtx::try_get() else {
+        pg_log_info("tiko: ProjectCtx not initialised; skipping WAL streaming task");
+        return;
+    };
+
+    let Some(sim) = SimStore::try_get() else {
+        pg_log_warning("tiko: SimStore not initialised; skipping WAL streaming task");
+        return;
+    };
+
+    let ns = ctx.ns().clone();
+    runtime.spawn(wal_streaming_task(sim, ns, WalStreamConfig::default()));
+    pg_log_info("tiko: WAL streaming task spawned");
 }
 
 /// The global Tokio runtime handle stored safely using OnceLock

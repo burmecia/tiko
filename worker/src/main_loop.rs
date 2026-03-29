@@ -93,6 +93,9 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     // Spawn the PITR background task now that the runtime and ProjectCtx are initialised.
     thread_pool::spawn_pitr_task();
 
+    // Spawn WAL streaming task.
+    thread_pool::spawn_wal_streaming_task();
+
     // Get shared memory IO control structure
     let io_control = IoControl::get();
 

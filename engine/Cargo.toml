@@ -14,6 +14,7 @@ store = { path = "../store" }
 libc = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

@@ -228,7 +228,7 @@ dynamic_shared_memory_type = posix	# the default is usually the first option
 
 # - Settings -
 
-#wal_level = replica			# minimal, replica, or logical
+wal_level = replica			# minimal, replica, or logical
 					# (change requires restart)
 #fsync = on				# flush data to disk for crash safety
 					# (turning this off can cause
@@ -336,12 +336,12 @@ min_wal_size = 80MB
 
 # Set these on the primary and on any standby that will send replication data.
 
-#max_wal_senders = 10		# max number of walsender processes
+max_wal_senders = 2		# max number of walsender processes
 				# (change requires restart)
-#max_replication_slots = 10	# max number of replication slots
+max_replication_slots = 2	# max number of replication slots
 				# (change requires restart)
 #wal_keep_size = 0		# in megabytes; 0 disables
-#max_slot_wal_keep_size = -1	# in megabytes; -1 disables
+max_slot_wal_keep_size = 1024	# in megabytes; -1 disables
 #idle_replication_slot_timeout = 0	# in seconds; 0 disables
 #wal_sender_timeout = 60s	# in milliseconds; 0 disables
 #track_commit_timestamp = off	# collect timestamp of transaction commit
@@ -887,12 +887,12 @@ shared_preload_libraries=libtikoworker
 shared_buffers=256kB
 log_statement=all
 
-# - Tiko WAL archiving -
-archive_mode = on		# enables archiving; off, on, or always
-archive_command = '/Users/bolu/supabase/tiko/target/debug/tiko_archive %p %f'		# command to use to archive a WAL file
-				# placeholders: %p = path of file to archive
-				#               %f = file name only
-				# e.g. 'test ! -f /mnt/server/archivedir/%f && cp %p /mnt/server/archivedir/%f'
-#archive_timeout = 0		# force a WAL file switch after this
-				# number of seconds; 0 disables
+# WAL is streamed in real-time by the tikoworker background task.
+# archive_mode / archive_command are not used with Tiko.
+wal_level             = replica
+max_wal_senders       = 2      # ≥ 1 for the streaming task; +1 spare
+max_replication_slots = 2      # ≥ 1 for tiko_wal_stream; +1 spare
 
+# Safety valve: bounds pg_wal disk usage if streaming falls behind.
+# When hit, the slot is invalidated and a WAL gap results — size accordingly.
+max_slot_wal_keep_size = 1GB

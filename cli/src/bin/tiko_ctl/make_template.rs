@@ -48,11 +48,16 @@ pub fn run(pg_bindir: &Path, tiko_root: Option<&Path>) {
     }
 
     // ── 3. Create postgresql.tiko.conf and include it from postgresql.conf ──────
-    let tiko_conf = "\
-# Tiko storage manager settings\n\
-shared_preload_libraries = 'libtikoworker'\n\
-log_min_messages = debug1\n\
-";
+    let tiko_conf = r#"# Tiko storage manager settings
+shared_preload_libraries = 'libtikoworker'
+log_min_messages = debug1
+
+# WAL streaming settings
+wal_level = replica
+max_wal_senders = 2
+max_replication_slots = 2
+max_slot_wal_keep_size = 1GB
+"#;
     fs::write(pgdata.join("postgresql.tiko.conf"), tiko_conf).unwrap_or_else(|e| {
         eprintln!("error: failed to write postgresql.tiko.conf: {e}");
         std::process::exit(1);

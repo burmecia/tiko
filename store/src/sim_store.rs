@@ -130,6 +130,23 @@ impl SimStore {
         remove_optional(&self.standard_root.join(key))
     }
 
+    /// Remove an empty directory under the standard bucket (e.g. a `.chunks/` folder
+    /// after all chunk objects have been deleted).  Silently succeeds if the
+    /// directory does not exist or is not empty.
+    pub fn remove_dir_standard(&self, prefix: &str) -> io::Result<()> {
+        let path = self.standard_root.join(prefix);
+        match fs::remove_dir(&path) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.kind() == io::ErrorKind::DirectoryNotEmpty =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     // ── Template helpers ──────────────────────────────────────────────────
 
     fn template_key(&self, filename: &str) -> PathBuf {

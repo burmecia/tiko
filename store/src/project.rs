@@ -164,6 +164,29 @@ impl ProjectNamespace {
         )
     }
 
+    /// Prefix for all 256 KiB chunk objects belonging to one in-flight segment.
+    ///
+    /// `{org}/pitr/{proj}/wal/{timeline:08X}/{segment}.chunks/`
+    ///
+    /// The `.chunks` suffix distinguishes the chunk directory from the sealed
+    /// segment object (`{segment}`) stored at the same parent prefix.
+    pub fn wal_chunk_prefix(&self, timeline: u32, segment: &str) -> String {
+        format!(
+            "{}/pitr/{}/wal/{:08X}/{}.chunks/",
+            self.org_id, self.project_id, timeline, segment
+        )
+    }
+
+    /// Key for one 256 KiB streaming chunk within an in-flight WAL segment.
+    ///
+    /// `{org}/pitr/{proj}/wal/{timeline:08X}/{segment}.chunks/{byte_offset:016X}`
+    pub fn wal_chunk_key(&self, timeline: u32, segment: &str, byte_offset: usize) -> String {
+        format!(
+            "{}/pitr/{}/wal/{:08X}/{}.chunks/{:016X}",
+            self.org_id, self.project_id, timeline, segment, byte_offset
+        )
+    }
+
     /// `{org}/metadata/{proj}/project.json`
     pub fn project_meta_key(&self) -> String {
         format!("{}/metadata/{}/project.json", self.org_id, self.project_id)
