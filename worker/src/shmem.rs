@@ -6,7 +6,7 @@
 //! - `shmem_startup_hook` to initialize structures
 //! - `ShmemInitStruct` to create the shared control structure + backend pools
 
-use engine::io_queue::IoControl;
+use core::io_queue::IoControl;
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS},
     logging::*,
@@ -33,7 +33,7 @@ pub extern "C" fn worker_shmem_request() {
             "tiko: requested {} bytes shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
             size,
             max_backends,
-            engine::cache::CACHE_NUM_SLOTS
+            core::cache::CACHE_NUM_SLOTS
         ));
     }
 }
@@ -52,7 +52,7 @@ pub extern "C" fn worker_shmem_startup() {
         pg_log_debug1(&format!(
             "tiko: initialized shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
             max_backends,
-            engine::cache::CACHE_NUM_SLOTS
+            core::cache::CACHE_NUM_SLOTS
         ));
     }
 }

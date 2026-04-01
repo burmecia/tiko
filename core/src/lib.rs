@@ -1,9 +1,17 @@
+pub mod cache;
 pub mod chunk;
+pub mod dispatcher;
+pub mod io_queue;
+pub mod log_relay;
 pub mod manifest;
+pub mod nblocks_table;
 pub mod org;
+pub mod pitr_task;
 pub mod project;
 pub mod recovery;
+pub mod s3_ops;
 pub mod sim_store;
+pub mod wal_streaming;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkLogEntry, ChunkTag, RelFork};
 

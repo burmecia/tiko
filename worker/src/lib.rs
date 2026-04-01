@@ -1,8 +1,8 @@
 // Re-export engine modules (moved from worker to engine crate)
-pub use engine::{cache, dispatcher, io_queue, log_relay, pitr_task, s3_ops};
+pub use core::{cache, dispatcher, io_queue, log_relay, pitr_task, s3_ops};
 
 // Re-export the shared store modules
-pub use store::{manifest, project, recovery, sim_store};
+pub use core::{manifest, project, recovery, sim_store};
 
 mod io_handler;
 mod main_loop;

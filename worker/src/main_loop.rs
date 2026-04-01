@@ -10,7 +10,8 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use engine::{dispatcher::Dispatcher, io_queue::IoControl, log_relay};
+use core::{dispatcher::Dispatcher, io_queue::IoControl, log_relay};
+use core::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 use pgsys::{
     common::{MyProcPid, SIGHUP, SIGTERM},
     cshim::check_for_interrupts,
@@ -18,7 +19,6 @@ use pgsys::{
     logging::*,
     wait_events::new_wait_event,
 };
-use store::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 
 use crate::io_handler;
 use crate::thread_pool;

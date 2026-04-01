@@ -52,7 +52,7 @@ use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use pgsys::logging::pg_log_debug1;
 
 use crate::io_queue::IoControl;
-use store::{
+use crate::{
     chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkLogEntry, ChunkTag, RelFork},
     tiko_root_path,
 };
@@ -270,7 +270,7 @@ impl CacheControl {
     // ── Cache data file ──
 
     fn cache_file_path() -> PathBuf {
-        store::tiko_root_path().join("cache")
+        crate::tiko_root_path().join("cache")
     }
 
     pub fn cache_file() -> &'static File {
@@ -701,8 +701,8 @@ impl CacheControl {
         // Express PUT + eviction log append.
         // Guard: only run when SimStore and ProjectCtx are initialised.
         if let (Some(sim), Some(ctx)) = (
-            store::sim_store::SimStore::try_get(),
-            store::project::ProjectCtx::try_get(),
+            crate::sim_store::SimStore::try_get(),
+            crate::project::ProjectCtx::try_get(),
         ) {
             let mut chunk_data = vec![0u8; CHUNK_SIZE];
             self.read_blocks_from_slot(slot_index, 0, BLOCKS_PER_CHUNK, &mut chunk_data);
@@ -1057,11 +1057,11 @@ impl CacheControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ProjectNamespace;
+    use crate::sim_store::SimStore;
     use pgsys::Lsn;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use store::project::ProjectNamespace;
-    use store::sim_store::SimStore;
     use tempfile::TempDir;
 
     fn make_tag(i: u32) -> ChunkTag {
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[test]
     fn read_cache_log_all_three_variants() {
-        use store::chunk::RelFork;
+        use crate::chunk::RelFork;
         let dir = TempDir::new().unwrap();
         let path = CacheControl::cache_log_path(dir.path());
 

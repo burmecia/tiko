@@ -14,8 +14,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 pgsys = { path = "../pgsys" }
-engine = { path = "../engine" }
-store = { path = "../store" }
+core = { path = "../core" }
 tracing = { workspace = true }
 zstd = { workspace = true }
 tar = { workspace = true }

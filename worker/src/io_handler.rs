@@ -15,12 +15,12 @@
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
+use core::chunk::RelFork;
 use pgsys::latch::SetLatch;
-use store::chunk::RelFork;
 
-use engine::dispatcher::IoWorkRequest;
-use engine::io_queue::{IoControl, IoOpKind};
-use engine::s3_ops;
+use core::dispatcher::IoWorkRequest;
+use core::io_queue::{IoControl, IoOpKind};
+use core::s3_ops;
 
 /// Main I/O worker loop — receives requests from the dispatcher channel
 /// and spawns a Tokio task for each request.

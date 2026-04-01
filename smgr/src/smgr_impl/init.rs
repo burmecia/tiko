@@ -1,10 +1,10 @@
-use engine::io_queue::IoControl;
+use core::io_queue::IoControl;
+use core::{org::OrgMeta, project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number, is_under_postmaster},
     logging::*,
     wait_events::new_wait_event,
 };
-use store::{org::OrgMeta, project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_init() {
@@ -24,9 +24,9 @@ pub extern "C-unwind" fn tiko_init() {
     ProjectCtx::init_from_env(&root_dir);
 
     // If a recovery manifest exists, load it into memory and set RECOVERY_MODE=true.
-    let recovery_manifest = store::manifest::Manifest::recovery_manifest_path(&root_dir);
+    let recovery_manifest = core::manifest::Manifest::recovery_manifest_path(&root_dir);
     if recovery_manifest.exists() {
-        if let Err(e) = store::recovery::load_recovery_manifest(&recovery_manifest) {
+        if let Err(e) = core::recovery::load_recovery_manifest(&recovery_manifest) {
             pg_log_error(&format!("tiko_init: failed to load recovery manifest: {e}"));
         }
     }

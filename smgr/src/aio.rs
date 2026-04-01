@@ -1,6 +1,6 @@
-use engine::{io_queue::IoOpKind, s3_ops};
+use core::chunk::RelFork;
+use core::{io_queue::IoOpKind, s3_ops};
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
-use store::chunk::RelFork;
 
 use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipeline};
 

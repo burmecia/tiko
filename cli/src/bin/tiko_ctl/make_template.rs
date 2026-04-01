@@ -1,8 +1,8 @@
+use core::sim_store::SimStore;
 use pgsys::common::PG_VERSION_NUM;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use store::sim_store::SimStore;
 
 pub fn run(pg_bindir: &Path, tiko_root: Option<&Path>) {
     let temp_dir = tempfile::tempdir().unwrap_or_else(|e| {

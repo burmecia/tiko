@@ -30,10 +30,10 @@
 
 use std::path::{Path, PathBuf};
 
-use pgsys::Lsn;
-use store::{
+use core::{
     ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, project::ProjectNamespace, sim_store::SimStore,
 };
+use pgsys::Lsn;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

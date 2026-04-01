@@ -2,12 +2,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use pgsys::Lsn;
-use store::{
+use core::{
     project::{ProjectMeta, ProjectNamespace, create_branch},
     recovery::prepare_recovery,
     sim_store::SimStore,
 };
+use pgsys::Lsn;
 
 pub fn run(
     sim: &SimStore,

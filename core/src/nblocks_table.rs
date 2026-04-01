@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use store::chunk::{REL_FORK_SIZE, RelFork};
+use crate::chunk::{REL_FORK_SIZE, RelFork};
 
 use crate::cache::AtomicRWLock;
 
@@ -369,7 +369,7 @@ impl NblocksControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use store::chunk::RelFork;
+    use crate::chunk::RelFork;
 
     fn make_control() -> Box<(NblocksControl, Vec<NblocksEntry>, Vec<AtomicRWLock>)> {
         let mut entries: Vec<NblocksEntry> = (0..NBLOCKS_NUM_ENTRIES)

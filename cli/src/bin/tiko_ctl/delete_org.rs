@@ -1,5 +1,5 @@
-use store::org::OrgMeta;
-use store::sim_store::SimStore;
+use core::org::OrgMeta;
+use core::sim_store::SimStore;
 
 pub fn run(sim: &SimStore, org: u64, force: bool) {
     match OrgMeta::delete(sim, org, force) {

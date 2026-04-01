@@ -1,7 +1,7 @@
+use core::org::OrgMeta;
+use core::sim_store::SimStore;
 use std::fs;
 use std::process::Command;
-use store::org::OrgMeta;
-use store::sim_store::SimStore;
 
 /// Source org_id baked into the template by `make_template` (initdb runs with TIKO_ORG_ID=0).
 const TEMPLATE_ORG_ID: u64 = 0;

@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use store::{project::ProjectNamespace, sim_store::SimStore};
+use core::{project::ProjectNamespace, sim_store::SimStore};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

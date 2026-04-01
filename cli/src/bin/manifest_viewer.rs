@@ -42,8 +42,8 @@
 
 use std::path::{Path, PathBuf};
 
-use store::manifest::Manifest;
-use store::sim_store::SimStore;
+use core::manifest::Manifest;
+use core::sim_store::SimStore;
 
 // ── Argument parsing ─────────────────────────────────────────────────────────
 

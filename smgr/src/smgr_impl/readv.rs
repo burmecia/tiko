@@ -1,10 +1,10 @@
-use engine::s3_ops;
+use core::chunk::RelFork;
+use core::s3_ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, in_recovery},
     logging::pg_log_error,
     smgr::*,
 };
-use store::chunk::RelFork;
 
 use crate::buffers;
 

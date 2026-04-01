@@ -1,8 +1,8 @@
-use pgsys::Lsn;
-use store::{
+use core::{
     project::{ProjectMeta, ProjectNamespace, build_initial_manifest},
     sim_store::SimStore,
 };
+use pgsys::Lsn;
 
 pub fn run(sim: &SimStore, org: u64, project: u64, branch: u64, lsn: &str) {
     let ns = ProjectNamespace::new(org, project, branch);

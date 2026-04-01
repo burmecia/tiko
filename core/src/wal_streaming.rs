@@ -23,8 +23,8 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::log_relay;
+use crate::{project::ProjectNamespace, sim_store::SimStore};
 use pgsys::common::XLOG_SEG_SIZE;
-use store::{project::ProjectNamespace, sim_store::SimStore};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

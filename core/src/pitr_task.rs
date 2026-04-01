@@ -11,7 +11,7 @@
 use pgsys::Lsn;
 
 use crate::log_relay;
-use store::{
+use crate::{
     ENV_PITR_INTERVAL_SECS,
     manifest::Manifest,
     project::{ProjectCtx, ProjectNamespace},
@@ -242,9 +242,9 @@ pub fn materialize_base(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::ChunkTag;
+    use crate::manifest::ChunkRef;
     use std::collections::HashMap;
-    use store::chunk::ChunkTag;
-    use store::manifest::ChunkRef;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, SimStore) {

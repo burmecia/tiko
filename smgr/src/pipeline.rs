@@ -7,7 +7,7 @@
 
 use std::sync::atomic::Ordering;
 
-use engine::io_queue::*;
+use core::io_queue::*;
 use pgsys::{
     common::{BlockNumber, ForkNumber, Oid, RelFileNumber, get_my_proc_number},
     latch::*,

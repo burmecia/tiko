@@ -1,6 +1,6 @@
 [package]
-name = "store"
-description = "Shared storage layer: chunk types, manifest, project, sim store, recovery"
+name = "core"
+description = "Tiko core: storage layer, I/O engine, shared-memory cache, block-level S3 ops"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -10,8 +10,13 @@ rust-version = { workspace = true }
 
 [dependencies]
 pgsys = { path = "../pgsys" }
+libc = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 zstd = { workspace = true }
+tar = { workspace = true }
 tempfile = { workspace = true }

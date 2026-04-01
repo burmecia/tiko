@@ -20,14 +20,14 @@
 use std::io;
 use std::sync::atomic::Ordering;
 
+use crate::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkLogEntry, ChunkTag, RelFork};
 use crate::{cache::CacheControl, io_queue::IoControl};
-use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
-use store::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkLogEntry, ChunkTag, RelFork};
-use store::{
+use crate::{
     project::{ProjectCtx, ProjectNamespace},
     recovery,
     sim_store::SimStore,
 };
+use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 
 // ── S3 chunk fetch ────────────────────────────────────────────────────────────
 
@@ -703,14 +703,14 @@ pub fn warm_cache_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::ChunkTag;
+    use crate::manifest::{ChunkRef, Manifest};
+    use crate::project::ProjectNamespace;
+    use crate::recovery;
+    use crate::sim_store::SimStore;
     use pgsys::Lsn;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
-    use store::chunk::ChunkTag;
-    use store::manifest::{ChunkRef, Manifest};
-    use store::project::ProjectNamespace;
-    use store::recovery;
-    use store::sim_store::SimStore;
     use tempfile::TempDir;
 
     /// Serialises tests in this module that read or write `RECOVERY_MODE`.

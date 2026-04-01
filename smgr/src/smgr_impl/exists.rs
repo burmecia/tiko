@@ -1,6 +1,6 @@
-use engine::s3_ops;
+use core::chunk::RelFork;
+use core::s3_ops;
 use pgsys::{common::ForkNumber, smgr::*};
-use store::chunk::RelFork;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_exists(reln: *mut SMgrRelationData, forknum: ForkNumber) -> bool {

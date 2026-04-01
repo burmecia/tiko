@@ -10,8 +10,8 @@ mod make_template;
 mod restore;
 
 use clap::{Parser, Subcommand};
+use core::sim_store::SimStore;
 use std::path::{Path, PathBuf};
-use store::sim_store::SimStore;
 
 #[derive(Parser)]
 #[command(name = "tiko_ctl", about = "Tiko control CLI tools")]

@@ -9,9 +9,9 @@
 use pgsys::logging::*;
 use std::sync::{Once, OnceLock};
 
-use engine::pitr_task::{PitrConfig, pitr_background_task};
-use engine::wal_streaming::{WalStreamConfig, wal_streaming_task};
-use store::{
+use core::pitr_task::{PitrConfig, pitr_background_task};
+use core::wal_streaming::{WalStreamConfig, wal_streaming_task};
+use core::{
     project::{ProjectCtx, ProjectNamespace},
     sim_store::SimStore,
 };

@@ -56,15 +56,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use engine::{cache::CacheControl, io_queue::IoControl, pitr_task::materialize_base};
-use pgsys::{Lsn, common::data_dir_path, logging::*};
-use store::{
+use core::{cache::CacheControl, io_queue::IoControl, pitr_task::materialize_base};
+use core::{
     chunk::{ChunkLogEntry, ChunkTag, RelFork},
     manifest::{ChunkRef, Manifest},
     project::{ProjectCtx, ProjectNamespace},
     sim_store::SimStore,
     tiko_root_path,
 };
+use pgsys::{Lsn, common::data_dir_path, logging::*};
 
 // ── flush_all_dirty_nblocks ────────────────────────────────────────────────────
 
@@ -413,13 +413,13 @@ fn build_pg_state_archive(pgdata: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::chunk::{CHUNK_SIZE, ChunkLogEntry, ChunkTag};
+    use core::manifest::{ChunkRef, Manifest};
+    use core::project::ProjectNamespace;
+    use core::sim_store::SimStore;
     use pgsys::Lsn;
     use std::fs;
     use std::io::Write as _;
-    use store::chunk::{CHUNK_SIZE, ChunkLogEntry, ChunkTag};
-    use store::manifest::{ChunkRef, Manifest};
-    use store::project::ProjectNamespace;
-    use store::sim_store::SimStore;
     use tempfile::TempDir;
 
     // ── Test helpers ──────────────────────────────────────────────────────
