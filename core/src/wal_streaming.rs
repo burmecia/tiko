@@ -22,7 +22,6 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use crate::log_relay;
 use crate::{project::ProjectNamespace, sim_store::SimStore};
 use pgsys::common::XLOG_SEG_SIZE;
 
@@ -69,21 +68,19 @@ pub async fn wal_streaming_task(
     ns: ProjectNamespace,
     config: WalStreamConfig,
 ) {
-    log_relay::relay_info(&format!(
+    tracing::info!(
         "tiko: wal_streaming: task started with connstr: {}, slot: {}",
         config.connstr, config.slot_name
-    ));
+    );
     let mut backoff = Duration::from_secs(1);
     loop {
         match run_streaming(sim, &ns, &config).await {
             Ok(()) => {
-                log_relay::relay_info("tiko: wal_streaming: connection closed, reconnecting");
+                tracing::info!("tiko: wal_streaming: connection closed, reconnecting");
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
-                log_relay::relay_warning(format!(
-                    "tiko: wal_streaming: {e}, reconnecting in {backoff:?}"
-                ));
+                tracing::warn!("tiko: wal_streaming: {e}, reconnecting in {backoff:?}");
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
@@ -132,7 +129,7 @@ async fn run_streaming(
     let os_user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
     let user = params.get("user").copied().unwrap_or(os_user.as_str());
     let mut conn = ReplConn::connect(&socket_path, user).await?;
-    log_relay::relay_info("tiko: wal_streaming: connected to postmaster");
+    tracing::info!("tiko: wal_streaming: connected to postmaster");
 
     // ── IDENTIFY_SYSTEM → timeline + current xlogpos ─────────────────────────
     // Columns: systemid | timeline | xlogpos | dbname
@@ -179,10 +176,10 @@ async fn run_streaming(
             config.slot_name
         );
         conn.simple_query(&create_sql).await?;
-        log_relay::relay_info(format!(
+        tracing::info!(
             "tiko: wal_streaming: created slot '{}', starting from {xlogpos_str}",
             config.slot_name
-        ));
+        );
         // consistent_point in the CREATE response is always 0/0 for physical
         // slots — meaningless.  RESERVE_WAL retains WAL from xlogpos onwards.
         xlogpos
@@ -190,19 +187,19 @@ async fn run_streaming(
         // Slot exists — column 1 is restart_lsn (may be NULL if slot has never streamed).
         match row.into_iter().nth(1).flatten() {
             Some(s) => {
-                log_relay::relay_debug1(format!(
+                tracing::debug!(
                     "tiko: wal_streaming: slot '{}' already exists, resuming",
                     config.slot_name
-                ));
+                );
                 parse_lsn(&s).map_err(|e| format!("slot restart_lsn parse error: {e}"))?
             }
             None => {
                 // restart_lsn is NULL — slot was not created with RESERVE_WAL
                 // or has never streamed.  Start from current WAL position.
-                log_relay::relay_info(format!(
+                tracing::info!(
                     "tiko: wal_streaming: slot '{}' has no restart_lsn, starting from current WAL position ({xlogpos_str})",
                     config.slot_name
-                ));
+                );
                 xlogpos
             }
         }
@@ -217,13 +214,13 @@ async fn run_streaming(
         timeline
     );
     conn.start_replication(&start_sql).await?;
-    log_relay::relay_info(format!(
+    tracing::info!(
         "tiko: wal_streaming: streaming started (slot={}, tl={}, lsn={:X}/{:X})",
         config.slot_name,
         timeline,
         (start_lsn >> 32) as u32,
         start_lsn as u32,
-    ));
+    );
 
     // ── Message loop ──────────────────────────────────────────────────────────
     let mut confirmed_lsn: u64 = start_lsn;
@@ -258,10 +255,10 @@ async fn run_streaming(
                         }
                     }
                     _ => {
-                        log_relay::relay_warning(format!(
+                        tracing::warn!(
                             "tiko: wal_streaming: unknown CopyData type 0x{:02X}",
                             msg[0]
-                        ));
+                        );
                     }
                 }
             }
@@ -380,7 +377,7 @@ async fn seal_segment(
         .map_err(|e| format!("seal spawn_blocking panicked: {e}"))?
         .map_err(|e| format!("sealed PUT failed for {name_log}: {e}"))?;
 
-    log_relay::relay_debug2(format!("tiko: wal_streaming: sealed {name}"));
+    tracing::trace!("tiko: wal_streaming: sealed {name}");
 
     // 4. Advance confirmed_lsn — only here, always at a segment boundary.
     *confirmed_lsn = (seg_no + 1) * XLOG_SEG_SIZE as u64;

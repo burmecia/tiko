@@ -1,5 +1,7 @@
+pub mod log_relay;
+
 // Re-export engine modules (moved from worker to engine crate)
-pub use core::{cache, dispatcher, io_queue, log_relay, pitr_task, s3_ops};
+pub use core::{cache, dispatcher, io_queue, pitr_task, s3_ops};
 
 // Re-export the shared store modules
 pub use core::{manifest, project, recovery, sim_store};

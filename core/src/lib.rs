@@ -2,7 +2,6 @@ pub mod cache;
 pub mod chunk;
 pub mod dispatcher;
 pub mod io_queue;
-pub mod log_relay;
 pub mod manifest;
 pub mod nblocks_table;
 pub mod org;

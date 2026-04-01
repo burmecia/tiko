@@ -10,7 +10,6 @@
 
 use pgsys::Lsn;
 
-use crate::log_relay;
 use crate::{
     ENV_PITR_INTERVAL_SECS,
     manifest::Manifest,
@@ -57,14 +56,11 @@ pub async fn pitr_background_task(
     ns: ProjectNamespace,
     config: PitrConfig,
 ) {
-    // pg_log_* must not be called from a Tokio thread (requires PG process-local
-    // state).  Use log_relay::relay_* instead — messages are queued and forwarded
-    // to pg_log_* by the main PG thread each loop iteration.
-    log_relay::relay_info(format!(
+    tracing::info!(
         "tiko: pitr_background_task started (project={}, interval={}s)",
         ns.project_id,
         config.materialization_interval.as_secs(),
-    ));
+    );
     let mut interval = tokio::time::interval(config.materialization_interval);
     loop {
         interval.tick().await;
@@ -76,28 +72,28 @@ pub async fn pitr_background_task(
             .unwrap_or(1);
         match materialize_base(&sim, &ns, timeline) {
             Ok(MaterializeResult::NoNewDeltas { base_lsn }) => {
-                log_relay::relay_info(format!(
+                tracing::info!(
                     "tiko: pitr: no new deltas since base {base_lsn} — skipping (project={})",
                     ns.project_id
-                ));
+                );
             }
             Ok(MaterializeResult::Materialized {
                 prev_base_lsn,
                 new_lsn,
                 delta_count,
             }) => {
-                log_relay::relay_info(format!(
+                tracing::info!(
                     "tiko: pitr: materialized new base at lsn={} \
                      ({delta_count} delta(s) merged, prev_base={prev_base_lsn}, project={})",
                     new_lsn.to_hex(),
                     ns.project_id,
-                ));
+                );
             }
             Err(e) => {
-                log_relay::relay_warning(format!(
+                tracing::warn!(
                     "tiko: pitr: materialize_base failed (project={}): {e}",
                     ns.project_id
-                ));
+                );
             }
         }
     }
@@ -179,7 +175,7 @@ pub fn materialize_base(
 
     // Step 3: nothing new to merge.
     if delta_lsns.is_empty() {
-        log_relay::relay_debug1(format!("tiko: pitr: no new deltas since base {base_lsn}"));
+        tracing::debug!("tiko: pitr: no new deltas since base {base_lsn}");
         return Ok(MaterializeResult::NoNewDeltas { base_lsn });
     }
 
@@ -205,12 +201,12 @@ pub fn materialize_base(
     // This is a single atomic write; the new base is valid after this PUT.
     let new_lsn = *delta_lsns.last().unwrap(); // non-empty: checked above
     let delta_count = delta_lsns.len();
-    log_relay::relay_debug1(format!(
+    tracing::debug!(
         "tiko: pitr: uploading new base manifest at lsn={} ({} delta(s) merged, prev_base={})",
         new_lsn.to_hex(),
         delta_count,
         base_lsn,
-    ));
+    );
     sim.put_standard(&ns.base_manifest_key(timeline, new_lsn), &base.to_bytes()?)?;
 
     // Step 6: refresh the global manifest in-place.
