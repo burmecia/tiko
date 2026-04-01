@@ -23,12 +23,10 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::log_relay;
+use pgsys::common::XLOG_SEG_SIZE;
 use store::{project::ProjectNamespace, sim_store::SimStore};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
-/// Default WAL segment size (16 MiB, PostgreSQL default).
-const XLOG_SEG_SIZE: usize = 16 * 1024 * 1024;
 
 /// Chunk upload size (256 KiB — fixed, not configurable).
 const CHUNK_BYTES: usize = 256 * 1024;

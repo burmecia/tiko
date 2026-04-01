@@ -74,3 +74,33 @@ WHERE name IN ('archive_mode', 'archive_command', 'archive_timeout');
 
 # force WAL archive to switch to a new segment, so that we can test archive_command with a known WAL file
 SELECT pg_switch_wal();
+
+-------------- 
+
+Branch creation process for non-root project:
+
+1. Run CHECKPOINT on parent
+   → pg_control now has: checkPoint.redo=R
+
+2. Snapshot pg_state + manifests from parent
+
+3. Read R from snapshotted pg_control
+
+4. Synchronously copy all WAL pages covering [R, <present>) from parent's 
+   pg_wal/ into the child's pg_wal/
+   (this is a bounded, small, blocking operation — a few KB at most)
+
+5. Configure child:
+   - recovery.signal
+   - recovery_target = 'immediate'
+   - recovery_target_action = shutdown
+   No need to set restore_command, as the child will read WAL segments directly
+   from its local pg_wal/ during recovery.
+   This avoids any dependency on the store or streaming task for WAL access during recovery.
+   Replays only [R, <present>), resolves in-flight transactions via child's local WAL
+   Shut down as soon as a consistent state is reached on a new timeline.
+   zero dependency on streaming task
+
+6. Start child
+   → remove recovery configuration
+   → start normally

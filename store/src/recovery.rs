@@ -19,7 +19,7 @@ use crate::chunk::ChunkTag;
 use crate::manifest::{ChunkRef, Manifest};
 use crate::project::ProjectNamespace;
 use crate::sim_store::SimStore;
-use pgsys::Lsn;
+use pgsys::{Lsn, common::XLOG_SEG_SIZE};
 
 /// Exposed as `pub(crate)` so tests in sibling modules can force the flag.
 pub static RECOVERY_MODE: AtomicBool = AtomicBool::new(false);
@@ -99,16 +99,102 @@ pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
     }
 }
 
+// ── WAL copy from parent pg_wal/ to child pg_wal/ ────────────────────────────
+
+/// Read `checkPointCopy.redo` from the `pg_control` file.
+///
+/// PostgreSQL's `ControlFileData` layout on a 64-bit system places
+/// `checkPointCopy.redo` (the first `XLogRecPtr` of the `CheckPoint` struct)
+/// at byte offset 40:
+///   - offset  0: system_identifier (uint64, 8 bytes)
+///   - offset  8: pg_control_version (uint32, 4 bytes)
+///   - offset 12: catalog_version_no (uint32, 4 bytes)
+///   - offset 16: state (DBState / int, 4 bytes)
+///   - offset 20: padding (4 bytes, 8-byte alignment for time)
+///   - offset 24: time (pg_time_t / int64, 8 bytes)
+///   - offset 32: checkPoint (XLogRecPtr / uint64, 8 bytes)
+///   - offset 40: checkPointCopy.redo (XLogRecPtr / uint64, 8 bytes)  ← here
+fn read_checkpoint_redo(pg_control_path: &Path) -> Result<u64> {
+    let data = fs::read(pg_control_path)?;
+    if data.len() < 48 {
+        return Err(Error::Other(format!(
+            "pg_control too short: {} bytes (expected ≥ 48)",
+            data.len()
+        )));
+    }
+    let redo = u64::from_le_bytes(data[40..48].try_into().unwrap());
+    Ok(redo)
+}
+
+/// Copy WAL segment files from `parent_pg_wal` into `child_pg_wal`, starting
+/// from the segment that contains `redo_lsn` through all segments that
+/// currently exist in the parent's `pg_wal/` directory.
+///
+/// Copies everything available so the child has the full WAL history from the
+/// redo point up to the present, not just up to the branch-point checkpoint.
+///
+/// Creates `child_pg_wal` if it does not exist.  Only files whose names match
+/// the WAL segment pattern for `timeline` (`{tl:08X}{log_id:08X}{log_seg:08X}`,
+/// 24 hex chars) with a segment number ≥ `first_seg(redo_lsn)` are copied;
+/// all other entries (history files, `archive_status/`, partial segments, etc.)
+/// are ignored.
+fn copy_branch_wal(
+    parent_pg_wal: &Path,
+    child_pg_wal: &Path,
+    redo_lsn: u64,
+    timeline: u32,
+) -> Result<()> {
+    fs::create_dir_all(child_pg_wal)?;
+
+    let seg_size = XLOG_SEG_SIZE as u64;
+    let segs_per_xlog_id = 0x1_0000_0000_u64 / seg_size; // 256 for 16 MiB
+    let first_seg = redo_lsn / seg_size;
+    let tl_prefix = format!("{timeline:08X}");
+
+    let entries = fs::read_dir(parent_pg_wal)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        // WAL segment filenames are exactly 24 uppercase hex characters.
+        if name.len() != 24 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        // Must belong to the same timeline.
+        if !name.starts_with(&tl_prefix) {
+            continue;
+        }
+        // Parse log_id + log_seg from the remaining 16 hex chars.
+        let log_id = u32::from_str_radix(&name[8..16], 16)
+            .map_err(|_| Error::Other(format!("unparseable WAL seg name: {name}")))?;
+        let log_seg = u32::from_str_radix(&name[16..24], 16)
+            .map_err(|_| Error::Other(format!("unparseable WAL seg name: {name}")))?;
+        let seg_no = log_id as u64 * segs_per_xlog_id + log_seg as u64;
+
+        if seg_no < first_seg {
+            continue;
+        }
+
+        fs::copy(entry.path(), child_pg_wal.join(&*name)).map_err(Error::Store)?;
+        eprintln!("Copied WAL segment {name} (segment {seg_no})");
+    }
+    Ok(())
+}
+
 /// Prepare PGDATA for crash recovery to `(target_tl, target_lsn)`.
 ///
 /// Steps:
 /// 1. Validate `deltas/{target_tl}/{target_lsn}/manifest.bin` exists.
 /// 2. Download and extract `pg_state.tar.zst` (pg_control, transaction logs,
 ///    pg_filenode.map) into PGDATA.
-/// 3. Build and write `recovery_manifest.bin` into PGDATA — newest base with
+/// 3. If `parent_pgdata` is provided, read `checkPointCopy.redo` from the
+///    extracted `pg_control`, then copy WAL segments covering
+///    `[redo_lsn, target_lsn]` from parent's `pg_wal/` into child's `pg_wal/`.
+/// 4. Build and write `recovery_manifest.bin` — newest base with
 ///    `base_lsn <= target_lsn` merged with all deltas in `(base_lsn, target_lsn]`.
-/// 4. Append recovery settings to `postgresql.conf`.
-/// 5. Touch `recovery.signal`.
+/// 5. Append recovery settings to `postgresql.tiko.conf`.
+/// 6. Touch `recovery.signal`.
 ///
 /// Intermediate files (pg_state archive, manifest working files) are written to
 /// a temporary directory that is cleaned up automatically on return.
@@ -119,8 +205,9 @@ pub fn prepare_recovery(
     root_path: &Path, // root path for recovery_manifest.bin files
     target_tl: u32,
     target_lsn: Lsn,
+    parent_pgdata: Option<&Path>, // parent's PGDATA; pg_wal/ is copied to child's pg_wal/
 ) -> Result<()> {
-    // ── 0. Validate target ────────────────────────────────────────────────────
+    // ── 1. Validate target ────────────────────────────────────────────────────
     let delta_key = ns.delta_manifest_key(target_tl, target_lsn);
     if sim
         .get_standard(&delta_key)
@@ -133,7 +220,7 @@ pub fn prepare_recovery(
     let work =
         tempfile::tempdir().map_err(|e| Error::Other(format!("failed to create temp dir: {e}")))?;
 
-    // ── 1. pg_state ───────────────────────────────────────────────────────────
+    // ── 2. pg_state ───────────────────────────────────────────────────────────
     let pg_state_key = ns.pg_state_key(target_tl, target_lsn);
     let pg_state_bytes = sim
         .get_standard(&pg_state_key)
@@ -156,7 +243,23 @@ pub fn prepare_recovery(
         return Err(Error::Other("pg_state tar extraction failed".into()));
     }
 
-    // ── 2. recovery_manifest.bin ──────────────────────────────────────────────
+    // ── 3. Copy parent WAL into child's pg_wal/ ───────────────────────────────
+    // pg_control is now in pgdata (extracted above). Read checkPointCopy.redo
+    // (offset 40) to find the earliest WAL byte the child needs, then copy
+    // every segment from [redo_lsn, target_lsn] from parent's pg_wal/.
+    // No restore_command — PostgreSQL reads WAL directly from local pg_wal/.
+    if let Some(parent_pgdata) = parent_pgdata {
+        let pg_control_path = pgdata.join("global").join("pg_control");
+        let redo_lsn = read_checkpoint_redo(&pg_control_path)?;
+        copy_branch_wal(
+            &parent_pgdata.join("pg_wal"),
+            &pgdata.join("pg_wal"),
+            redo_lsn,
+            target_tl,
+        )?;
+    }
+
+    // ── 4. recovery_manifest.bin ──────────────────────────────────────────────
     let manifest_path = Manifest::local_manifest_path(work.path());
     let base = load_base_manifest(sim, ns, target_tl, target_lsn, &manifest_path)?;
     apply_deltas_up_to(sim, ns, &base, work.path(), target_tl, target_lsn)?;
@@ -166,13 +269,10 @@ pub fn prepare_recovery(
     fs::create_dir_all(root_path)?;
     fs::copy(&manifest_path, Manifest::recovery_manifest_path(root_path)).map_err(Error::Store)?;
 
-    // ── 3. postgresql.tiko.conf ────────────────────────────────────────────────────
-    write_recovery_conf(
-        &pgdata.join(TIKO_CONF_FILE),
-        "/Users/bolu/supabase/tiko/target/debug/tiko_restore %f %p",
-    )?;
+    // ── 5. postgresql.tiko.conf ───────────────────────────────────────────────
+    write_recovery_conf(&pgdata.join(TIKO_CONF_FILE))?;
 
-    // ── 4. recovery.signal ────────────────────────────────────────────────────
+    // ── 6. recovery.signal ────────────────────────────────────────────────────
     fs::write(pgdata.join("recovery.signal"), b"")?;
 
     Ok(())
@@ -293,14 +393,17 @@ pub fn remove_recovery_conf(conf_path: &Path) -> Result<()> {
 /// shutdown checkpoints, where `checkPoint.redo == ProcLastRecPtr` and the
 /// checkpoint record is consumed before the WAL replay loop starts, so any
 /// `recovery_target_lsn` pointing at the checkpoint would never be reached.
-pub fn write_recovery_conf(conf_path: &Path, restore_command: &str) -> Result<()> {
+///
+/// No `restore_command` is written: WAL segments are copied directly into the
+/// child's `pg_wal/` by `prepare_recovery`, so PostgreSQL reads them from the
+/// local directory without calling an external command.
+pub fn write_recovery_conf(conf_path: &Path) -> Result<()> {
     let snippet = format!(
         "\n{}\
-         restore_command = '{}'\n\
          recovery_target = 'immediate'\n\
          recovery_target_action = 'shutdown'\n\
          {}",
-        RECOVERY_CONF_BEGIN, restore_command, RECOVERY_CONF_END,
+        RECOVERY_CONF_BEGIN, RECOVERY_CONF_END,
     );
     let existing = fs::read_to_string(conf_path).unwrap_or_default();
     fs::write(conf_path, format!("{existing}{snippet}"))?;

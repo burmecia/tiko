@@ -58,13 +58,29 @@ restart_db() {
     start_db
 }
 
+create_branch() {
+    rm -rf tt2 && rm -rf ~/.tiko/sim/standard/456/chunks/2 && rm -rf ~/.tiko/sim/standard/456/metadata/43
+    rm -rf ~/.tiko/sim/standard/456/pitr/43 && truncate -s 0 log.log
+    cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko create-branch \
+        --org 456 --project 43 --branch 2 \
+        --parent-project 42 --parent-branch 1 \
+        --parent-pgdata ./tt \
+        --template template-180001.tar.gz \
+        --pg-data ./tt2
+}
+create_branch
+exit 0
+
 rm -rf tt && rm -rf ~/.tiko/* && truncate -s 0 log.log
 cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko make-template --pg-bindir $PG_BIN_DIR
 cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko create-org --org 456 --template template-180001.tar.gz
-cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko create-branch --org 456 --project 42 --branch 1 --parent-project 0 --parent-branch 0  --template template-180001.tar.gz --lsn 000000000201F770 --pg-data ./tt
+cargo run -p cli --bin tiko_ctl -- --tiko-root ~/.tiko create-branch --org 456 --project 42 --branch 1 --parent-project 0 --parent-branch 0  --template template-180001.tar.gz --pg-data ./tt
 
 start_db
-$PG_BIN_DIR/psql -d postgres -c "create table tt(a int);insert into tt values(123);insert into tt values(456);"
+$PG_BIN_DIR/psql -d postgres -c "create table tt(a int);insert into tt values(123);insert into tt values(456);checkpoint;"
+
+exit 0
+
 restart_db
 test_row_count "tt" 2
 

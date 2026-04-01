@@ -16,32 +16,64 @@ pub fn run(
     branch: u64,
     parent_project: u64,
     parent_branch: u64,
-    lsn: &str,
+    parent_pgdata: Option<&Path>,
     template: &str,
     pg_data: &Path,
     tiko_root: &Path,
 ) {
     let ns = ProjectNamespace::new(org, project, branch);
     let parent_ns = ProjectNamespace::new(org, parent_project, parent_branch);
-    let target_lsn = Lsn::parse_either(lsn).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    });
+    let tl = {
+        let meta = ProjectMeta::load(sim, &parent_ns).unwrap_or_else(|e| {
+            eprintln!("error: failed to load parent project meta: {e}");
+            std::process::exit(1);
+        });
+        meta.current_timeline_id
+    };
 
-    let parent_meta = ProjectMeta::load(sim, &parent_ns).unwrap_or_else(|e| {
-        eprintln!("error: failed to load parent project meta: {e}");
-        std::process::exit(1);
-    });
+    // ── Determine branch LSN (latest checkpoint on parent's timeline) ─────────
+    let branch_lsn = if parent_project == 0 && parent_branch == 0 {
+        // Root project: latest base manifest LSN (shutdown checkpoint).
+        let base_prefix = parent_ns.base_prefix_for_timeline(tl);
+        let base_keys = sim.list_prefix_standard(&base_prefix).unwrap_or_else(|e| {
+            eprintln!("error: failed to list parent base manifests: {e}");
+            std::process::exit(1);
+        });
+        base_keys
+            .iter()
+            .filter_map(|k| {
+                let rel = k.strip_prefix(&base_prefix)?;
+                let lsn_hex = rel.split('/').next()?;
+                Lsn::from_hex(lsn_hex).ok()
+            })
+            .max()
+            .unwrap_or_else(|| {
+                eprintln!("error: no base manifests found for parent");
+                std::process::exit(1);
+            })
+    } else {
+        // Non-root project: latest delta manifest LSN (online checkpoint).
+        let delta_prefix = parent_ns.delta_prefix_for_timeline(tl);
+        let delta_keys = sim.list_prefix_standard(&delta_prefix).unwrap_or_else(|e| {
+            eprintln!("error: failed to list parent delta manifests: {e}");
+            std::process::exit(1);
+        });
+        delta_keys
+            .iter()
+            .filter_map(|k| {
+                let rest = k.strip_prefix(&delta_prefix)?;
+                let lsn_hex = rest.split('/').next()?;
+                Lsn::from_hex(lsn_hex).ok()
+            })
+            .max()
+            .unwrap_or_else(|| {
+                eprintln!("error: no checkpoints found for parent");
+                std::process::exit(1);
+            })
+    };
 
-    // Create the new branch in store
-    let child_meta = create_branch(
-        sim,
-        &parent_ns,
-        parent_meta.current_timeline_id,
-        &ns,
-        target_lsn,
-    )
-    .unwrap_or_else(|e| {
+    // ── Register the branch in the store ─────────────────────────────────────
+    let child_meta = create_branch(sim, &parent_ns, tl, &ns, branch_lsn).unwrap_or_else(|e| {
         eprintln!("error: failed to create branch: {e}");
         std::process::exit(1);
     });
@@ -80,43 +112,23 @@ pub fn run(
     });
 
     if parent_project == 0 && parent_branch == 0 {
-        // ── Phase 2 (root project): copy latest parent base manifest ─────────
+        // ── Phase 2 (root project): copy latest base manifest ────────────────
         // The root project uses a shutdown checkpoint — PostgreSQL archive
-        // recovery cannot target it. Instead, find the latest base manifest
-        // with base_lsn ≤ target_lsn, copy it into the child's namespace as
-        // the initial base, and start PostgreSQL normally (no recovery.signal).
-        let base_prefix = parent_ns.base_prefix_for_timeline(parent_meta.current_timeline_id);
-        let base_keys = sim.list_prefix_standard(&base_prefix).unwrap_or_else(|e| {
-            eprintln!("error: failed to list parent base manifests: {e}");
-            std::process::exit(1);
-        });
-
-        let (chosen_lsn, best_key) = base_keys
-            .iter()
-            .filter_map(|k| {
-                let rel = k.strip_prefix(&base_prefix)?;
-                let lsn_hex = rel.split('/').next()?;
-                let lsn = Lsn::from_hex(lsn_hex).ok()?;
-                (lsn <= target_lsn).then_some((lsn, k))
-            })
-            .max_by_key(|(lsn, _)| *lsn)
-            .unwrap_or_else(|| {
-                eprintln!("error: no base manifest with lsn ≤ {}", target_lsn.to_hex());
-                std::process::exit(1);
-            });
-
+        // recovery cannot target it. Copy the base manifest and pg_state into
+        // the child's namespace, then start PostgreSQL normally (no recovery.signal).
+        let manifest_key = parent_ns.base_manifest_key(tl, branch_lsn);
         let manifest_bytes = sim
-            .get_standard(best_key)
+            .get_standard(&manifest_key)
             .unwrap_or_else(|e| {
                 eprintln!("error: failed to read parent base manifest: {e}");
                 std::process::exit(1);
             })
             .unwrap_or_else(|| {
-                eprintln!("error: parent base manifest not found: {best_key}");
+                eprintln!("error: parent base manifest not found: {manifest_key}");
                 std::process::exit(1);
             });
 
-        sim.put_standard(&ns.base_manifest_key(1, target_lsn), &manifest_bytes)
+        sim.put_standard(&ns.base_manifest_key(1, branch_lsn), &manifest_bytes)
             .unwrap_or_else(|e| {
                 eprintln!("error: failed to upload initial base manifest: {e}");
                 std::process::exit(1);
@@ -124,7 +136,7 @@ pub fn run(
 
         // Extract the checkpoint's pg_state.tar.zst (pg_control, pg_xact, …)
         // into pgdata so PostgreSQL starts with a consistent control file.
-        let pg_state_key = parent_ns.pg_state_key(parent_meta.current_timeline_id, chosen_lsn);
+        let pg_state_key = parent_ns.pg_state_key(tl, branch_lsn);
         let pg_state_bytes = sim
             .get_standard(&pg_state_key)
             .unwrap_or_else(|e| {
@@ -149,8 +161,9 @@ pub fn run(
             &parent_ns,
             pg_data,
             tiko_root,
-            parent_meta.current_timeline_id,
-            target_lsn,
+            tl,
+            branch_lsn,
+            parent_pgdata,
         )
         .unwrap_or_else(|e| {
             eprintln!("error: failed to prepare recovery in store: {e}");

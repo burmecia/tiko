@@ -60,7 +60,7 @@ enum Command_ {
         #[arg(long)]
         force: bool,
     },
-    /// Create a branch forked from a parent project at a given LSN.
+    /// Create a branch forked from a parent project at its latest checkpoint.
     CreateBranch {
         #[arg(long)]
         org: u64,
@@ -72,9 +72,11 @@ enum Command_ {
         parent_project: u64,
         #[arg(long)]
         parent_branch: u64,
-        /// Branch point LSN, e.g. "0/3000000"
-        #[arg(long)]
-        lsn: String,
+        /// Parent's PGDATA directory (e.g. /var/lib/postgresql/data).
+        /// WAL segments from <parent-pgdata>/pg_wal/ are copied into the child's
+        /// pg_wal/ so the child can recover without a restore_command.
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        parent_pgdata: Option<PathBuf>,
         /// Template filename to seed the base PGDATA from (e.g. template-18.tar.gz)
         #[arg(long, value_name = "FILE")]
         template: String,
@@ -130,7 +132,7 @@ fn main() {
             branch,
             parent_project,
             parent_branch,
-            lsn,
+            parent_pgdata,
             template,
             pg_data,
         } => {
@@ -145,7 +147,7 @@ fn main() {
                 branch,
                 parent_project,
                 parent_branch,
-                &lsn,
+                parent_pgdata.as_deref(),
                 &template,
                 &pg_data,
                 tiko_root,
