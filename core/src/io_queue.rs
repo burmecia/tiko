@@ -67,7 +67,6 @@ use crate::cache::{
     AtomicRWLock, CACHE_NUM_HASH_ENTRIES, CACHE_NUM_PARTITIONS, CACHE_NUM_SLOTS, CacheControl,
     CacheHashEntry, CacheSlotMeta,
 };
-use crate::dispatcher::{Dispatcher, IoWorkRequest};
 use crate::nblocks_table::{
     NBLOCKS_NUM_ENTRIES, NBLOCKS_NUM_PARTITIONS, NblocksControl, NblocksEntry,
 };
@@ -140,6 +139,18 @@ pub enum IoOpKind {
     Truncate = 8,    // direct s3_ops only
     Unlink = 9,      // direct s3_ops only
     ZeroExtend = 10, // direct s3_ops only
+}
+
+/// Work request sent from worker main thread to Tokio workers.
+///
+/// Identifies a slot by its backend pool and slot index.
+/// `backend_id` is a ProcNumber (u32), `slot_index` is 0..SLOTS_PER_BACKEND-1,
+/// and `generation` guards against stale completions after backend slot recycle.
+#[derive(Debug, Clone)]
+pub struct IoWorkRequest {
+    pub backend_id: u32,
+    pub slot_index: u8,
+    pub generation: u32,
 }
 
 // ── IoSlot ──
@@ -702,7 +713,10 @@ impl IoControl {
     /// transitions Submitted → InProgress, validates, and dispatches.
     ///
     /// Returns the number of requests dispatched, or Err(()) on fatal error.
-    pub fn poll_submit_queue(&self, dispatcher: &Dispatcher) -> Result<u64, ()> {
+    pub fn poll_submit_queue<F>(&self, mut dispatch: F) -> Result<u64, ()>
+    where
+        F: FnMut(IoWorkRequest) -> Result<(), TrySendError<IoWorkRequest>>,
+    {
         let mut dispatched_count = 0u64;
         let head = self.submit_queue.head.load(Ordering::Acquire);
         let mut tail = self.submit_queue.tail.load(Ordering::Relaxed);
@@ -755,7 +769,7 @@ impl IoControl {
                 generation: slot.generation.load(Ordering::Relaxed),
             };
 
-            match dispatcher.send_work(request) {
+            match dispatch(request) {
                 Ok(()) => {
                     dispatched_count += 1;
                     pg_log_debug3(&format!(

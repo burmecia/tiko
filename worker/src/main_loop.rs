@@ -10,7 +10,8 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use core::{dispatcher::Dispatcher, io_queue::IoControl};
+use core::io_queue::IoControl;
+use crate::dispatcher::Dispatcher;
 use crate::log_relay;
 use core::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 use pgsys::{
@@ -125,7 +126,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         log_relay::drain(&log_rx);
 
         // Pop from submit queue and dispatch to Tokio
-        match io_control.poll_submit_queue(&dispatcher) {
+        match io_control.poll_submit_queue(|request| dispatcher.send_work(request)) {
             Ok(dispatched) => requests_processed += dispatched,
             Err(()) => break, // fatal: dispatcher disconnected
         }
