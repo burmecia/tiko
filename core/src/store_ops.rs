@@ -21,7 +21,7 @@ use std::io;
 use std::sync::atomic::Ordering;
 
 use crate::chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkLogEntry, ChunkTag, RelFork};
-use crate::{cache::CacheControl, io_queue::IoControl};
+use crate::{cache::CacheControl, io_control::IoControl};
 use crate::{
     project::{ProjectCtx, ProjectNamespace},
     recovery,

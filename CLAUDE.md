@@ -57,7 +57,7 @@ Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker 
 - **`thread_pool`** — initializes Tokio runtime (4 async workers + 8 blocking threads)
 - **`dispatcher`** — bounded `sync_channel` for work requests from main thread to Tokio (no completion channel — Tokio notifies backends directly via SetLatch)
 - **`io_handler`** — async S3 GET/PUT and local cache read/write with SetLatch completion path
-- **`io_queue`** (pub) — the shared memory data structures, also used by `s3smgr`
+- **`io_control`** (pub) — the shared memory data structures, also used by `s3smgr`
 - **`store_ops`** (pub) — synchronous block-level file I/O (`read_blocks`, `write_blocks`, `create_file`, etc.). Called directly by s3smgr sync functions and by s3worker's `io_handler`. Uses S3-style path layout: `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
 - **`shmem`** — hooks into `shmem_request_hook`/`shmem_startup_hook` for PG shared memory init
 

@@ -4,7 +4,7 @@
 //! The receiver half is returned from `Dispatcher::new()` and passed to
 //! `io_worker_loop`.
 
-use core::io_queue::IoWorkRequest;
+use core::io_control::IoWorkRequest;
 use pgsys::logging::*;
 use tokio::sync::mpsc;
 

@@ -1,4 +1,4 @@
-use core::io_queue::IoOpKind;
+use core::io_control::IoOpKind;
 use pgsys::{
     common::{BlockNumber, ForkNumber},
     smgr::*,

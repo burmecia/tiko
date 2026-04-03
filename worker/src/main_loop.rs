@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dispatcher::Dispatcher;
 use crate::log_relay;
-use core::io_queue::IoControl;
+use core::io_control::IoControl;
 use core::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 use pgsys::{
     common::{MyProcPid, SIGHUP, SIGTERM},

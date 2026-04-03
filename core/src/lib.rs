@@ -8,7 +8,7 @@ pub mod sim_store;
 pub mod store_ops;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkLogEntry, ChunkTag, RelFork};
-pub use io::{cache, fork_nblocks, io_queue};
+pub use io::{cache, fork_nblocks, io_control};
 
 use std::path::PathBuf;
 

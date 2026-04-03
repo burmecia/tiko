@@ -1,4 +1,4 @@
-use core::io_queue::IoControl;
+use core::io_control::IoControl;
 use pgsys::{common::ForkNumber, smgr::*};
 
 /// Immediately flush dirty cache chunks for a relation fork to backing files.

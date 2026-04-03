@@ -6,7 +6,7 @@
 //! - `shmem_startup_hook` to initialize structures
 //! - `ShmemInitStruct` to create the shared control structure + backend pools
 
-use core::io_queue::IoControl;
+use core::io_control::IoControl;
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS},
     logging::*,

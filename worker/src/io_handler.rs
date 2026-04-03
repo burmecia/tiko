@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use core::chunk::RelFork;
 use pgsys::latch::SetLatch;
 
-use core::io_queue::{IoControl, IoOpKind, IoWorkRequest};
+use core::io_control::{IoControl, IoOpKind, IoWorkRequest};
 use core::store_ops;
 
 /// Main I/O worker loop — receives requests from the dispatcher channel

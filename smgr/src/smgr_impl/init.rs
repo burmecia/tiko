@@ -1,4 +1,4 @@
-use core::io_queue::IoControl;
+use core::io_control::IoControl;
 use core::{org::OrgMeta, project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number, is_under_postmaster},
