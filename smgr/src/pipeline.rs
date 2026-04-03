@@ -83,7 +83,7 @@ pub unsafe fn submit_and_wait(
 /// **MUST NOT call `pg_log_error`** — this function may be called from within
 /// `pgaio_io_perform_synchronously`'s `START_CRIT_SECTION()`, where `elog(ERROR)`
 /// escalates to PANIC. Uses `pg_log_warning` for diagnostics instead.
-pub unsafe fn submit_and_wait_raw(
+pub(crate) unsafe fn submit_and_wait_raw(
     op: IoOpKind,
     spc_oid: Oid,
     db_oid: Oid,

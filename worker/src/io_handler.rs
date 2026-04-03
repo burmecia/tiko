@@ -64,39 +64,8 @@ async fn process_io_request(request: IoWorkRequest) {
                 Err(errno) => (errno as u32, 0u32),
             }
         }
-        IoOpKind::Exists => {
-            if ops::exists(rf) {
-                (0u32, 1)
-            } else {
-                // fork doesn't exist — not an error, just report 0
-                (0u32, 0)
-            }
-        }
-        IoOpKind::Create => match ops::create(rf) {
-            Ok(created) => (0u32, if created { 1 } else { 0 }),
-            Err(errno) => (errno as u32, 0u32),
-        },
-        IoOpKind::Nblocks => match ops::nblocks(rf) {
-            Ok(n) => (0u32, n),
-            Err(errno) => (errno as u32, 0u32),
-        },
         IoOpKind::Prefetch => match ops::prefetch_blocks(rf, slot.block_number, slot.nblocks) {
             Ok(n) => (0u32, n),
-            Err(errno) => (errno as u32, 0u32),
-        },
-        IoOpKind::Truncate => {
-            // Target nblocks is stored in block_number
-            match ops::truncate_file(rf, slot.block_number) {
-                Ok(()) => (0u32, 0u32),
-                Err(errno) => (errno as u32, 0u32),
-            }
-        }
-        IoOpKind::Unlink => match ops::delete_file(rf) {
-            Ok(()) => (0u32, 0u32),
-            Err(errno) => (errno as u32, 0u32),
-        },
-        IoOpKind::ZeroExtend => match ops::zeroextend(rf, slot.block_number, slot.nblocks) {
-            Ok(()) => (0u32, 0u32),
             Err(errno) => (errno as u32, 0u32),
         },
         _ => {

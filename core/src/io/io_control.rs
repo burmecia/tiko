@@ -129,16 +129,9 @@ impl From<u8> for SlotState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoOpKind {
     Invalid = 0,
-    Read = 1,        // AIO pipeline + direct ops
-    Write = 2,       // AIO pipeline + direct ops
-    Exists = 3,      // direct ops only
-    Create = 4,      // direct ops only
-    Fsync = 5,       // direct ops only
-    Nblocks = 6,     // direct ops only
-    Prefetch = 7,    // pipeline only (cache warming, no buffer_ptr)
-    Truncate = 8,    // direct ops only
-    Unlink = 9,      // direct ops only
-    ZeroExtend = 10, // direct ops only
+    Read = 1,     // AIO pipeline only
+    Write = 2,    // AIO pipeline only
+    Prefetch = 3, // pipeline only (cache warming, no buffer_ptr)
 }
 
 /// Work request sent from worker main thread to Tokio workers.
@@ -269,7 +262,7 @@ impl IoSlot {
         // Only operations that transfer blocks need nblocks validation
         let needs_nblocks = matches!(
             self.op,
-            IoOpKind::Read | IoOpKind::Write | IoOpKind::ZeroExtend | IoOpKind::Prefetch
+            IoOpKind::Read | IoOpKind::Write | IoOpKind::Prefetch
         );
         if needs_nblocks && (self.nblocks == 0 || self.nblocks > 1024) {
             return Err(libc::EINVAL as u32);
