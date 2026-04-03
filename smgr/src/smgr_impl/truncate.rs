@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::store_ops;
+use core::ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, in_recovery},
     logging::pg_log_error,
@@ -36,7 +36,7 @@ pub extern "C-unwind" fn tiko_truncate(
 
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    if let Err(errno) = store_ops::cached_truncate_file(
+    if let Err(errno) = ops::cached_truncate_file(
         RelFork {
             spc_oid: loc.spc_oid,
             db_oid: loc.db_oid,

@@ -121,7 +121,7 @@ impl From<u8> for SlotState {
 ///   local cache from S3. No `buffer_ptr` needed (Tiko worker manages its own buffers).
 ///
 /// All other sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, etc.)
-/// call `store_ops` directly in the backend process — they do **not** use the
+/// call `ops` directly in the backend process — they do **not** use the
 /// pipeline, because their buffers may be in backend-local memory (e.g.
 /// `PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local
 /// `PGIOAlignedBlock`) which Tiko worker cannot access.
@@ -129,16 +129,16 @@ impl From<u8> for SlotState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoOpKind {
     Invalid = 0,
-    Read = 1,        // AIO pipeline + direct store_ops
-    Write = 2,       // AIO pipeline + direct store_ops
-    Exists = 3,      // direct store_ops only
-    Create = 4,      // direct store_ops only
-    Fsync = 5,       // direct store_ops only
-    Nblocks = 6,     // direct store_ops only
+    Read = 1,        // AIO pipeline + direct ops
+    Write = 2,       // AIO pipeline + direct ops
+    Exists = 3,      // direct ops only
+    Create = 4,      // direct ops only
+    Fsync = 5,       // direct ops only
+    Nblocks = 6,     // direct ops only
     Prefetch = 7,    // pipeline only (cache warming, no buffer_ptr)
-    Truncate = 8,    // direct store_ops only
-    Unlink = 9,      // direct store_ops only
-    ZeroExtend = 10, // direct store_ops only
+    Truncate = 8,    // direct ops only
+    Unlink = 9,      // direct ops only
+    ZeroExtend = 10, // direct ops only
 }
 
 /// Work request sent from worker main thread to Tokio workers.

@@ -4,11 +4,11 @@ pub mod manifest;
 pub mod org;
 pub mod project;
 pub mod recovery;
-pub mod sim_store;
-pub mod store_ops;
+pub mod store;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkLogEntry, ChunkTag, RelFork};
 pub use io::{cache, fork_nblocks, io_control};
+pub use store::{ops, sim_store};
 
 use std::path::PathBuf;
 

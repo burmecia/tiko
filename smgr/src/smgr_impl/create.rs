@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::store_ops;
+use core::ops;
 use pgsys::{common::ForkNumber, logging::pg_log_error, smgr::*};
 
 #[unsafe(no_mangle)]
@@ -10,7 +10,7 @@ pub extern "C-unwind" fn tiko_create(
 ) {
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    match store_ops::store_create(RelFork {
+    match ops::store_create(RelFork {
         spc_oid: loc.spc_oid,
         db_oid: loc.db_oid,
         rel_number: loc.rel_number,

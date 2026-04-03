@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::{io_control::IoOpKind, store_ops};
+use core::{io_control::IoOpKind, ops};
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 
 use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipeline};
@@ -13,7 +13,7 @@ use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipelin
 /// postmaster with s3worker alive, submits each entry through the s3worker
 /// async pipeline via `submit_and_wait_raw`. When the pipeline is unavailable
 /// (initdb, shutdown checkpoint, s3worker crash), performs direct
-/// `store_ops::read_blocks` / `write_blocks` calls instead.
+/// `ops::read_blocks` / `write_blocks` calls instead.
 ///
 /// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
 unsafe fn tiko_io_perform(
@@ -52,7 +52,7 @@ unsafe fn tiko_io_perform(
                 )
                 .map(|_| ())
             } else {
-                // No pipeline (initdb / shutdown / s3worker dead): direct store_ops call
+                // No pipeline (initdb / shutdown / s3worker dead): direct ops call
                 let rf = RelFork {
                     spc_oid,
                     db_oid,
@@ -60,14 +60,14 @@ unsafe fn tiko_io_perform(
                     fork_number,
                 };
                 match op {
-                    IoOpKind::Read => store_ops::cached_read_blocks(
+                    IoOpKind::Read => ops::cached_read_blocks(
                         rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *mut u8,
                     )
                     .map(|_| ()),
-                    IoOpKind::Write => store_ops::cached_write_blocks(
+                    IoOpKind::Write => ops::cached_write_blocks(
                         rf,
                         current_block,
                         entry_nblocks,

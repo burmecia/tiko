@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::store_ops;
+use core::ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},
     logging::pg_log_error,
@@ -24,7 +24,7 @@ pub extern "C-unwind" fn tiko_extend(
         return;
     }
 
-    if let Err(errno) = store_ops::cached_write_blocks(
+    if let Err(errno) = ops::cached_write_blocks(
         RelFork {
             spc_oid: loc.spc_oid,
             db_oid: loc.db_oid,
