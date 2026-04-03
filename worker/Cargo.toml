@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pgsys = { path = "../pgsys" }
 core = { path = "../core" }
+bytes = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

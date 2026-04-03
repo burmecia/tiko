@@ -1,6 +1,6 @@
 pub mod dispatcher;
 pub mod log_relay;
-pub mod pitr_task;
+pub mod tasks;
 
 // Re-export engine modules (moved from worker to engine crate)
 pub use core::{cache, io_queue, s3_ops};

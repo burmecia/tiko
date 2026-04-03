@@ -9,8 +9,8 @@
 use pgsys::logging::*;
 use std::sync::{Once, OnceLock};
 
-use crate::pitr_task::{PitrConfig, pitr_background_task};
-use core::wal_streaming::{WalStreamConfig, wal_streaming_task};
+use crate::tasks::compactor::{CompactorConfig, compactor_task};
+use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
 use core::{
     project::{ProjectCtx, ProjectNamespace},
     sim_store::SimStore,
@@ -25,51 +25,51 @@ use core::{
 ///
 /// Call this from `worker_main` after both `init_tokio_runtime` and
 /// `init_project_ctx` have completed.
-pub fn spawn_pitr_task() {
+pub fn spawn_compactor_task() {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
-        pg_log_warning("tiko: spawn_pitr_task called before runtime init; skipping");
+        pg_log_warning("tiko: spawn_compactor_task called before runtime init; skipping");
         return;
     };
 
     let Some(ctx) = ProjectCtx::try_get() else {
-        pg_log_info("tiko: ProjectCtx not initialised; skipping PITR background task");
+        pg_log_info("tiko: ProjectCtx not initialised; skipping compactor task");
         return;
     };
 
     let Some(sim) = SimStore::try_get() else {
-        pg_log_warning("tiko: SimStore not initialised; skipping PITR background task");
+        pg_log_warning("tiko: SimStore not initialised; skipping compactor task");
         return;
     };
 
     let ns: ProjectNamespace = ctx.ns().clone();
-    let cfg = PitrConfig::from_env();
+    let cfg = CompactorConfig::from_env();
 
-    runtime.spawn(pitr_background_task(sim, ns, cfg));
-    pg_log_info("tiko: PITR background task spawned");
+    runtime.spawn(compactor_task(sim, ns, cfg));
+    pg_log_info("tiko: compactor task spawned");
 }
 
-/// Spawn the WAL streaming task on the Tokio runtime.
+/// Spawn the WAL receiver task on the Tokio runtime.
 ///
 /// Does nothing if the runtime, `ProjectCtx`, or `SimStore` are not yet initialised.
-pub fn spawn_wal_streaming_task() {
+pub fn spawn_wal_receiver_task() {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
-        pg_log_warning("tiko: spawn_wal_streaming_task called before runtime init; skipping");
+        pg_log_warning("tiko: spawn_wal_receiver_task called before runtime init; skipping");
         return;
     };
 
     let Some(ctx) = ProjectCtx::try_get() else {
-        pg_log_info("tiko: ProjectCtx not initialised; skipping WAL streaming task");
+        pg_log_info("tiko: ProjectCtx not initialised; skipping WAL receiver task");
         return;
     };
 
     let Some(sim) = SimStore::try_get() else {
-        pg_log_warning("tiko: SimStore not initialised; skipping WAL streaming task");
+        pg_log_warning("tiko: SimStore not initialised; skipping WAL receiver task");
         return;
     };
 
     let ns = ctx.ns().clone();
-    runtime.spawn(wal_streaming_task(sim, ns, WalStreamConfig::default()));
-    pg_log_info("tiko: WAL streaming task spawned");
+    runtime.spawn(wal_receiver_task(sim, ns, WalReceiverConfig::default()));
+    pg_log_info("tiko: WAL receiver task spawned");
 }
 
 /// The global Tokio runtime handle stored safely using OnceLock

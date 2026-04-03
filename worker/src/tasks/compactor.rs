@@ -1,4 +1,4 @@
-//! PITR background task — periodic base manifest materialization.
+//! Compactor — periodic base manifest materialization.
 //!
 //! Runs on Tokio. Merges accumulated delta manifests into the latest base
 //! manifest at a configurable interval (default 1 hour). Non-fatal: if
@@ -15,16 +15,16 @@ use core::{
     sim_store::SimStore,
 };
 
-// ── PitrConfig ────────────────────────────────────────────────────────────────
+// ── CompactorConfig ──────────────────────────────────────────────────────────
 
-/// Configuration for the PITR background task.
-pub struct PitrConfig {
+/// Configuration for the compactor background task.
+pub struct CompactorConfig {
     /// How often to materialize a new base manifest.
     /// Read from `TIKO_PITR_INTERVAL_SECS` (default: 3600 seconds).
     pub materialization_interval: std::time::Duration,
 }
 
-impl PitrConfig {
+impl CompactorConfig {
     /// Build config from environment.  Falls back to 3600s if the variable
     /// is absent or cannot be parsed.
     pub fn from_env() -> Self {
@@ -32,7 +32,7 @@ impl PitrConfig {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3600);
-        PitrConfig {
+        CompactorConfig {
             materialization_interval: std::time::Duration::from_secs(secs),
         }
     }
@@ -45,13 +45,13 @@ impl PitrConfig {
 /// Runs until the process exits.  Errors are non-fatal — logged to stderr and
 /// skipped.  A failed materialization only means the next recovery will replay
 /// more deltas; correctness is never compromised.
-pub async fn pitr_background_task(
+pub async fn compactor_task(
     sim: &'static SimStore,
     ns: ProjectNamespace,
-    config: PitrConfig,
+    config: CompactorConfig,
 ) {
     tracing::info!(
-        "tiko: pitr_background_task started (project={}, interval={}s)",
+        "tiko: compactor: started (project={}, interval={}s)",
         ns.project_id,
         config.materialization_interval.as_secs(),
     );

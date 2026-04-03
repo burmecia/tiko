@@ -1,4 +1,4 @@
-//! WAL streaming receiver — uploads WAL to the sim/S3 store in near-realtime.
+//! WAL receiver — uploads WAL to the sim/S3 store in near-realtime.
 //!
 //! Connects to the local postmaster via the **PostgreSQL physical streaming
 //! replication protocol** over a Unix socket.  Accumulates WAL bytes in a
@@ -10,7 +10,7 @@
 //! replication), so this module implements the minimal PostgreSQL wire
 //! protocol directly over `tokio::net::UnixStream`.
 //!
-//! See `wal_streaming.md` for the full design rationale.
+//! See `wal_streaming.md` for the design rationale.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,7 +22,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use crate::{project::ProjectNamespace, sim_store::SimStore};
+use core::{project::ProjectNamespace, sim_store::SimStore};
 use pgsys::common::XLOG_SEG_SIZE;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -42,16 +42,16 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_CONNSTR: &str = "host=/tmp port=5432 dbname=postgres replication=true";
 const DEFAULT_SLOT_NAME: &str = "tiko_wal_stream";
 
-pub struct WalStreamConfig {
+pub struct WalReceiverConfig {
     /// libpq-style connstring: `host=/tmp port=5432 dbname=postgres replication=true`
     pub connstr: &'static str,
     /// Physical replication slot name.
     pub slot_name: &'static str,
 }
 
-impl Default for WalStreamConfig {
+impl Default for WalReceiverConfig {
     fn default() -> Self {
-        WalStreamConfig {
+        WalReceiverConfig {
             connstr: DEFAULT_CONNSTR,
             slot_name: DEFAULT_SLOT_NAME,
         }
@@ -63,13 +63,13 @@ impl Default for WalStreamConfig {
 /// Tokio task: stream WAL from the local primary to the sim store.
 ///
 /// Never returns.  Reconnects with exponential backoff on any error.
-pub async fn wal_streaming_task(
+pub async fn wal_receiver_task(
     sim: &'static SimStore,
     ns: ProjectNamespace,
-    config: WalStreamConfig,
+    config: WalReceiverConfig,
 ) {
     tracing::info!(
-        "tiko: wal_streaming: task started with connstr: {}, slot: {}",
+        "tiko: wal_receiver: task started with connstr: {}, slot: {}",
         config.connstr,
         config.slot_name
     );
@@ -77,11 +77,11 @@ pub async fn wal_streaming_task(
     loop {
         match run_streaming(sim, &ns, &config).await {
             Ok(()) => {
-                tracing::info!("tiko: wal_streaming: connection closed, reconnecting");
+                tracing::info!("tiko: wal_receiver: connection closed, reconnecting");
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
-                tracing::warn!("tiko: wal_streaming: {e}, reconnecting in {backoff:?}");
+                tracing::warn!("tiko: wal_receiver: {e}, reconnecting in {backoff:?}");
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
@@ -119,7 +119,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 async fn run_streaming(
     sim: &'static SimStore,
     ns: &ProjectNamespace,
-    config: &WalStreamConfig,
+    config: &WalReceiverConfig,
 ) -> Result<(), BoxError> {
     let params = parse_connstr(&config.connstr);
 
@@ -130,7 +130,7 @@ async fn run_streaming(
     let os_user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
     let user = params.get("user").copied().unwrap_or(os_user.as_str());
     let mut conn = ReplConn::connect(&socket_path, user).await?;
-    tracing::info!("tiko: wal_streaming: connected to postmaster");
+    tracing::info!("tiko: wal_receiver: connected to postmaster");
 
     // ── IDENTIFY_SYSTEM → timeline + current xlogpos ─────────────────────────
     // Columns: systemid | timeline | xlogpos | dbname
@@ -178,7 +178,7 @@ async fn run_streaming(
         );
         conn.simple_query(&create_sql).await?;
         tracing::info!(
-            "tiko: wal_streaming: created slot '{}', starting from {xlogpos_str}",
+            "tiko: wal_receiver: created slot '{}', starting from {xlogpos_str}",
             config.slot_name
         );
         // consistent_point in the CREATE response is always 0/0 for physical
@@ -189,7 +189,7 @@ async fn run_streaming(
         match row.into_iter().nth(1).flatten() {
             Some(s) => {
                 tracing::debug!(
-                    "tiko: wal_streaming: slot '{}' already exists, resuming",
+                    "tiko: wal_receiver: slot '{}' already exists, resuming",
                     config.slot_name
                 );
                 parse_lsn(&s).map_err(|e| format!("slot restart_lsn parse error: {e}"))?
@@ -198,7 +198,7 @@ async fn run_streaming(
                 // restart_lsn is NULL — slot was not created with RESERVE_WAL
                 // or has never streamed.  Start from current WAL position.
                 tracing::info!(
-                    "tiko: wal_streaming: slot '{}' has no restart_lsn, starting from current WAL position ({xlogpos_str})",
+                    "tiko: wal_receiver: slot '{}' has no restart_lsn, starting from current WAL position ({xlogpos_str})",
                     config.slot_name
                 );
                 xlogpos
@@ -216,7 +216,7 @@ async fn run_streaming(
     );
     conn.start_replication(&start_sql).await?;
     tracing::info!(
-        "tiko: wal_streaming: streaming started (slot={}, tl={}, lsn={:X}/{:X})",
+        "tiko: wal_receiver: streaming started (slot={}, tl={}, lsn={:X}/{:X})",
         config.slot_name,
         timeline,
         (start_lsn >> 32) as u32,
@@ -257,7 +257,7 @@ async fn run_streaming(
                     }
                     _ => {
                         tracing::warn!(
-                            "tiko: wal_streaming: unknown CopyData type 0x{:02X}",
+                            "tiko: wal_receiver: unknown CopyData type 0x{:02X}",
                             msg[0]
                         );
                     }
@@ -378,7 +378,7 @@ async fn seal_segment(
         .map_err(|e| format!("seal spawn_blocking panicked: {e}"))?
         .map_err(|e| format!("sealed PUT failed for {name_log}: {e}"))?;
 
-    tracing::trace!("tiko: wal_streaming: sealed {name}");
+    tracing::trace!("tiko: wal_receiver: sealed {name}");
 
     // 4. Advance confirmed_lsn — only here, always at a segment boundary.
     *confirmed_lsn = (seg_no + 1) * XLOG_SEG_SIZE as u64;
