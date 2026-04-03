@@ -16,18 +16,8 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-use pgsys::Lsn;
-
-use crate::chunk::ChunkTag;
-use crate::project::ProjectNamespace;
-
-// ── Globals ───────────────────────────────────────────────────────────────────
-
-/// Sim store initialised by `S3Sim::init` at s3worker startup.
-/// Accessed from `cached_read_blocks` via `try_fetch_chunk_from_s3`.
-pub(crate) static SIM_STORE: OnceLock<S3Sim> = OnceLock::new();
+use super::backend::ObjectStore;
 
 // ── S3Sim ─────────────────────────────────────────────────────────────────
 
@@ -41,30 +31,6 @@ pub struct S3Sim {
 }
 
 impl S3Sim {
-    /// Initialise the sim store.
-    ///
-    /// Must be called once from `s3worker_main()` before `ProjectCtx::load()`.
-    /// Subsequent calls are silently ignored (OnceLock semantics).
-    pub fn init(tiko_root_dir: &Path) -> &'static Self {
-        let _ = SIM_STORE.set(S3Sim::new(tiko_root_dir));
-        Self::get()
-    }
-
-    /// Return the global `S3Sim`.
-    ///
-    /// # Panics
-    /// Panics if `S3Sim::init` has not been called.
-    pub fn get() -> &'static Self {
-        SIM_STORE
-            .get()
-            .expect("S3Sim::get() called before S3Sim::init()")
-    }
-
-    /// Return the global `S3Sim`, or `None` if not yet initialised.
-    pub fn try_get() -> Option<&'static Self> {
-        SIM_STORE.get()
-    }
-
     /// Create a new `S3Sim` instance with the given root directory.
     pub fn new(tiko_root_dir: &Path) -> Self {
         let base = tiko_root_dir.join("sim");
@@ -195,43 +161,58 @@ impl S3Sim {
     pub fn list_prefix_standard(&self, prefix: &str) -> io::Result<Vec<String>> {
         list_under_prefix(&self.standard_root, prefix)
     }
+}
 
-    // ── Compound operations ───────────────────────────────────────────────
+// ── ObjectStore impl ──────────────────────────────────────────────────────────
 
-    /// Three-step checkpoint write:
-    /// 1. PUT staging file to express bucket
-    /// 2. COPY staging → versioned object in standard bucket
-    /// 3. Atomic RENAME staging → `latest` in express bucket
-    ///
-    /// Used **only** at checkpoint time. Mid-interval evictions use
-    /// [`put_express_latest`] instead.
-    pub fn three_step_write(
-        &self,
-        ns: &ProjectNamespace,
-        key: &ChunkTag,
-        timeline: u32,
-        checkpoint_lsn: Lsn,
-        data: &[u8],
-    ) -> io::Result<()> {
-        let staging = ns.chunk_staging_key(key, checkpoint_lsn);
-        let versioned = ns.chunk_versioned_key(key, ns.branch_id, timeline, checkpoint_lsn);
-        let latest = ns.chunk_latest_key(key, timeline);
-        self.put_express(&staging, data)?;
-        self.copy_express_to_standard(&staging, &versioned)?;
-        self.rename_express(&staging, &latest)?;
-        Ok(())
+impl ObjectStore for S3Sim {
+    fn put_express(&self, key: &str, data: &[u8]) -> io::Result<()> {
+        self.put_express(key, data)
     }
-
-    /// Eviction write: plain PUT to express-bucket `latest`.
-    /// No staging, no standard-bucket copy — those happen at checkpoint.
-    pub fn put_express_latest(
+    fn get_express(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        self.get_express(key)
+    }
+    fn rename_express(&self, src_key: &str, dst_key: &str) -> io::Result<()> {
+        self.rename_express(src_key, dst_key)
+    }
+    fn delete_express(&self, key: &str) -> io::Result<()> {
+        self.delete_express(key)
+    }
+    fn list_prefix_express(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.list_prefix_express(prefix)
+    }
+    fn put_standard(&self, key: &str, data: &[u8]) -> io::Result<()> {
+        self.put_standard(key, data)
+    }
+    fn get_standard(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        self.get_standard(key)
+    }
+    fn delete_standard(&self, key: &str) -> io::Result<()> {
+        self.delete_standard(key)
+    }
+    fn remove_dir_standard(&self, prefix: &str) -> io::Result<()> {
+        self.remove_dir_standard(prefix)
+    }
+    fn list_prefix_standard(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.list_prefix_standard(prefix)
+    }
+    fn copy_express_to_standard(&self, src_key: &str, dst_key: &str) -> io::Result<()> {
+        self.copy_express_to_standard(src_key, dst_key)
+    }
+    fn put_template(&self, filename: &str, data: &[u8]) -> io::Result<()> {
+        self.put_template(filename, data)
+    }
+    fn get_template(&self, filename: &str) -> io::Result<Option<Vec<u8>>> {
+        self.get_template(filename)
+    }
+    fn copy_org_data(
         &self,
-        ns: &ProjectNamespace,
-        key: &ChunkTag,
-        timeline: u32,
-        data: &[u8],
+        src_standard: &Path,
+        src_express: &Path,
+        src_org_id: u64,
+        dst_org_id: u64,
     ) -> io::Result<()> {
-        self.put_express(&ns.chunk_latest_key(key, timeline), data)
+        self.copy_org_data(src_standard, src_express, src_org_id, dst_org_id)
     }
 }
 
@@ -350,6 +331,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::ChunkTag;
     use crate::project::ProjectNamespace;
     use pgsys::Lsn;
     use tempfile::TempDir;
@@ -412,127 +394,6 @@ mod tests {
         let (_dir, store) = setup();
         assert_eq!(store.get_express("does/not/exist").unwrap(), None);
         assert_eq!(store.get_standard("does/not/exist").unwrap(), None);
-    }
-
-    // ── put_express_latest ────────────────────────────────────────────────
-
-    #[test]
-    fn put_express_latest_writes_only_latest() {
-        let (_dir, store) = setup();
-        let ns = ns();
-        let tag = chunk_tag();
-        let lsn = Lsn::new(0x100);
-
-        store
-            .put_express_latest(&ns, &tag, 1, b"chunk-data")
-            .unwrap();
-
-        // latest exists
-        let latest_key = ns.chunk_latest_key(&tag, 1);
-        assert_eq!(
-            store.get_express(&latest_key).unwrap(),
-            Some(b"chunk-data".to_vec())
-        );
-
-        // no staging file
-        let staging_key = ns.chunk_staging_key(&tag, lsn);
-        assert_eq!(store.get_express(&staging_key).unwrap(), None);
-
-        // no versioned object in standard
-        let versioned_key = ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn);
-        assert_eq!(store.get_standard(&versioned_key).unwrap(), None);
-    }
-
-    // ── three_step_write ──────────────────────────────────────────────────
-
-    #[test]
-    fn three_step_write_full_success() {
-        let (_dir, store) = setup();
-        let ns = ns();
-        let tag = chunk_tag();
-        let lsn = Lsn::new(0x200);
-
-        store
-            .three_step_write(&ns, &tag, 1, lsn, b"block-data")
-            .unwrap();
-
-        // latest in express
-        assert_eq!(
-            store.get_express(&ns.chunk_latest_key(&tag, 1)).unwrap(),
-            Some(b"block-data".to_vec())
-        );
-        // versioned in standard
-        assert_eq!(
-            store
-                .get_standard(&ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn))
-                .unwrap(),
-            Some(b"block-data".to_vec())
-        );
-        // staging cleaned up
-        assert_eq!(
-            store.get_express(&ns.chunk_staging_key(&tag, lsn)).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn three_step_crash_after_step1_old_latest_unchanged() {
-        let (_dir, store) = setup();
-        let ns = ns();
-        let tag = chunk_tag();
-        let lsn = Lsn::new(0x300);
-
-        // Simulate pre-existing latest
-        store.put_express_latest(&ns, &tag, 1, b"old-data").unwrap();
-
-        // Step 1 only: staging written
-        let staging = ns.chunk_staging_key(&tag, lsn);
-        store.put_express(&staging, b"new-data").unwrap();
-
-        // latest unchanged, no versioned object
-        assert_eq!(
-            store.get_express(&ns.chunk_latest_key(&tag, 1)).unwrap(),
-            Some(b"old-data".to_vec())
-        );
-        assert_eq!(
-            store
-                .get_standard(&ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn))
-                .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn three_step_crash_after_step2_old_latest_unchanged_versioned_valid() {
-        let (_dir, store) = setup();
-        let ns = ns();
-        let tag = chunk_tag();
-        let lsn = Lsn::new(0x400);
-
-        store.put_express_latest(&ns, &tag, 1, b"old-data").unwrap();
-
-        // Steps 1 + 2: staging + versioned written, rename not done
-        let staging = ns.chunk_staging_key(&tag, lsn);
-        store.put_express(&staging, b"new-data").unwrap();
-        store
-            .copy_express_to_standard(
-                &staging,
-                &ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn),
-            )
-            .unwrap();
-
-        // latest still old
-        assert_eq!(
-            store.get_express(&ns.chunk_latest_key(&tag, 1)).unwrap(),
-            Some(b"old-data".to_vec())
-        );
-        // versioned is valid
-        assert_eq!(
-            store
-                .get_standard(&ns.chunk_versioned_key(&tag, ns.branch_id, 1, lsn))
-                .unwrap(),
-            Some(b"new-data".to_vec())
-        );
     }
 
     // ── Key prefix formatting ─────────────────────────────────────────────

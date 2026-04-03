@@ -22,7 +22,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use core::{project::ProjectNamespace, s3_sim::S3Sim};
+use core::{project::ProjectNamespace, store::Store};
 use pgsys::common::XLOG_SEG_SIZE;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ impl Default for WalReceiverConfig {
 ///
 /// Never returns.  Reconnects with exponential backoff on any error.
 pub async fn wal_receiver_task(
-    sim: &'static S3Sim,
+    sim: &'static Store,
     ns: ProjectNamespace,
     config: WalReceiverConfig,
 ) {
@@ -117,7 +117,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // ── Core streaming loop ───────────────────────────────────────────────────────
 
 async fn run_streaming(
-    sim: &'static S3Sim,
+    sim: &'static Store,
     ns: &ProjectNamespace,
     config: &WalReceiverConfig,
 ) -> Result<(), BoxError> {
@@ -283,7 +283,7 @@ async fn run_streaming(
 #[allow(clippy::too_many_arguments)]
 async fn handle_xlogdata(
     msg: &[u8],
-    sim: &'static S3Sim,
+    sim: &'static Store,
     ns: &ProjectNamespace,
     timeline: u32,
     cur_seg: &mut Option<SegState>,
@@ -343,7 +343,7 @@ async fn handle_xlogdata(
 /// 5. Spawn best-effort deletion of superseded chunk objects.
 async fn seal_segment(
     mut state: SegState,
-    sim: &'static S3Sim,
+    sim: &'static Store,
     ns: &ProjectNamespace,
     timeline: u32,
     confirmed_lsn: &mut u64,

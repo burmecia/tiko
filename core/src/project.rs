@@ -18,7 +18,7 @@ use crate::{
     ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID,
     chunk::{ChunkTag, RelFork},
     manifest::{ChunkRef, Manifest},
-    s3_sim::S3Sim,
+    store::Store,
 };
 
 /// Global project context for the running s3worker process.
@@ -322,7 +322,7 @@ impl ProjectMeta {
     }
 
     /// Write `project.json` for a root project to S3Sim.
-    pub fn create_root(sim: &S3Sim, ns: &ProjectNamespace) -> Result<()> {
+    pub fn create_root(sim: &Store, ns: &ProjectNamespace) -> Result<()> {
         let meta = Self::new_root(ns);
         sim.put_standard(&ns.project_meta_key(), &serde_json::to_vec(&meta)?)?;
         Ok(())
@@ -338,7 +338,7 @@ impl ProjectMeta {
     /// Idempotent: if `project.json` already exists it is left unchanged.
     /// Only call for root projects (`parent_project_id: None`); branches write
     /// their `project.json` via `create_branch`.
-    pub fn ensure_root(sim: &S3Sim, ns: &ProjectNamespace) -> Result<()> {
+    pub fn ensure_root(sim: &Store, ns: &ProjectNamespace) -> Result<()> {
         let key = ns.project_meta_key();
         if sim.get_standard(&key)?.is_some() {
             return Ok(());
@@ -346,7 +346,7 @@ impl ProjectMeta {
         Self::create_root(sim, ns)
     }
 
-    pub fn load(sim: &S3Sim, ns: &ProjectNamespace) -> Result<Self> {
+    pub fn load(sim: &Store, ns: &ProjectNamespace) -> Result<Self> {
         let key = ns.project_meta_key();
         let bytes = sim
             .get_standard(&key)?
@@ -427,7 +427,7 @@ impl ProjectCtx {
             ProjectNamespace::new(org_id, 0, 0)
         };
 
-        let sim = S3Sim::get();
+        let sim = Store::get();
 
         // During initdb, project.json has not been written yet — fall back to
         // a namespace-only ctx with an empty manifest so writes are routed
@@ -480,7 +480,7 @@ impl ProjectCtx {
     /// returns `true` so callers can skip root-only operations (e.g. base
     /// compaction after initdb). The initial base is written by the
     /// restore-from-parent process after initdb completes.
-    pub fn load(ns: &ProjectNamespace, root_dir: &Path, sim: &S3Sim) -> Result<Self> {
+    pub fn load(ns: &ProjectNamespace, root_dir: &Path, sim: &Store) -> Result<Self> {
         // Step 1: fetch project.json
         let meta_key = ns.project_meta_key();
         let meta_bytes = sim
@@ -575,7 +575,7 @@ impl ProjectCtx {
 ///
 /// Returns an error if no base manifest exists with `lsn ≤ branch_lsn`.
 pub fn build_initial_manifest(
-    sim: &S3Sim,
+    sim: &Store,
     parent_ns: &ProjectNamespace,
     parent_timeline: u32,
     branch_lsn: Lsn,
@@ -651,7 +651,7 @@ pub fn build_initial_manifest(
 ///
 /// The branch is valid once both writes succeed.
 pub fn create_branch(
-    sim: &S3Sim,
+    sim: &Store,
     parent_ns: &ProjectNamespace,
     parent_timeline: u32,
     child_ns: &ProjectNamespace,
@@ -675,7 +675,7 @@ pub fn create_branch(
 ///
 /// Standard-bucket chunk objects (`{org}/chunks/{branch_id}/`) are intentionally
 /// left in place and will be collected by the next GC run.
-pub fn delete_branch(sim: &S3Sim, branch_ns: &ProjectNamespace) -> Result<()> {
+pub fn delete_branch(sim: &Store, branch_ns: &ProjectNamespace) -> Result<()> {
     // 1. Remove express-bucket hot data.
     let express_prefix = format!("{}/{}/", branch_ns.org_id, branch_ns.project_id);
     for key in sim.list_prefix_express(&express_prefix)? {
@@ -713,9 +713,9 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, S3Sim) {
+    fn setup() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
-        let store = S3Sim::new(dir.path());
+        let store = Store::new_sim(dir.path());
         (dir, store)
     }
 
@@ -760,7 +760,7 @@ mod tests {
         }
     }
 
-    fn store_meta(sim: &S3Sim, meta: &ProjectMeta) {
+    fn store_meta(sim: &Store, meta: &ProjectMeta) {
         let key = meta.ns.project_meta_key();
         let bytes = serde_json::to_vec(meta).unwrap();
         sim.put_standard(&key, &bytes).unwrap();
@@ -982,9 +982,9 @@ mod module7_tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, S3Sim) {
+    fn setup() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
-        let store = S3Sim::new(dir.path());
+        let store = Store::new_sim(dir.path());
         (dir, store)
     }
 
@@ -1019,7 +1019,7 @@ mod module7_tests {
     }
 
     fn store_manifest_bytes(
-        sim: &S3Sim,
+        sim: &Store,
         key: &str,
         lsn: Lsn,
         chunks: Vec<(ChunkTag, ChunkRef)>,

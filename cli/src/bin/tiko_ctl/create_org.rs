@@ -1,21 +1,21 @@
 use core::org::OrgMeta;
-use core::s3_sim::S3Sim;
+use core::store::Store;
 use std::fs;
 use std::process::Command;
 
 /// Source org_id baked into the template by `make_template` (initdb runs with TIKO_ORG_ID=0).
 const TEMPLATE_ORG_ID: u64 = 0;
 
-pub fn run(sim: &S3Sim, org_id: u64, template: &str) {
+pub fn run(sim: &Store, org_id: u64, template: &str) {
     // ── 1. Retrieve template tarball from S3Sim ─────────────────────────────
     let tarball = sim
         .get_template(template)
         .unwrap_or_else(|e| {
-            eprintln!("error: failed to read template from S3Sim: {e}");
+            eprintln!("error: failed to read template from Store: {e}");
             std::process::exit(1);
         })
         .unwrap_or_else(|| {
-            eprintln!("error: template '{template}' not found in S3Sim");
+            eprintln!("error: template '{template}' not found in Store");
             std::process::exit(1);
         });
 

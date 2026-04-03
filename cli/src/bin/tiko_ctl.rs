@@ -10,7 +10,7 @@ mod make_template;
 mod restore;
 
 use clap::{Parser, Subcommand};
-use core::s3_sim::S3Sim;
+use core::store::Store;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -97,12 +97,12 @@ enum Command_ {
     },
 }
 
-fn require_sim(tiko_root: Option<&Path>, op: &str) -> &'static S3Sim {
+fn require_sim(tiko_root: Option<&Path>, op: &str) -> &'static Store {
     let path = tiko_root.unwrap_or_else(|| {
         eprintln!("error: {op} requires '--tiko-root <PATH>' (or TIKO_ROOT_PATH)");
         std::process::exit(2);
     });
-    S3Sim::init(path)
+    Store::init(path)
 }
 
 fn main() {

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::dispatcher::Dispatcher;
 use crate::log_relay;
 use core::io_control::IoControl;
-use core::{project::ProjectCtx, s3_sim::S3Sim, tiko_root_path};
+use core::{project::ProjectCtx, store::Store, tiko_root_path};
 use pgsys::{
     common::{MyProcPid, SIGHUP, SIGTERM},
     cshim::check_for_interrupts,
@@ -89,7 +89,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
 
     // Initialize S3Sim and ProjectCtx from the data directory and env vars
     let root_dir = tiko_root_path();
-    S3Sim::init(&root_dir);
+    Store::init(&root_dir);
     ProjectCtx::init_from_env(&root_dir);
 
     // Spawn the PITR background task now that the runtime and ProjectCtx are initialised.

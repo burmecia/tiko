@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::project::{ProjectMeta, ProjectNamespace};
-use crate::s3_sim::S3Sim;
+use crate::store::Store;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ impl OrgMeta {
         format!("{}/metadata/", self.org_id)
     }
 
-    pub fn ensure_org_meta(sim: &S3Sim, org_id: u64) -> Result<()> {
+    pub fn ensure_org_meta(sim: &Store, org_id: u64) -> Result<()> {
         let key = format!("{}/metadata/org.json", org_id);
         if sim.get_standard(&key)?.is_none() {
             // No org.json exists — create root org and project.
@@ -79,7 +79,7 @@ impl OrgMeta {
     /// The root project always uses `project_id = 0` and `branch_id = 0`.
     /// Both `org.json` and `project.json` are written in a single logical step —
     /// an org without a root project is an invalid state.
-    pub fn create(sim: &S3Sim, org_id: u64) -> Result<OrgMeta> {
+    pub fn create(sim: &Store, org_id: u64) -> Result<OrgMeta> {
         let ns = ProjectNamespace::new(org_id, 0, 0);
 
         let meta = OrgMeta {
@@ -98,7 +98,7 @@ impl OrgMeta {
     }
 
     /// Read `org.json` without modifying it.
-    pub fn get(sim: &S3Sim, org_id: u64) -> Result<OrgMeta> {
+    pub fn get(sim: &Store, org_id: u64) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
         let bytes = sim.get_standard(&key)?.ok_or(Error::NotFound)?;
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))
@@ -109,7 +109,7 @@ impl OrgMeta {
     /// Physical removal of all `{org}/` objects is deferred to the GC run.
     /// With `force = false`, returns `AlreadyExists` (i.e. already deleted) if
     /// `deleted_at` is already set.
-    pub fn delete(sim: &S3Sim, org_id: u64, force: bool) -> Result<OrgMeta> {
+    pub fn delete(sim: &Store, org_id: u64, force: bool) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
         let bytes = sim.get_standard(&key)?.ok_or(Error::NotFound)?;
         let mut meta: OrgMeta =
@@ -143,15 +143,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn temp_sim() -> (S3Sim, TempDir) {
+    fn temp_store() -> (Store, TempDir) {
         let dir = TempDir::new().unwrap();
-        let sim = S3Sim::new(dir.path());
+        let sim = Store::new_sim(dir.path());
         (sim, dir)
     }
 
     #[test]
     fn create_org_writes_org_json_with_correct_fields() {
-        let (sim, _dir) = temp_sim();
+        let (sim, _dir) = temp_store();
         let meta = OrgMeta::create(&sim, 42).unwrap();
 
         assert_eq!(meta.org_id, 42);
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn create_org_also_writes_root_project_json() {
-        let (sim, _dir) = temp_sim();
+        let (sim, _dir) = temp_store();
         OrgMeta::create(&sim, 10).unwrap();
 
         // Root project.json must exist at (org=10, proj=0, branch=0).
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn delete_org_sets_deleted_at_without_removing_objects() {
-        let (sim, _dir) = temp_sim();
+        let (sim, _dir) = temp_store();
         OrgMeta::create(&sim, 7).unwrap();
 
         let deleted = OrgMeta::delete(&sim, 7, false).unwrap();
@@ -190,14 +190,14 @@ mod tests {
 
     #[test]
     fn delete_org_returns_not_found_for_missing_org() {
-        let (sim, _dir) = temp_sim();
+        let (sim, _dir) = temp_store();
         let err = OrgMeta::delete(&sim, 999, false).unwrap_err();
         assert!(matches!(err, Error::NotFound));
     }
 
     #[test]
     fn delete_org_force_allows_double_deletion() {
-        let (sim, _dir) = temp_sim();
+        let (sim, _dir) = temp_store();
         OrgMeta::create(&sim, 5).unwrap();
         OrgMeta::delete(&sim, 5, false).unwrap();
         // Second delete without force should fail.

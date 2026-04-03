@@ -1,4 +1,4 @@
-use core::s3_sim::S3Sim;
+use core::store::Store;
 use pgsys::common::PG_VERSION_NUM;
 use std::fs;
 use std::path::Path;
@@ -137,9 +137,9 @@ max_slot_wal_keep_size = 1GB
             eprintln!("error: failed to read {}: {e}", output.display());
             std::process::exit(1);
         });
-        let sim = S3Sim::init(root);
+        let sim = Store::init(root);
         sim.put_template(filename, &data).unwrap_or_else(|e| {
-            eprintln!("error: S3Sim upload failed: {e}");
+            eprintln!("error: Store upload failed: {e}");
             std::process::exit(1);
         });
         println!("Stored  {}", filename);

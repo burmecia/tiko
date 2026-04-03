@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
 use crate::project::{ProjectCtx, ProjectNamespace};
-use crate::s3_sim::S3Sim;
+use crate::store::Store;
 
 // ── TIKM constants ──
 
@@ -545,7 +545,7 @@ pub enum MaterializeResult {
 /// deltas (idempotent). Does NOT delete delta manifests — cleanup is
 /// enforce_retention_org's responsibility.
 pub fn materialize_base(
-    sim: &S3Sim,
+    sim: &Store,
     ns: &ProjectNamespace,
     timeline: u32,
 ) -> MaterializeResultInner<MaterializeResult> {
@@ -640,7 +640,7 @@ pub fn materialize_base(
 mod tests {
     use super::*;
     use crate::project::ProjectNamespace;
-    use crate::s3_sim::S3Sim;
+    use crate::store::Store;
     use pgsys::Lsn;
     use tempfile::{TempDir, tempdir};
 
@@ -664,9 +664,9 @@ mod tests {
         }
     }
 
-    fn setup_sim() -> (TempDir, S3Sim) {
+    fn setup_sim() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
-        let store = S3Sim::new(dir.path());
+        let store = Store::new_sim(dir.path());
         (dir, store)
     }
 
@@ -679,7 +679,7 @@ mod tests {
     }
 
     fn store_manifest(
-        sim: &S3Sim,
+        sim: &Store,
         key: &str,
         lsn: Lsn,
         chunks: Vec<(ChunkTag, ChunkRef)>,

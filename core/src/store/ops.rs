@@ -25,7 +25,7 @@ use crate::{cache::CacheControl, io_control::IoControl};
 use crate::{
     project::{ProjectCtx, ProjectNamespace},
     recovery,
-    s3_sim::S3Sim,
+    store::Store,
 };
 use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 
@@ -50,7 +50,7 @@ use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 ///
 /// Returns the raw chunk bytes on success, `None` on all misses.
 fn try_fetch_chunk_from_s3_with(
-    sim: &S3Sim,
+    sim: &Store,
     ns: &ProjectNamespace,
     tag: &ChunkTag,
 ) -> Option<Vec<u8>> {
@@ -102,7 +102,7 @@ fn try_fetch_chunk_from_s3_with(
 }
 
 fn try_fetch_chunk_from_s3(tag: &ChunkTag) -> Option<Vec<u8>> {
-    let sim = S3Sim::get();
+    let sim = Store::get();
     let ns = ProjectCtx::get().ns();
     try_fetch_chunk_from_s3_with(sim, ns, tag)
 }
@@ -156,7 +156,7 @@ fn io_err_to_errno(e: &io::Error) -> i32 {
 /// Returns `Some(n)` when the key exists (including `Some(0)` for a relation
 /// truncated to zero), and `None` when the key is absent. Callers that need a
 /// plain integer should fall back to the base manifest or 0 themselves.
-fn store_get_nblocks(sim: &S3Sim, ns: &ProjectNamespace, rf: RelFork) -> Option<BlockNumber> {
+fn store_get_nblocks(sim: &Store, ns: &ProjectNamespace, rf: RelFork) -> Option<BlockNumber> {
     let key = ns.rel_nblocks_key(rf);
     match sim.get_express(&key) {
         Ok(Some(bytes)) if bytes.len() >= 4 => {
@@ -176,12 +176,7 @@ fn store_get_nblocks(sim: &S3Sim, ns: &ProjectNamespace, rf: RelFork) -> Option<
 /// **Initdb / single-user path** (IoControl not available): write directly to
 /// express and append a `NblocksSet` entry to the cache log so that the
 /// shutdown checkpoint can build the initial manifest.
-fn set_nblocks(
-    sim: &S3Sim,
-    ns: &ProjectNamespace,
-    rf: RelFork,
-    n: BlockNumber,
-) -> io::Result<()> {
+fn set_nblocks(sim: &Store, ns: &ProjectNamespace, rf: RelFork, n: BlockNumber) -> io::Result<()> {
     if IoControl::is_initialized() {
         IoControl::get().nblocks.set(rf, n);
     } else {
@@ -203,7 +198,7 @@ pub fn store_exists(rf: RelFork) -> bool {
     if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
         return true;
     }
-    let sim = S3Sim::get();
+    let sim = Store::get();
     let ctx = ProjectCtx::get();
     let key = ctx.ns().rel_nblocks_key(rf);
     if matches!(sim.get_express(&key), Ok(Some(_))) {
@@ -224,7 +219,7 @@ pub fn store_create(rf: RelFork) -> Result<bool, i32> {
     if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
         return Ok(false);
     }
-    let sim = S3Sim::get();
+    let sim = Store::get();
     let ctx = ProjectCtx::get();
     let ns = ctx.ns();
     let key = ns.rel_nblocks_key(rf);
@@ -253,7 +248,7 @@ pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) 
     // flushed to express.
     let current = cached_file_nblocks(rf)?;
     if new_nblocks > current {
-        let sim = S3Sim::get();
+        let sim = Store::get();
         let ctx = ProjectCtx::get();
         set_nblocks(sim, ctx.ns(), rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
     }
@@ -262,7 +257,7 @@ pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) 
 
 /// Delete all express chunk objects for a relation fork (chunk latest + staging keys).
 /// Does NOT delete the nblocks key — the caller handles that.
-fn store_delete_all_chunks(sim: &S3Sim, ns: &ProjectNamespace, rf: RelFork) -> io::Result<()> {
+fn store_delete_all_chunks(sim: &Store, ns: &ProjectNamespace, rf: RelFork) -> io::Result<()> {
     let prefix = ns.rel_chunks_prefix(rf);
     for key in sim.list_prefix_express(&prefix)? {
         sim.delete_express(&key)?;
@@ -306,7 +301,7 @@ pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
     }
 
     // Level 2 + 3: cold miss — read from express / base manifest.
-    let n = if let (Some(sim), Some(ctx)) = (S3Sim::try_get(), ProjectCtx::try_get()) {
+    let n = if let (Some(sim), Some(ctx)) = (Store::try_get(), ProjectCtx::try_get()) {
         match store_get_nblocks(sim, ctx.ns(), rf) {
             Some(n) => {
                 // Populate NblocksTable (clean) so next call is O(1).
@@ -338,7 +333,7 @@ pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32
         IoControl::get().cache.invalidate_range(rf, nblocks);
     }
 
-    let sim = S3Sim::get();
+    let sim = Store::get();
     let ns = ProjectCtx::get().ns();
 
     // Delete express chunk keys for chunks beyond the new nblocks boundary.
@@ -380,7 +375,7 @@ pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
         IoControl::get().nblocks.remove(rf);
     }
 
-    let sim = S3Sim::get();
+    let sim = Store::get();
     let ns = ProjectCtx::get().ns();
 
     // Remove all chunk express objects (includes chunk latest/staging keys).
@@ -524,7 +519,7 @@ pub fn cached_write_blocks(
 ) -> Result<BlockNumber, i32> {
     if !cache_is_available() {
         // initdb: chunk-level read-modify-write on S3Sim express.
-        let sim = S3Sim::get();
+        let sim = Store::get();
         let ctx = ProjectCtx::get();
         let ns = ctx.ns();
         let timeline = ctx.current_timeline_id();
@@ -631,7 +626,7 @@ pub fn cached_write_blocks(
     let new_nblocks = block_number + nblocks;
     let current = cached_file_nblocks(rf)?;
     if new_nblocks > current {
-        let sim = S3Sim::get();
+        let sim = Store::get();
         let ctx = ProjectCtx::get();
         set_nblocks(sim, ctx.ns(), rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
     }
@@ -707,7 +702,7 @@ mod tests {
     use crate::manifest::{ChunkRef, Manifest};
     use crate::project::ProjectNamespace;
     use crate::recovery;
-    use crate::s3_sim::S3Sim;
+    use crate::store::Store;
     use pgsys::Lsn;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -743,7 +738,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = S3Sim::new(dir.path());
+        let sim = Store::new_sim(dir.path());
         let tag = tag(100);
 
         // Ensure recovery mode is off.
@@ -765,7 +760,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = S3Sim::new(dir.path());
+        let sim = Store::new_sim(dir.path());
         let tag = tag(101);
 
         recovery::RECOVERY_MODE.store(false, Ordering::SeqCst);
@@ -821,7 +816,7 @@ mod tests {
         // built from a manifest lookup against an entry in the standard sim.
         let dir = TempDir::new().unwrap();
         let ns = ProjectNamespace::new(2002, 3003, 10);
-        let sim = S3Sim::new(dir.path());
+        let sim = Store::new_sim(dir.path());
         let tag = tag(300);
         let parent_branch_id: u64 = 42;
         let lsn = Lsn::new(0x800);
@@ -875,7 +870,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = S3Sim::new(dir.path());
+        let sim = Store::new_sim(dir.path());
         let tag = tag(400);
         let branch_id: u64 = 55;
         let lsn = Lsn::new(0x2000);
@@ -930,7 +925,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = S3Sim::new(dir.path());
+        let sim = Store::new_sim(dir.path());
         let tag = tag(500);
 
         // Enable recovery mode but do NOT put a matching versioned object.

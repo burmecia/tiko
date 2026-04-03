@@ -12,7 +12,7 @@ use core::{
     ENV_PITR_INTERVAL_SECS,
     manifest::{MaterializeResult, materialize_base},
     project::{ProjectCtx, ProjectNamespace},
-    s3_sim::S3Sim,
+    store::Store,
 };
 
 // ── CompactorConfig ──────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ impl CompactorConfig {
 /// Runs until the process exits.  Errors are non-fatal — logged to stderr and
 /// skipped.  A failed materialization only means the next recovery will replay
 /// more deltas; correctness is never compromised.
-pub async fn compactor_task(sim: &'static S3Sim, ns: ProjectNamespace, config: CompactorConfig) {
+pub async fn compactor_task(sim: &'static Store, ns: ProjectNamespace, config: CompactorConfig) {
     tracing::info!(
         "tiko: compactor: started (project={}, interval={}s)",
         ns.project_id,

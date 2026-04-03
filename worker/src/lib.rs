@@ -6,7 +6,7 @@ pub mod tasks;
 pub use core::{cache, io_control, ops};
 
 // Re-export the shared store modules
-pub use core::{s3_sim, manifest, project, recovery, s3};
+pub use core::{manifest, project, recovery, s3, s3_sim, store};
 
 mod io_handler;
 mod main_loop;

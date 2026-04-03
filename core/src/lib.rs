@@ -8,7 +8,8 @@ pub mod store;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkLogEntry, ChunkTag, RelFork};
 pub use io::{cache, fork_nblocks, io_control};
-pub use store::{s3_sim, ops, s3};
+pub use store::Store;
+pub use store::{backend, ops, s3, s3_sim};
 
 use std::path::PathBuf;
 

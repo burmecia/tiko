@@ -13,7 +13,7 @@ use crate::tasks::compactor::{CompactorConfig, compactor_task};
 use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
 use core::{
     project::{ProjectCtx, ProjectNamespace},
-    s3_sim::S3Sim,
+    store::Store,
 };
 
 /// Spawn the PITR background task on the Tokio runtime.
@@ -36,8 +36,8 @@ pub fn spawn_compactor_task() {
         return;
     };
 
-    let Some(sim) = S3Sim::try_get() else {
-        pg_log_warning("tiko: S3Sim not initialised; skipping compactor task");
+    let Some(sim) = Store::try_get() else {
+        pg_log_warning("tiko: Store not initialised; skipping compactor task");
         return;
     };
 
@@ -62,8 +62,8 @@ pub fn spawn_wal_receiver_task() {
         return;
     };
 
-    let Some(sim) = S3Sim::try_get() else {
-        pg_log_warning("tiko: S3Sim not initialised; skipping WAL receiver task");
+    let Some(sim) = Store::try_get() else {
+        pg_log_warning("tiko: Store not initialised; skipping WAL receiver task");
         return;
     };
 

@@ -43,7 +43,7 @@
 use std::path::{Path, PathBuf};
 
 use core::manifest::Manifest;
-use core::s3_sim::S3Sim;
+use core::store::Store;
 
 // ── Argument parsing ─────────────────────────────────────────────────────────
 
@@ -123,9 +123,9 @@ fn parse_args() -> Args {
 
 // ── S3Sim helper ───────────────────────────────────────────────────────────
 
-fn sim_from_env() -> Result<&'static S3Sim, String> {
+fn sim_from_env() -> Result<&'static Store, String> {
     let pgdata = std::env::var("PGDATA").map_err(|_| "PGDATA is not set".to_string())?;
-    Ok(S3Sim::init(Path::new(&pgdata)))
+    Ok(Store::init(Path::new(&pgdata)))
 }
 
 // ── TIKM magic detection ──────────────────────────────────────────────────────
@@ -322,7 +322,7 @@ fn run(args: &Args) -> Result<(), String> {
             let sim = sim_from_env()?;
             let data = sim
                 .get_standard(key)
-                .map_err(|e| format!("S3Sim error: {e}"))?
+                .map_err(|e| format!("Store error: {e}"))?
                 .ok_or_else(|| format!("key not found in standard bucket: {key}"))?;
             let file_size = data.len();
             let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
@@ -341,7 +341,7 @@ fn run(args: &Args) -> Result<(), String> {
             let sim = sim_from_env()?;
             let data = sim
                 .get_express(key)
-                .map_err(|e| format!("S3Sim error: {e}"))?
+                .map_err(|e| format!("Store error: {e}"))?
                 .ok_or_else(|| format!("key not found in express bucket: {key}"))?;
             let file_size = data.len();
             let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;

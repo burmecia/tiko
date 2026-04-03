@@ -1,5 +1,5 @@
 use core::io_control::IoControl;
-use core::{org::OrgMeta, project::ProjectCtx, s3_sim::S3Sim, tiko_root_path};
+use core::{org::OrgMeta, project::ProjectCtx, store::Store, tiko_root_path};
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number, is_under_postmaster},
     logging::*,
@@ -17,7 +17,7 @@ pub extern "C-unwind" fn tiko_init() {
     let root_dir = tiko_root_path();
 
     // Initialize S3Sim unconditionally — needed for both initdb and normal run.
-    S3Sim::init(&root_dir);
+    Store::init(&root_dir);
 
     // Try to initialize ProjectCtx from env vars (TIKO_ORG_ID/TIKO_PROJECT_ID/TIKO_BRANCH_ID).
     // This enables the initdb write path to reach S3Sim express.
@@ -36,7 +36,7 @@ pub extern "C-unwind" fn tiko_init() {
     // was never sized/initialised via shmem_request_hook.
     if !is_under_postmaster() {
         let org_id = ProjectCtx::get().meta.ns.org_id;
-        OrgMeta::ensure_org_meta(S3Sim::get(), org_id)
+        OrgMeta::ensure_org_meta(Store::get(), org_id)
             .unwrap_or_else(|e| pg_log_error(&format!("tiko_init: ensure_org_meta failed: {e}")));
         return;
     }
