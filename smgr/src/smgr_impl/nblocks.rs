@@ -8,7 +8,7 @@ use pgsys::{
 
 /// Get the number of blocks stored in a relation fork.
 ///
-/// Returns `max(file_nblocks, cache_max)` — the backing file may lag behind
+/// Returns `max(nblocks, cache_max)` — the backing file may lag behind
 /// the cache under the write-back policy, so we must also check the cache for
 /// blocks that have been written but not yet evicted to the S3-sim file.
 #[unsafe(no_mangle)]
@@ -18,7 +18,7 @@ pub extern "C-unwind" fn tiko_nblocks(
 ) -> BlockNumber {
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    match ops::file_nblocks(RelFork {
+    match ops::nblocks(RelFork {
         spc_oid: loc.spc_oid,
         db_oid: loc.db_oid,
         rel_number: loc.rel_number,

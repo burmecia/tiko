@@ -729,7 +729,7 @@ impl CacheControl {
     ///
     /// Pinned slots (mid-I/O) are skipped without spinning — their contribution is
     /// either already reflected on disk or will be seen in a future call. The caller
-    /// (`file_nblocks`) always takes `max(disk_nblocks, cache_max)`, so
+    /// (`nblocks`) always takes `max(disk_nblocks, cache_max)`, so
     /// skipping a pinned slot is safe for correctness.
     pub fn max_block_for_relation(&self, rf: RelFork) -> BlockNumber {
         let mut nblocks: BlockNumber = 0;

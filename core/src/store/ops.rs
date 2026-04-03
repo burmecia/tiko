@@ -10,7 +10,7 @@
 //! | `exists` | Check whether a relation fork exists (nblocks key present) |
 //! | `create` | Create a relation fork (write nblocks=0) |
 //! | `zeroextend` | Extend a relation fork (update nblocks if larger) |
-//! | `file_nblocks` | Block count: max(S3Sim nblocks, cache max) |
+//! | `nblocks` | Block count: max(S3Sim nblocks, cache max) |
 //! | `read_blocks` | Read blocks: cache hit or S3Sim fetch |
 //! | `write_blocks` | Write blocks: cache (or initdb S3Sim RMW) |
 //! | `truncate_file` | Truncate: invalidate cache + trim S3Sim + update nblocks |
@@ -243,10 +243,10 @@ pub fn create(rf: RelFork) -> Result<bool, i32> {
 /// cache returns zeros for non-existent blocks, and S3Sim returns None.
 pub fn zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) -> Result<(), i32> {
     let new_nblocks = blkno + nblocks;
-    // Use file_nblocks for the three-level read (NblocksTable → express →
+    // Use nblocks for the three-level read (NblocksTable → express →
     // base manifest) so we never undercount when NblocksTable has a value not yet
     // flushed to express.
-    let current = file_nblocks(rf)?;
+    let current = self::nblocks(rf)?;
     if new_nblocks > current {
         let sim = Store::get();
         let ctx = ProjectCtx::get();
@@ -292,7 +292,7 @@ fn parse_chunk_id_from_key(key: &str, prefix: &str) -> Option<u32> {
 ///    created the express key in the child's namespace.
 ///
 /// Falls back to levels 2 + 3 alone when IoControl is unavailable (initdb).
-pub fn file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
+pub fn nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
     // Level 1: NblocksTable (shared memory) — fastest path.
     if IoControl::is_initialized() {
         if let Some(n) = IoControl::get().nblocks.get(rf) {
@@ -621,10 +621,10 @@ pub fn write_blocks(
     }
 
     // Update nblocks if this write extends the relation (e.g. tiko_extend).
-    // Uses file_nblocks for the three-level read so we never undercount
+    // Uses nblocks for the three-level read so we never undercount
     // when NblocksTable has a value not yet flushed to express.
     let new_nblocks = block_number + nblocks;
-    let current = file_nblocks(rf)?;
+    let current = self::nblocks(rf)?;
     if new_nblocks > current {
         let sim = Store::get();
         let ctx = ProjectCtx::get();

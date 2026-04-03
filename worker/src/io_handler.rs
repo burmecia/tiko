@@ -76,7 +76,7 @@ async fn process_io_request(request: IoWorkRequest) {
             Ok(created) => (0u32, if created { 1 } else { 0 }),
             Err(errno) => (errno as u32, 0u32),
         },
-        IoOpKind::Nblocks => match ops::file_nblocks(rf) {
+        IoOpKind::Nblocks => match ops::nblocks(rf) {
             Ok(n) => (0u32, n),
             Err(errno) => (errno as u32, 0u32),
         },
