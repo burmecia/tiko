@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::s3_ops;
+use core::store_ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, in_recovery},
     logging::pg_log_error,
@@ -38,7 +38,7 @@ pub extern "C-unwind" fn tiko_writev(
     for entry in &iov {
         let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
 
-        if let Err(errno) = s3_ops::cached_write_blocks(
+        if let Err(errno) = store_ops::cached_write_blocks(
             rf,
             blocknum + block_offset,
             run_nblocks,

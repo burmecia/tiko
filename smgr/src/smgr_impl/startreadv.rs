@@ -44,7 +44,7 @@ pub extern "C-unwind" fn tiko_startreadv(
         pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
 
         // 4. Stage as PGAIO_OP_TIKO_READV — returns immediately.
-        //    During initdb the perform function handles I/O directly via s3_ops;
+        //    During initdb the perform function handles I/O directly via store_ops;
         //    under the postmaster, IO workers submit to the s3worker pipeline.
         pgaio_io_start_tiko_readv(ioh, iovcnt);
     }

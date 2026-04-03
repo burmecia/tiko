@@ -13,7 +13,7 @@ pub(crate) static mut WAIT_EVENT_S3_IO_WRITE: u32 = 0;
 /// Returns `true` when running under the postmaster AND worker is alive.
 /// Returns `false` during initdb, single-user mode, shutdown checkpoint
 /// (worker already terminated), or worker crash — callers should fall
-/// back to direct `s3_ops` calls.
+/// back to direct `store_ops` calls.
 pub(crate) fn use_pipeline() -> bool {
     use core::io_queue::IoControl;
     use pgsys::common::is_under_postmaster;

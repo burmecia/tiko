@@ -792,7 +792,7 @@ The checkpointer process calls `s3_checkpoint_flush()` in s3smgr. This runs
 outside s3worker (which is dead during the shutdown checkpoint). Therefore
 delta manifests are written using a **lightweight blocking S3 client** in the
 checkpointer process directly — mirroring the same fallback logic used for
-`s3_ops` sync writes. This keeps correctness during shutdown without
+`store_ops` sync writes. This keeps correctness during shutdown without
 depending on s3worker being alive.
 
 ## Rolling Base Materialization (Background Task in s3worker)
@@ -1017,7 +1017,7 @@ express-bucket latest). The recovery manifest is removed.
 | File | Change |
 |---|---|
 | `s3worker/src/cache.rs` | `flush_dirty_chunk()` PUT chunk to express-bucket `latest` and append `ChunkTag` to eviction log. Added `pub append_chunk_tag_to_eviction_log(tag)` for use by the initdb write path |
-| `s3worker/src/s3_ops.rs` | initdb path of `cached_write_blocks`: after express PUT, call `CacheControl::append_chunk_tag_to_eviction_log` (guarded by `!is_under_postmaster()`). Normal path: PUT to shmem cache (write-back). `read_blocks` normal: GET own express `latest`, fallback to base manifest → standard-bucket; recovery mode: GET standard-bucket `{lsn_hex}` via chunk_map |
+| `core/src/store_ops.rs` | initdb path of `cached_write_blocks`: after express PUT, call `CacheControl::append_chunk_tag_to_eviction_log` (guarded by `!is_under_postmaster()`). Normal path: PUT to shmem cache (write-back). `read_blocks` normal: GET own express `latest`, fallback to base manifest → standard-bucket; recovery mode: GET standard-bucket `{lsn_hex}` via chunk_map |
 | `s3worker/src/pitr_task.rs` | `materialize_base` made `pub`. "No base" early-return replaced: bootstrap from `Manifest::empty()` at `Lsn::INVALID`, merge all deltas, write first base |
 | `s3worker/src/project.rs` | `ProjectCtx::load()` branch-with-no-base case changed from `Err` to empty manifest. `is_branch()` still returns `true` when `parent_project_id.is_some()`. Enables initdb to succeed for branch projects without a pre-existing base |
 | `s3worker/src/io_handler.rs` | Pass project namespace to `read_blocks`/`write_blocks` |

@@ -6,8 +6,8 @@ pub mod nblocks_table;
 pub mod org;
 pub mod project;
 pub mod recovery;
-pub mod s3_ops;
 pub mod sim_store;
+pub mod store_ops;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkLogEntry, ChunkTag, RelFork};
 

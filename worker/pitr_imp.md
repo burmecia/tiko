@@ -428,7 +428,7 @@ file-backed index well.
 
 **Status:** `[x]`
 **Depends on:** Modules 1, 2, 3
-**Modified file:** `s3worker/src/s3_ops.rs`
+**Modified file:** `core/src/store_ops.rs`
 **New file:** `s3worker/src/recovery.rs`
 **Modified file:** `s3worker/src/lib.rs` (add `pub mod recovery;`)
 
@@ -456,7 +456,7 @@ happen in Module 5 (eviction) and Module 6 (checkpoint).
 - [x] `pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>>`:
   `RECOVERY_MANIFEST.get()?.lookup(key)` — returns `Ok(None)` if manifest not loaded.
 
-**s3_ops.rs additions:**
+**store_ops.rs additions:**
 - [x] Add `static SIM_STORE: OnceLock<SimStore>` — initialised at s3worker startup
 - [x] Add `static PROJECT_NS: OnceLock<ProjectNamespace>` — from env vars
   (`TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`)
@@ -870,7 +870,7 @@ creation) ← 1,2,3  ← 2, 6
 | 1 | `s3worker/src/manifest.rs` | `s3worker/src/lib.rs`, `s3worker/src/cache.rs` |
 | 2 | `s3worker/src/sim_store.rs` | `s3worker/src/lib.rs` |
 | 3 | `s3worker/src/project.rs` | `s3worker/src/lib.rs`, `s3worker/src/main_loop.rs` |
-| 4 | `s3worker/src/recovery.rs` | `s3worker/src/s3_ops.rs`, `s3worker/src/lib.rs` |
+| 4 | `s3worker/src/recovery.rs` | `core/src/store_ops.rs`, `s3worker/src/lib.rs` |
 | 5 | — | `s3worker/src/cache.rs` |
 | 6 | `s3smgr/src/wal_archive.rs` | `s3smgr/src/checkpoint.rs`, `postgres/src/backend/access/transam/xlog.c` |
 | 7 | — | `s3worker/src/project.rs` |

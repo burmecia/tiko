@@ -1,4 +1,4 @@
-//! S3 block-level read/write operations.
+//! Store-backed block-level read/write operations.
 //!
 //! Two-layer storage: **shared-memory chunk cache → SimStore (express bucket)**.
 //! The local backing-file layer (`{DataDir}/tiko/`) has been removed.

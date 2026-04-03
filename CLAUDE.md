@@ -46,10 +46,10 @@ Raw `extern "C"` declarations for PG internals: smgr (md* functions), background
 ### `s3smgr` — Storage manager interface (staticlib)
 Implements the PG `smgr` interface with `s3_*` functions (`s3_readv`, `s3_writev`, `s3_open`, etc.) that are registered as the storage manager. Two I/O paths:
 
-- **Sync path** (all smgr functions except `s3_startreadv` and `s3_prefetch`): Calls `s3_ops` directly in the backend process (`pread`/`pwrite` on local cache files). This is correct because sync smgr callers may pass backend-local memory pointers (`PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local `PGIOAlignedBlock`) that s3worker cannot access cross-process.
+- **Sync path** (all smgr functions except `s3_startreadv` and `s3_prefetch`): Calls `store_ops` directly in the backend process (`pread`/`pwrite` on local cache files). This is correct because sync smgr callers may pass backend-local memory pointers (`PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local `PGIOAlignedBlock`) that s3worker cannot access cross-process.
 - **Async path** (`s3_startreadv` → `s3_io_perform_read`/`s3_io_perform_write`): Uses the shared-memory pipeline to s3worker. Buffers are always in shared memory (`BufferBlocks`), so cross-process access is safe. Also used by `s3_prefetch` for local cache warming (no `buffer_ptr`).
 
-The `use_pipeline()` helper (combines `is_under_postmaster()` + `is_s3worker_alive()`) guards the async path in `aio.rs` and `prefetch.rs`, falling back to direct `s3_ops` when unavailable (initdb, shutdown checkpoint, s3worker crash).
+The `use_pipeline()` helper (combines `is_under_postmaster()` + `is_s3worker_alive()`) guards the async path in `aio.rs` and `prefetch.rs`, falling back to direct `store_ops` when unavailable (initdb, shutdown checkpoint, s3worker crash).
 
 ### `s3worker` — Background worker process (cdylib)
 Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker that calls `s3worker_main`. Internal structure:
@@ -58,7 +58,7 @@ Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker 
 - **`dispatcher`** — bounded `sync_channel` for work requests from main thread to Tokio (no completion channel — Tokio notifies backends directly via SetLatch)
 - **`io_handler`** — async S3 GET/PUT and local cache read/write with SetLatch completion path
 - **`io_queue`** (pub) — the shared memory data structures, also used by `s3smgr`
-- **`s3_ops`** (pub) — synchronous block-level file I/O (`read_blocks`, `write_blocks`, `create_file`, etc.). Called directly by s3smgr sync functions and by s3worker's `io_handler`. Uses S3-style path layout: `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
+- **`store_ops`** (pub) — synchronous block-level file I/O (`read_blocks`, `write_blocks`, `create_file`, etc.). Called directly by s3smgr sync functions and by s3worker's `io_handler`. Uses S3-style path layout: `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
 - **`shmem`** — hooks into `shmem_request_hook`/`shmem_startup_hook` for PG shared memory init
 
 ### Shared Memory IPC
@@ -88,9 +88,9 @@ PostgreSQL kills all `B_BG_WORKER` processes (including s3worker) in `PM_STOP_BA
 **`use_pipeline()` guard** (used in `aio.rs` and `prefetch.rs`):
 - `is_under_postmaster()` — false during initdb (both `--boot` and `--single` phases). Checked via PG's `IsUnderPostmaster` global (process-local, no shared memory).
 - `is_s3worker_alive()` — uses `kill(pid, 0)` on PID stored in shared memory. Returns false if s3worker is dead (shutdown, crash).
-- When `use_pipeline()` returns false, the AIO path falls back to direct `s3_ops` calls (same as the sync smgr functions).
+- When `use_pipeline()` returns false, the AIO path falls back to direct `store_ops` calls (same as the sync smgr functions).
 
-All sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, `s3_create`, etc.) always call `s3_ops` directly — no pipeline, no fallback needed. This handles initdb, shutdown checkpoint, and s3worker crash. Pages land in the local cache (persistent), WAL guarantees recoverability, and on next startup s3worker reconciles cache-dirty pages with S3.
+All sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, `s3_create`, etc.) always call `store_ops` directly — no pipeline, no fallback needed. This handles initdb, shutdown checkpoint, and s3worker crash. Pages land in the local cache (persistent), WAL guarantees recoverability, and on next startup s3worker reconciles cache-dirty pages with S3.
 
 ### PG18 AIO Integration
 
@@ -415,7 +415,7 @@ pub async fn snapshot_task(tracker: Arc<SnapshotTracker>) {
 The cache currently uses local S3-sim files as the backing store
 (`{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`). Dirty cache
 blocks are flushed to these files at checkpoint time. When a real S3 client
-is added, `s3_ops::write_blocks` and `read_blocks` will be replaced with
+is added, `store_ops::write_blocks` and `read_blocks` will be replaced with
 S3 PUT/GET calls.
 
 **3.1 Checkpoint Flush** (`s3smgr/src/checkpoint.rs`) — **already implemented**:
@@ -436,14 +436,14 @@ pub extern "C-unwind" fn s3_checkpoint_flush() {
 `flush_all_dirty_chunks` scans every cache slot, spins to pin each dirty
 slot exclusively, calls `flush_dirty_chunk` (which reads each dirty block
 from the cache file and writes it to the backing relation file via
-`s3_ops::write_blocks`), clears `dirty_blocks`, then unpins. This is a
+`store_ops::write_blocks`), clears `dirty_blocks`, then unpins. This is a
 synchronous, blocking flush — it runs on the checkpointer process main thread
 before the checkpoint WAL record is written.
 
 `s3_shutdown` (smgr shutdown hook) is **intentionally empty**: by the time it
 fires, the shutdown checkpoint has already flushed all dirty chunks.
 
-**3.2 Future: Replace S3-sim with real S3** (modify `s3worker/src/s3_ops.rs`):
+**3.2 Future: Replace S3-sim with real S3** (modify `core/src/store_ops.rs`):
 
 Chunk granularity is 256 KB (32 blocks). The S3 key layout mirrors the local
 path structure but uses `chunk_id` as the object key suffix:
@@ -577,7 +577,7 @@ Configure S3 bucket lifecycle rules:
 **Files to modify:**
 - [ ] `s3worker/src/lib.rs` - Export new modules
 - [ ] `s3worker/src/main_loop.rs` - Add snapshot task
-- [ ] `s3worker/src/s3_ops.rs` - Add S3 sync functions
+- [ ] `core/src/store_ops.rs` - Add S3 sync functions
 - [ ] `postgres/src/test/modules/test_pico/test_pico.c` - Add PITR tests
 
 ### Testing Plan

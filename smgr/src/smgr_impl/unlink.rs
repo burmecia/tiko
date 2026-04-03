@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::s3_ops;
+use core::store_ops;
 use pgsys::{
     common::{ForkNumber, INVALID_FORK_NUMBER, MAX_FORKNUM},
     logging::pg_log_warning,
@@ -36,7 +36,7 @@ pub extern "C-unwind" fn tiko_unlink(
 fn unlink_fork(rlocator: &RelFileLocatorBackend, forknum: ForkNumber) {
     let loc = &rlocator.locator;
 
-    if let Err(errno) = s3_ops::cached_delete_file(RelFork {
+    if let Err(errno) = store_ops::cached_delete_file(RelFork {
         spc_oid: loc.spc_oid,
         db_oid: loc.db_oid,
         rel_number: loc.rel_number,

@@ -45,11 +45,7 @@ impl CompactorConfig {
 /// Runs until the process exits.  Errors are non-fatal — logged to stderr and
 /// skipped.  A failed materialization only means the next recovery will replay
 /// more deltas; correctness is never compromised.
-pub async fn compactor_task(
-    sim: &'static SimStore,
-    ns: ProjectNamespace,
-    config: CompactorConfig,
-) {
+pub async fn compactor_task(sim: &'static SimStore, ns: ProjectNamespace, config: CompactorConfig) {
     tracing::info!(
         "tiko: compactor: started (project={}, interval={}s)",
         ns.project_id,

@@ -93,7 +93,7 @@ Total cache metadata: ~92 KB.
 
 ### `cache_is_available()` guard
 
-Used in `s3_ops` to gate cache access:
+Used in `store_ops` to gate cache access:
 ```rust
 fn cache_is_available() -> bool {
     is_under_postmaster() && S3IoControl::is_initialized()
@@ -118,7 +118,7 @@ workloads:
 - Clock hand sweeps the array; decrements `usage_count` on each pass
 - Evicts first unpinned slot with `usage_count == 0`
 - **Dirty chunks flushed before eviction**: iterates `dirty_blocks` bitmask,
-  writes each dirty block to the S3-sim file via `s3_ops::write_blocks()`
+  writes each dirty block to the S3-sim file via `store_ops::write_blocks()`
 
 **Why clock-sweep over LRU**: no per-access linked-list manipulation. A single
 atomic increment on `usage_count` per access is all that's needed.
@@ -249,7 +249,7 @@ dirty blocks from being flushed back to a truncated or deleted file.
 
 ## 11. Cache-Aware File Operations
 
-All smgr-facing operations have cache-aware wrappers in `s3_ops`:
+All smgr-facing operations have cache-aware wrappers in `store_ops`:
 
 | Function | Cache interaction |
 |---|---|
@@ -315,10 +315,10 @@ checkpoint in `PM_WAIT_XLOG_SHUTDOWN`.
 
 | Scenario | Detection | Fallback |
 |---|---|---|
-| initdb (bootstrap + single-user) | `!is_under_postmaster()` | Direct `s3_ops` |
-| shmem not yet initialized | `!S3IoControl::is_initialized()` | Direct `s3_ops` |
-| Shutdown checkpoint | `is_s3worker_alive() == false` | Direct `s3_ops` |
-| s3worker crash | `is_s3worker_alive() == false` | Direct `s3_ops` |
+| initdb (bootstrap + single-user) | `!is_under_postmaster()` | Direct `store_ops` |
+| shmem not yet initialized | `!S3IoControl::is_initialized()` | Direct `store_ops` |
+| Shutdown checkpoint | `is_s3worker_alive() == false` | Direct `store_ops` |
+| s3worker crash | `is_s3worker_alive() == false` | Direct `store_ops` |
 
 When cache is not initialized (initdb), reads/writes fall back to raw
 `read_blocks`/`write_blocks` directly on S3-sim files. `invalidate_range`

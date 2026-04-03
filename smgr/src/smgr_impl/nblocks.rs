@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::s3_ops;
+use core::store_ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber},
     logging::pg_log_error,
@@ -18,7 +18,7 @@ pub extern "C-unwind" fn tiko_nblocks(
 ) -> BlockNumber {
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    match s3_ops::cached_file_nblocks(RelFork {
+    match store_ops::cached_file_nblocks(RelFork {
         spc_oid: loc.spc_oid,
         db_oid: loc.db_oid,
         rel_number: loc.rel_number,

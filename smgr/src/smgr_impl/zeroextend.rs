@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::s3_ops;
+use core::store_ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},
     logging::pg_log_error,
@@ -38,7 +38,7 @@ pub extern "C-unwind" fn tiko_zeroextend(
         return;
     }
 
-    if let Err(errno) = s3_ops::cached_zeroextend(
+    if let Err(errno) = store_ops::cached_zeroextend(
         RelFork {
             spc_oid: loc.spc_oid,
             db_oid: loc.db_oid,
