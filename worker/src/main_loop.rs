@@ -10,9 +10,9 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use core::io_queue::IoControl;
 use crate::dispatcher::Dispatcher;
 use crate::log_relay;
+use core::io_queue::IoControl;
 use core::{project::ProjectCtx, sim_store::SimStore, tiko_root_path};
 use pgsys::{
     common::{MyProcPid, SIGHUP, SIGTERM},

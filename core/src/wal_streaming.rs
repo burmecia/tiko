@@ -70,7 +70,8 @@ pub async fn wal_streaming_task(
 ) {
     tracing::info!(
         "tiko: wal_streaming: task started with connstr: {}, slot: {}",
-        config.connstr, config.slot_name
+        config.connstr,
+        config.slot_name
     );
     let mut backoff = Duration::from_secs(1);
     loop {

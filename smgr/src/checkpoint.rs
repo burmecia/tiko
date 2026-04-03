@@ -56,7 +56,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use core::{cache::CacheControl, io_queue::IoControl, pitr_task::materialize_base};
+use core::{cache::CacheControl, io_queue::IoControl, manifest::materialize_base};
 use core::{
     chunk::{ChunkLogEntry, ChunkTag, RelFork},
     manifest::{ChunkRef, Manifest},

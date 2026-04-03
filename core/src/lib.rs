@@ -4,7 +4,6 @@ pub mod io_queue;
 pub mod manifest;
 pub mod nblocks_table;
 pub mod org;
-pub mod pitr_task;
 pub mod project;
 pub mod recovery;
 pub mod s3_ops;

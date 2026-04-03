@@ -38,6 +38,8 @@ use pgsys::Lsn;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
+use crate::project::{ProjectCtx, ProjectNamespace};
+use crate::sim_store::SimStore;
 
 // ── TIKM constants ──
 
@@ -519,13 +521,128 @@ impl Manifest {
     }
 }
 
+// ── PITR base materialization ──
+
+type MaterializeResultInner<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Outcome of a single `materialize_base` call.
+#[derive(Debug)]
+pub enum MaterializeResult {
+    /// No new deltas were found; the existing base is already up to date.
+    NoNewDeltas { base_lsn: Lsn },
+    /// A new base manifest was uploaded.
+    Materialized {
+        prev_base_lsn: Lsn,
+        new_lsn: Lsn,
+        delta_count: usize,
+    },
+}
+
+/// Merge all delta manifests newer than the latest base into a new base and
+/// upload it to the standard store.
+///
+/// Returns [`MaterializeResult::NoNewDeltas`] immediately if there are no new
+/// deltas (idempotent). Does NOT delete delta manifests — cleanup is
+/// enforce_retention_org's responsibility.
+pub fn materialize_base(
+    sim: &SimStore,
+    ns: &ProjectNamespace,
+    timeline: u32,
+) -> MaterializeResultInner<MaterializeResult> {
+    let base_prefix = ns.base_prefix_for_timeline(timeline);
+    let base_keys = sim.list_prefix_standard(&base_prefix)?;
+
+    let mut base_lsns: Vec<Lsn> = base_keys
+        .iter()
+        .filter_map(|key| {
+            let rest = key.strip_prefix(&base_prefix)?;
+            let lsn_hex = rest.split('/').next()?;
+            Lsn::from_hex(lsn_hex).ok()
+        })
+        .collect();
+    base_lsns.sort();
+
+    let base_local_path =
+        std::env::temp_dir().join(format!("tiko_pitr_base_{}.tikm", ns.project_id));
+
+    let (base, base_lsn) = if let Some(&lsn) = base_lsns.last() {
+        let manifest_key = ns.base_manifest_key(timeline, lsn);
+        let bytes = sim
+            .get_standard(&manifest_key)?
+            .ok_or_else(|| format!("base manifest not found: {manifest_key}"))?;
+        (Manifest::from_bytes(&bytes, &base_local_path)?, lsn)
+    } else {
+        (Manifest::empty(&base_local_path)?, Lsn::INVALID)
+    };
+
+    let delta_prefix = ns.delta_prefix_for_timeline(timeline);
+    let delta_keys = sim.list_prefix_standard(&delta_prefix)?;
+
+    let mut delta_lsns: Vec<Lsn> = delta_keys
+        .iter()
+        .filter_map(|key| {
+            let rest = key.strip_prefix(&delta_prefix)?;
+            let lsn_hex = rest.split('/').next()?;
+            Lsn::from_hex(lsn_hex).ok()
+        })
+        .filter(|&lsn| lsn > base_lsn)
+        .collect();
+    delta_lsns.sort();
+    delta_lsns.dedup();
+
+    if delta_lsns.is_empty() {
+        tracing::debug!("tiko: pitr: no new deltas since base {base_lsn}");
+        return Ok(MaterializeResult::NoNewDeltas { base_lsn });
+    }
+
+    let mut deltas = Vec::with_capacity(delta_lsns.len());
+    for &delta_lsn in &delta_lsns {
+        let key = ns.delta_manifest_key(timeline, delta_lsn);
+        let delta_bytes = sim
+            .get_standard(&key)?
+            .ok_or_else(|| format!("delta manifest not found: {key}"))?;
+        let delta_path = std::env::temp_dir().join(format!(
+            "tiko_pitr_delta_{}_{}.tikm",
+            ns.project_id,
+            delta_lsn.to_hex()
+        ));
+        deltas.push(Manifest::from_bytes(&delta_bytes, &delta_path)?);
+    }
+
+    base.apply_deltas(&deltas)?;
+
+    let new_lsn = *delta_lsns.last().unwrap();
+    let delta_count = delta_lsns.len();
+    tracing::debug!(
+        "tiko: pitr: uploading new base manifest at lsn={} ({} delta(s) merged, prev_base={})",
+        new_lsn.to_hex(),
+        delta_count,
+        base_lsn,
+    );
+    sim.put_standard(&ns.base_manifest_key(timeline, new_lsn), &base.to_bytes()?)?;
+
+    if let Some(ctx) = ProjectCtx::try_get() {
+        let mut all_updates = vec![base];
+        all_updates.extend(deltas);
+        ctx.base_manifest.apply_deltas(&all_updates)?;
+    }
+
+    Ok(MaterializeResult::Materialized {
+        prev_base_lsn: base_lsn,
+        new_lsn,
+        delta_count,
+    })
+}
+
 // ── Tests ──
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ProjectNamespace;
+    use crate::sim_store::SimStore;
     use pgsys::Lsn;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     // ── Test helpers ──
 
@@ -545,6 +662,31 @@ mod tests {
             timeline_id: 1,
             lsn: Lsn::new(lsn_val),
         }
+    }
+
+    fn setup_sim() -> (TempDir, SimStore) {
+        let dir = TempDir::new().unwrap();
+        let store = SimStore::new(dir.path());
+        (dir, store)
+    }
+
+    fn ns_with_project(project_id: u64) -> ProjectNamespace {
+        ProjectNamespace::new(1001, project_id, 1)
+    }
+
+    fn tag(rel: u32) -> ChunkTag {
+        chunk(1663, 5, rel, 0, 0)
+    }
+
+    fn store_manifest(
+        sim: &SimStore,
+        key: &str,
+        lsn: Lsn,
+        chunks: Vec<(ChunkTag, ChunkRef)>,
+        tmp: &Path,
+    ) {
+        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), vec![], tmp).unwrap();
+        sim.put_standard(key, &m.to_bytes().unwrap()).unwrap();
     }
 
     /// Read and verify raw TIKM header fields directly from the file on disk.
@@ -1113,5 +1255,376 @@ mod tests {
 
         // The nblocks entry for the deleted fork must be removed.
         assert_eq!(base.lookup_nblocks(rf), None);
+    }
+
+    #[test]
+    fn materialize_merges_new_deltas_onto_base() {
+        let (dir, sim) = setup_sim();
+        let ns = ns_with_project(20_001);
+
+        let lsns: Vec<Lsn> = (1u64..=10).map(|i| Lsn::new(i * 0x100)).collect();
+
+        let base_chunks: Vec<(ChunkTag, ChunkRef)> = (1u32..=3)
+            .map(|i| {
+                (
+                    tag(i),
+                    ChunkRef {
+                        branch_id: 1,
+                        timeline_id: 1,
+                        lsn: lsns[i as usize - 1],
+                    },
+                )
+            })
+            .collect();
+        store_manifest(
+            &sim,
+            &ns.base_manifest_key(1, lsns[2]),
+            lsns[2],
+            base_chunks,
+            &dir.path().join("base.tikm"),
+        );
+
+        for i in 1u32..=10 {
+            let delta_lsn = lsns[i as usize - 1];
+            let chunks = vec![
+                (
+                    tag(i),
+                    ChunkRef {
+                        branch_id: 1,
+                        timeline_id: 1,
+                        lsn: delta_lsn,
+                    },
+                ),
+                (
+                    tag(0),
+                    ChunkRef {
+                        branch_id: 1,
+                        timeline_id: 1,
+                        lsn: delta_lsn,
+                    },
+                ),
+            ];
+            store_manifest(
+                &sim,
+                &ns.delta_manifest_key(1, delta_lsn),
+                delta_lsn,
+                chunks,
+                &dir.path().join(format!("d{i}.tikm")),
+            );
+        }
+
+        materialize_base(&sim, &ns, 1).unwrap();
+
+        let bytes = sim
+            .get_standard(&ns.base_manifest_key(1, lsns[9]))
+            .unwrap()
+            .expect("new base manifest must exist after materialization");
+        let tmp = dir.path().join("verify.tikm");
+        let merged = Manifest::from_bytes(&bytes, &tmp).unwrap();
+
+        assert_eq!(
+            merged.lookup(&tag(7)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: lsns[6],
+            })
+        );
+        assert_eq!(
+            merged.lookup(&tag(0)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: lsns[9],
+            })
+        );
+
+        for i in 1u32..=10 {
+            assert!(
+                sim.get_standard(&ns.delta_manifest_key(1, lsns[i as usize - 1]))
+                    .unwrap()
+                    .is_some(),
+                "delta {i} must not be deleted by materialize_base"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_correct_chunk_ref_after_materialization() {
+        let (dir, sim) = setup_sim();
+        let ns = ns_with_project(20_002);
+
+        let base_lsn = Lsn::new(0x100);
+        let d4_lsn = Lsn::new(0x400);
+        let d7_lsn = Lsn::new(0x700);
+
+        store_manifest(
+            &sim,
+            &ns.base_manifest_key(1, Lsn::new(0x300)),
+            Lsn::new(0x300),
+            vec![
+                (
+                    tag(1),
+                    ChunkRef {
+                        branch_id: 1,
+                        timeline_id: 1,
+                        lsn: base_lsn,
+                    },
+                ),
+                (
+                    tag(2),
+                    ChunkRef {
+                        branch_id: 1,
+                        timeline_id: 1,
+                        lsn: base_lsn,
+                    },
+                ),
+                (
+                    tag(3),
+                    ChunkRef {
+                        branch_id: 1,
+                        timeline_id: 1,
+                        lsn: base_lsn,
+                    },
+                ),
+            ],
+            &dir.path().join("base.tikm"),
+        );
+        store_manifest(
+            &sim,
+            &ns.delta_manifest_key(1, d4_lsn),
+            d4_lsn,
+            vec![(
+                tag(2),
+                ChunkRef {
+                    branch_id: 1,
+                    timeline_id: 1,
+                    lsn: d4_lsn,
+                },
+            )],
+            &dir.path().join("d4.tikm"),
+        );
+        store_manifest(
+            &sim,
+            &ns.delta_manifest_key(1, d7_lsn),
+            d7_lsn,
+            vec![(
+                tag(7),
+                ChunkRef {
+                    branch_id: 1,
+                    timeline_id: 1,
+                    lsn: d7_lsn,
+                },
+            )],
+            &dir.path().join("d7.tikm"),
+        );
+
+        materialize_base(&sim, &ns, 1).unwrap();
+
+        let bytes = sim
+            .get_standard(&ns.base_manifest_key(1, d7_lsn))
+            .unwrap()
+            .expect("new base at d7_lsn must exist");
+        let tmp = dir.path().join("verify.tikm");
+        let m = Manifest::from_bytes(&bytes, &tmp).unwrap();
+
+        assert_eq!(
+            m.lookup(&tag(1)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: base_lsn,
+            })
+        );
+        assert_eq!(
+            m.lookup(&tag(2)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: d4_lsn,
+            })
+        );
+        assert_eq!(
+            m.lookup(&tag(7)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: d7_lsn,
+            })
+        );
+    }
+
+    #[test]
+    fn materialize_idempotent() {
+        let (dir, sim) = setup_sim();
+        let ns = ns_with_project(20_003);
+
+        let base_lsn = Lsn::new(0x100);
+        let delta_lsn = Lsn::new(0x200);
+
+        store_manifest(
+            &sim,
+            &ns.base_manifest_key(1, base_lsn),
+            base_lsn,
+            vec![(
+                tag(1),
+                ChunkRef {
+                    branch_id: 1,
+                    timeline_id: 1,
+                    lsn: base_lsn,
+                },
+            )],
+            &dir.path().join("base.tikm"),
+        );
+        store_manifest(
+            &sim,
+            &ns.delta_manifest_key(1, delta_lsn),
+            delta_lsn,
+            vec![(
+                tag(1),
+                ChunkRef {
+                    branch_id: 1,
+                    timeline_id: 1,
+                    lsn: delta_lsn,
+                },
+            )],
+            &dir.path().join("d1.tikm"),
+        );
+
+        materialize_base(&sim, &ns, 1).unwrap();
+        materialize_base(&sim, &ns, 1).unwrap();
+
+        let keys = sim
+            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
+            .unwrap();
+        assert_eq!(keys.len(), 2, "second run must not write another base");
+
+        let bytes = sim
+            .get_standard(&ns.base_manifest_key(1, delta_lsn))
+            .unwrap()
+            .expect("materialized base must exist");
+        let tmp = dir.path().join("verify.tikm");
+        let m = Manifest::from_bytes(&bytes, &tmp).unwrap();
+        assert_eq!(
+            m.lookup(&tag(1)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: delta_lsn,
+            })
+        );
+    }
+
+    #[test]
+    fn materialize_no_new_deltas_is_noop() {
+        let (dir, sim) = setup_sim();
+        let ns = ns_with_project(20_004);
+
+        let lsn = Lsn::new(0x100);
+        store_manifest(
+            &sim,
+            &ns.base_manifest_key(1, lsn),
+            lsn,
+            vec![(
+                tag(1),
+                ChunkRef {
+                    branch_id: 1,
+                    timeline_id: 1,
+                    lsn,
+                },
+            )],
+            &dir.path().join("base.tikm"),
+        );
+
+        materialize_base(&sim, &ns, 1).unwrap();
+
+        let keys = sim
+            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "no new base should be written when no deltas"
+        );
+    }
+
+    #[test]
+    fn materialize_no_base_returns_ok() {
+        let (_dir, sim) = setup_sim();
+        let ns = ns_with_project(20_005);
+
+        materialize_base(&sim, &ns, 1).unwrap();
+
+        let keys = sim
+            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
+            .unwrap();
+        assert!(
+            keys.is_empty(),
+            "no base should be written when no deltas exist"
+        );
+    }
+
+    #[test]
+    fn materialize_no_base_with_deltas_creates_first_base() {
+        let (dir, sim) = setup_sim();
+        let ns = ns_with_project(20_006);
+
+        let d1_lsn = Lsn::new(0x100);
+        let d2_lsn = Lsn::new(0x200);
+
+        store_manifest(
+            &sim,
+            &ns.delta_manifest_key(1, d1_lsn),
+            d1_lsn,
+            vec![(
+                tag(1),
+                ChunkRef {
+                    branch_id: 1,
+                    timeline_id: 1,
+                    lsn: d1_lsn,
+                },
+            )],
+            &dir.path().join("d1.tikm"),
+        );
+        store_manifest(
+            &sim,
+            &ns.delta_manifest_key(1, d2_lsn),
+            d2_lsn,
+            vec![(
+                tag(2),
+                ChunkRef {
+                    branch_id: 1,
+                    timeline_id: 1,
+                    lsn: d2_lsn,
+                },
+            )],
+            &dir.path().join("d2.tikm"),
+        );
+
+        materialize_base(&sim, &ns, 1).unwrap();
+
+        let bytes = sim
+            .get_standard(&ns.base_manifest_key(1, d2_lsn))
+            .unwrap()
+            .expect("initial base manifest must exist after materialization");
+        let tmp = dir.path().join("verify.tikm");
+        let m = Manifest::from_bytes(&bytes, &tmp).unwrap();
+
+        assert_eq!(
+            m.lookup(&tag(1)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: d1_lsn,
+            })
+        );
+        assert_eq!(
+            m.lookup(&tag(2)).unwrap(),
+            Some(ChunkRef {
+                branch_id: 1,
+                timeline_id: 1,
+                lsn: d2_lsn,
+            })
+        );
     }
 }
