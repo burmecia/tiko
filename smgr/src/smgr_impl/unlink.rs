@@ -36,7 +36,7 @@ pub extern "C-unwind" fn tiko_unlink(
 fn unlink_fork(rlocator: &RelFileLocatorBackend, forknum: ForkNumber) {
     let loc = &rlocator.locator;
 
-    if let Err(errno) = ops::cached_delete_file(RelFork {
+    if let Err(errno) = ops::delete_file(RelFork {
         spc_oid: loc.spc_oid,
         db_oid: loc.db_oid,
         rel_number: loc.rel_number,

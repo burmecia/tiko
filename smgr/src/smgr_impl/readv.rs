@@ -37,7 +37,7 @@ pub extern "C-unwind" fn tiko_readv(
     for entry in &iov {
         let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
 
-        if let Err(errno) = ops::cached_read_blocks(
+        if let Err(errno) = ops::read_blocks(
             rf,
             blocknum + block_offset,
             run_nblocks,

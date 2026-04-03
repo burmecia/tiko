@@ -60,14 +60,14 @@ unsafe fn tiko_io_perform(
                     fork_number,
                 };
                 match op {
-                    IoOpKind::Read => ops::cached_read_blocks(
+                    IoOpKind::Read => ops::read_blocks(
                         rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *mut u8,
                     )
                     .map(|_| ()),
-                    IoOpKind::Write => ops::cached_write_blocks(
+                    IoOpKind::Write => ops::write_blocks(
                         rf,
                         current_block,
                         entry_nblocks,

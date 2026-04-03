@@ -38,7 +38,7 @@ pub extern "C-unwind" fn tiko_zeroextend(
         return;
     }
 
-    if let Err(errno) = ops::cached_zeroextend(
+    if let Err(errno) = ops::zeroextend(
         RelFork {
             spc_oid: loc.spc_oid,
             db_oid: loc.db_oid,

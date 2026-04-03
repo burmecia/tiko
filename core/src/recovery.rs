@@ -2,7 +2,7 @@
 //!
 //! During PostgreSQL point-in-time recovery, `RECOVERY_MODE` is set to true
 //! and `RECOVERY_MANIFEST` holds the loaded manifest that maps each chunk to
-//! its versioned S3 location. The `cached_read_blocks()` fallback uses this
+//! its versioned S3 location. The `read_blocks()` fallback uses this
 //! to serve reads from the versioned standard-bucket objects.
 //!
 //! The recovery manifest is loaded from `$PGDATA/tiko/recovery_manifest.bin`,

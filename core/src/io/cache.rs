@@ -34,7 +34,7 @@
 //!
 //! - Hash table partitions use `AtomicRWLock` (spin-based, in PG shared memory).
 //!   PG LWLocks cannot be used because Tokio threads in worker also access the
-//!   hash table (via `cached_read_blocks`/`cached_write_blocks` in `io_handler`),
+//!   hash table (via `read_blocks`/`write_blocks` in `io_handler`),
 //!   and LWLocks require per-process state (`MyProc`) that isn't thread-safe.
 //! - Lookups hold a shared (read) lock. Insertions/evictions hold exclusive (write).
 //! - `pin_count` is atomically incremented/decremented — a pinned slot
@@ -729,7 +729,7 @@ impl CacheControl {
     ///
     /// Pinned slots (mid-I/O) are skipped without spinning — their contribution is
     /// either already reflected on disk or will be seen in a future call. The caller
-    /// (`cached_file_nblocks`) always takes `max(disk_nblocks, cache_max)`, so
+    /// (`file_nblocks`) always takes `max(disk_nblocks, cache_max)`, so
     /// skipping a pinned slot is safe for correctness.
     pub fn max_block_for_relation(&self, rf: RelFork) -> BlockNumber {
         let mut nblocks: BlockNumber = 0;

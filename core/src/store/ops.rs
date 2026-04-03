@@ -7,15 +7,15 @@
 //!
 //! | Function | Purpose |
 //! |---|---|
-//! | `store_exists` | Check whether a relation fork exists (nblocks key present) |
-//! | `store_create` | Create a relation fork (write nblocks=0) |
-//! | `cached_zeroextend` | Extend a relation fork (update nblocks if larger) |
-//! | `cached_file_nblocks` | Block count: max(S3Sim nblocks, cache max) |
-//! | `cached_read_blocks` | Read blocks: cache hit or S3Sim fetch |
-//! | `cached_write_blocks` | Write blocks: cache (or initdb S3Sim RMW) |
-//! | `cached_truncate_file` | Truncate: invalidate cache + trim S3Sim + update nblocks |
-//! | `cached_delete_file` | Delete: invalidate cache + remove all S3Sim chunks |
-//! | `warm_cache_blocks` | Prefetch: populate cache from S3Sim |
+//! | `exists` | Check whether a relation fork exists (nblocks key present) |
+//! | `create` | Create a relation fork (write nblocks=0) |
+//! | `zeroextend` | Extend a relation fork (update nblocks if larger) |
+//! | `file_nblocks` | Block count: max(S3Sim nblocks, cache max) |
+//! | `read_blocks` | Read blocks: cache hit or S3Sim fetch |
+//! | `write_blocks` | Write blocks: cache (or initdb S3Sim RMW) |
+//! | `truncate_file` | Truncate: invalidate cache + trim S3Sim + update nblocks |
+//! | `delete_file` | Delete: invalidate cache + remove all S3Sim chunks |
+//! | `prefetch_blocks` | Prefetch: populate cache from S3Sim |
 
 use std::io;
 use std::sync::atomic::Ordering;
@@ -193,7 +193,7 @@ fn set_nblocks(sim: &Store, ns: &ProjectNamespace, rf: RelFork, n: BlockNumber) 
 ///   extended since the last checkpoint, whose express key hasn't been written yet.
 /// Level 1: express nblocks key — the durable record written at checkpoint.
 /// Level 2: base manifest — covers inherited relations on a fresh branch.
-pub fn store_exists(rf: RelFork) -> bool {
+pub fn exists(rf: RelFork) -> bool {
     // Level 0: NblocksTable (write-back).
     if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
         return true;
@@ -213,7 +213,7 @@ pub fn store_exists(rf: RelFork) -> bool {
 /// - `Ok(false)` if the fork already existed
 /// - `Ok(true)` if a new fork was created
 /// - `Err(errno)` on I/O failure
-pub fn store_create(rf: RelFork) -> Result<bool, i32> {
+pub fn create(rf: RelFork) -> Result<bool, i32> {
     // NblocksTable (write-back): relation may exist only in shared memory,
     // with no express key yet (express is written only at checkpoint).
     if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
@@ -241,12 +241,12 @@ pub fn store_create(rf: RelFork) -> Result<bool, i32> {
 ///
 /// Actual chunk data for extended-but-never-written blocks is implicitly zero:
 /// cache returns zeros for non-existent blocks, and S3Sim returns None.
-pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) -> Result<(), i32> {
+pub fn zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) -> Result<(), i32> {
     let new_nblocks = blkno + nblocks;
-    // Use cached_file_nblocks for the three-level read (NblocksTable → express →
+    // Use file_nblocks for the three-level read (NblocksTable → express →
     // base manifest) so we never undercount when NblocksTable has a value not yet
     // flushed to express.
-    let current = cached_file_nblocks(rf)?;
+    let current = file_nblocks(rf)?;
     if new_nblocks > current {
         let sim = Store::get();
         let ctx = ProjectCtx::get();
@@ -292,7 +292,7 @@ fn parse_chunk_id_from_key(key: &str, prefix: &str) -> Option<u32> {
 ///    created the express key in the child's namespace.
 ///
 /// Falls back to levels 2 + 3 alone when IoControl is unavailable (initdb).
-pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
+pub fn file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
     // Level 1: NblocksTable (shared memory) — fastest path.
     if IoControl::is_initialized() {
         if let Some(n) = IoControl::get().nblocks.get(rf) {
@@ -328,7 +328,7 @@ pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
 /// are removed.
 ///
 /// Falls back to only updating the nblocks key when the cache is unavailable.
-pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32> {
+pub fn truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32> {
     if cache_is_available() {
         IoControl::get().cache.invalidate_range(rf, nblocks);
     }
@@ -365,7 +365,7 @@ pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32
 /// `rel_number` is later reused.
 ///
 /// Falls back to only removing S3Sim objects when the cache is unavailable.
-pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
+pub fn delete_file(rf: RelFork) -> Result<(), i32> {
     if cache_is_available() {
         // first_block=0 invalidates every chunk for this fork
         IoControl::get().cache.invalidate_range(rf, 0);
@@ -402,7 +402,7 @@ pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
 /// On chunk hit with a valid block, reads directly from cache.
 /// On chunk hit with an invalid block, or chunk miss, fetches the full chunk
 /// from S3Sim and populates the cache.
-pub fn cached_read_blocks(
+pub fn read_blocks(
     rf: RelFork,
     block_number: BlockNumber,
     nblocks: BlockNumber,
@@ -511,7 +511,7 @@ pub fn cached_read_blocks(
 /// unavailable (initdb). Namespace must be initialized before initdb writes.
 ///
 /// Dirty blocks are flushed to S3Sim express on eviction — no write-through.
-pub fn cached_write_blocks(
+pub fn write_blocks(
     rf: RelFork,
     block_number: BlockNumber,
     nblocks: BlockNumber,
@@ -621,10 +621,10 @@ pub fn cached_write_blocks(
     }
 
     // Update nblocks if this write extends the relation (e.g. tiko_extend).
-    // Uses cached_file_nblocks for the three-level read so we never undercount
+    // Uses file_nblocks for the three-level read so we never undercount
     // when NblocksTable has a value not yet flushed to express.
     let new_nblocks = block_number + nblocks;
-    let current = cached_file_nblocks(rf)?;
+    let current = file_nblocks(rf)?;
     if new_nblocks > current {
         let sim = Store::get();
         let ctx = ProjectCtx::get();
@@ -643,11 +643,11 @@ pub fn cached_write_blocks(
 ///   for inherited ancestor-branch chunks), mark loaded blocks valid, then unpin.
 ///
 /// This is the backend of `S3IoOpKind::Prefetch` — it allows subsequent
-/// `cached_read_blocks` calls to be served entirely from the cache.
+/// `read_blocks` calls to be served entirely from the cache.
 ///
 /// No-op (returns `Ok(0)`) when the cache is unavailable (initdb,
 /// single-user mode).
-pub fn warm_cache_blocks(
+pub fn prefetch_blocks(
     rf: RelFork,
     block_number: BlockNumber,
     nblocks: BlockNumber,

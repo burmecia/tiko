@@ -164,7 +164,7 @@ impl NblocksControl {
 
     /// Populate an entry from a cold express read without marking it dirty.
     ///
-    /// Used by `cached_file_nblocks` to cache a value retrieved from express,
+    /// Used by `file_nblocks` to cache a value retrieved from express,
     /// avoiding future round-trips without dirtying the entry.
     pub fn set_clean(&self, rf: RelFork, nblocks: u32) {
         self.upsert(rf, nblocks, false);

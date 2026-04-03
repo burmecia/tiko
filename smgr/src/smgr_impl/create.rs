@@ -10,7 +10,7 @@ pub extern "C-unwind" fn tiko_create(
 ) {
     let loc = unsafe { &(*reln).smgr_rlocator.locator };
 
-    match ops::store_create(RelFork {
+    match ops::create(RelFork {
         spc_oid: loc.spc_oid,
         db_oid: loc.db_oid,
         rel_number: loc.rel_number,

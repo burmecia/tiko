@@ -24,7 +24,7 @@ pub extern "C-unwind" fn tiko_extend(
         return;
     }
 
-    if let Err(errno) = ops::cached_write_blocks(
+    if let Err(errno) = ops::write_blocks(
         RelFork {
             spc_oid: loc.spc_oid,
             db_oid: loc.db_oid,

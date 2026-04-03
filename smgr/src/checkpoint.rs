@@ -124,7 +124,7 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
         flush_all_dirty_nblocks(sim, ctx.ns());
     }
     // Initdb path: writes already went directly to express + cache_log
-    // (via cached_write_blocks / set_nblocks), so no flush needed.
+    // (via write_blocks / set_nblocks), so no flush needed.
 
     // Steps 2-6: process cache_log → standard bucket → delta manifest.
     // Non-fatal: log and continue. WAL will cover any gap on recovery.
