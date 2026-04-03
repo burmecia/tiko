@@ -63,11 +63,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc::error::TrySendError;
 
-use crate::cache::{
+use super::cache::{
     AtomicRWLock, CACHE_NUM_HASH_ENTRIES, CACHE_NUM_PARTITIONS, CACHE_NUM_SLOTS, CacheControl,
     CacheHashEntry, CacheSlotMeta,
 };
-use crate::nblocks_table::{
+use super::fork_nblocks::{
     NBLOCKS_NUM_ENTRIES, NBLOCKS_NUM_PARTITIONS, NblocksControl, NblocksEntry,
 };
 

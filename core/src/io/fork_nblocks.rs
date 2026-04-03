@@ -1,4 +1,4 @@
-//! Write-back nblocks table in IoControl shared memory.
+//! Write-back per-fork nblocks map in IoControl shared memory.
 //!
 //! A fixed-size open-addressing hash table storing the live block count for
 //! each relation fork, symmetric with the chunk cache ([`CacheControl`]).
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::chunk::{REL_FORK_SIZE, RelFork};
 
-use crate::cache::AtomicRWLock;
+use super::cache::AtomicRWLock;
 
 // ── Constants ──
 

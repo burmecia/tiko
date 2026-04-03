@@ -1,8 +1,6 @@
-pub mod cache;
 pub mod chunk;
-pub mod io_queue;
+pub mod io;
 pub mod manifest;
-pub mod nblocks_table;
 pub mod org;
 pub mod project;
 pub mod recovery;
@@ -10,6 +8,7 @@ pub mod sim_store;
 pub mod store_ops;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkLogEntry, ChunkTag, RelFork};
+pub use io::{cache, fork_nblocks, io_queue};
 
 use std::path::PathBuf;
 

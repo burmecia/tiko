@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use pgsys::logging::pg_log_debug1;
 
-use crate::io_queue::IoControl;
+use super::io_queue::IoControl;
 use crate::{
     chunk::{BLOCKS_PER_CHUNK, CHUNK_SIZE, ChunkLogEntry, ChunkTag, RelFork},
     tiko_root_path,
@@ -558,12 +558,12 @@ impl CacheControl {
             let dirty = meta.dirty_blocks.load(Ordering::Acquire);
             if dirty != 0 {
                 self.flush_dirty_chunk(slot_index);
-                crate::io_queue::IoControl::get()
+                super::io_queue::IoControl::get()
                     .stats
                     .dirty_evictions
                     .fetch_add(1, Ordering::Relaxed);
             }
-            crate::io_queue::IoControl::get()
+            super::io_queue::IoControl::get()
                 .stats
                 .evictions
                 .fetch_add(1, Ordering::Relaxed);
