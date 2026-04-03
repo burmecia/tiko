@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use core::{project::ProjectNamespace, sim_store::SimStore};
+use core::{project::ProjectNamespace, s3_sim::S3Sim};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -32,7 +32,7 @@ fn main() {
     let wal_path = PathBuf::from(&args[1]);
     let wal_filename = &args[2];
 
-    let sim = SimStore::new_from_env();
+    let sim = S3Sim::new_from_env();
     let ns = ProjectNamespace::new_from_env();
 
     let timeline = match parse_timeline(wal_filename) {
@@ -65,7 +65,7 @@ fn parse_timeline(filename: &str) -> Option<u32> {
 /// Read a WAL segment from disk and PUT it into the sim standard store at
 /// `{org}/pitr/{proj}/wal/{timeline:08X}/{segment}`.
 fn upload_wal_segment(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     timeline: u32,
     segment: &str,
@@ -82,9 +82,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, SimStore) {
+    fn setup() -> (TempDir, S3Sim) {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         (dir, sim)
     }
 

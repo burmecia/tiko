@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::chunk::ChunkTag;
 use crate::manifest::{ChunkRef, Manifest};
 use crate::project::ProjectNamespace;
-use crate::sim_store::SimStore;
+use crate::s3_sim::S3Sim;
 use pgsys::{Lsn, common::XLOG_SEG_SIZE};
 
 /// Exposed as `pub(crate)` so tests in sibling modules can force the flag.
@@ -199,7 +199,7 @@ fn copy_branch_wal(
 /// Intermediate files (pg_state archive, manifest working files) are written to
 /// a temporary directory that is cleaned up automatically on return.
 pub fn prepare_recovery(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     pgdata: &Path,    // target PGDATA directory to prepare for recovery
     root_path: &Path, // root path for recovery_manifest.bin files
@@ -282,7 +282,7 @@ pub fn prepare_recovery(
 
 /// Load the newest base manifest with `base_lsn <= target_lsn` on `target_tl`.
 fn load_base_manifest(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     target_tl: u32,
     target_lsn: Lsn,
@@ -316,7 +316,7 @@ fn load_base_manifest(
 ///
 /// Temp delta files are written under `work_dir` and removed after merging.
 fn apply_deltas_up_to(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     base: &Manifest,
     work_dir: &Path,

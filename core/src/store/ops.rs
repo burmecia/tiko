@@ -1,6 +1,6 @@
 //! Store-backed block-level read/write operations.
 //!
-//! Two-layer storage: **shared-memory chunk cache → SimStore (express bucket)**.
+//! Two-layer storage: **shared-memory chunk cache → S3Sim (express bucket)**.
 //! The local backing-file layer (`{DataDir}/tiko/`) has been removed.
 //!
 //! # Public surface
@@ -10,12 +10,12 @@
 //! | `store_exists` | Check whether a relation fork exists (nblocks key present) |
 //! | `store_create` | Create a relation fork (write nblocks=0) |
 //! | `cached_zeroextend` | Extend a relation fork (update nblocks if larger) |
-//! | `cached_file_nblocks` | Block count: max(SimStore nblocks, cache max) |
-//! | `cached_read_blocks` | Read blocks: cache hit or SimStore fetch |
-//! | `cached_write_blocks` | Write blocks: cache (or initdb SimStore RMW) |
-//! | `cached_truncate_file` | Truncate: invalidate cache + trim SimStore + update nblocks |
-//! | `cached_delete_file` | Delete: invalidate cache + remove all SimStore chunks |
-//! | `warm_cache_blocks` | Prefetch: populate cache from SimStore |
+//! | `cached_file_nblocks` | Block count: max(S3Sim nblocks, cache max) |
+//! | `cached_read_blocks` | Read blocks: cache hit or S3Sim fetch |
+//! | `cached_write_blocks` | Write blocks: cache (or initdb S3Sim RMW) |
+//! | `cached_truncate_file` | Truncate: invalidate cache + trim S3Sim + update nblocks |
+//! | `cached_delete_file` | Delete: invalidate cache + remove all S3Sim chunks |
+//! | `warm_cache_blocks` | Prefetch: populate cache from S3Sim |
 
 use std::io;
 use std::sync::atomic::Ordering;
@@ -25,7 +25,7 @@ use crate::{cache::CacheControl, io_control::IoControl};
 use crate::{
     project::{ProjectCtx, ProjectNamespace},
     recovery,
-    sim_store::SimStore,
+    s3_sim::S3Sim,
 };
 use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 
@@ -50,7 +50,7 @@ use pgsys::common::{BLCKSZ, BlockNumber, is_under_postmaster};
 ///
 /// Returns the raw chunk bytes on success, `None` on all misses.
 fn try_fetch_chunk_from_s3_with(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     tag: &ChunkTag,
 ) -> Option<Vec<u8>> {
@@ -102,13 +102,13 @@ fn try_fetch_chunk_from_s3_with(
 }
 
 fn try_fetch_chunk_from_s3(tag: &ChunkTag) -> Option<Vec<u8>> {
-    let sim = SimStore::get();
+    let sim = S3Sim::get();
     let ns = ProjectCtx::get().ns();
     try_fetch_chunk_from_s3_with(sim, ns, tag)
 }
 
-/// Fetch chunk data from SimStore and populate the cache slot.
-/// Returns `true` if data was found and written, `false` if SimStore had no data.
+/// Fetch chunk data from S3Sim and populate the cache slot.
+/// Returns `true` if data was found and written, `false` if S3Sim had no data.
 fn populate_cache_slot_from_s3(cache: &CacheControl, slot: u32, chunk_tag: &ChunkTag) -> bool {
     if let Some(chunk_data) = try_fetch_chunk_from_s3(chunk_tag) {
         if chunk_data.len() % BLCKSZ == 0 {
@@ -149,14 +149,14 @@ fn io_err_to_errno(e: &io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
 
-// ── SimStore-backed relation metadata ─────────────────────────────────────────
+// ── S3Sim-backed relation metadata ─────────────────────────────────────────
 
 /// Read the live block count for a relation fork from the express nblocks key.
 ///
 /// Returns `Some(n)` when the key exists (including `Some(0)` for a relation
 /// truncated to zero), and `None` when the key is absent. Callers that need a
 /// plain integer should fall back to the base manifest or 0 themselves.
-fn store_get_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> Option<BlockNumber> {
+fn store_get_nblocks(sim: &S3Sim, ns: &ProjectNamespace, rf: RelFork) -> Option<BlockNumber> {
     let key = ns.rel_nblocks_key(rf);
     match sim.get_express(&key) {
         Ok(Some(bytes)) if bytes.len() >= 4 => {
@@ -177,7 +177,7 @@ fn store_get_nblocks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> Opti
 /// express and append a `NblocksSet` entry to the cache log so that the
 /// shutdown checkpoint can build the initial manifest.
 fn set_nblocks(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     rf: RelFork,
     n: BlockNumber,
@@ -203,7 +203,7 @@ pub fn store_exists(rf: RelFork) -> bool {
     if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
         return true;
     }
-    let sim = SimStore::get();
+    let sim = S3Sim::get();
     let ctx = ProjectCtx::get();
     let key = ctx.ns().rel_nblocks_key(rf);
     if matches!(sim.get_express(&key), Ok(Some(_))) {
@@ -224,7 +224,7 @@ pub fn store_create(rf: RelFork) -> Result<bool, i32> {
     if IoControl::is_initialized() && IoControl::get().nblocks.get(rf).is_some() {
         return Ok(false);
     }
-    let sim = SimStore::get();
+    let sim = S3Sim::get();
     let ctx = ProjectCtx::get();
     let ns = ctx.ns();
     let key = ns.rel_nblocks_key(rf);
@@ -245,7 +245,7 @@ pub fn store_create(rf: RelFork) -> Result<bool, i32> {
 /// if `blkno + nblocks` exceeds the current value.
 ///
 /// Actual chunk data for extended-but-never-written blocks is implicitly zero:
-/// cache returns zeros for non-existent blocks, and SimStore returns None.
+/// cache returns zeros for non-existent blocks, and S3Sim returns None.
 pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) -> Result<(), i32> {
     let new_nblocks = blkno + nblocks;
     // Use cached_file_nblocks for the three-level read (NblocksTable → express →
@@ -253,7 +253,7 @@ pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) 
     // flushed to express.
     let current = cached_file_nblocks(rf)?;
     if new_nblocks > current {
-        let sim = SimStore::get();
+        let sim = S3Sim::get();
         let ctx = ProjectCtx::get();
         set_nblocks(sim, ctx.ns(), rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
     }
@@ -262,7 +262,7 @@ pub fn cached_zeroextend(rf: RelFork, blkno: BlockNumber, nblocks: BlockNumber) 
 
 /// Delete all express chunk objects for a relation fork (chunk latest + staging keys).
 /// Does NOT delete the nblocks key — the caller handles that.
-fn store_delete_all_chunks(sim: &SimStore, ns: &ProjectNamespace, rf: RelFork) -> io::Result<()> {
+fn store_delete_all_chunks(sim: &S3Sim, ns: &ProjectNamespace, rf: RelFork) -> io::Result<()> {
     let prefix = ns.rel_chunks_prefix(rf);
     for key in sim.list_prefix_express(&prefix)? {
         sim.delete_express(&key)?;
@@ -306,7 +306,7 @@ pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
     }
 
     // Level 2 + 3: cold miss — read from express / base manifest.
-    let n = if let (Some(sim), Some(ctx)) = (SimStore::try_get(), ProjectCtx::try_get()) {
+    let n = if let (Some(sim), Some(ctx)) = (S3Sim::try_get(), ProjectCtx::try_get()) {
         match store_get_nblocks(sim, ctx.ns(), rf) {
             Some(n) => {
                 // Populate NblocksTable (clean) so next call is O(1).
@@ -326,10 +326,10 @@ pub fn cached_file_nblocks(rf: RelFork) -> Result<BlockNumber, i32> {
 }
 
 /// Cache-aware truncate. Invalidates cache blocks at or beyond `nblocks`,
-/// deletes excess chunks from SimStore, then updates the nblocks key.
+/// deletes excess chunks from S3Sim, then updates the nblocks key.
 ///
 /// Order matters: invalidating first prevents a dirty block in the truncated
-/// range from being flushed by `flush_dirty_chunk` after the SimStore chunks
+/// range from being flushed by `flush_dirty_chunk` after the S3Sim chunks
 /// are removed.
 ///
 /// Falls back to only updating the nblocks key when the cache is unavailable.
@@ -338,7 +338,7 @@ pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32
         IoControl::get().cache.invalidate_range(rf, nblocks);
     }
 
-    let sim = SimStore::get();
+    let sim = S3Sim::get();
     let ns = ProjectCtx::get().ns();
 
     // Delete express chunk keys for chunks beyond the new nblocks boundary.
@@ -362,14 +362,14 @@ pub fn cached_truncate_file(rf: RelFork, nblocks: BlockNumber) -> Result<(), i32
 }
 
 /// Cache-aware delete. Invalidates ALL cache blocks for the relation fork,
-/// then removes all express objects (chunks + nblocks key) from SimStore.
+/// then removes all express objects (chunks + nblocks key) from S3Sim.
 ///
 /// Order matters: invalidating first prevents dirty blocks from being flushed
-/// by `flush_dirty_chunk` after the SimStore objects are gone — which would
+/// by `flush_dirty_chunk` after the S3Sim objects are gone — which would
 /// silently recreate them. It also prevents stale cache hits if the same
 /// `rel_number` is later reused.
 ///
-/// Falls back to only removing SimStore objects when the cache is unavailable.
+/// Falls back to only removing S3Sim objects when the cache is unavailable.
 pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
     if cache_is_available() {
         // first_block=0 invalidates every chunk for this fork
@@ -380,7 +380,7 @@ pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
         IoControl::get().nblocks.remove(rf);
     }
 
-    let sim = SimStore::get();
+    let sim = S3Sim::get();
     let ns = ProjectCtx::get().ns();
 
     // Remove all chunk express objects (includes chunk latest/staging keys).
@@ -398,15 +398,15 @@ pub fn cached_delete_file(rf: RelFork) -> Result<(), i32> {
     Ok(())
 }
 
-/// Cache-aware read. Checks the local cache before fetching from SimStore.
+/// Cache-aware read. Checks the local cache before fetching from S3Sim.
 ///
-/// Falls back to direct SimStore reads when the cache is unavailable (initdb,
+/// Falls back to direct S3Sim reads when the cache is unavailable (initdb,
 /// single-user mode, before shared memory is initialized).
 ///
 /// Uses chunk-level granularity: each cache slot holds 256 KB (32 blocks).
 /// On chunk hit with a valid block, reads directly from cache.
 /// On chunk hit with an invalid block, or chunk miss, fetches the full chunk
-/// from SimStore and populates the cache.
+/// from S3Sim and populates the cache.
 pub fn cached_read_blocks(
     rf: RelFork,
     block_number: BlockNumber,
@@ -414,7 +414,7 @@ pub fn cached_read_blocks(
     buffer_ptr: *mut u8,
 ) -> Result<BlockNumber, i32> {
     if !cache_is_available() {
-        // initdb / single-user: read directly from SimStore express.
+        // initdb / single-user: read directly from S3Sim express.
         for i in 0..nblocks {
             let blkno = block_number + i;
             let chunk_tag = ChunkTag::from_block(rf, blkno);
@@ -459,7 +459,7 @@ pub fn cached_read_blocks(
                 // Block is populated — read directly from cache.
                 cache.read_block(slot, block_offset, buf);
             } else {
-                // Block not in cache — fetch whole chunk from SimStore and
+                // Block not in cache — fetch whole chunk from S3Sim and
                 // populate only the invalid slots (preserve dirty/valid blocks).
                 if let Some(chunk_data) = try_fetch_chunk_from_s3(&chunk_tag) {
                     if chunk_data.len() % BLCKSZ == 0 {
@@ -483,15 +483,15 @@ pub fn cached_read_blocks(
             cache.touch(slot);
             cache.unpin(slot);
         } else {
-            // Chunk miss — insert new slot, fetch full chunk from SimStore.
+            // Chunk miss — insert new slot, fetch full chunk from S3Sim.
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
             // insert() returns a pinned slot; may be an existing slot if a concurrent
             // thread inserted the same tag between our lookup miss and now.
             let slot = cache.insert(&chunk_tag);
 
-            // Newly allocated slot — fetch from SimStore and populate.
+            // Newly allocated slot — fetch from S3Sim and populate.
             populate_cache_slot_from_s3(cache, slot, &chunk_tag);
-            // If SimStore had no data, slot stays with valid_blocks=0; caller
+            // If S3Sim had no data, slot stays with valid_blocks=0; caller
             // handles via is_block_valid check below (zero-fill for new blocks).
 
             if cache.is_block_valid(slot, block_offset) {
@@ -508,14 +508,14 @@ pub fn cached_read_blocks(
     Ok(nblocks)
 }
 
-/// Cache-aware write. On a cache miss, pre-populates the slot from SimStore
+/// Cache-aware write. On a cache miss, pre-populates the slot from S3Sim
 /// (read-modify-write) so that `flush_dirty_chunk` never emits stale bytes
 /// from the previous slot occupant for blocks the caller didn't write.
 ///
-/// Falls back to chunk-level read-modify-write on SimStore when the cache is
+/// Falls back to chunk-level read-modify-write on S3Sim when the cache is
 /// unavailable (initdb). Namespace must be initialized before initdb writes.
 ///
-/// Dirty blocks are flushed to SimStore express on eviction — no write-through.
+/// Dirty blocks are flushed to S3Sim express on eviction — no write-through.
 pub fn cached_write_blocks(
     rf: RelFork,
     block_number: BlockNumber,
@@ -523,8 +523,8 @@ pub fn cached_write_blocks(
     buffer_ptr: *const u8,
 ) -> Result<BlockNumber, i32> {
     if !cache_is_available() {
-        // initdb: chunk-level read-modify-write on SimStore express.
-        let sim = SimStore::get();
+        // initdb: chunk-level read-modify-write on S3Sim express.
+        let sim = S3Sim::get();
         let ctx = ProjectCtx::get();
         let ns = ctx.ns();
         let timeline = ctx.current_timeline_id();
@@ -600,7 +600,7 @@ pub fn cached_write_blocks(
                 stats.cache_misses.fetch_add(1, Ordering::Relaxed);
                 let slot = cache.insert(&chunk_tag);
 
-                // Newly allocated slot: pre-populate from SimStore before writing.
+                // Newly allocated slot: pre-populate from S3Sim before writing.
                 //
                 // `insert()` resets `valid_blocks` but does NOT zero the cache
                 // file region — it retains raw bytes from the previous occupant.
@@ -608,7 +608,7 @@ pub fn cached_write_blocks(
                 // slot on eviction and emits stale bytes for every block the
                 // caller never explicitly wrote — silently corrupting those blocks.
                 if !populate_cache_slot_from_s3(cache, slot, &chunk_tag) {
-                    // New chunk (no data in SimStore yet) — zero the slot so
+                    // New chunk (no data in S3Sim yet) — zero the slot so
                     // flush_dirty_chunk never emits stale bytes from the prior
                     // occupant for blocks the caller doesn't write.
                     cache.write_blocks_to_slot(slot, 0, BLOCKS_PER_CHUNK, &vec![0u8; CHUNK_SIZE]);
@@ -631,7 +631,7 @@ pub fn cached_write_blocks(
     let new_nblocks = block_number + nblocks;
     let current = cached_file_nblocks(rf)?;
     if new_nblocks > current {
-        let sim = SimStore::get();
+        let sim = S3Sim::get();
         let ctx = ProjectCtx::get();
         set_nblocks(sim, ctx.ns(), rf, new_nblocks).map_err(|e| io_err_to_errno(&e))?;
     }
@@ -644,7 +644,7 @@ pub fn cached_write_blocks(
 /// Iterates chunk-by-chunk over the requested range. For each chunk:
 /// - **Cache hit**: pin, touch, unpin — data is already present.
 /// - **Cache miss**: insert an empty slot (pinned), fetch the full chunk from
-///   SimStore (express latest first, then standard bucket via base manifest
+///   S3Sim (express latest first, then standard bucket via base manifest
 ///   for inherited ancestor-branch chunks), mark loaded blocks valid, then unpin.
 ///
 /// This is the backend of `S3IoOpKind::Prefetch` — it allows subsequent
@@ -684,7 +684,7 @@ pub fn warm_cache_blocks(
             cache.touch(slot);
             cache.unpin(slot);
         } else {
-            // Cache miss — insert empty slot and populate from SimStore.
+            // Cache miss — insert empty slot and populate from S3Sim.
             stats.cache_misses.fetch_add(1, Ordering::Relaxed);
             let slot = cache.insert(&chunk_tag);
 
@@ -707,7 +707,7 @@ mod tests {
     use crate::manifest::{ChunkRef, Manifest};
     use crate::project::ProjectNamespace;
     use crate::recovery;
-    use crate::sim_store::SimStore;
+    use crate::s3_sim::S3Sim;
     use pgsys::Lsn;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -743,7 +743,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let tag = tag(100);
 
         // Ensure recovery mode is off.
@@ -765,7 +765,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let tag = tag(101);
 
         recovery::RECOVERY_MODE.store(false, Ordering::SeqCst);
@@ -821,7 +821,7 @@ mod tests {
         // built from a manifest lookup against an entry in the standard sim.
         let dir = TempDir::new().unwrap();
         let ns = ProjectNamespace::new(2002, 3003, 10);
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let tag = tag(300);
         let parent_branch_id: u64 = 42;
         let lsn = Lsn::new(0x800);
@@ -875,7 +875,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let tag = tag(400);
         let branch_id: u64 = 55;
         let lsn = Lsn::new(0x2000);
@@ -930,7 +930,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let ns = ns();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let tag = tag(500);
 
         // Enable recovery mode but do NOT put a matching versioned object.

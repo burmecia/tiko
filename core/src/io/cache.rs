@@ -678,17 +678,17 @@ impl CacheControl {
             .expect("cache write_blocks_to_slot: pwrite failed");
     }
 
-    /// Flush dirty blocks from a cache slot to SimStore express.
+    /// Flush dirty blocks from a cache slot to S3Sim express.
     ///
     /// 1. PUTs the full 256 KB chunk to the express-bucket `latest` object via
-    ///    `SimStore::put_express_latest` — a plain PUT, no staging, no
+    ///    `S3Sim::put_express_latest` — a plain PUT, no staging, no
     ///    standard-bucket copy (those happen only at checkpoint time).
     /// 2. On a successful PUT, appends one `ChunkTag` (20 bytes) to the
     ///    eviction log with `O_APPEND` — atomic on Linux/macOS for writes this
     ///    small. No log entry is written if the PUT failed, so there are never
     ///    phantom entries for chunks that didn't reach express storage.
     ///
-    /// Both steps are guarded: they are skipped when `SimStore` or `ProjectCtx`
+    /// Both steps are guarded: they are skipped when `S3Sim` or `ProjectCtx`
     /// are not yet initialised (e.g. during initdb, single-user mode, or very
     /// early in backend startup before env vars are read).
     ///
@@ -699,9 +699,9 @@ impl CacheControl {
         let tag = meta.tag; // copy — avoids holding a borrow across I/O
 
         // Express PUT + eviction log append.
-        // Guard: only run when SimStore and ProjectCtx are initialised.
+        // Guard: only run when S3Sim and ProjectCtx are initialised.
         if let (Some(sim), Some(ctx)) = (
-            crate::sim_store::SimStore::try_get(),
+            crate::s3_sim::S3Sim::try_get(),
             crate::project::ProjectCtx::try_get(),
         ) {
             let mut chunk_data = vec![0u8; CHUNK_SIZE];
@@ -1058,7 +1058,7 @@ impl CacheControl {
 mod tests {
     use super::*;
     use crate::project::ProjectNamespace;
-    use crate::sim_store::SimStore;
+    use crate::s3_sim::S3Sim;
     use pgsys::Lsn;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1212,7 +1212,7 @@ mod tests {
     #[test]
     fn express_put_creates_only_latest_no_staging_no_standard() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ProjectNamespace::new(1001, 2001, 7);
         let tag = make_tag(42);
         let data = vec![0u8; CHUNK_SIZE];

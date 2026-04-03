@@ -1,10 +1,10 @@
 use core::{
     project::{ProjectMeta, ProjectNamespace, build_initial_manifest},
-    sim_store::SimStore,
+    s3_sim::S3Sim,
 };
 use pgsys::Lsn;
 
-pub fn run(sim: &SimStore, org: u64, project: u64, branch: u64, lsn: &str) {
+pub fn run(sim: &S3Sim, org: u64, project: u64, branch: u64, lsn: &str) {
     let ns = ProjectNamespace::new(org, project, branch);
     let restore_lsn = Lsn::parse_either(lsn).unwrap_or_else(|e| {
         eprintln!("error: {e}");

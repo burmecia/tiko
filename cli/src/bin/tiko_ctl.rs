@@ -10,7 +10,7 @@ mod make_template;
 mod restore;
 
 use clap::{Parser, Subcommand};
-use core::sim_store::SimStore;
+use core::s3_sim::S3Sim;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -32,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command_ {
-    /// Create a PGDATA template tarball and store it in the SimStore standard bucket.
+    /// Create a PGDATA template tarball and store it in the S3Sim standard bucket.
     ///
     /// Runs `initdb`, strips relation files and transactional state, tarballs the result,
     /// and uploads it to `standard/template/<output-filename>`.
@@ -43,8 +43,8 @@ enum Command_ {
     },
     /// Create an org (also creates the root project).
     ///
-    /// Finds the named template in the SimStore, extracts it, copies the
-    /// embedded SimStore data into the org's namespace, then writes org.json
+    /// Finds the named template in the S3Sim, extracts it, copies the
+    /// embedded S3Sim data into the org's namespace, then writes org.json
     /// and project.json.
     CreateOrg {
         #[arg(long)]
@@ -97,12 +97,12 @@ enum Command_ {
     },
 }
 
-fn require_sim(tiko_root: Option<&Path>, op: &str) -> &'static SimStore {
+fn require_sim(tiko_root: Option<&Path>, op: &str) -> &'static S3Sim {
     let path = tiko_root.unwrap_or_else(|| {
         eprintln!("error: {op} requires '--tiko-root <PATH>' (or TIKO_ROOT_PATH)");
         std::process::exit(2);
     });
-    SimStore::init(path)
+    S3Sim::init(path)
 }
 
 fn main() {

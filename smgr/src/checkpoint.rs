@@ -2,11 +2,11 @@
 //!
 //! Called from `CheckPointGuts()` in `xlog.c` after `CheckPointBuffers()`.
 //! The checkpointer is a plain PG process — no Tokio runtime.  All I/O is
-//! synchronous (`std::fs` + `SimStore` which is also `std::fs`).
+//! synchronous (`std::fs` + `S3Sim` which is also `std::fs`).
 //!
 //! # Six-step algorithm
 //!
-//! 0. **Guard**: returns early if `IoControl`, `SimStore`, or `ProjectCtx`
+//! 0. **Guard**: returns early if `IoControl`, `S3Sim`, or `ProjectCtx`
 //!    are not yet initialised — nothing to flush or upload.
 //!
 //! 1. **Flush dirty chunks** (`flush_all_dirty_chunks`): every dirty cache
@@ -61,7 +61,7 @@ use core::{
     chunk::{ChunkLogEntry, ChunkTag, RelFork},
     manifest::{ChunkRef, Manifest},
     project::{ProjectCtx, ProjectNamespace},
-    sim_store::SimStore,
+    s3_sim::S3Sim,
     tiko_root_path,
 };
 use pgsys::{Lsn, common::data_dir_path, logging::*};
@@ -74,7 +74,7 @@ use pgsys::{Lsn, common::data_dir_path, logging::*};
 /// This is step 1b of the checkpoint algorithm and is called before the log
 /// snapshot (step 2) so that all nblocks changes from this interval are present
 /// in `cache_log` before it is atomically snapshotted.
-fn flush_all_dirty_nblocks(sim: &SimStore, ns: &ProjectNamespace) {
+fn flush_all_dirty_nblocks(sim: &S3Sim, ns: &ProjectNamespace) {
     IoControl::get().nblocks.drain_dirty(|rf, n| {
         // Write to express for persistence across restarts.
         let _ = sim.put_express(&ns.rel_nblocks_key(rf), &n.to_le_bytes());
@@ -94,14 +94,14 @@ fn flush_all_dirty_nblocks(sim: &SimStore, ns: &ProjectNamespace) {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u64) {
     // During --boot (BOOTSTRAP_PROCESSING), checkpoint_lsn is 0 and neither
-    // SimStore nor ProjectCtx are initialised — nothing to do.
+    // S3Sim nor ProjectCtx are initialised — nothing to do.
     if checkpoint_lsn == 0 {
         return;
     }
 
-    let (sim, ctx) = match (SimStore::try_get(), ProjectCtx::try_get()) {
+    let (sim, ctx) = match (S3Sim::try_get(), ProjectCtx::try_get()) {
         (Some(s), Some(c)) => (s, c),
-        _ => return, // env vars absent or SimStore not yet initialised
+        _ => return, // env vars absent or S3Sim not yet initialised
     };
 
     let lsn = Lsn::new(checkpoint_lsn);
@@ -201,7 +201,7 @@ struct CheckpointStats {
 ///
 /// Returns `Ok(None)` when the dirty set is empty (no-op).
 fn checkpoint_flush_inner(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     timeline: u32,
     checkpoint_lsn: Lsn,
@@ -259,7 +259,7 @@ fn checkpoint_flush_inner(
 
     // Step 4 — read each sidecar and write to the standard bucket.
     //
-    // Sidecar files contain zstd-compressed chunk data. SimStore's `put_standard`
+    // Sidecar files contain zstd-compressed chunk data. S3Sim's `put_standard`
     // transparently re-compresses whatever bytes it receives (for non-.zst keys),
     // so the sidecar bytes must be decompressed first to avoid double compression.
     // express `latest` is left untouched — it was already set correctly in
@@ -335,7 +335,7 @@ fn now_unix() -> i64 {
 /// Serialise `manifest` to the S3 wire format and PUT it at the delta manifest
 /// key `{org}/pitr/{proj}/deltas/{lsn_hex}/manifest.bin` in the standard bucket.
 fn upload_delta_manifest(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     timeline: u32,
     checkpoint_lsn: Lsn,
@@ -352,7 +352,7 @@ fn upload_delta_manifest(
 /// chunk uploads) via `build_pg_state_archive` so the archive captures the
 /// filesystem state at checkpoint initiation rather than after slow uploads.
 fn upload_pg_state(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     timeline: u32,
     checkpoint_lsn: Lsn,
@@ -416,7 +416,7 @@ mod tests {
     use core::chunk::{CHUNK_SIZE, ChunkLogEntry, ChunkTag};
     use core::manifest::{ChunkRef, Manifest};
     use core::project::ProjectNamespace;
-    use core::sim_store::SimStore;
+    use core::s3_sim::S3Sim;
     use pgsys::Lsn;
     use std::fs;
     use std::io::Write as _;
@@ -510,7 +510,7 @@ mod tests {
     // Run `checkpoint_flush_inner` with a fresh tempdir.
     fn run_flush(
         dir: &TempDir,
-        sim: &SimStore,
+        sim: &S3Sim,
         ns: &ProjectNamespace,
         lsn: Lsn,
         timeline: u32,
@@ -521,7 +521,7 @@ mod tests {
     /// Deserialise the delta manifest from the standard sim for `lsn`.
     fn read_delta_manifest(
         dir: &TempDir,
-        sim: &SimStore,
+        sim: &S3Sim,
         ns: &ProjectNamespace,
         timeline: u32,
         lsn: Lsn,
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn scenario1_chunk_in_log_appears_in_delta_manifest() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x1000);
         let tag = make_tag(1);
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn scenario2_mid_interval_chunk_log_entry_in_manifest() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x2000);
         let tag = make_tag(2);
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn scenario3_dedup_collapses_duplicate_log_entries_to_one_upload() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x3000);
         let tag = make_tag(3);
@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn scenario5_ckpt_exists_without_log_reprocessed_idempotently() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x5000);
         let tag = make_tag(5);
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn all_manifest_entries_have_correct_lsn_and_branch_id() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x6000);
         let tags: Vec<ChunkTag> = (10..15).map(make_tag).collect();
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn idempotent_second_call_with_ckpt_present_produces_same_manifest() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x7000);
         let tag = make_tag(77);
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn cache_log_ckpt_removed_on_success() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x8000);
 
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn empty_cache_log_produces_no_delta_manifest() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x9000);
 
@@ -775,7 +775,7 @@ mod tests {
     #[test]
     fn nblocks_change_only_produces_delta_manifest_with_fork_nblocks() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0xa000);
 
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn nblocks_change_and_dirty_chunk_both_appear_in_manifest() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0xb000);
 
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     fn sidecar_seq_uniqueness_prevents_overwrite() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x10000);
         let tag = make_tag(10);
@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn fork_deleted_chunk_excluded_from_manifest() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x11000);
         let tag = make_tag(20);
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn nblocks_set_then_fork_deleted_removes_from_fork_nblocks() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x12000);
         let rf = RelFork {
@@ -970,7 +970,7 @@ mod tests {
     #[test]
     fn orphaned_sidecar_does_not_cause_crash() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x13000);
         let tag = make_tag(30);
@@ -1017,7 +1017,7 @@ mod tests {
     #[test]
     fn upload_delta_manifest_stores_at_correct_key() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x200);
         let manifest = make_manifest(dir.path(), lsn);
@@ -1039,7 +1039,7 @@ mod tests {
     #[test]
     fn upload_pg_state_empty_pgdata_succeeds() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x300);
 
@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn upload_pg_state_includes_pg_control_and_xact() {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         let ns = ns();
         let lsn = Lsn::new(0x400);
 

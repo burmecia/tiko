@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 
 use core::{
-    ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, project::ProjectNamespace, sim_store::SimStore,
+    ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, project::ProjectNamespace, s3_sim::S3Sim,
 };
 use pgsys::Lsn;
 
@@ -95,10 +95,10 @@ fn main() {
 
 // ── Core helpers (also used by tests) ────────────────────────────────────────
 
-/// Build a `SimStore` from `$TIKO_ROOT_PATH`.
-fn sim_from_env() -> Result<&'static SimStore, String> {
+/// Build a `S3Sim` from `$TIKO_ROOT_PATH`.
+fn sim_from_env() -> Result<&'static S3Sim, String> {
     let root = std::env::var("TIKO_ROOT_PATH").map_err(|_| "TIKO_ROOT_PATH not set".to_string())?;
-    Ok(SimStore::init(Path::new(&root)))
+    Ok(S3Sim::init(Path::new(&root)))
 }
 
 /// Build own `ProjectNamespace` from `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID`.
@@ -139,7 +139,7 @@ fn branch_checkpoint_lsn_from_env() -> Option<Lsn> {
 /// 2. If a parent namespace is provided AND the segment's LSN is within the
 ///    branch point (`segment_lsn ≤ branch_lsn`), try the parent namespace.
 fn restore_segment(
-    sim: &SimStore,
+    sim: &S3Sim,
     own_ns: &ProjectNamespace,
     parent_ns: Option<&ProjectNamespace>,
     branch_lsn: Option<Lsn>,
@@ -173,7 +173,7 @@ fn restore_segment(
 ///
 /// Returns `Ok(true)` on success, `Ok(false)` if the key does not exist.
 fn download_wal_segment(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     timeline: u32,
     segment: &str,
@@ -228,9 +228,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, SimStore) {
+    fn setup() -> (TempDir, S3Sim) {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         (dir, sim)
     }
 
@@ -243,7 +243,7 @@ mod tests {
     }
 
     /// Store a WAL segment in the sim standard bucket.
-    fn seed_wal(sim: &SimStore, ns: &ProjectNamespace, segment: &str, data: &[u8]) {
+    fn seed_wal(sim: &S3Sim, ns: &ProjectNamespace, segment: &str, data: &[u8]) {
         let timeline = parse_timeline(segment).unwrap();
         let key = ns.wal_key(timeline, segment);
         sim.put_standard(&key, data).unwrap();

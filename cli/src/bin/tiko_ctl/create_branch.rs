@@ -5,12 +5,12 @@ use std::process::Command;
 use core::{
     project::{ProjectMeta, ProjectNamespace, create_branch},
     recovery::prepare_recovery,
-    sim_store::SimStore,
+    s3_sim::S3Sim,
 };
 use pgsys::Lsn;
 
 pub fn run(
-    sim: &SimStore,
+    sim: &S3Sim,
     org: u64,
     project: u64,
     branch: u64,
@@ -84,11 +84,11 @@ pub fn run(
     let tarball = sim
         .get_template(template)
         .unwrap_or_else(|e| {
-            eprintln!("error: failed to read template from SimStore: {e}");
+            eprintln!("error: failed to read template from S3Sim: {e}");
             std::process::exit(1);
         })
         .unwrap_or_else(|| {
-            eprintln!("error: template '{template}' not found in SimStore");
+            eprintln!("error: template '{template}' not found in S3Sim");
             std::process::exit(1);
         });
 

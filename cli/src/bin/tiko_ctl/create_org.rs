@@ -1,21 +1,21 @@
 use core::org::OrgMeta;
-use core::sim_store::SimStore;
+use core::s3_sim::S3Sim;
 use std::fs;
 use std::process::Command;
 
 /// Source org_id baked into the template by `make_template` (initdb runs with TIKO_ORG_ID=0).
 const TEMPLATE_ORG_ID: u64 = 0;
 
-pub fn run(sim: &SimStore, org_id: u64, template: &str) {
-    // ── 1. Retrieve template tarball from SimStore ─────────────────────────────
+pub fn run(sim: &S3Sim, org_id: u64, template: &str) {
+    // ── 1. Retrieve template tarball from S3Sim ─────────────────────────────
     let tarball = sim
         .get_template(template)
         .unwrap_or_else(|e| {
-            eprintln!("error: failed to read template from SimStore: {e}");
+            eprintln!("error: failed to read template from S3Sim: {e}");
             std::process::exit(1);
         })
         .unwrap_or_else(|| {
-            eprintln!("error: template '{template}' not found in SimStore");
+            eprintln!("error: template '{template}' not found in S3Sim");
             std::process::exit(1);
         });
 
@@ -46,7 +46,7 @@ pub fn run(sim: &SimStore, org_id: u64, template: &str) {
         std::process::exit(1);
     }
 
-    // ── 3. Copy SimStore data from template (org=0) → new org ─────────────────
+    // ── 3. Copy S3Sim data from template (org=0) → new org ─────────────────
     // The template tarball includes `store/sim/{standard,express}/0/...` written
     // by initdb running with TIKO_ORG_ID=0. Re-key all those objects to `{org}/`.
     let tiko_sim = work.path().join("store").join("sim");

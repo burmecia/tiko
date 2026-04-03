@@ -25,56 +25,56 @@ use crate::project::ProjectNamespace;
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 
-/// Sim store initialised by `SimStore::init` at s3worker startup.
+/// Sim store initialised by `S3Sim::init` at s3worker startup.
 /// Accessed from `cached_read_blocks` via `try_fetch_chunk_from_s3`.
-pub(crate) static SIM_STORE: OnceLock<SimStore> = OnceLock::new();
+pub(crate) static SIM_STORE: OnceLock<S3Sim> = OnceLock::new();
 
-// ── SimStore ─────────────────────────────────────────────────────────────────
+// ── S3Sim ─────────────────────────────────────────────────────────────────
 
 /// Local-filesystem simulation of S3 Express + Standard buckets.
 #[derive(Debug)]
-pub struct SimStore {
+pub struct S3Sim {
     /// `{DataDir}/tiko/sim/express`
     express_root: PathBuf,
     /// `{DataDir}/tiko/sim/standard`
     standard_root: PathBuf,
 }
 
-impl SimStore {
+impl S3Sim {
     /// Initialise the sim store.
     ///
     /// Must be called once from `s3worker_main()` before `ProjectCtx::load()`.
     /// Subsequent calls are silently ignored (OnceLock semantics).
     pub fn init(tiko_root_dir: &Path) -> &'static Self {
-        let _ = SIM_STORE.set(SimStore::new(tiko_root_dir));
+        let _ = SIM_STORE.set(S3Sim::new(tiko_root_dir));
         Self::get()
     }
 
-    /// Return the global `SimStore`.
+    /// Return the global `S3Sim`.
     ///
     /// # Panics
-    /// Panics if `SimStore::init` has not been called.
+    /// Panics if `S3Sim::init` has not been called.
     pub fn get() -> &'static Self {
         SIM_STORE
             .get()
-            .expect("SimStore::get() called before SimStore::init()")
+            .expect("S3Sim::get() called before S3Sim::init()")
     }
 
-    /// Return the global `SimStore`, or `None` if not yet initialised.
+    /// Return the global `S3Sim`, or `None` if not yet initialised.
     pub fn try_get() -> Option<&'static Self> {
         SIM_STORE.get()
     }
 
-    /// Create a new `SimStore` instance with the given root directory.
+    /// Create a new `S3Sim` instance with the given root directory.
     pub fn new(tiko_root_dir: &Path) -> Self {
         let base = tiko_root_dir.join("sim");
-        SimStore {
+        S3Sim {
             express_root: base.join("express"),
             standard_root: base.join("standard"),
         }
     }
 
-    /// Create a new `SimStore` instance using the `TIKO_ROOT_PATH` environment variable.
+    /// Create a new `S3Sim` instance using the `TIKO_ROOT_PATH` environment variable.
     ///
     /// # Panics
     /// Panics if `TIKO_ROOT_PATH` is not set.
@@ -164,13 +164,13 @@ impl SimStore {
         read_optional(&self.template_key(filename))
     }
 
-    /// Copy all objects from `src_standard` and `src_express` into this SimStore,
+    /// Copy all objects from `src_standard` and `src_express` into this S3Sim,
     /// rewriting the leading org component from `src_org_id` to `dst_org_id`.
     ///
     /// Files are copied at the raw filesystem level (preserving on-disk encoding)
     /// rather than going through the put/get layer to avoid double-compression.
     ///
-    /// Used by `create_org` to seed a new org from a template's embedded SimStore.
+    /// Used by `create_org` to seed a new org from a template's embedded S3Sim.
     pub fn copy_org_data(
         &self,
         src_standard: &Path,
@@ -354,9 +354,9 @@ mod tests {
     use pgsys::Lsn;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, SimStore) {
+    fn setup() -> (TempDir, S3Sim) {
         let dir = TempDir::new().unwrap();
-        let store = SimStore::new(dir.path());
+        let store = S3Sim::new(dir.path());
         (dir, store)
     }
 

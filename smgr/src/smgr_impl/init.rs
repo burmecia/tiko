@@ -1,5 +1,5 @@
 use core::io_control::IoControl;
-use core::{org::OrgMeta, project::ProjectCtx, sim_store::SimStore, tiko_root_path};
+use core::{org::OrgMeta, project::ProjectCtx, s3_sim::S3Sim, tiko_root_path};
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number, is_under_postmaster},
     logging::*,
@@ -16,11 +16,11 @@ pub extern "C-unwind" fn tiko_init() {
 
     let root_dir = tiko_root_path();
 
-    // Initialize SimStore unconditionally — needed for both initdb and normal run.
-    SimStore::init(&root_dir);
+    // Initialize S3Sim unconditionally — needed for both initdb and normal run.
+    S3Sim::init(&root_dir);
 
     // Try to initialize ProjectCtx from env vars (TIKO_ORG_ID/TIKO_PROJECT_ID/TIKO_BRANCH_ID).
-    // This enables the initdb write path to reach SimStore express.
+    // This enables the initdb write path to reach S3Sim express.
     ProjectCtx::init_from_env(&root_dir);
 
     // If a recovery manifest exists, load it into memory and set RECOVERY_MODE=true.
@@ -36,7 +36,7 @@ pub extern "C-unwind" fn tiko_init() {
     // was never sized/initialised via shmem_request_hook.
     if !is_under_postmaster() {
         let org_id = ProjectCtx::get().meta.ns.org_id;
-        OrgMeta::ensure_org_meta(SimStore::get(), org_id)
+        OrgMeta::ensure_org_meta(S3Sim::get(), org_id)
             .unwrap_or_else(|e| pg_log_error(&format!("tiko_init: ensure_org_meta failed: {e}")));
         return;
     }

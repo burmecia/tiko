@@ -1,4 +1,4 @@
-use core::sim_store::SimStore;
+use core::s3_sim::S3Sim;
 use pgsys::common::PG_VERSION_NUM;
 use std::fs;
 use std::path::Path;
@@ -38,7 +38,7 @@ pub fn run(pg_bindir: &Path, tiko_root: Option<&Path>) {
     // that runs at the end of initdb deletes the referenced sidecars, but
     // intermediate sidecars for the same chunk (one per block write) are
     // cleaned up during log parse. Any remaining files are safe to drop here
-    // because the checkpoint has already uploaded the data to the SimStore.
+    // because the checkpoint has already uploaded the data to the S3Sim.
     let dirty_chunks_dir = store_root.join("dirty_chunks");
     if dirty_chunks_dir.exists() {
         fs::remove_dir_all(&dirty_chunks_dir).unwrap_or_else(|e| {
@@ -124,7 +124,7 @@ max_slot_wal_keep_size = 1GB
         size
     );
 
-    // ── 8. Upload to SimStore ─────────────────────────────────────────────────
+    // ── 8. Upload to S3Sim ─────────────────────────────────────────────────
     if let Some(root) = tiko_root {
         let filename = output
             .file_name()
@@ -137,9 +137,9 @@ max_slot_wal_keep_size = 1GB
             eprintln!("error: failed to read {}: {e}", output.display());
             std::process::exit(1);
         });
-        let sim = SimStore::init(root);
+        let sim = S3Sim::init(root);
         sim.put_template(filename, &data).unwrap_or_else(|e| {
-            eprintln!("error: SimStore upload failed: {e}");
+            eprintln!("error: S3Sim upload failed: {e}");
             std::process::exit(1);
         });
         println!("Stored  {}", filename);

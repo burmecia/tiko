@@ -1,7 +1,7 @@
 //! Manifest types and file-backed merge logic for PITR.
 //!
 //! `Manifest` is the unified type for both base and delta manifests. It is:
-//! - **Stored on S3** as `manifest.bin` — a `msgpack(...)` blob (SimStore applies zstd).
+//! - **Stored on S3** as `manifest.bin` — a `msgpack(...)` blob (S3Sim applies zstd).
 //! - **Cached locally** as a fixed-size sorted binary file (TIKM format) that
 //!   enables O(log N) binary search via direct `pread` calls (no in-memory
 //!   page cache — the block cache in `cache.rs` covers the hot path).
@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
 use crate::project::{ProjectCtx, ProjectNamespace};
-use crate::sim_store::SimStore;
+use crate::s3_sim::S3Sim;
 
 // ── TIKM constants ──
 
@@ -545,7 +545,7 @@ pub enum MaterializeResult {
 /// deltas (idempotent). Does NOT delete delta manifests — cleanup is
 /// enforce_retention_org's responsibility.
 pub fn materialize_base(
-    sim: &SimStore,
+    sim: &S3Sim,
     ns: &ProjectNamespace,
     timeline: u32,
 ) -> MaterializeResultInner<MaterializeResult> {
@@ -640,7 +640,7 @@ pub fn materialize_base(
 mod tests {
     use super::*;
     use crate::project::ProjectNamespace;
-    use crate::sim_store::SimStore;
+    use crate::s3_sim::S3Sim;
     use pgsys::Lsn;
     use tempfile::{TempDir, tempdir};
 
@@ -664,9 +664,9 @@ mod tests {
         }
     }
 
-    fn setup_sim() -> (TempDir, SimStore) {
+    fn setup_sim() -> (TempDir, S3Sim) {
         let dir = TempDir::new().unwrap();
-        let store = SimStore::new(dir.path());
+        let store = S3Sim::new(dir.path());
         (dir, store)
     }
 
@@ -679,7 +679,7 @@ mod tests {
     }
 
     fn store_manifest(
-        sim: &SimStore,
+        sim: &S3Sim,
         key: &str,
         lsn: Lsn,
         chunks: Vec<(ChunkTag, ChunkRef)>,

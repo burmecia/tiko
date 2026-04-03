@@ -7,14 +7,14 @@
 //!
 //! ```text
 //! manifest_viewer <file>                   Auto-detect by magic bytes
-//! manifest_viewer --s3 <key>               Read from SimStore standard bucket ($PGDATA required)
-//! manifest_viewer --s3-express <key>       Read from SimStore express bucket ($PGDATA required)
+//! manifest_viewer --s3 <key>               Read from S3Sim standard bucket ($PGDATA required)
+//! manifest_viewer --s3-express <key>       Read from S3Sim express bucket ($PGDATA required)
 //! manifest_viewer --show-entries [...]     Also print fork_nblocks and entries table (default: summary only)
 //! ```
 //!
 //! Auto-detection: if the file begins with the `TIKM` magic it is opened as a
 //! local TIKM file; if it begins with the zstd magic it is decompressed first
-//! (SimStore compresses on disk); otherwise the raw bytes are decoded as msgpack.
+//! (S3Sim compresses on disk); otherwise the raw bytes are decoded as msgpack.
 //!
 //! # Examples
 //!
@@ -31,11 +31,11 @@
 //! # Summary only — skip the per-entry table (useful for large manifests):
 //! ./target/debug/manifest_viewer --show-entries /path/to/base_manifest.bin
 //!
-//! # From SimStore standard bucket (holds base/delta manifests and WAL):
+//! # From S3Sim standard bucket (holds base/delta manifests and WAL):
 //! PGDATA=/path/to/pgdata ./target/debug/manifest_viewer \
 //!     --s3 "0/pitr/0/bases/0000000002800000/manifest.bin"
 //!
-//! # From SimStore express bucket:
+//! # From S3Sim express bucket:
 //! PGDATA=/path/to/pgdata ./target/debug/manifest_viewer \
 //!     --s3-express "0/0/chunks/1663/5/16384.0/latest"
 //! ```
@@ -43,16 +43,16 @@
 use std::path::{Path, PathBuf};
 
 use core::manifest::Manifest;
-use core::sim_store::SimStore;
+use core::s3_sim::S3Sim;
 
 // ── Argument parsing ─────────────────────────────────────────────────────────
 
 enum Source {
     /// Path to a local file — auto-detected or forced to one format.
     File(PathBuf),
-    /// Key in the SimStore standard bucket; needs $PGDATA.
+    /// Key in the S3Sim standard bucket; needs $PGDATA.
     S3Standard(String),
-    /// Key in the SimStore express bucket; needs $PGDATA.
+    /// Key in the S3Sim express bucket; needs $PGDATA.
     S3Express(String),
 }
 
@@ -121,11 +121,11 @@ fn parse_args() -> Args {
     }
 }
 
-// ── SimStore helper ───────────────────────────────────────────────────────────
+// ── S3Sim helper ───────────────────────────────────────────────────────────
 
-fn sim_from_env() -> Result<&'static SimStore, String> {
+fn sim_from_env() -> Result<&'static S3Sim, String> {
     let pgdata = std::env::var("PGDATA").map_err(|_| "PGDATA is not set".to_string())?;
-    Ok(SimStore::init(Path::new(&pgdata)))
+    Ok(S3Sim::init(Path::new(&pgdata)))
 }
 
 // ── TIKM magic detection ──────────────────────────────────────────────────────
@@ -301,7 +301,7 @@ fn run(args: &Args) -> Result<(), String> {
                     Manifest::open(path).map_err(|e| format!("failed to open TIKM: {e}"))?;
                 print_manifest(&manifest, "local TIKM", args.show_entries, file_size);
             } else {
-                // SimStore compresses non-JSON files with zstd on disk.
+                // S3Sim compresses non-JSON files with zstd on disk.
                 // Decompress before passing to from_bytes() which expects plain msgpack.
                 const ZSTD_MAGIC: &[u8; 4] = &[0x28, 0xB5, 0x2F, 0xFD];
                 let msgpack = if data.starts_with(ZSTD_MAGIC) {
@@ -322,7 +322,7 @@ fn run(args: &Args) -> Result<(), String> {
             let sim = sim_from_env()?;
             let data = sim
                 .get_standard(key)
-                .map_err(|e| format!("SimStore error: {e}"))?
+                .map_err(|e| format!("S3Sim error: {e}"))?
                 .ok_or_else(|| format!("key not found in standard bucket: {key}"))?;
             let file_size = data.len();
             let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
@@ -341,7 +341,7 @@ fn run(args: &Args) -> Result<(), String> {
             let sim = sim_from_env()?;
             let data = sim
                 .get_express(key)
-                .map_err(|e| format!("SimStore error: {e}"))?
+                .map_err(|e| format!("S3Sim error: {e}"))?
                 .ok_or_else(|| format!("key not found in express bucket: {key}"))?;
             let file_size = data.len();
             let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;

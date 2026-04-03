@@ -13,7 +13,7 @@ use crate::tasks::compactor::{CompactorConfig, compactor_task};
 use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
 use core::{
     project::{ProjectCtx, ProjectNamespace},
-    sim_store::SimStore,
+    s3_sim::S3Sim,
 };
 
 /// Spawn the PITR background task on the Tokio runtime.
@@ -21,7 +21,7 @@ use core::{
 /// Does nothing if:
 /// - The runtime has not been initialised.
 /// - `ProjectCtx` is not yet loaded (env vars absent).
-/// - `SimStore` has not been initialised.
+/// - `S3Sim` has not been initialised.
 ///
 /// Call this from `worker_main` after both `init_tokio_runtime` and
 /// `init_project_ctx` have completed.
@@ -36,8 +36,8 @@ pub fn spawn_compactor_task() {
         return;
     };
 
-    let Some(sim) = SimStore::try_get() else {
-        pg_log_warning("tiko: SimStore not initialised; skipping compactor task");
+    let Some(sim) = S3Sim::try_get() else {
+        pg_log_warning("tiko: S3Sim not initialised; skipping compactor task");
         return;
     };
 
@@ -50,7 +50,7 @@ pub fn spawn_compactor_task() {
 
 /// Spawn the WAL receiver task on the Tokio runtime.
 ///
-/// Does nothing if the runtime, `ProjectCtx`, or `SimStore` are not yet initialised.
+/// Does nothing if the runtime, `ProjectCtx`, or `S3Sim` are not yet initialised.
 pub fn spawn_wal_receiver_task() {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_wal_receiver_task called before runtime init; skipping");
@@ -62,8 +62,8 @@ pub fn spawn_wal_receiver_task() {
         return;
     };
 
-    let Some(sim) = SimStore::try_get() else {
-        pg_log_warning("tiko: SimStore not initialised; skipping WAL receiver task");
+    let Some(sim) = S3Sim::try_get() else {
+        pg_log_warning("tiko: S3Sim not initialised; skipping WAL receiver task");
         return;
     };
 

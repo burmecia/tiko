@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::project::{ProjectMeta, ProjectNamespace};
-use crate::sim_store::SimStore;
+use crate::s3_sim::S3Sim;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ impl OrgMeta {
         format!("{}/metadata/", self.org_id)
     }
 
-    pub fn ensure_org_meta(sim: &SimStore, org_id: u64) -> Result<()> {
+    pub fn ensure_org_meta(sim: &S3Sim, org_id: u64) -> Result<()> {
         let key = format!("{}/metadata/org.json", org_id);
         if sim.get_standard(&key)?.is_none() {
             // No org.json exists — create root org and project.
@@ -79,7 +79,7 @@ impl OrgMeta {
     /// The root project always uses `project_id = 0` and `branch_id = 0`.
     /// Both `org.json` and `project.json` are written in a single logical step —
     /// an org without a root project is an invalid state.
-    pub fn create(sim: &SimStore, org_id: u64) -> Result<OrgMeta> {
+    pub fn create(sim: &S3Sim, org_id: u64) -> Result<OrgMeta> {
         let ns = ProjectNamespace::new(org_id, 0, 0);
 
         let meta = OrgMeta {
@@ -98,7 +98,7 @@ impl OrgMeta {
     }
 
     /// Read `org.json` without modifying it.
-    pub fn get(sim: &SimStore, org_id: u64) -> Result<OrgMeta> {
+    pub fn get(sim: &S3Sim, org_id: u64) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
         let bytes = sim.get_standard(&key)?.ok_or(Error::NotFound)?;
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))
@@ -109,7 +109,7 @@ impl OrgMeta {
     /// Physical removal of all `{org}/` objects is deferred to the GC run.
     /// With `force = false`, returns `AlreadyExists` (i.e. already deleted) if
     /// `deleted_at` is already set.
-    pub fn delete(sim: &SimStore, org_id: u64, force: bool) -> Result<OrgMeta> {
+    pub fn delete(sim: &S3Sim, org_id: u64, force: bool) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
         let bytes = sim.get_standard(&key)?.ok_or(Error::NotFound)?;
         let mut meta: OrgMeta =
@@ -143,9 +143,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn temp_sim() -> (SimStore, TempDir) {
+    fn temp_sim() -> (S3Sim, TempDir) {
         let dir = TempDir::new().unwrap();
-        let sim = SimStore::new(dir.path());
+        let sim = S3Sim::new(dir.path());
         (sim, dir)
     }
 
