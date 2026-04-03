@@ -342,10 +342,6 @@ mod tests {
         (dir, store)
     }
 
-    fn ns() -> ProjectNamespace {
-        ProjectNamespace::new(1, 42, 7)
-    }
-
     fn chunk_tag() -> ChunkTag {
         ChunkTag {
             spc_oid: 1663,
