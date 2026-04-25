@@ -79,8 +79,9 @@ impl DbMeta {
     pub(crate) fn relfork_meta_key(&self, rf: &RelFork) -> String {
         let inner = self.inner.lock().unwrap();
         format!(
-            "{}/chunks/{}/{rf}/meta.json",
+            "{}/chunks/{}/{}/{rf}/meta.json",
             inner.ns,
+            inner.timeline_id,
             inner.checkpoint_lsn.to_hex()
         )
     }
@@ -89,8 +90,9 @@ impl DbMeta {
         let inner = self.inner.lock().unwrap();
         let rf = tag.relfork();
         format!(
-            "{}/chunks/{}/{rf}/{}",
+            "{}/chunks/{}/{}/{rf}/{}",
             inner.ns,
+            inner.timeline_id,
             inner.checkpoint_lsn.to_hex(),
             tag.chunk_id
         )

@@ -48,7 +48,7 @@ impl ObjectStore for S3Sim {
     fn put_express(&self, key: &str, data: &[u8]) -> Result<()> {
         write_file(&self.express_root.join(key), data)
     }
-    fn get_express(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    fn get_express(&self, key: &str) -> Result<Vec<u8>> {
         read_file(&self.express_root.join(key))
     }
     fn rename_express(&self, src_key: &str, dst_key: &str) -> Result<()> {
@@ -66,7 +66,7 @@ impl ObjectStore for S3Sim {
     fn put_standard(&self, key: &str, data: &[u8]) -> Result<()> {
         write_file(&self.standard_root.join(key), data)
     }
-    fn get_standard(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    fn get_standard(&self, key: &str) -> Result<Vec<u8>> {
         read_file(&self.standard_root.join(key))
     }
     fn delete_standard(&self, key: &str) -> Result<()> {
@@ -127,18 +127,13 @@ fn write_file(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    let raw = match fs::read(path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+fn read_file(path: &Path) -> Result<Vec<u8>> {
+    let raw = fs::read(path)?;
     if raw.is_empty() || skip_compression(path) {
-        Ok(Some(raw))
+        Ok(raw)
     } else {
-        let data = zstd::decode_all(raw.as_slice())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        Ok(Some(data))
+        let data = zstd::decode_all(raw.as_slice())?;
+        Ok(data)
     }
 }
 

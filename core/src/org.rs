@@ -67,7 +67,7 @@ impl OrgMeta {
 
     pub fn ensure_org_meta(sim: &Store, org_id: u64) -> Result<()> {
         let key = format!("{}/metadata/org.json", org_id);
-        if sim.get_standard(&key).map_err(Error::Store)?.is_none() {
+        if sim.get_standard(&key).map_err(Error::Store).is_err() {
             // No org.json exists — create root org and project.
             Self::create(sim, org_id)?;
         }
@@ -105,10 +105,7 @@ impl OrgMeta {
     /// Read `org.json` without modifying it.
     pub fn get(sim: &Store, org_id: u64) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
-        let bytes = sim
-            .get_standard(&key)
-            .map_err(Error::Store)?
-            .ok_or(Error::NotFound)?;
+        let bytes = sim.get_standard(&key).map_err(Error::Store)?;
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))
     }
 
@@ -119,10 +116,7 @@ impl OrgMeta {
     /// `deleted_at` is already set.
     pub fn delete(sim: &Store, org_id: u64, force: bool) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
-        let bytes = sim
-            .get_standard(&key)
-            .map_err(Error::Store)?
-            .ok_or(Error::NotFound)?;
+        let bytes = sim.get_standard(&key).map_err(Error::Store)?;
         let mut meta: OrgMeta =
             serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
 

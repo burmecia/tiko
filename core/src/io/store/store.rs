@@ -76,16 +76,16 @@ impl Store {
 
     pub(crate) fn get_meta(&self, rf: &RelFork) -> Result<RelForkMeta> {
         let key = self.db.relfork_meta_key(rf);
-        let result = self.get_express(&key)?;
-        match result {
-            Some(bytes) => {
+        match self.get_express(&(vec![key][..])) {
+            Ok(bytes) => {
                 let meta = serde_json::from_slice::<RelForkMeta>(&bytes)?;
                 Ok(meta)
             }
-            None => match self.base_manifest.lookup_relfork_meta(rf) {
+            Err(err) if err.is_not_found() => match self.base_manifest.lookup_relfork_meta(rf) {
                 Some(meta) => Ok(meta),
                 None => Err(Error::not_found("relfork not found")),
             },
+            Err(err) => Err(err),
         }
     }
 
@@ -145,26 +145,23 @@ impl Store {
         debug_assert_eq!(dst.len(), CHUNK_SIZE);
 
         let key = self.db.relfork_chunk_key(tag);
-        let result = self.get_express(&key)?;
-        match result {
-            Some(src) => {
+        match self.get_express(&(vec![key][..])) {
+            Ok(src) => {
                 dst.copy_from_slice(&src);
                 Ok(())
             }
-            None => {
+            Err(err) if err.is_not_found() => {
                 let chunk_ref = self.base_manifest.lookup(tag)?;
                 if let Some(chunk_ref) = chunk_ref {
                     let key = self.db.chunk_key_standard(tag, &chunk_ref);
-                    if let Some(src) = self.get_standard(&key)? {
-                        dst.copy_from_slice(&src);
-                        Ok(())
-                    } else {
-                        Err(Error::not_found("chunk not found in store"))
-                    }
+                    let src = self.get_standard(&key)?;
+                    dst.copy_from_slice(&src);
+                    Ok(())
                 } else {
                     Err(Error::not_found("chunk not found in store"))
                 }
             }
+            Err(err) => Err(err),
         }
     }
 
@@ -190,14 +187,13 @@ impl Store {
         }
     }
 
-    pub fn get_express(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let result = self.backend.get_express(key)?;
-        if let Some(ref data) = result {
+    pub fn get_express(&self, keys: &[String]) -> Result<Vec<u8>> {
+        for key in keys {
+            let data = self.backend.get_express(key)?;
             IoControl::get().stats.store_express.inc_gets(data.len());
-        } else {
-            IoControl::get().stats.store_express.inc_gets(0);
+            return Ok(data);
         }
-        Ok(result)
+        Err(Error::not_found("not found in express bucket"))
     }
 
     pub fn put_express(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -206,14 +202,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_standard(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let result = self.backend.get_standard(key)?;
-        if let Some(ref data) = result {
-            IoControl::get().stats.store_standard.inc_gets(data.len());
-        } else {
-            IoControl::get().stats.store_standard.inc_gets(0);
-        }
-        Ok(result)
+    pub fn get_standard(&self, key: &str) -> Result<Vec<u8>> {
+        let data = self.backend.get_standard(key)?;
+        IoControl::get().stats.store_standard.inc_gets(data.len());
+        Ok(data)
     }
 
     pub fn put_standard(&self, key: &str, data: &[u8]) -> Result<()> {

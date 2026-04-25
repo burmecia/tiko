@@ -617,9 +617,7 @@ pub fn materialize_base(
 
     let (base, base_lsn) = if let Some(&lsn) = base_lsns.last() {
         let manifest_key = ns.base_manifest_key(timeline, lsn);
-        let bytes = sim
-            .get_standard(&manifest_key)?
-            .ok_or_else(|| format!("base manifest not found: {manifest_key}"))?;
+        let bytes = sim.get_standard(&manifest_key)?;
         (Manifest::from_bytes(&bytes, &base_local_path)?, lsn)
     } else {
         (Manifest::empty(&base_local_path)?, Lsn::INVALID)
@@ -648,9 +646,7 @@ pub fn materialize_base(
     let mut deltas = Vec::with_capacity(delta_lsns.len());
     for &delta_lsn in &delta_lsns {
         let key = ns.delta_manifest_key(timeline, delta_lsn);
-        let delta_bytes = sim
-            .get_standard(&key)?
-            .ok_or_else(|| format!("delta manifest not found: {key}"))?;
+        let delta_bytes = sim.get_standard(&key)?;
         let delta_path = std::env::temp_dir().join(format!(
             "tiko_pitr_delta_{}_{}.tikm",
             ns.project_id,

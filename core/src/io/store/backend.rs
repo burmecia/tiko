@@ -17,7 +17,7 @@ pub trait ObjectStore {
     fn put_express(&self, key: &str, data: &[u8]) -> Result<()>;
 
     /// Returns `None` if the key does not exist.
-    fn get_express(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn get_express(&self, key: &str) -> Result<Vec<u8>>;
 
     /// Atomically rename within the express bucket.
     /// Equivalent to S3 Express `RenameObject` — atomic on POSIX filesystems.
@@ -35,7 +35,7 @@ pub trait ObjectStore {
     fn put_standard(&self, key: &str, data: &[u8]) -> Result<()>;
 
     /// Returns `None` if the key does not exist.
-    fn get_standard(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn get_standard(&self, key: &str) -> Result<Vec<u8>>;
 
     /// Delete from the standard bucket; silently succeeds if key is absent.
     fn delete_standard(&self, key: &str) -> Result<()>;

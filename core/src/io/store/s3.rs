@@ -22,7 +22,7 @@ impl ObjectStore for S3 {
     fn put_express(&self, _key: &str, _data: &[u8]) -> Result<()> {
         todo!("remote S3 backend is not implemented yet")
     }
-    fn get_express(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+    fn get_express(&self, _key: &str) -> Result<Vec<u8>> {
         todo!("remote S3 backend is not implemented yet")
     }
     fn rename_express(&self, _src_key: &str, _dst_key: &str) -> Result<()> {
@@ -37,7 +37,7 @@ impl ObjectStore for S3 {
     fn put_standard(&self, _key: &str, _data: &[u8]) -> Result<()> {
         todo!("remote S3 backend is not implemented yet")
     }
-    fn get_standard(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+    fn get_standard(&self, _key: &str) -> Result<Vec<u8>> {
         todo!("remote S3 backend is not implemented yet")
     }
     fn delete_standard(&self, _key: &str) -> Result<()> {

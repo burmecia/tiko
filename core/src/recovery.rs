@@ -210,24 +210,21 @@ pub fn prepare_recovery(
     parent_pgdata: Option<&Path>, // parent's PGDATA; pg_wal/ is copied to child's pg_wal/
 ) -> Result<()> {
     // ── 1. Validate target ────────────────────────────────────────────────────
-    let delta_key = ns.delta_manifest_key(target_tl, target_lsn);
-    if sim
-        .get_standard(&delta_key)
-        .map_err(Error::Store)?
-        .is_none()
-    {
-        return Err(Error::TargetNotFound(delta_key));
-    }
+    // let delta_key = ns.delta_manifest_key(target_tl, target_lsn);
+    // if sim
+    //     .get_standard(&delta_key)
+    //     .map_err(Error::Store)?
+    //     .is_error()
+    // {
+    //     return Err(Error::TargetNotFound(delta_key));
+    // }
 
     let work =
         tempfile::tempdir().map_err(|e| Error::Other(format!("failed to create temp dir: {e}")))?;
 
     // ── 2. pg_state ───────────────────────────────────────────────────────────
     let pg_state_key = ns.pg_state_key(target_tl, target_lsn);
-    let pg_state_bytes = sim
-        .get_standard(&pg_state_key)
-        .map_err(Error::Store)?
-        .ok_or_else(|| Error::Other(format!("pg_state not found: {pg_state_key}")))?;
+    let pg_state_bytes = sim.get_standard(&pg_state_key).map_err(Error::Store)?;
 
     let pg_state_tmp = work.path().join("pg_state.tar.zst");
     fs::write(&pg_state_tmp, &pg_state_bytes)?;
@@ -308,10 +305,7 @@ fn load_base_manifest(
         .map(|(_, k)| k)
         .ok_or(Error::NoCheckpoint)?;
 
-    let bytes = sim
-        .get_standard(best_key)
-        .map_err(Error::Store)?
-        .ok_or_else(|| Error::Other(format!("base manifest not found: {best_key}")))?;
+    let bytes = sim.get_standard(best_key).map_err(Error::Store)?;
 
     Manifest::from_bytes(&bytes, manifest_path)
         .map_err(crate::Error::Io)
@@ -349,10 +343,7 @@ fn apply_deltas_up_to(
         if lsn <= base_lsn || lsn > target_lsn {
             continue;
         }
-        let bytes = sim
-            .get_standard(key)
-            .map_err(Error::Store)?
-            .ok_or_else(|| Error::Other(format!("delta manifest missing: {key}")))?;
+        let bytes = sim.get_standard(key).map_err(Error::Store)?;
         let path = work_dir.join(format!("delta_{lsn_hex}.tikm"));
         let m = Manifest::from_bytes(&bytes, &path)
             .map_err(crate::Error::Io)

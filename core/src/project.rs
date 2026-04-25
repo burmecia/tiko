@@ -431,7 +431,7 @@ impl ProjectMeta {
     /// their `project.json` via `create_branch`.
     pub fn ensure_root(sim: &Store, ns: &ProjectNamespace) -> Result<()> {
         let key = ns.project_meta_key();
-        if sim.get_standard(&key)?.is_some() {
+        if sim.get_standard(&key).is_ok() {
             return Ok(());
         }
         Self::create_root(sim, ns)
@@ -439,9 +439,7 @@ impl ProjectMeta {
 
     pub fn load(sim: &Store, ns: &ProjectNamespace) -> Result<Self> {
         let key = ns.project_meta_key();
-        let bytes = sim
-            .get_standard(&key)?
-            .ok_or_else(|| format!("project.json not found at key: {key}"))?;
+        let bytes = sim.get_standard(&key)?;
         let meta: Self = serde_json::from_slice(&bytes)?;
         Ok(meta)
     }
@@ -577,9 +575,7 @@ impl ProjectCtx {
     pub fn load(ns: &ProjectNamespace, root_dir: &Path, sim: &Store) -> Result<Self> {
         // Step 1: fetch project.json
         let meta_key = ns.project_meta_key();
-        let meta_bytes = sim
-            .get_standard(&meta_key)?
-            .ok_or_else(|| format!("project.json not found at key: {meta_key}"))?;
+        let meta_bytes = sim.get_standard(&meta_key)?;
         let meta: ProjectMeta = serde_json::from_slice(&meta_bytes)?;
 
         // Step 2: validate identity
@@ -618,9 +614,7 @@ impl ProjectCtx {
         // Step 4: download or construct the base manifest
         let base_manifest = if let Some(&latest_lsn) = base_lsns.last() {
             let manifest_key = ns.base_manifest_key(timeline, latest_lsn);
-            let bytes = sim
-                .get_standard(&manifest_key)?
-                .ok_or_else(|| format!("manifest.bin not found at key: {manifest_key}"))?;
+            let bytes = sim.get_standard(&manifest_key)?;
             Manifest::from_bytes(&bytes, &local_path)?
         } else {
             // No bases yet — either root project (before initdb checkpoint) or
@@ -700,9 +694,7 @@ pub fn build_initial_manifest(
 
     // Step 2: download the chosen base manifest.
     let base_manifest_key = parent_ns.base_manifest_key(parent_timeline, chosen_base_lsn);
-    let bytes = sim
-        .get_standard(&base_manifest_key)?
-        .ok_or_else(|| format!("base manifest not found: {base_manifest_key}"))?;
+    let bytes = sim.get_standard(&base_manifest_key)?;
     let base = Manifest::from_bytes(&bytes, out_path)?;
 
     // Step 3: list deltas on the parent's timeline in (chosen_base_lsn, branch_lsn].
@@ -724,9 +716,7 @@ pub fn build_initial_manifest(
     let mut deltas: Vec<Manifest> = Vec::with_capacity(delta_lsns.len());
     for &delta_lsn in &delta_lsns {
         let key = parent_ns.delta_manifest_key(parent_timeline, delta_lsn);
-        let bytes = sim
-            .get_standard(&key)?
-            .ok_or_else(|| format!("delta manifest not found: {key}"))?;
+        let bytes = sim.get_standard(&key)?;
         // Place each delta TIKM file alongside the output base manifest.
         let delta_path = out_path.with_file_name(format!("delta_{}.tikm", delta_lsn.to_hex()));
         deltas.push(Manifest::from_bytes(&bytes, &delta_path)?);
