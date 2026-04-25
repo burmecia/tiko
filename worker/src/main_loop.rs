@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dispatcher::Dispatcher;
 use crate::log_relay;
-use core::io_control::IoControl;
-use core::{project::ProjectCtx, store::Store, tiko_root_path};
+use core::{io_control::IoControl, store::Store};
 use pgsys::{
     common::{MyProcPid, SIGHUP, SIGTERM},
     cshim::check_for_interrupts,
@@ -61,6 +60,11 @@ static mut WAIT_EVENT_TIKO_WORKER_MAIN: u32 = 0;
 pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     pg_log_info("tiko: main loop starting");
 
+    // Initialize the worker cdylib's own copy of Store. The smgr staticlib
+    // has a separate copy (initialized by tiko_init) that Tokio threads here
+    // cannot see — each linked copy of core has its own STORE OnceLock.
+    Store::init();
+
     setup_signal_handlers();
 
     // Initialize wait event identifiers for this worker
@@ -87,16 +91,11 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     // Spawn io_worker_loop on Tokio — receives requests and spawns per-request tasks
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
 
-    // Initialize S3Sim and ProjectCtx from the data directory and env vars
-    let root_dir = tiko_root_path();
-    Store::init(&root_dir);
-    ProjectCtx::init_from_env(&root_dir);
-
     // Spawn the PITR background task now that the runtime and ProjectCtx are initialised.
-    thread_pool::spawn_compactor_task();
+    //thread_pool::spawn_compactor_task();
 
     // Spawn WAL streaming task.
-    thread_pool::spawn_wal_receiver_task();
+    //thread_pool::spawn_wal_receiver_task();
 
     // Get shared memory IO control structure
     let io_control = IoControl::get();

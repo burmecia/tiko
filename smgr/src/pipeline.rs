@@ -21,7 +21,7 @@ const ENOENT: i32 = 2;
 /// Result of a completed async I/O request.
 #[allow(dead_code)]
 pub struct IoResult {
-    pub status: u32,
+    pub status: i32,
     pub nblocks: u32,
 }
 
@@ -60,7 +60,7 @@ pub unsafe fn submit_and_wait(
         );
         match result {
             Ok(io_result) => Some(io_result),
-            Err(_errno) => {
+            Err(errno) => {
                 pg_log_error(&format!(
                     "{}({}): I/O failed for rel {} fork {} block {}: errno {}",
                     label,
@@ -68,7 +68,7 @@ pub unsafe fn submit_and_wait(
                     loc.rel_number,
                     forknum,
                     blocknum,
-                    _errno
+                    errno
                 ));
                 None
             }
@@ -220,7 +220,7 @@ pub(crate) unsafe fn submit_and_wait_raw(
         ));
 
         if result_status != 0 {
-            Err(result_status as i32)
+            Err(result_status)
         } else {
             Ok(IoResult {
                 status: result_status,

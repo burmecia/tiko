@@ -34,20 +34,11 @@ pub extern "C-unwind" fn tiko_truncate(
         return; // no work
     }
 
-    let loc = unsafe { &(*reln).smgr_rlocator.locator };
+    let relfork = RelFork::from_rel(reln, forknum);
 
-    if let Err(errno) = ops::truncate_file(
-        RelFork {
-            spc_oid: loc.spc_oid,
-            db_oid: loc.db_oid,
-            rel_number: loc.rel_number,
-            fork_number: forknum,
-        },
-        nblocks,
-    ) {
+    if let Err(err) = ops::truncate_relfork(&relfork, nblocks) {
         pg_log_error(&format!(
-            "tiko_truncate: failed for rel {}/{}/{} fork {} nblocks {}: errno {}",
-            loc.spc_oid, loc.db_oid, loc.rel_number, forknum, nblocks, errno
+            "tiko_truncate: failed for relfork {relfork} nblocks {nblocks}: {err}",
         ));
     }
 }

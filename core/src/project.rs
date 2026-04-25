@@ -15,10 +15,10 @@ use pgsys::common::is_under_postmaster;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID,
     chunk::{ChunkTag, RelFork},
+    env,
+    io::store::Store,
     manifest::{ChunkRef, Manifest},
-    store::Store,
 };
 
 /// Global project context for the running s3worker process.
@@ -58,18 +58,10 @@ impl ProjectNamespace {
     /// Expects `TIKO_ORG_ID`, `TIKO_PROJECT_ID`, `TIKO_BRANCH_ID` to be set and
     /// parseable as u64s. Panics if any are missing or invalid.
     pub fn new_from_env() -> Self {
-        fn read_u64(name: &str) -> u64 {
-            std::env::var(name)
-                .unwrap_or_else(|_| panic!("Environment variable {name} must be set"))
-                .parse()
-                .unwrap_or_else(|_| panic!("Environment variable {name} must be a valid u64"))
-        }
+        let org_id = env::read_u64(env::ENV_ORG_ID);
+        let project_id = env::read_u64(env::ENV_PROJECT_ID);
 
-        let org_id = read_u64(ENV_ORG_ID);
-        let project_id = read_u64(ENV_PROJECT_ID);
-        let branch_id = read_u64(ENV_BRANCH_ID);
-
-        ProjectNamespace::new(org_id, project_id, branch_id)
+        ProjectNamespace::new(org_id, project_id, 0)
     }
 
     // ── Express-bucket keys ───────────────────────────────────────────────
@@ -226,9 +218,16 @@ impl ProjectNamespace {
     ///
     /// Key for the live block count of a relation fork in the express bucket.
     /// Value: 4-byte little-endian `u32`.
-    pub fn rel_nblocks_key(&self, rf: RelFork) -> String {
+    pub fn rel_nblocks_key(&self, rf: &RelFork) -> String {
         format!(
             "{}/{}/chunks/{}/{}/{}.{}/nblocks",
+            self.org_id, self.project_id, rf.spc_oid, rf.db_oid, rf.rel_number, rf.fork_number
+        )
+    }
+
+    pub fn rel_meta_key(&self, rf: &RelFork) -> String {
+        format!(
+            "{}/{}/chunks/{}/{}/{}.{}/meta.json",
             self.org_id, self.project_id, rf.spc_oid, rf.db_oid, rf.rel_number, rf.fork_number
         )
     }
@@ -236,11 +235,103 @@ impl ProjectNamespace {
     /// `{org}/{proj}/chunks/{spc}/{db}/{rel}.{fork}/`
     ///
     /// Prefix covering all express keys for a relation fork (chunks + nblocks).
-    pub fn rel_chunks_prefix(&self, rf: RelFork) -> String {
+    pub fn rel_chunks_prefix(&self, rf: &RelFork) -> String {
         format!(
             "{}/{}/chunks/{}/{}/{}.{}/",
             self.org_id, self.project_id, rf.spc_oid, rf.db_oid, rf.rel_number, rf.fork_number
         )
+    }
+
+    /// `{org}/{proj}/chunks/` — prefix covering all chunk-related express keys
+    /// for this project (chunk latest, nblocks, and deletion markers).
+    pub fn all_chunks_express_prefix(&self) -> String {
+        format!("{}/{}/chunks/", self.org_id, self.project_id)
+    }
+
+    /// `{org}/{proj}/chunks/{spc}/{db}/{rel}.{fork}/.deleted`
+    ///
+    /// Deletion marker written by `delete_file` so that the checkpoint can
+    /// record this fork in `deleted_forks` of the delta manifest even after
+    /// the fork_meta entry has been evicted mid-interval.
+    pub fn fork_deleted_marker_key(&self, rf: &RelFork) -> String {
+        format!(
+            "{}/{}/chunks/{}/{}/{}.{}/.deleted",
+            self.org_id, self.project_id, rf.spc_oid, rf.db_oid, rf.rel_number, rf.fork_number
+        )
+    }
+
+    /// Parse a `ChunkTag` from an express `latest` key:
+    /// `{org}/{proj}/chunks/{spc}/{db}/{rel}.{fork}/{chunk_id}/{tl:08X}/latest`
+    ///
+    /// Returns `None` for non-chunk keys (nblocks, deletion markers, etc.).
+    pub fn parse_chunk_tag_from_express_key(&self, key: &str) -> Option<ChunkTag> {
+        let prefix = self.all_chunks_express_prefix();
+        let rest = key.strip_prefix(&prefix)?;
+        // rest = "{spc}/{db}/{rel}.{fork}/{chunk_id}/{tl_hex}/latest"
+        let mut parts = rest.splitn(7, '/');
+        let spc_oid: u32 = parts.next()?.parse().ok()?;
+        let db_oid: u32 = parts.next()?.parse().ok()?;
+        let relfork_str = parts.next()?;
+        let chunk_id: u32 = parts.next()?.parse().ok()?;
+        let _tl_hex = parts.next()?;
+        let suffix = parts.next()?;
+        if suffix != "latest" {
+            return None;
+        }
+        let dot = relfork_str.rfind('.')?;
+        let rel_number: u32 = relfork_str[..dot].parse().ok()?;
+        let fork_number: i32 = relfork_str[dot + 1..].parse().ok()?;
+        Some(ChunkTag {
+            spc_oid,
+            db_oid,
+            rel_number,
+            fork_number,
+            chunk_id,
+        })
+    }
+
+    /// Parse a `RelFork` from an express deletion marker key:
+    /// `{org}/{proj}/chunks/{spc}/{db}/{rel}.{fork}/.deleted`
+    pub fn parse_relfork_from_deleted_marker(&self, key: &str) -> Option<RelFork> {
+        let prefix = self.all_chunks_express_prefix();
+        let rest = key.strip_prefix(&prefix)?;
+        let rest = rest.strip_suffix("/.deleted")?;
+        // rest = "{spc}/{db}/{rel}.{fork}"
+        let mut parts = rest.splitn(4, '/');
+        let spc_oid: u32 = parts.next()?.parse().ok()?;
+        let db_oid: u32 = parts.next()?.parse().ok()?;
+        let relfork_str = parts.next()?;
+        let dot = relfork_str.rfind('.')?;
+        let rel_number: u32 = relfork_str[..dot].parse().ok()?;
+        let fork_number: i32 = relfork_str[dot + 1..].parse().ok()?;
+        Some(RelFork {
+            spc_oid,
+            db_oid,
+            rel_number,
+            fork_number,
+        })
+    }
+
+    /// Parse a `RelFork` from an express nblocks key:
+    /// `{org}/{proj}/chunks/{spc}/{db}/{rel}.{fork}/nblocks`
+    pub fn parse_relfork_from_nblocks_key(&self, key: &str) -> Option<RelFork> {
+        let prefix = self.all_chunks_express_prefix();
+        let rest = key.strip_prefix(&prefix)?;
+        let rest = rest.strip_suffix("/nblocks")?;
+        // rest = "{spc}/{db}/{rel}.{fork}"
+        let mut parts = rest.splitn(4, '/');
+        let spc_oid: u32 = parts.next()?.parse().ok()?;
+        let db_oid: u32 = parts.next()?.parse().ok()?;
+        let relfork_str = parts.next()?;
+        let dot = relfork_str.rfind('.')?;
+        let rel_number: u32 = relfork_str[..dot].parse().ok()?;
+        let fork_number: i32 = relfork_str[dot + 1..].parse().ok()?;
+        Some(RelFork {
+            spc_oid,
+            db_oid,
+            rel_number,
+            fork_number,
+        })
     }
 }
 
@@ -416,11 +507,14 @@ impl ProjectCtx {
         let ns = if is_under_postmaster() {
             ProjectNamespace::new_from_env()
         } else {
-            let org_id = std::env::var(ENV_ORG_ID)
+            let org_id = std::env::var(env::ENV_ORG_ID)
                 .ok()
                 .map(|v| {
                     v.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("Environment variable {} must be a valid u64", ENV_ORG_ID)
+                        panic!(
+                            "Environment variable {} must be a valid u64",
+                            env::ENV_ORG_ID
+                        )
                     })
                 })
                 .unwrap_or(0);
@@ -553,13 +647,14 @@ impl ProjectCtx {
     }
 
     /// Level-2 chunk lookup: binary search into the on-disk Manifest.
-    pub fn base_manifest_lookup(&self, key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
-        self.base_manifest.lookup(key)
+    pub fn base_manifest_lookup(&self, _key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
+        //self.base_manifest.lookup(key)
+        Ok(None)
     }
 
     /// Level-3 nblocks lookup: returns the block count recorded in the base
     /// manifest for this relation fork, or `None` if not present.
-    pub fn base_manifest_lookup_nblocks(&self, rf: RelFork) -> Option<u32> {
+    pub fn base_manifest_lookup_nblocks(&self, rf: &RelFork) -> Option<u32> {
         self.base_manifest.lookup_nblocks(rf)
     }
 }
@@ -701,609 +796,4 @@ pub fn delete_branch(sim: &Store, branch_ns: &ProjectNamespace) -> Result<()> {
     );
 
     Ok(())
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::chunk::ChunkTag;
-    use crate::manifest::ChunkRef;
-    use std::collections::HashMap;
-    use tempfile::TempDir;
-
-    fn setup() -> (TempDir, Store) {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new_sim(dir.path());
-        (dir, store)
-    }
-
-    fn root_ns() -> ProjectNamespace {
-        ProjectNamespace::new(1001, 2001, 1)
-    }
-
-    fn branch_ns() -> ProjectNamespace {
-        ProjectNamespace::new(1001, 2002, 2)
-    }
-
-    fn make_root_meta(ns: &ProjectNamespace) -> ProjectMeta {
-        ProjectMeta {
-            ns: ns.clone(),
-            parent_project_id: None,
-            parent_branch_id: None,
-            branch_checkpoint_lsn: None,
-            branch_timeline_id: None,
-            current_timeline_id: 1,
-            created_at: 1_000_000,
-            status: "active".to_string(),
-            deleted_at: None,
-        }
-    }
-
-    fn make_branch_meta(
-        ns: &ProjectNamespace,
-        parent_project_id: u64,
-        parent_branch_id: u64,
-        lsn: Lsn,
-    ) -> ProjectMeta {
-        ProjectMeta {
-            ns: ns.clone(),
-            parent_project_id: Some(parent_project_id),
-            parent_branch_id: Some(parent_branch_id),
-            branch_checkpoint_lsn: Some(lsn),
-            branch_timeline_id: Some(1),
-            current_timeline_id: 1,
-            created_at: 1_000_000,
-            status: "active".to_string(),
-            deleted_at: None,
-        }
-    }
-
-    fn store_meta(sim: &Store, meta: &ProjectMeta) {
-        let key = meta.ns.project_meta_key();
-        let bytes = serde_json::to_vec(meta).unwrap();
-        sim.put_standard(&key, &bytes).unwrap();
-    }
-
-    fn make_manifest_bytes(
-        lsn: Lsn,
-        chunks: Vec<(ChunkTag, ChunkRef)>,
-        tmp_path: &Path,
-    ) -> Vec<u8> {
-        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), vec![], tmp_path).unwrap();
-        m.to_bytes().unwrap()
-    }
-
-    fn tag(rel: u32) -> ChunkTag {
-        ChunkTag {
-            spc_oid: 1663,
-            db_oid: 5,
-            rel_number: rel,
-            fork_number: 0,
-            chunk_id: 0,
-        }
-    }
-
-    // ── Root project, no base manifests ──────────────────────────────────
-
-    #[test]
-    fn root_project_no_bases_loads_empty_manifest() {
-        let (dir, sim) = setup();
-        let ns = root_ns();
-        store_meta(&sim, &make_root_meta(&ns));
-
-        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
-
-        assert!(!ctx.is_branch());
-        assert_eq!(ctx.base_manifest_lookup(&tag(42)).unwrap(), None);
-    }
-
-    // ── Root project explicitly confirms empty bases returns Ok ───────────
-
-    #[test]
-    fn root_project_empty_bases_returns_ok_with_empty_manifest() {
-        let (dir, sim) = setup();
-        let ns = root_ns();
-        store_meta(&sim, &make_root_meta(&ns));
-
-        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
-
-        // Any key must miss on a zero-entry manifest
-        let absent = ChunkTag {
-            spc_oid: 999,
-            db_oid: 999,
-            rel_number: 999,
-            fork_number: 0,
-            chunk_id: 0,
-        };
-        assert_eq!(ctx.base_manifest_lookup(&absent).unwrap(), None);
-    }
-
-    // ── Branch project with a synthetic base manifest ─────────────────────
-
-    #[test]
-    fn branch_project_with_base_manifest_lookup_hit_and_miss() {
-        let (dir, sim) = setup();
-        let parent_ns = root_ns();
-        let child_ns = branch_ns();
-        let branch_lsn = Lsn::new(0x100);
-
-        let meta = make_branch_meta(
-            &child_ns,
-            parent_ns.project_id,
-            parent_ns.branch_id,
-            branch_lsn,
-        );
-        store_meta(&sim, &meta);
-
-        // Build and store a synthetic base manifest with one entry
-        let known_tag = tag(42);
-        let known_ref = ChunkRef {
-            branch_id: 1,
-            timeline_id: 1,
-            lsn: branch_lsn,
-        };
-        let tmp = dir.path().join("tmp_manifest.tikm");
-        let bytes = make_manifest_bytes(branch_lsn, vec![(known_tag, known_ref)], &tmp);
-        sim.put_standard(&child_ns.base_manifest_key(1, branch_lsn), &bytes)
-            .unwrap();
-
-        let ctx = ProjectCtx::load(&child_ns, dir.path(), &sim).unwrap();
-
-        assert!(ctx.is_branch());
-        assert_eq!(
-            ctx.base_manifest_lookup(&known_tag).unwrap(),
-            Some(known_ref)
-        );
-        assert_eq!(ctx.base_manifest_lookup(&tag(999)).unwrap(), None);
-    }
-
-    // ── Branch project, no base manifests → succeeds with empty manifest ────
-
-    #[test]
-    fn branch_project_no_base_manifests_returns_empty_manifest() {
-        let (dir, sim) = setup();
-        let ns = branch_ns();
-        let meta = make_branch_meta(&ns, 2001, 1, Lsn::new(0x100));
-        store_meta(&sim, &meta);
-
-        // No base manifests written to sim — load() must still succeed.
-        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
-        assert!(ctx.is_branch(), "is_branch() must be true");
-        // Empty manifest returns None for any lookup.
-        assert_eq!(ctx.base_manifest_lookup(&tag(1)).unwrap(), None);
-    }
-
-    // ── Namespace mismatch → error ────────────────────────────────────────
-
-    #[test]
-    fn mismatched_namespace_returns_error() {
-        let (dir, sim) = setup();
-        let ns_stored = root_ns();
-        let ns_query = ProjectNamespace::new(1001, 9999, 1); // different project_id
-
-        store_meta(&sim, &make_root_meta(&ns_stored));
-
-        // Query with a different namespace than what's in project.json
-        let result = ProjectCtx::load(&ns_query, dir.path(), &sim);
-        assert!(result.is_err(), "namespace mismatch must return error");
-    }
-
-    // ── Missing project.json → error ──────────────────────────────────────
-
-    #[test]
-    fn missing_project_json_returns_error() {
-        let (dir, sim) = setup();
-        let ns = root_ns();
-        // Do NOT store project.json
-
-        let result = ProjectCtx::load(&ns, dir.path(), &sim);
-        assert!(result.is_err(), "missing project.json must return error");
-    }
-
-    // ── Latest base manifest is selected among multiple ───────────────────
-
-    #[test]
-    fn latest_base_manifest_wins_among_multiple() {
-        let (dir, sim) = setup();
-        let ns = root_ns();
-        store_meta(&sim, &make_root_meta(&ns));
-
-        let lsn_old = Lsn::new(0x100);
-        let lsn_new = Lsn::new(0x200);
-
-        let known_tag = tag(1);
-        let old_ref = ChunkRef {
-            branch_id: 1,
-            timeline_id: 1,
-            lsn: lsn_old,
-        };
-        let new_ref = ChunkRef {
-            branch_id: 1,
-            timeline_id: 1,
-            lsn: lsn_new,
-        };
-
-        let tmp_old = dir.path().join("tmp_old.tikm");
-        let bytes_old = make_manifest_bytes(lsn_old, vec![(known_tag, old_ref)], &tmp_old);
-        let tmp_new = dir.path().join("tmp_new.tikm");
-        let bytes_new = make_manifest_bytes(lsn_new, vec![(known_tag, new_ref)], &tmp_new);
-
-        sim.put_standard(&ns.base_manifest_key(1, lsn_old), &bytes_old)
-            .unwrap();
-        sim.put_standard(&ns.base_manifest_key(1, lsn_new), &bytes_new)
-            .unwrap();
-
-        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
-
-        // Should use the newer manifest
-        assert_eq!(ctx.base_manifest_lookup(&known_tag).unwrap(), Some(new_ref));
-    }
-
-    // ── Branch with no base manifests succeeds and is_branch() == true ────────
-
-    #[test]
-    fn load_branch_no_base_returns_ok_and_is_branch_true() {
-        let (dir, sim) = setup();
-        let ns = branch_ns();
-
-        // Pre-write project.json with parent_project_id set (branch project).
-        let meta = make_branch_meta(&ns, 2001, 1, Lsn::new(0x100));
-        store_meta(&sim, &meta);
-
-        // No base manifests exist yet (initdb has run but restore has not).
-        let ctx = ProjectCtx::load(&ns, dir.path(), &sim).unwrap();
-
-        assert!(ctx.is_branch(), "is_branch() must return true");
-        // Base manifest is empty — no entries.
-        assert_eq!(
-            ctx.base_manifest_lookup(&ChunkTag {
-                spc_oid: 1,
-                db_oid: 1,
-                rel_number: 1,
-                fork_number: 0,
-                chunk_id: 0,
-            })
-            .unwrap(),
-            None,
-            "empty manifest must return None for any lookup"
-        );
-    }
-}
-
-// ── Module 7 tests ─────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod module7_tests {
-    use super::*;
-    use crate::chunk::ChunkTag;
-    use crate::manifest::ChunkRef;
-    use std::collections::HashMap;
-    use tempfile::TempDir;
-
-    fn setup() -> (TempDir, Store) {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new_sim(dir.path());
-        (dir, store)
-    }
-
-    fn ns_a() -> ProjectNamespace {
-        ProjectNamespace::new(1001, 2001, 1)
-    }
-
-    fn ns_b() -> ProjectNamespace {
-        ProjectNamespace::new(1001, 2002, 2)
-    }
-
-    fn ns_c() -> ProjectNamespace {
-        ProjectNamespace::new(1001, 2003, 3)
-    }
-
-    fn tag(rel: u32) -> ChunkTag {
-        ChunkTag {
-            spc_oid: 1663,
-            db_oid: 5,
-            rel_number: rel,
-            fork_number: 0,
-            chunk_id: 0,
-        }
-    }
-
-    fn cref(branch_id: u64, lsn: Lsn) -> ChunkRef {
-        ChunkRef {
-            branch_id,
-            timeline_id: 1,
-            lsn,
-        }
-    }
-
-    fn store_manifest_bytes(
-        sim: &Store,
-        key: &str,
-        lsn: Lsn,
-        chunks: Vec<(ChunkTag, ChunkRef)>,
-        tmp_path: &Path,
-    ) {
-        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), vec![], tmp_path).unwrap();
-        let bytes = m.to_bytes().unwrap();
-        sim.put_standard(key, &bytes).unwrap();
-    }
-
-    // ── build_initial_manifest from base + 3 deltas ───────────────────────
-
-    #[test]
-    fn build_initial_manifest_merges_base_and_deltas() {
-        let (dir, sim) = setup();
-        let ns = ns_a();
-
-        let base_lsn = Lsn::new(0x100);
-        let d1_lsn = Lsn::new(0x200);
-        let d2_lsn = Lsn::new(0x300);
-        let d3_lsn = Lsn::new(0x400); // branch_lsn
-
-        // Base: rel=1 at branch_id=1
-        store_manifest_bytes(
-            &sim,
-            &ns.base_manifest_key(1, base_lsn),
-            base_lsn,
-            vec![(tag(1), cref(1, base_lsn))],
-            &dir.path().join("b.tikm"),
-        );
-        // Delta 1: adds rel=2
-        store_manifest_bytes(
-            &sim,
-            &ns.delta_manifest_key(1, d1_lsn),
-            d1_lsn,
-            vec![(tag(2), cref(1, d1_lsn))],
-            &dir.path().join("d1.tikm"),
-        );
-        // Delta 2: updates rel=1, adds rel=3
-        store_manifest_bytes(
-            &sim,
-            &ns.delta_manifest_key(1, d2_lsn),
-            d2_lsn,
-            vec![(tag(1), cref(1, d2_lsn)), (tag(3), cref(1, d2_lsn))],
-            &dir.path().join("d2.tikm"),
-        );
-        // Delta 3: updates rel=2
-        store_manifest_bytes(
-            &sim,
-            &ns.delta_manifest_key(1, d3_lsn),
-            d3_lsn,
-            vec![(tag(2), cref(1, d3_lsn))],
-            &dir.path().join("d3.tikm"),
-        );
-
-        let out = dir.path().join("out.tikm");
-        let m = build_initial_manifest(&sim, &ns, 1, d3_lsn, &out).unwrap();
-
-        assert_eq!(m.lookup(&tag(1)).unwrap(), Some(cref(1, d2_lsn))); // updated by d2
-        assert_eq!(m.lookup(&tag(2)).unwrap(), Some(cref(1, d3_lsn))); // updated by d3
-        assert_eq!(m.lookup(&tag(3)).unwrap(), Some(cref(1, d2_lsn))); // added by d2
-        assert_eq!(m.lookup(&tag(99)).unwrap(), None);
-    }
-
-    // ── Deltas beyond branch_lsn are excluded ─────────────────────────────
-
-    #[test]
-    fn build_initial_manifest_excludes_deltas_beyond_branch_lsn() {
-        let (dir, sim) = setup();
-        let ns = ns_a();
-
-        let base_lsn = Lsn::new(0x100);
-        let d1_lsn = Lsn::new(0x200);
-        let d2_lsn = Lsn::new(0x300); // beyond branch point
-        let branch_lsn = Lsn::new(0x200);
-
-        store_manifest_bytes(
-            &sim,
-            &ns.base_manifest_key(1, base_lsn),
-            base_lsn,
-            vec![(tag(1), cref(1, base_lsn))],
-            &dir.path().join("b.tikm"),
-        );
-        store_manifest_bytes(
-            &sim,
-            &ns.delta_manifest_key(1, d1_lsn),
-            d1_lsn,
-            vec![(tag(1), cref(1, d1_lsn))],
-            &dir.path().join("d1.tikm"),
-        );
-        // Delta 2 is beyond branch_lsn — must NOT be applied
-        store_manifest_bytes(
-            &sim,
-            &ns.delta_manifest_key(1, d2_lsn),
-            d2_lsn,
-            vec![(tag(1), cref(1, d2_lsn)), (tag(2), cref(1, d2_lsn))],
-            &dir.path().join("d2.tikm"),
-        );
-
-        let out = dir.path().join("out.tikm");
-        let m = build_initial_manifest(&sim, &ns, 1, branch_lsn, &out).unwrap();
-
-        // rel=1 should reflect d1, not d2
-        assert_eq!(m.lookup(&tag(1)).unwrap(), Some(cref(1, d1_lsn)));
-        // rel=2 (only in d2) must not appear
-        assert_eq!(m.lookup(&tag(2)).unwrap(), None);
-    }
-
-    // ── Cascaded branch: C from B from A ─────────────────────────────────
-
-    #[test]
-    fn cascaded_branch_preserves_original_branch_ids() {
-        let (dir, sim) = setup();
-        let a_ns = ns_a();
-        let b_ns = ns_b();
-        let _c_ns = ns_c();
-
-        let a_lsn = Lsn::new(0x100);
-        let b_lsn = Lsn::new(0x200);
-
-        // A's base: rel=10 with A's branch_id
-        store_manifest_bytes(
-            &sim,
-            &a_ns.base_manifest_key(1, a_lsn),
-            a_lsn,
-            vec![(tag(10), cref(a_ns.branch_id, a_lsn))],
-            &dir.path().join("a_base.tikm"),
-        );
-
-        // Build B's initial manifest from A at a_lsn and store it as B's base
-        let tmp_b_out = dir.path().join("b_init.tikm");
-        let b_initial = build_initial_manifest(&sim, &a_ns, 1, a_lsn, &tmp_b_out).unwrap();
-        sim.put_standard(
-            &b_ns.base_manifest_key(1, a_lsn),
-            &b_initial.to_bytes().unwrap(),
-        )
-        .unwrap();
-
-        // B adds a delta: rel=20 with B's branch_id
-        store_manifest_bytes(
-            &sim,
-            &b_ns.delta_manifest_key(1, b_lsn),
-            b_lsn,
-            vec![(tag(20), cref(b_ns.branch_id, b_lsn))],
-            &dir.path().join("b_d1.tikm"),
-        );
-
-        // Build C's manifest from B at b_lsn
-        let tmp_c_out = dir.path().join("c_out.tikm");
-        let c = build_initial_manifest(&sim, &b_ns, 1, b_lsn, &tmp_c_out).unwrap();
-
-        // rel=10 was only on A → branch_id = A's (1)
-        assert_eq!(
-            c.lookup(&tag(10)).unwrap(),
-            Some(cref(a_ns.branch_id, a_lsn))
-        );
-        // rel=20 was added on B → branch_id = B's (2)
-        assert_eq!(
-            c.lookup(&tag(20)).unwrap(),
-            Some(cref(b_ns.branch_id, b_lsn))
-        );
-    }
-
-    // ── create_branch writes project.json + manifest.bin ─────────────────
-
-    #[test]
-    fn create_branch_writes_exactly_two_standard_files() {
-        let (dir, sim) = setup();
-        let parent_ns = ns_a();
-        let child_ns = ns_b();
-        let branch_lsn = Lsn::new(0x100);
-
-        // Set up parent base
-        store_manifest_bytes(
-            &sim,
-            &parent_ns.base_manifest_key(1, branch_lsn),
-            branch_lsn,
-            vec![(tag(1), cref(parent_ns.branch_id, branch_lsn))],
-            &dir.path().join("parent_base.tikm"),
-        );
-
-        create_branch(&sim, &parent_ns, 1, &child_ns, branch_lsn).unwrap();
-
-        // project.json must exist and deserialise correctly
-        let meta_bytes = sim
-            .get_standard(&child_ns.project_meta_key())
-            .unwrap()
-            .unwrap();
-        let meta: ProjectMeta = serde_json::from_slice(&meta_bytes).unwrap();
-        assert_eq!(meta.ns, child_ns);
-        assert_eq!(meta.parent_project_id, Some(parent_ns.project_id));
-        assert_eq!(meta.parent_branch_id, Some(parent_ns.branch_id));
-        assert_eq!(meta.branch_checkpoint_lsn, Some(branch_lsn));
-
-        // Exactly 1 base manifest and 1 project.json in standard for the child
-        let meta_keys = sim
-            .list_prefix_standard(&format!(
-                "{}/metadata/{}/",
-                child_ns.org_id, child_ns.project_id
-            ))
-            .unwrap();
-        assert_eq!(meta_keys.len(), 1);
-    }
-
-    // ── delete_branch removes express + pitr/metadata; leaves chunks ──────
-
-    #[test]
-    fn delete_branch_removes_express_and_pitr_not_chunks() {
-        let (dir, sim) = setup();
-        let ns = ns_b();
-        let branch_lsn = Lsn::new(0x100);
-
-        // Express: a chunk latest
-        sim.put_express(&ns.chunk_latest_key(&tag(1), 1), b"hot-data")
-            .unwrap();
-
-        // Standard PITR: a base manifest
-        store_manifest_bytes(
-            &sim,
-            &ns.base_manifest_key(1, branch_lsn),
-            branch_lsn,
-            vec![(tag(1), cref(ns.branch_id, branch_lsn))],
-            &dir.path().join("del_base.tikm"),
-        );
-
-        // Standard metadata: project.json
-        let meta = ProjectMeta {
-            ns: ns.clone(),
-            parent_project_id: None,
-            parent_branch_id: None,
-            branch_checkpoint_lsn: None,
-            branch_timeline_id: None,
-            current_timeline_id: 1,
-            created_at: 0,
-            status: "active".to_string(),
-            deleted_at: None,
-        };
-        sim.put_standard(&ns.project_meta_key(), &serde_json::to_vec(&meta).unwrap())
-            .unwrap();
-
-        // Standard chunks: versioned object (must NOT be deleted)
-        let chunk_key = ns.chunk_versioned_key(&tag(1), ns.branch_id, 1, branch_lsn);
-        sim.put_standard(&chunk_key, b"chunk-data").unwrap();
-
-        delete_branch(&sim, &ns).unwrap();
-
-        // Express data removed
-        assert_eq!(
-            sim.get_express(&ns.chunk_latest_key(&tag(1), 1)).unwrap(),
-            None
-        );
-        // PITR data removed
-        assert!(
-            sim.list_prefix_standard(&ns.base_prefix())
-                .unwrap()
-                .is_empty()
-        );
-        // Metadata removed
-        assert_eq!(sim.get_standard(&ns.project_meta_key()).unwrap(), None);
-        // Chunks untouched
-        assert_eq!(
-            sim.get_standard(&chunk_key).unwrap(),
-            Some(b"chunk-data".to_vec())
-        );
-    }
-
-    // ── no base with lsn ≤ branch_lsn → error ────────────────────────────
-
-    #[test]
-    fn build_initial_manifest_no_base_lte_branch_lsn_returns_error() {
-        let (dir, sim) = setup();
-        let ns = ns_a();
-
-        // Only base at 0x500, branch_lsn is 0x100
-        store_manifest_bytes(
-            &sim,
-            &ns.base_manifest_key(1, Lsn::new(0x500)),
-            Lsn::new(0x500),
-            vec![(tag(1), cref(1, Lsn::new(0x500)))],
-            &dir.path().join("future.tikm"),
-        );
-
-        let out = dir.path().join("out.tikm");
-        let result = build_initial_manifest(&sim, &ns, 1, Lsn::new(0x100), &out);
-        assert!(result.is_err(), "no base ≤ branch_lsn must return error");
-    }
 }

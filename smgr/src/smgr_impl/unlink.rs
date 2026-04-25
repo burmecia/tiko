@@ -34,17 +34,16 @@ pub extern "C-unwind" fn tiko_unlink(
 }
 
 fn unlink_fork(rlocator: &RelFileLocatorBackend, forknum: ForkNumber) {
-    let loc = &rlocator.locator;
+    let rloc = &rlocator.locator;
+    let relfork = RelFork::new(rloc.spc_oid, rloc.db_oid, rloc.rel_number, forknum);
 
-    if let Err(errno) = ops::delete_file(RelFork {
-        spc_oid: loc.spc_oid,
-        db_oid: loc.db_oid,
-        rel_number: loc.rel_number,
-        fork_number: forknum,
-    }) {
-        pg_log_warning(&format!(
-            "tiko_unlink: could not remove rel {}/{}/{} fork {}: errno {}",
-            loc.spc_oid, loc.db_oid, loc.rel_number, forknum, errno
-        ));
+    match ops::delete_fork(&relfork) {
+        Ok(()) => {}
+        Err(err) if err.is_not_found() => {
+            // Ignore ENOENT: caller may have already removed the file, or it may not exist at all.
+        }
+        Err(err) => {
+            pg_log_warning(&format!("tiko_unlink: failed for relfork {relfork}: {err}",));
+        }
     }
 }

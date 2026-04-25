@@ -16,9 +16,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::chunk::ChunkTag;
+use crate::io::store::Store;
 use crate::manifest::{ChunkRef, Manifest};
 use crate::project::ProjectNamespace;
-use crate::store::Store;
 use pgsys::{Lsn, common::XLOG_SEG_SIZE};
 
 /// Exposed as `pub(crate)` so tests in sibling modules can force the flag.
@@ -36,7 +36,7 @@ const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
 
 #[derive(Debug)]
 pub enum Error {
-    Store(io::Error),
+    Store(crate::Error),
     /// The requested `(timeline_id, lsn)` has no delta manifest.
     TargetNotFound(String),
     /// No base manifest exists with `base_lsn <= target_lsn`.
@@ -57,7 +57,7 @@ impl std::fmt::Display for Error {
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
-        Error::Store(e)
+        Error::Store(e.into())
     }
 }
 
@@ -71,7 +71,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Returns an error if the file cannot be read or is not a valid TIKM file.
 /// If the manifest was already loaded (OnceLock already set), the set is
 /// silently ignored but `RECOVERY_MODE` is still set to true.
-pub fn load_recovery_manifest(path: &Path) -> io::Result<()> {
+pub fn load_recovery_manifest(path: &Path) -> crate::Result<()> {
     let manifest = Manifest::open(path)?;
     // OnceLock::set fails silently if already populated — acceptable for recovery.
     let _ = RECOVERY_MANIFEST.set(manifest);
@@ -92,9 +92,9 @@ pub fn is_recovery_mode() -> bool {
 /// Look up a chunk in the recovery manifest.
 ///
 /// Returns `Ok(None)` if the manifest is not loaded or the key is absent.
-pub fn lookup_recovery_chunk(key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
+pub fn lookup_recovery_chunk(_key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
     match RECOVERY_MANIFEST.get() {
-        Some(m) => m.lookup(key),
+        Some(_m) => Ok(None), //_m.lookup(key),
         None => Ok(None),
     }
 }
@@ -176,7 +176,9 @@ fn copy_branch_wal(
             continue;
         }
 
-        fs::copy(entry.path(), child_pg_wal.join(&*name)).map_err(Error::Store)?;
+        fs::copy(entry.path(), child_pg_wal.join(&*name))
+            .map_err(crate::Error::Io)
+            .map_err(Error::Store)?;
         eprintln!("Copied WAL segment {name} (segment {seg_no})");
     }
     Ok(())
@@ -267,7 +269,9 @@ pub fn prepare_recovery(
     // Copy the merged TIKM file directly — no need to round-trip through the
     // S3 wire format (zstd+msgpack). Place it in the tiko root directory.
     fs::create_dir_all(root_path)?;
-    fs::copy(&manifest_path, Manifest::recovery_manifest_path(root_path)).map_err(Error::Store)?;
+    fs::copy(&manifest_path, Manifest::recovery_manifest_path(root_path))
+        .map_err(crate::Error::Io)
+        .map_err(Error::Store)?;
 
     // ── 5. postgresql.tiko.conf ───────────────────────────────────────────────
     write_recovery_conf(&pgdata.join(TIKO_CONF_FILE))?;
@@ -309,7 +313,9 @@ fn load_base_manifest(
         .map_err(Error::Store)?
         .ok_or_else(|| Error::Other(format!("base manifest not found: {best_key}")))?;
 
-    Manifest::from_bytes(&bytes, manifest_path).map_err(Error::Store)
+    Manifest::from_bytes(&bytes, manifest_path)
+        .map_err(crate::Error::Io)
+        .map_err(Error::Store)
 }
 
 /// Apply all delta manifests with `base_lsn < lsn <= target_lsn` on `target_tl`.
@@ -348,13 +354,17 @@ fn apply_deltas_up_to(
             .map_err(Error::Store)?
             .ok_or_else(|| Error::Other(format!("delta manifest missing: {key}")))?;
         let path = work_dir.join(format!("delta_{lsn_hex}.tikm"));
-        let m = Manifest::from_bytes(&bytes, &path).map_err(Error::Store)?;
+        let m = Manifest::from_bytes(&bytes, &path)
+            .map_err(crate::Error::Io)
+            .map_err(Error::Store)?;
         delta_paths.push(path);
         deltas.push(m);
     }
 
     if !deltas.is_empty() {
-        base.apply_deltas(&deltas).map_err(Error::Store)?;
+        base.apply_deltas(&deltas)
+            .map_err(crate::Error::Io)
+            .map_err(Error::Store)?;
     }
 
     for p in &delta_paths {

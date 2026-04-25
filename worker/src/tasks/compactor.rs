@@ -9,7 +9,7 @@
 //! intentionally absent from this task.
 
 use core::{
-    ENV_PITR_INTERVAL_SECS,
+    env,
     manifest::{MaterializeResult, materialize_base},
     project::{ProjectCtx, ProjectNamespace},
     store::Store,
@@ -28,10 +28,7 @@ impl CompactorConfig {
     /// Build config from environment.  Falls back to 3600s if the variable
     /// is absent or cannot be parsed.
     pub fn from_env() -> Self {
-        let secs = std::env::var(ENV_PITR_INTERVAL_SECS)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(3600);
+        let secs = env::read_u64_or(env::ENV_PITR_INTERVAL_SECS, 3600);
         CompactorConfig {
             materialization_interval: std::time::Duration::from_secs(secs),
         }

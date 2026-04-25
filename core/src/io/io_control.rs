@@ -38,37 +38,40 @@
 //! IoControl (fixed size)
 //! ├── num_backend_pools, worker_pid, worker_latch
 //! ├── submit_queue (SubmitQueue)
-//! ├── stats (S3IoStats)
-//! ├── cache (CacheControl)
-//! └── nblocks (NblocksControl)
+//! ├── stats (IoStats)
+//! └── cache (CacheControl)
 //! BackendSlotPool[0]  ← immediately after IoControl (aligned)
 //! BackendSlotPool[1]
 //! ...
 //! BackendSlotPool[MaxBackends-1]
-//! CacheSlotMeta[0..1024]      ← cache chunk slot metadata (~36 KB)
-//! CacheHashEntry[0..2048]     ← cache hash table (~52 KB)
-//! AtomicRWLock[0..128]        ← cache partition locks (512 bytes)
-//! NblocksEntry[0..4096]       ← nblocks hash table (~96 KB)
-//! AtomicRWLock[0..64]         ← nblocks partition locks (256 bytes)
+//! ChunkSlot[0..1024]         ← cache chunk slot metadata (~36 KB)
+//! AtomicU32[0..2048]          ← cache bucket heads (~8 KB)
+//! AtomicRWLock[0..2048]       ← cache bucket locks (~8 KB, one per bucket)
+//! AtomicRWLock[0..1024]       ← per-slot I/O locks (~4 KB, one per chunk slot)
+//! MetaSlot[0..1024]      ← fork metadata table (~28 KB)
+//! AtomicU32[0..2048]          ← fork meta bucket heads (~8 KB)
+//! AtomicRWLock[0..2048]       ← fork meta bucket locks (~8 KB)
+//! AtomicRWLock[0..1024]       ← per-slot I/O locks (~4 KB, one per meta slot)
 //! ```
 
 use pgsys::{
-    common::{BlockNumber, ForkNumber, Oid, RelFileNumber},
+    common::{BlockNumber, ForkNumber, Oid, RelFileNumber, is_under_postmaster},
     latch::{Latch, SetLatch},
     logging::*,
     lwlock::*,
     shmem::{ShmemInitStruct, rust_get_addin_shmem_init_lock},
 };
+use std::mem::{align_of, size_of};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc::error::TrySendError;
 
-use super::cache::{
-    AtomicRWLock, CACHE_NUM_HASH_ENTRIES, CACHE_NUM_PARTITIONS, CACHE_NUM_SLOTS, CacheControl,
-    CacheHashEntry, CacheSlotMeta,
-};
-use super::fork_nblocks::{
-    NBLOCKS_NUM_ENTRIES, NBLOCKS_NUM_PARTITIONS, NblocksControl, NblocksEntry,
+use super::{
+    cache::{
+        CHUNK_NUM_BUCKETS, CHUNK_NUM_SLOTS, CacheControl, ChunkSlot, META_NUM_BUCKETS,
+        META_NUM_SLOTS, MetaSlot, rwlock::AtomicRWLock,
+    },
+    stats::IoStats,
 };
 
 // ── Constants ──
@@ -184,15 +187,12 @@ pub struct IoSlot {
     pub buffer_ptr: AtomicU64,
 
     // ── Result ──
-    pub result_status: AtomicU32,
+    pub result_status: AtomicI32,
     pub result_nblocks: AtomicU32,
     // No _reserved needed: generation + alignment padding fill the 64 bytes exactly.
 }
 
-const _: () = assert!(
-    std::mem::size_of::<IoSlot>() == 64,
-    "IoSlot must be exactly 64 bytes"
-);
+const _: () = assert!(size_of::<IoSlot>() == 64, "IoSlot must be exactly 64 bytes");
 
 impl IoSlot {
     fn init(&mut self) {
@@ -245,9 +245,9 @@ impl IoSlot {
     }
 
     /// Validate slot data before dispatching to Tokio.
-    pub fn validate(&self) -> Result<(), u32> {
+    pub fn validate(&self) -> Result<(), i32> {
         if self.op == IoOpKind::Invalid {
-            return Err(libc::EINVAL as u32);
+            return Err(libc::EINVAL);
         }
 
         // Only Read and Write operations require a buffer
@@ -255,7 +255,7 @@ impl IoSlot {
         if needs_buffer {
             let buffer_ptr = self.buffer_ptr.load(Ordering::Acquire);
             if buffer_ptr == 0 {
-                return Err(libc::EFAULT as u32);
+                return Err(libc::EFAULT);
             }
         }
 
@@ -265,14 +265,14 @@ impl IoSlot {
             IoOpKind::Read | IoOpKind::Write | IoOpKind::Prefetch
         );
         if needs_nblocks && (self.nblocks == 0 || self.nblocks > 1024) {
-            return Err(libc::EINVAL as u32);
+            return Err(libc::EINVAL);
         }
 
         Ok(())
     }
 
     /// Fail slot with an error and wake the backend via SetLatch.
-    pub fn fail_with_error(&self, error_code: u32) {
+    pub fn fail_with_error(&self, error_code: i32) {
         self.result_status.store(error_code, Ordering::Release);
         self.mark_completed();
         // Wake the backend directly
@@ -459,58 +459,6 @@ const _: () = assert!(
     "entries must be at offset 128"
 );
 
-// ── S3IoStats ──
-
-#[repr(C)]
-pub struct S3IoStats {
-    pub total_reads: AtomicU64,
-    pub total_writes: AtomicU64,
-    pub cache_hits: AtomicU64,
-    pub cache_misses: AtomicU64,
-    pub evictions: AtomicU64,
-    pub dirty_evictions: AtomicU64,
-    pub s3_gets: AtomicU64,
-    pub s3_puts: AtomicU64,
-    pub queue_full_waits: AtomicU64,
-}
-
-impl S3IoStats {
-    pub fn init(&self) {
-        self.total_reads.store(0, Ordering::Relaxed);
-        self.total_writes.store(0, Ordering::Relaxed);
-        self.cache_hits.store(0, Ordering::Relaxed);
-        self.cache_misses.store(0, Ordering::Relaxed);
-        self.evictions.store(0, Ordering::Relaxed);
-        self.dirty_evictions.store(0, Ordering::Relaxed);
-        self.s3_gets.store(0, Ordering::Relaxed);
-        self.s3_puts.store(0, Ordering::Relaxed);
-        self.queue_full_waits.store(0, Ordering::Relaxed);
-    }
-
-    /// Log a summary of cache performance stats.
-    pub fn log_summary(&self) {
-        let hits = self.cache_hits.load(Ordering::Relaxed);
-        let misses = self.cache_misses.load(Ordering::Relaxed);
-        let total_lookups = hits + misses;
-        let hit_rate = if total_lookups > 0 {
-            hits as f64 / total_lookups as f64 * 100.0
-        } else {
-            0.0
-        };
-
-        pgsys::logging::pg_log_debug1(&format!(
-            "tiko cache stats: reads={} writes={} hits={} misses={} hit_rate={:.1}% evictions={} dirty_evictions={}",
-            self.total_reads.load(Ordering::Relaxed),
-            self.total_writes.load(Ordering::Relaxed),
-            hits,
-            misses,
-            hit_rate,
-            self.evictions.load(Ordering::Relaxed),
-            self.dirty_evictions.load(Ordering::Relaxed),
-        ));
-    }
-}
-
 // ── IoControl ──
 
 /// Main control structure for I/O queues. Lives in PostgreSQL shared memory.
@@ -535,15 +483,7 @@ pub struct IoControl {
     pub cache: CacheControl,
 
     /// I/O statistics
-    pub stats: S3IoStats,
-
-    /// Write-back nblocks hash table (relation fork → live block count)
-    pub nblocks: NblocksControl,
-
-    /// Global monotonic counter for cache dirty chunk sidecar file uniqueness.
-    /// Each call to `CacheControl::next_sidecar_seq()` does fetch_add(1, Relaxed).
-    /// Uniqueness (not ordering) is the only requirement.
-    pub sidecar_seq: AtomicU64,
+    pub stats: IoStats,
 }
 
 impl IoControl {
@@ -561,80 +501,112 @@ impl IoControl {
             unsafe { &mut *pools_base.add(i) }.init();
         }
 
-        // Initialize cache control + metadata arrays in shared memory
+        // Initialize cache control + all trailing arrays in shared memory
         unsafe {
             let base = self as *mut Self as *mut u8;
-            let slots = base.add(Self::slot_meta_offset(max_backends)) as *mut CacheSlotMeta;
-            let locks = base.add(Self::cache_locks_offset(max_backends)) as *mut AtomicRWLock;
-            let hash = base.add(Self::hash_entries_offset(max_backends)) as *mut CacheHashEntry;
-            self.cache.init(slots, hash, locks);
+            let chunk_slots = base.add(Self::chunk_slots_offset(max_backends)) as *mut ChunkSlot;
+            let chunk_buckets =
+                base.add(Self::chunk_buckets_offset(max_backends)) as *mut AtomicU32;
+            let chunk_bucket_locks =
+                base.add(Self::chunk_bucket_locks_offset(max_backends)) as *mut AtomicRWLock;
+            let chunk_io_locks =
+                base.add(Self::chunk_io_locks_offset(max_backends)) as *mut AtomicRWLock;
+            let meta_slots = base.add(Self::meta_slots_offset(max_backends)) as *mut MetaSlot;
+            let meta_buckets = base.add(Self::meta_buckets_offset(max_backends)) as *mut AtomicU32;
+            let meta_locks = base.add(Self::meta_locks_offset(max_backends)) as *mut AtomicRWLock;
+            let meta_io_locks =
+                base.add(Self::meta_io_locks_offset(max_backends)) as *mut AtomicRWLock;
+            self.cache.init(
+                chunk_slots,
+                chunk_buckets,
+                chunk_bucket_locks,
+                chunk_io_locks,
+                meta_slots,
+                meta_buckets,
+                meta_locks,
+                meta_io_locks,
+            );
         }
 
         self.stats.init();
-
-        // Initialize nblocks table + its arrays in shared memory
-        unsafe {
-            let base = self as *mut Self as *mut u8;
-            let entries = base.add(Self::nblocks_entries_offset(max_backends)) as *mut NblocksEntry;
-            let nlocks = base.add(Self::nblocks_locks_offset(max_backends)) as *mut AtomicRWLock;
-            self.nblocks.init(entries, nlocks);
-        }
-
-        self.sidecar_seq.store(0, Ordering::Relaxed);
     }
 
     /// Byte offset from the start of IoControl to the first BackendSlotPool.
     /// Accounts for alignment requirements of BackendSlotPool.
     fn backend_pools_offset() -> usize {
-        let base = std::mem::size_of::<Self>();
-        let align = std::mem::align_of::<BackendSlotPool>();
+        let base = size_of::<Self>();
+        let align = align_of::<BackendSlotPool>();
         (base + align - 1) & !(align - 1)
     }
 
     /// Byte offset to the slot metadata array (after backend pools).
-    fn slot_meta_offset(max_backends: usize) -> usize {
+    fn chunk_slots_offset(max_backends: usize) -> usize {
         let after_pools =
-            Self::backend_pools_offset() + max_backends * std::mem::size_of::<BackendSlotPool>();
-        let align = std::mem::align_of::<CacheSlotMeta>();
+            Self::backend_pools_offset() + max_backends * size_of::<BackendSlotPool>();
+        let align = align_of::<ChunkSlot>();
         (after_pools + align - 1) & !(align - 1)
     }
 
     /// Byte offset to the hash entries array (after slot metadata).
-    fn hash_entries_offset(max_backends: usize) -> usize {
-        let after_slots = Self::slot_meta_offset(max_backends)
-            + CACHE_NUM_SLOTS as usize * std::mem::size_of::<CacheSlotMeta>();
-        let align = std::mem::align_of::<CacheHashEntry>();
+    fn chunk_buckets_offset(max_backends: usize) -> usize {
+        let after_slots = Self::chunk_slots_offset(max_backends)
+            + CHUNK_NUM_SLOTS as usize * size_of::<ChunkSlot>();
+        let align = align_of::<AtomicU32>();
         (after_slots + align - 1) & !(align - 1)
     }
 
-    /// Byte offset to the partition locks array (after hash entries).
-    fn cache_locks_offset(max_backends: usize) -> usize {
-        let after_hash = Self::hash_entries_offset(max_backends)
-            + CACHE_NUM_HASH_ENTRIES as usize * std::mem::size_of::<CacheHashEntry>();
-        let align = std::mem::align_of::<AtomicRWLock>();
+    /// Byte offset to the partition locks array (after bucket heads).
+    fn chunk_bucket_locks_offset(max_backends: usize) -> usize {
+        let after_hash = Self::chunk_buckets_offset(max_backends)
+            + CHUNK_NUM_BUCKETS as usize * size_of::<AtomicU32>();
+        let align = align_of::<AtomicRWLock>();
         (after_hash + align - 1) & !(align - 1)
     }
 
-    /// Byte offset to the nblocks entries array (after cache partition locks).
-    fn nblocks_entries_offset(max_backends: usize) -> usize {
-        let after_cache_locks = Self::cache_locks_offset(max_backends)
-            + CACHE_NUM_PARTITIONS as usize * std::mem::size_of::<AtomicRWLock>();
-        let align = std::mem::align_of::<NblocksEntry>();
+    /// Byte offset to the per-slot I/O locks array (after cache bucket locks).
+    fn chunk_io_locks_offset(max_backends: usize) -> usize {
+        let after_cache_locks = Self::chunk_bucket_locks_offset(max_backends)
+            + CHUNK_NUM_BUCKETS as usize * size_of::<AtomicRWLock>();
+        let align = align_of::<AtomicRWLock>();
         (after_cache_locks + align - 1) & !(align - 1)
     }
 
-    /// Byte offset to the nblocks partition locks array (after nblocks entries).
-    fn nblocks_locks_offset(max_backends: usize) -> usize {
-        let after_entries = Self::nblocks_entries_offset(max_backends)
-            + NBLOCKS_NUM_ENTRIES as usize * std::mem::size_of::<NblocksEntry>();
-        let align = std::mem::align_of::<AtomicRWLock>();
+    /// Byte offset to the fork metadata entry pool (after per-slot I/O locks).
+    fn meta_slots_offset(max_backends: usize) -> usize {
+        let after_chunk_io_locks = Self::chunk_io_locks_offset(max_backends)
+            + CHUNK_NUM_SLOTS as usize * size_of::<AtomicRWLock>();
+        let align = align_of::<MetaSlot>();
+        (after_chunk_io_locks + align - 1) & !(align - 1)
+    }
+
+    /// Byte offset to the fork metadata bucket heads array (after entry pool).
+    fn meta_buckets_offset(max_backends: usize) -> usize {
+        let after_entries =
+            Self::meta_slots_offset(max_backends) + META_NUM_SLOTS as usize * size_of::<MetaSlot>();
+        let align = align_of::<AtomicU32>();
         (after_entries + align - 1) & !(align - 1)
+    }
+
+    /// Byte offset to the fork metadata per-bucket locks array (after bucket heads).
+    fn meta_locks_offset(max_backends: usize) -> usize {
+        let after_buckets = Self::meta_buckets_offset(max_backends)
+            + META_NUM_BUCKETS as usize * size_of::<AtomicU32>();
+        let align = align_of::<AtomicRWLock>();
+        (after_buckets + align - 1) & !(align - 1)
+    }
+
+    /// Byte offset to the fork metadata per-slot I/O locks array (after bucket locks).
+    fn meta_io_locks_offset(max_backends: usize) -> usize {
+        let after_locks = Self::meta_locks_offset(max_backends)
+            + META_NUM_BUCKETS as usize * size_of::<AtomicRWLock>();
+        let align = align_of::<AtomicRWLock>();
+        (after_locks + align - 1) & !(align - 1)
     }
 
     /// Total shared memory size for the control structure + backend pools + all arrays.
     pub fn shmem_size(max_backends: usize) -> usize {
-        Self::nblocks_locks_offset(max_backends)
-            + NBLOCKS_NUM_PARTITIONS as usize * std::mem::size_of::<AtomicRWLock>()
+        Self::meta_io_locks_offset(max_backends)
+            + CHUNK_NUM_SLOTS as usize * size_of::<AtomicRWLock>()
     }
 
     /// Get the backend slot pool for a given proc number.
@@ -684,9 +656,25 @@ impl IoControl {
             .expect("IoControl::get() called before init_or_attach()")
     }
 
+    pub fn get_cache() -> &'static CacheControl {
+        &Self::get().cache
+    }
+
     /// Check if shared memory has been initialized (i.e. init_or_attach has been called).
     pub fn is_initialized() -> bool {
         IO_CONTROL.get().is_some()
+    }
+
+    /// True when the shared-memory cache is reachable from this process.
+    ///
+    /// Requires both conditions:
+    /// - `is_under_postmaster()` — false during initdb (`--boot`/`--single`) where
+    ///   `MyProcNumber` is invalid and IoControl was never sized via
+    ///   `shmem_request_hook`.
+    /// - `IoControl::is_initialized()` — false if the shmem startup hook has not
+    ///   yet run in this process (e.g. very early in backend startup).
+    pub fn cache_is_available() -> bool {
+        is_under_postmaster() && IoControl::is_initialized()
     }
 
     /// Check if Tiko worker is alive by sending signal 0 to its PID.
@@ -790,7 +778,7 @@ impl IoControl {
                         "tiko: dispatcher disconnected, failing backend={} slot={}",
                         backend_id, slot_idx
                     ));
-                    slot.fail_with_error(libc::EIO as u32);
+                    slot.fail_with_error(libc::EIO);
                     entry.store(0, Ordering::Relaxed);
                     tail = tail.wrapping_add(1);
                     self.submit_queue.tail.store(tail, Ordering::Release);

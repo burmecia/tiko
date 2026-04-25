@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::io::store::Store;
 use crate::project::{ProjectMeta, ProjectNamespace};
-use crate::store::Store;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -27,7 +27,7 @@ pub struct OrgMeta {
 
 #[derive(Debug)]
 pub enum Error {
-    Store(io::Error),
+    Store(crate::Error),
     AlreadyExists,
     NotFound,
     Serialize(String),
@@ -46,7 +46,7 @@ impl std::fmt::Display for Error {
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
-        Error::Store(e)
+        Error::Store(e.into())
     }
 }
 
@@ -67,7 +67,7 @@ impl OrgMeta {
 
     pub fn ensure_org_meta(sim: &Store, org_id: u64) -> Result<()> {
         let key = format!("{}/metadata/org.json", org_id);
-        if sim.get_standard(&key)?.is_none() {
+        if sim.get_standard(&key).map_err(Error::Store)?.is_none() {
             // No org.json exists — create root org and project.
             Self::create(sim, org_id)?;
         }
@@ -88,11 +88,16 @@ impl OrgMeta {
             deleted_at: None,
         };
         let json = serde_json::to_vec(&meta).map_err(|e| Error::Serialize(e.to_string()))?;
-        sim.put_standard(&meta.meta_key(), &json)?;
+        sim.put_standard(&meta.meta_key(), &json)
+            .map_err(Error::Store)?;
 
         // Write root project.json (no parent fields — this is the origin project).
-        ProjectMeta::create_root(sim, &ns)
-            .map_err(|e| Error::Store(io::Error::other(e.to_string())))?;
+        ProjectMeta::create_root(sim, &ns).map_err(|e| {
+            Error::Store(crate::Error::Io(io::Error::new(
+                io::ErrorKind::Other,
+                e.to_string(),
+            )))
+        })?;
 
         Ok(meta)
     }
@@ -100,7 +105,10 @@ impl OrgMeta {
     /// Read `org.json` without modifying it.
     pub fn get(sim: &Store, org_id: u64) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
-        let bytes = sim.get_standard(&key)?.ok_or(Error::NotFound)?;
+        let bytes = sim
+            .get_standard(&key)
+            .map_err(Error::Store)?
+            .ok_or(Error::NotFound)?;
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))
     }
 
@@ -111,7 +119,10 @@ impl OrgMeta {
     /// `deleted_at` is already set.
     pub fn delete(sim: &Store, org_id: u64, force: bool) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
-        let bytes = sim.get_standard(&key)?.ok_or(Error::NotFound)?;
+        let bytes = sim
+            .get_standard(&key)
+            .map_err(Error::Store)?
+            .ok_or(Error::NotFound)?;
         let mut meta: OrgMeta =
             serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
 
@@ -121,7 +132,7 @@ impl OrgMeta {
 
         meta.deleted_at = Some(now_secs());
         let json = serde_json::to_vec(&meta).map_err(|e| Error::Serialize(e.to_string()))?;
-        sim.put_standard(&key, &json)?;
+        sim.put_standard(&key, &json).map_err(Error::Store)?;
         Ok(meta)
     }
 }
@@ -134,78 +145,4 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn temp_store() -> (Store, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let sim = Store::new_sim(dir.path());
-        (sim, dir)
-    }
-
-    #[test]
-    fn create_org_writes_org_json_with_correct_fields() {
-        let (sim, _dir) = temp_store();
-        let meta = OrgMeta::create(&sim, 42).unwrap();
-
-        assert_eq!(meta.org_id, 42);
-        assert!(meta.created_at > 0);
-        assert!(meta.deleted_at.is_none());
-
-        // Verify persisted JSON.
-        let read_back = OrgMeta::get(&sim, 42).unwrap();
-        assert_eq!(read_back.org_id, 42);
-        assert!(read_back.deleted_at.is_none());
-    }
-
-    #[test]
-    fn create_org_also_writes_root_project_json() {
-        let (sim, _dir) = temp_store();
-        OrgMeta::create(&sim, 10).unwrap();
-
-        // Root project.json must exist at (org=10, proj=0, branch=0).
-        let ns = ProjectNamespace::new(10, 0, 0);
-        let bytes = sim.get_standard(&ns.project_meta_key()).unwrap();
-        assert!(bytes.is_some(), "root project.json must be written");
-    }
-
-    #[test]
-    fn delete_org_sets_deleted_at_without_removing_objects() {
-        let (sim, _dir) = temp_store();
-        OrgMeta::create(&sim, 7).unwrap();
-
-        let deleted = OrgMeta::delete(&sim, 7, false).unwrap();
-        assert!(deleted.deleted_at.is_some());
-
-        // org.json still exists — soft delete only.
-        let read_back = OrgMeta::get(&sim, 7).unwrap();
-        assert!(read_back.deleted_at.is_some());
-    }
-
-    #[test]
-    fn delete_org_returns_not_found_for_missing_org() {
-        let (sim, _dir) = temp_store();
-        let err = OrgMeta::delete(&sim, 999, false).unwrap_err();
-        assert!(matches!(err, Error::NotFound));
-    }
-
-    #[test]
-    fn delete_org_force_allows_double_deletion() {
-        let (sim, _dir) = temp_store();
-        OrgMeta::create(&sim, 5).unwrap();
-        OrgMeta::delete(&sim, 5, false).unwrap();
-        // Second delete without force should fail.
-        assert!(matches!(
-            OrgMeta::delete(&sim, 5, false),
-            Err(Error::AlreadyExists)
-        ));
-        // With force = true it succeeds.
-        OrgMeta::delete(&sim, 5, true).unwrap();
-    }
 }

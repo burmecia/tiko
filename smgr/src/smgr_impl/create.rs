@@ -8,27 +8,15 @@ pub extern "C-unwind" fn tiko_create(
     forknum: ForkNumber,
     is_redo: bool,
 ) {
-    let loc = unsafe { &(*reln).smgr_rlocator.locator };
-
-    match ops::create(RelFork {
-        spc_oid: loc.spc_oid,
-        db_oid: loc.db_oid,
-        rel_number: loc.rel_number,
-        fork_number: forknum,
-    }) {
+    let relfork = RelFork::from_rel(reln, forknum);
+    match ops::create(&relfork) {
         Ok(true) => {}             // newly created
         Ok(false) if is_redo => {} // exists, WAL replay — OK
         Ok(false) => {
-            pg_log_error(&format!(
-                "tiko_create: file already exists for rel {}/{}/{} fork {}",
-                loc.spc_oid, loc.db_oid, loc.rel_number, forknum
-            ));
+            pg_log_error(&format!("tiko_create: relfork already exists {relfork}",));
         }
-        Err(errno) => {
-            pg_log_error(&format!(
-                "tiko_create: failed for rel {}/{}/{} fork {}: errno {}",
-                loc.spc_oid, loc.db_oid, loc.rel_number, forknum, errno
-            ));
+        Err(err) => {
+            pg_log_error(&format!("tiko_create: failed for relfork {relfork}: {err}",));
         }
     }
 }

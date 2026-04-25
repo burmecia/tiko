@@ -16,19 +16,13 @@ pub extern "C-unwind" fn tiko_nblocks(
     reln: *mut SMgrRelationData,
     forknum: ForkNumber,
 ) -> BlockNumber {
-    let loc = unsafe { &(*reln).smgr_rlocator.locator };
+    let relfork = RelFork::from_rel(reln, forknum);
 
-    match ops::nblocks(RelFork {
-        spc_oid: loc.spc_oid,
-        db_oid: loc.db_oid,
-        rel_number: loc.rel_number,
-        fork_number: forknum,
-    }) {
+    match ops::get_nblocks(&relfork) {
         Ok(n) => n,
-        Err(errno) => {
+        Err(err) => {
             pg_log_error(&format!(
-                "tiko_nblocks: failed for rel {}/{}/{} fork {}: errno {}",
-                loc.spc_oid, loc.db_oid, loc.rel_number, forknum, errno
+                "tiko_nblocks: failed for relfork {relfork}: {err}",
             ));
             0
         }

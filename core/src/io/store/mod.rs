@@ -1,5 +1,4 @@
 pub mod backend;
-pub mod ops;
 pub mod s3;
 pub mod s3_sim;
 mod store;

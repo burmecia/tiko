@@ -36,7 +36,7 @@ pub fn spawn_compactor_task() {
         return;
     };
 
-    let Some(sim) = Store::try_get() else {
+    let Ok(sim) = Store::try_get() else {
         pg_log_warning("tiko: Store not initialised; skipping compactor task");
         return;
     };
@@ -62,7 +62,7 @@ pub fn spawn_wal_receiver_task() {
         return;
     };
 
-    let Some(sim) = Store::try_get() else {
+    let Ok(sim) = Store::try_get() else {
         pg_log_warning("tiko: Store not initialised; skipping WAL receiver task");
         return;
     };

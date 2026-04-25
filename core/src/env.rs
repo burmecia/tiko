@@ -1,0 +1,26 @@
+use std::env;
+
+/// Environment variable for the Tiko root path (overrides default of `$PGDATA/tiko`).
+pub const ENV_TIKO_ROOT_PATH: &str = "TIKO_ROOT_PATH";
+
+// Environment variable names for db identity (org_id, db_id, project_id).
+pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";
+pub const ENV_DB_ID: &str = "TIKO_DB_ID";
+pub const ENV_PROJECT_ID: &str = "TIKO_PROJECT_ID";
+
+/// Environment variable for how often the PITR worker should materialize a new base manifest, in seconds (default: 3600).
+pub const ENV_PITR_INTERVAL_SECS: &str = "TIKO_PITR_INTERVAL_SECS";
+
+pub fn read_u64(name: &str) -> u64 {
+    env::var(name)
+        .unwrap_or_else(|_| panic!("Environment variable {name} must be set"))
+        .parse()
+        .unwrap_or_else(|_| panic!("Environment variable {name} must be a valid u64"))
+}
+
+pub fn read_u64_or(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}

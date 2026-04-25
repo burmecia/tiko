@@ -27,54 +27,54 @@ unsafe extern "C" {
 /// # Arguments
 /// * `elevel` - Error level (e.g., LOG, INFO, NOTICE, WARNING, ERROR)
 /// * `message` - Message to log
-pub fn pg_log(elevel: i32, message: &str) {
+pub fn pg_log(elevel: i32, message: impl AsRef<str>) {
     unsafe {
-        let msg = CString::new(message).unwrap_or_else(|_| CString::new("").unwrap());
+        let msg = CString::new(message.as_ref()).unwrap_or_else(|_| CString::new("").unwrap());
         rust_pg_log(elevel, msg.as_ptr());
     }
 }
 
 #[inline(always)]
-pub fn pg_log_debug5(message: &str) {
+pub fn pg_log_debug5(message: impl AsRef<str>) {
     pg_log(DEBUG5, message);
 }
 
 #[inline(always)]
-pub fn pg_log_debug4(message: &str) {
+pub fn pg_log_debug4(message: impl AsRef<str>) {
     pg_log(DEBUG4, message);
 }
 
 #[inline(always)]
-pub fn pg_log_debug3(message: &str) {
+pub fn pg_log_debug3(message: impl AsRef<str>) {
     pg_log(DEBUG3, message);
 }
 
 #[inline(always)]
-pub fn pg_log_debug2(message: &str) {
+pub fn pg_log_debug2(message: impl AsRef<str>) {
     pg_log(DEBUG2, message);
 }
 
 #[inline(always)]
-pub fn pg_log_debug1(message: &str) {
+pub fn pg_log_debug1(message: impl AsRef<str>) {
     pg_log(DEBUG1, message);
 }
 
 #[inline(always)]
-pub fn pg_log_info(message: &str) {
+pub fn pg_log_info(message: impl AsRef<str>) {
     pg_log(INFO, message);
 }
 
 #[inline(always)]
-pub fn pg_log_warning(message: &str) {
+pub fn pg_log_warning(message: impl AsRef<str>) {
     pg_log(WARNING, message);
 }
 
 #[inline(always)]
-pub fn pg_log_error(message: &str) {
+pub fn pg_log_error(message: impl AsRef<str>) {
     pg_log(ERROR, message);
 }
 
 #[inline(always)]
-pub fn pg_log_notice(message: &str) {
+pub fn pg_log_notice(message: impl AsRef<str>) {
     pg_log(NOTICE, message);
 }

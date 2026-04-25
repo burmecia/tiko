@@ -72,6 +72,38 @@ pub fn run(
             })
     };
 
+    // ── Verify branch point checkpoint is complete ────────────────────────────
+    // Refuse to create a branch from an incomplete checkpoint. An incomplete
+    // checkpoint (flush_failures > 0) means some dirty chunks never reached
+    // the standard bucket; for non-root branches WAL replay would reconstruct
+    // them, but for root-to-child branches no WAL replay runs at all, which
+    // would produce silent data corruption in the new branch.
+    {
+        let manifest_key = if parent_project == 0 && parent_branch == 0 {
+            parent_ns.base_manifest_key(tl, branch_lsn)
+        } else {
+            parent_ns.delta_manifest_key(tl, branch_lsn)
+        };
+        if let Ok(Some(bytes)) = sim.get_standard(&manifest_key) {
+            let tmp = tempfile::NamedTempFile::new().unwrap_or_else(|e| {
+                eprintln!("error: failed to create temp file: {e}");
+                std::process::exit(1);
+            });
+            if let Ok(m) = core::manifest::Manifest::from_bytes(&bytes, tmp.path()) {
+                let failures = m.flush_failures();
+                if failures > 0 {
+                    eprintln!(
+                        "error: branch point checkpoint at lsn={} has {failures} incomplete \
+                         chunk flush(es); branching from an incomplete checkpoint risks \
+                         silent data loss. Run another checkpoint on the parent and retry.",
+                        branch_lsn.to_hex()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     // ── Register the branch in the store ─────────────────────────────────────
     let child_meta = create_branch(sim, &parent_ns, tl, &ns, branch_lsn).unwrap_or_else(|e| {
         eprintln!("error: failed to create branch: {e}");

@@ -104,3 +104,94 @@ Branch creation process for non-root project:
 6. Start child
    → remove recovery configuration
    → start normally
+
+------------------------------------------
+closed addressing
+
+Yes, it cleanly solves the partition boundary problem — and eliminates tombstones too. Here's why and how:
+
+Why it solves it:
+
+With closed addressing, a tag hashes to exactly one bucket. All nodes in that bucket's chain belong to the same partition. No probing ever crosses a partition boundary, so one partition lock is always sufficient for the entire operation.
+
+The simplest design for this codebase:
+
+Rather than a separate node pool, embed the chain in CacheSlotMeta itself:
+
+
+struct CacheSlotMeta {
+    tag: ChunkTag,
+    valid_blocks: AtomicU32,
+    dirty_blocks: AtomicU32,
+    usage_count: AtomicU8,
+    _pad: [u8; 3],
+    pin_count: AtomicU32,
+    next_slot: AtomicU32,  // chain link; u32::MAX = end of chain
+}
+The hash table becomes a flat array of AtomicU32 head slot indices (sentinel = u32::MAX), one per bucket. No CacheHashEntry, no status field, no tombstones.
+
+Operations become:
+
+Lookup: lock partition → walk chain from head[bucket] comparing tags → if found, pin, unlock, return
+Insert: evict a slot (getting pin=1) → lock partition → re-probe chain for concurrent insert → if not found, prepend to chain head → unlock
+Evict (tombstone step): lock partition → walk chain to find predecessor → unlink the slot → unlock. Finding the predecessor requires walking from the head, but chains are short at 50% load (average ~1 node)
+Other benefits:
+
+No tombstones: deletion is an unlink, not a mark. No accumulating tombstones degrading lookup performance over time.
+Simpler probe loop: just while slot != u32::MAX { if meta[slot].tag == tag ... slot = meta[slot].next } — no empty/deleted/occupied state machine.
+Cleaner eviction: the evictor's tombstone step is now simply "find predecessor, update predecessor.next = slot.next" — all under the write_lock, all within one partition.
+One new consideration:
+
+Eviction needs to unlink by walking from the chain head to find the predecessor. That's O(chain length) under the write_lock. At 50% load with 2048 buckets and 1024 slots, expected chain length is ~0.5 nodes — negligible. Only worth worrying about at pathologically high load factors, which the current design already protects against via CACHE_NUM_HASH_ENTRIES = 2 × CACHE_NUM_SLOTS.
+
+Summary: switching to closed addressing is strictly better for this use case. The cross-partition race is architecturally impossible, tombstone management disappears, and the code simplifies overall. The only cost is adding a next_slot: AtomicU32 field to CacheSlotMeta and replacing CacheHashEntry[] with a simpler AtomicU32[] heads array.
+
+------------------------------------------
+
+The best overall design for this specific use case — shared-memory write-back block cache, mixed process/Tokio-thread access, clock-sweep eviction — has a few key components:
+
+1. Hash table: closed addressing (as discussed)
+
+Already covered. Clear winner for the partition-lock model.
+
+2. Separate the "dirty flush" from the eviction hot path
+
+The current design flushes dirty chunks synchronously during eviction — S3 I/O while holding pin_count=1, blocking the clock sweep for that slot's duration. Under write-heavy workloads this means every eviction potentially stalls for an S3 PUT.
+
+The better design is a background flusher (analogous to PostgreSQL's bgwriter):
+
+A background thread (or Tokio task in s3worker) periodically scans for dirty slots and flushes them proactively
+By the time eviction picks a slot, it's already clean — eviction becomes a fast unlink + metadata clear
+Flush rate is tunable; slots are flushed based on dirtyness ratio, not eviction pressure
+This decouples write throughput from eviction latency. The current design accidentally couples them: high write rate → many dirty slots → slow evictions → eviction pressure backs up → writes stall.
+
+3. Eviction: keep clock-sweep, fix the clock hand
+
+Clock-sweep is the right algorithm here — O(1) amortized, no priority queue overhead. But the single shared clock_hand AtomicU32 is a hot cache line under many concurrent evictors.
+
+Better: give each process a local clock hint (process-local u32, not in shared memory) initialized to where it last evicted. The shared clock_hand is only used as a fallback tie-breaker or for the very first eviction. Since correctness doesn't depend on strict ordering of the sweep (it's a heuristic), per-process hints are safe and eliminate the shared atomic bounce.
+
+4. Pin count: keep as-is, but make the invariant structural
+
+The current pin_count: AtomicU32 with the assert!(prev > 0) guard is correct. One hardening improvement: introduce a RAII PinnedSlot wrapper that pins on construction and unpins on drop, making it impossible to forget an unpin or double-unpin at the type level:
+
+
+struct PinnedSlot<'a> {
+    cache: &'a CacheControl,
+    slot: u32,
+}
+impl Drop for PinnedSlot<'_> {
+    fn drop(&mut self) { self.cache.unpin(self.slot); }
+}
+All callers hold a PinnedSlot rather than a raw u32. The unpin/underflow bug discussed earlier becomes structurally impossible rather than just asserted.
+
+Putting it together — the ideal structure:
+
+Concern	Current	Best
+Hash table	Open addressing, cross-partition race	Closed addressing, chain in slot meta
+Dirty flush	Synchronous in eviction	Background flusher, eviction is clean path
+Clock hand	Single shared atomic	Per-process local hint
+Pin safety	assert!(prev > 0)	RAII PinnedSlot
+Partition locks	Spin RWLock (correct)	Keep as-is
+
+The background flusher and RAII pin are the two highest-value changes beyond the hash table fix. The background flusher eliminates the latency coupling; the RAII pin eliminates an entire class of bugs structurally rather than just detecting them at runtime.

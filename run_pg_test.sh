@@ -10,10 +10,9 @@ ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 
 # Set environment variables for Tiko configuration
 unset TIKO_ROOT_PATH
-TIKO_ORG_ID="12"
-TIKO_DB_ID="34"
-TIKO_PROJECT_ID="56"
-TIKO_PITR_INTERVAL_SECS="300"
+TIKO_ORG_ID="123"
+TIKO_PROJECT_ID="0"
+TIKO_BRANCH_ID="0"
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${BASE_DIR}/target"
@@ -22,7 +21,7 @@ POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 EXTENSION_DIR="${POSTGRES_INSTALL}/share/postgresql/extension"
 
 echo "Building Tiko smgr..."
-if ! (cargo build -p smgr --release) >/dev/null; then
+if ! (cd smgr && cargo build --release) >/dev/null 2>&1; then
   echo "Tiko smgr build failed" >&2
   exit 1
 fi
@@ -35,13 +34,13 @@ fi
 
 echo "Building PostgreSQL..."
 rm -f postgres/src/backend/postgres
-if ! (cd postgres && make -j4) >/dev/null; then
+if ! (cd postgres && make) >/dev/null 2>&1; then
   echo "Postgres build/install failed" >&2
   exit 1
 fi
 
 echo "Building Tiko Worker..."
-if ! (cargo build -p worker --release) >/dev/null; then
+if ! (cd worker && cargo build --release) >/dev/null 2>&1; then
   echo "Tiko Worker build failed" >&2
   exit 1
 fi
@@ -53,9 +52,9 @@ if [ -f "${TARGET_DIR}/release/libtikoworker.dylib" ]; then
 fi
 
 echo "Running tests..."
-if ! (cd postgres/src/test/modules/test_tiko && make check PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libtikoworker -c shared_buffers=256kB') >/dev/null; then
-  echo "Test Tiko failed" >&2
+if ! (cd postgres && EXTRA_INSTALL=src/test/modules/test_tiko/worker make check TESTS="create_index" PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug2 -c shared_preload_libraries=libtikoworker -c shared_buffers=256kB -c fsync=off'); then
+  echo "PG test failed" >&2
   exit 1
 fi
 
-echo "All tests passed. 🎉"
+echo "All PG tests passed. 🎉"

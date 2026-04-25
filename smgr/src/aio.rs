@@ -2,7 +2,7 @@ use core::chunk::RelFork;
 use core::{io_control::IoOpKind, ops};
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 
-use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipeline};
+use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pipeline};
 
 /// Common implementation for AIO read/write.
 ///
@@ -16,7 +16,7 @@ use crate::{WAIT_EVENT_S3_IO_READ, WAIT_EVENT_S3_IO_WRITE, pipeline, use_pipelin
 /// `ops::read_blocks` / `write_blocks` calls instead.
 ///
 /// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
-unsafe fn tiko_io_perform(
+unsafe fn perform_io(
     op: IoOpKind,
     iov: *mut pgsys::aio::IoVec,
     iov_length: i32,
@@ -25,7 +25,7 @@ unsafe fn tiko_io_perform(
     rel_number: RelFileNumber,
     fork_number: ForkNumber,
     block_number: BlockNumber,
-    nblocks: i32,
+    _nblocks: i32,
     wait_event: u32,
     label: &str,
 ) -> isize {
@@ -37,7 +37,7 @@ unsafe fn tiko_io_perform(
             let entry_nblocks = (entry.iov_len / BLCKSZ) as u32;
 
             let result = if use_pipeline() {
-                // Normal: submit to s3worker pipeline
+                // Normal: submit to worker pipeline and wait for completion
                 pipeline::submit_and_wait_raw(
                     op,
                     spc_oid,
@@ -50,9 +50,9 @@ unsafe fn tiko_io_perform(
                     wait_event,
                     label,
                 )
-                .map(|_| ())
+                .map(|result| result.nblocks)
             } else {
-                // No pipeline (initdb / shutdown / s3worker dead): direct ops call
+                // No pipeline (initdb / shutdown / worker dead): direct ops call
                 let rf = RelFork {
                     spc_oid,
                     db_oid,
@@ -61,26 +61,26 @@ unsafe fn tiko_io_perform(
                 };
                 match op {
                     IoOpKind::Read => ops::read_blocks(
-                        rf,
+                        &rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *mut u8,
                     )
-                    .map(|_| ()),
+                    .map_err(|e| e.to_errno()),
                     IoOpKind::Write => ops::write_blocks(
-                        rf,
+                        &rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *const u8,
                     )
-                    .map(|_| ()),
-                    _ => Err(45), // ENOTSUP
+                    .map_err(|e| e.to_errno()),
+                    _ => Err(libc::ENOTSUP),
                 }
             };
 
             match result {
-                Ok(_) => {
-                    current_block += entry_nblocks;
+                Ok(result_nblocks) => {
+                    current_block += result_nblocks;
                 }
                 Err(errno) => {
                     let blocks_done = current_block - block_number;
@@ -92,7 +92,7 @@ unsafe fn tiko_io_perform(
             }
         }
 
-        (nblocks as isize) * (BLCKSZ as isize)
+        (current_block as isize - block_number as isize) * (BLCKSZ as isize)
     }
 }
 
@@ -108,7 +108,7 @@ pub extern "C-unwind" fn tiko_io_perform_read(
     nblocks: i32,
 ) -> isize {
     unsafe {
-        tiko_io_perform(
+        perform_io(
             IoOpKind::Read,
             iov,
             iov_length,
@@ -118,7 +118,7 @@ pub extern "C-unwind" fn tiko_io_perform_read(
             fork_number,
             block_number,
             nblocks,
-            WAIT_EVENT_S3_IO_READ,
+            WAIT_EVENT_TIKO_IO_READ,
             "tiko_io_perform_read",
         )
     }
@@ -136,7 +136,7 @@ pub extern "C-unwind" fn tiko_io_perform_write(
     nblocks: i32,
 ) -> isize {
     unsafe {
-        tiko_io_perform(
+        perform_io(
             IoOpKind::Write,
             iov,
             iov_length,
@@ -146,7 +146,7 @@ pub extern "C-unwind" fn tiko_io_perform_write(
             fork_number,
             block_number,
             nblocks,
-            WAIT_EVENT_S3_IO_WRITE,
+            WAIT_EVENT_TIKO_IO_WRITE,
             "tiko_io_perform_write",
         )
     }

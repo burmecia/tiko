@@ -10,6 +10,7 @@ rust-version = { workspace = true }
 
 [dependencies]
 pgsys = { path = "../pgsys" }
+chrono = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
@@ -20,3 +21,4 @@ rmp-serde = { workspace = true }
 zstd = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }

@@ -33,7 +33,7 @@ pub extern "C" fn worker_shmem_request() {
             "tiko: requested {} bytes shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
             size,
             max_backends,
-            core::cache::CACHE_NUM_SLOTS
+            core::cache::CHUNK_NUM_SLOTS
         ));
     }
 }
@@ -52,7 +52,7 @@ pub extern "C" fn worker_shmem_startup() {
         pg_log_debug1(&format!(
             "tiko: initialized shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
             max_backends,
-            core::cache::CACHE_NUM_SLOTS
+            core::cache::CHUNK_NUM_SLOTS
         ));
     }
 }

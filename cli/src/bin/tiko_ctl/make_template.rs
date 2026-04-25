@@ -33,21 +33,7 @@ pub fn run(pg_bindir: &Path, tiko_root: Option<&Path>) {
         std::process::exit(1);
     }
 
-    // ── 2. Remove transient store artefacts left by initdb ────────────────────
-    // dirty_chunks/ holds sidecar files written during initdb. The checkpoint
-    // that runs at the end of initdb deletes the referenced sidecars, but
-    // intermediate sidecars for the same chunk (one per block write) are
-    // cleaned up during log parse. Any remaining files are safe to drop here
-    // because the checkpoint has already uploaded the data to the S3Sim.
-    let dirty_chunks_dir = store_root.join("dirty_chunks");
-    if dirty_chunks_dir.exists() {
-        fs::remove_dir_all(&dirty_chunks_dir).unwrap_or_else(|e| {
-            eprintln!("error: failed to remove dirty_chunks: {e}");
-            std::process::exit(1);
-        });
-    }
-
-    // ── 3. Create postgresql.tiko.conf and include it from postgresql.conf ──────
+    // ── 2. Create postgresql.tiko.conf and include it from postgresql.conf ──────
     let tiko_conf = r#"# Tiko storage manager settings
 shared_preload_libraries = 'libtikoworker'
 log_min_messages = debug1
@@ -73,13 +59,13 @@ max_slot_wal_keep_size = 1GB
         std::process::exit(1);
     });
 
-    // ── 4. Strip pg_control (restored from pg_state.tar.zst at recovery time) ─
+    // ── 3. Strip pg_control (restored from pg_state.tar.zst at recovery time) ─
     fs::remove_file(pgdata.join("global/pg_control")).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
 
-    // ── 5. Strip transactional state contents (keep directories) ─────────────
+    // ── 4. Strip transactional state contents (keep directories) ─────────────
     // pg_wal is intentionally kept: the initial WAL segment written by initdb
     // must be present so that branches created from this template can start PG
     // without needing a restore_command to fetch the very first segment.
@@ -92,11 +78,11 @@ max_slot_wal_keep_size = 1GB
         remove_dir_contents(&pgdata.join(dir));
     }
 
-    // ── 6. Strip relation files; keep pg_filenode.map and pg_internal.init ────
+    // ── 5. Strip relation files; keep pg_filenode.map and pg_internal.init ────
     strip_relation_files(&pgdata.join("global"), 1);
     strip_relation_files(&pgdata.join("base"), 2);
 
-    // ── 7. Create tarball ─────────────────────────────────────────────────────
+    // ── 6. Create tarball ─────────────────────────────────────────────────────
     let status = Command::new("tar")
         .args([
             "-czf",
@@ -124,7 +110,7 @@ max_slot_wal_keep_size = 1GB
         size
     );
 
-    // ── 8. Upload to S3Sim ─────────────────────────────────────────────────
+    // ── 7. Upload to S3Sim ─────────────────────────────────────────────────
     if let Some(root) = tiko_root {
         let filename = output
             .file_name()

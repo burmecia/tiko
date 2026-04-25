@@ -14,30 +14,19 @@ pub extern "C-unwind" fn tiko_extend(
     buffer: *const std::ffi::c_void,
     _skip_fsync: bool,
 ) {
-    let loc = unsafe { &(*reln).smgr_rlocator.locator };
+    let relfork = RelFork::from_rel(reln, forknum);
 
     if blocknum == INVALID_BLOCK_NUMBER {
         pg_log_error(&format!(
-            "tiko_extend: cannot extend rel {}/{}/{} fork {} beyond {} blocks",
-            loc.spc_oid, loc.db_oid, loc.rel_number, forknum, INVALID_BLOCK_NUMBER
+            "tiko_extend: cannot extend relfork {relfork} beyond {} blocks",
+            INVALID_BLOCK_NUMBER
         ));
         return;
     }
 
-    if let Err(errno) = ops::write_blocks(
-        RelFork {
-            spc_oid: loc.spc_oid,
-            db_oid: loc.db_oid,
-            rel_number: loc.rel_number,
-            fork_number: forknum,
-        },
-        blocknum,
-        1,
-        buffer as *const u8,
-    ) {
+    if let Err(err) = ops::write_blocks(&relfork, blocknum, 1, buffer as *const u8) {
         pg_log_error(&format!(
-            "tiko_extend: write failed for rel {}/{}/{} fork {} block {}: errno {}",
-            loc.spc_oid, loc.db_oid, loc.rel_number, forknum, blocknum, errno
+            "tiko_extend: failed for relfork {relfork} block {blocknum}: {err}",
         ));
     }
 }

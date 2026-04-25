@@ -1,7 +1,7 @@
 use core::chunk::RelFork;
 use core::ops;
 use pgsys::{
-    common::{BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},
+    common::{BLCKSZ, BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},
     logging::pg_log_error,
     smgr::*,
 };
@@ -20,37 +20,23 @@ pub extern "C-unwind" fn tiko_zeroextend(
     nblocks: i32,
     _skip_fsync: bool,
 ) {
-    let loc = unsafe { &(*reln).smgr_rlocator.locator };
+    let relfork = RelFork::from_rel(reln, forknum);
     let nblocks_u32 = nblocks as u32;
 
     // Check for overflow: matches mdzeroextend's boundary check
     if (blocknum as u64) + (nblocks_u32 as u64) >= INVALID_BLOCK_NUMBER as u64 {
         pg_log_error(&format!(
-            "tiko_zeroextend: cannot extend rel {}/{}/{} fork {} beyond block {} (requested {} + {})",
-            loc.spc_oid,
-            loc.db_oid,
-            loc.rel_number,
-            forknum,
-            INVALID_BLOCK_NUMBER,
-            blocknum,
-            nblocks_u32
+            "tiko_zeroextend: cannot extend relfork {relfork} beyond block {} (requested {} + {})",
+            INVALID_BLOCK_NUMBER, blocknum, nblocks_u32
         ));
         return;
     }
 
-    if let Err(errno) = ops::zeroextend(
-        RelFork {
-            spc_oid: loc.spc_oid,
-            db_oid: loc.db_oid,
-            rel_number: loc.rel_number,
-            fork_number: forknum,
-        },
-        blocknum,
-        nblocks_u32,
-    ) {
+    let buf = vec![0u8; nblocks as usize * BLCKSZ];
+
+    if let Err(err) = ops::write_blocks(&relfork, blocknum, nblocks_u32, buf.as_ptr()) {
         pg_log_error(&format!(
-            "tiko_zeroextend: failed for rel {}/{}/{} fork {} block {} nblocks {}: errno {}",
-            loc.spc_oid, loc.db_oid, loc.rel_number, forknum, blocknum, nblocks, errno
+            "tiko_zeroextend: failed for relfork {relfork} block {blocknum} nblocks {nblocks_u32}: {err}",
         ));
     }
 }

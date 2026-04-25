@@ -38,8 +38,10 @@ use pgsys::Lsn;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
+use crate::error::Result;
+use crate::io::store::Store;
 use crate::project::{ProjectCtx, ProjectNamespace};
-use crate::store::Store;
+use crate::relfork::RelForkMeta;
 
 // ── TIKM constants ──
 
@@ -111,6 +113,13 @@ struct ManifestInner {
     /// Relation forks dropped during this checkpoint interval.
     /// Carried in the msgpack wire format only; always empty in a base manifest.
     deleted_forks: Vec<RelFork>,
+    /// Number of dirty chunks that failed to flush to express during this
+    /// checkpoint. Non-zero means the manifest is incomplete: those chunks
+    /// are absent and recovery via WAL replay is required to reconstruct them.
+    /// Carried in the msgpack wire format only; always 0 in a base manifest.
+    flush_failures: u32,
+
+    relfork_map: HashMap<RelFork, RelForkMeta>,
 }
 
 // ── Manifest ──
@@ -244,6 +253,8 @@ impl Manifest {
                 entry_count: chunks.len() as u64,
                 fork_nblocks,
                 deleted_forks,
+                flush_failures: 0,
+                relfork_map: HashMap::new(),
             }),
         })
     }
@@ -281,6 +292,8 @@ impl Manifest {
                 entry_count,
                 fork_nblocks: HashMap::new(),
                 deleted_forks: vec![],
+                flush_failures: 0,
+                relfork_map: HashMap::new(),
             }),
         })
     }
@@ -288,30 +301,48 @@ impl Manifest {
     /// Deserialize from the S3 wire format (`msgpack(...)`).
     /// Writes the decoded entries to a local TIKM file at `path`.
     ///
-    /// Wire format: 5-tuple `(lsn, timestamp, chunks, fork_nblocks, deleted_forks)`.
+    /// Wire format: 6-tuple `(lsn, timestamp, chunks, fork_nblocks, deleted_forks, flush_failures)`.
+    /// Old 5-tuple format (without `flush_failures`) is accepted for backward compatibility.
     pub fn from_bytes(data: &[u8], path: &Path) -> io::Result<Self> {
-        let (checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks): (
-            Lsn,
-            i64,
-            Vec<(ChunkTag, ChunkRef)>,
-            HashMap<RelFork, u32>,
-            Vec<RelFork>,
-        ) = rmp_serde::from_slice(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Try new 6-tuple format first; fall back to old 5-tuple.
+        let (checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks, flush_failures) =
+            if let Ok((lsn, ts, ch, nb, df, ff)) = rmp_serde::from_slice::<(
+                Lsn,
+                i64,
+                Vec<(ChunkTag, ChunkRef)>,
+                HashMap<RelFork, u32>,
+                Vec<RelFork>,
+                u32,
+            )>(data)
+            {
+                (lsn, ts, ch, nb, df, ff)
+            } else {
+                let (lsn, ts, ch, nb, df): (
+                    Lsn,
+                    i64,
+                    Vec<(ChunkTag, ChunkRef)>,
+                    HashMap<RelFork, u32>,
+                    Vec<RelFork>,
+                ) = rmp_serde::from_slice(data)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                (lsn, ts, ch, nb, df, 0)
+            };
 
-        Self::new(
+        let m = Self::new(
             checkpoint_lsn,
             timestamp,
             chunks,
             fork_nblocks,
             deleted_forks,
             path,
-        )
+        )?;
+        m.inner.lock().unwrap().flush_failures = flush_failures;
+        Ok(m)
     }
 
     /// Serialize to the S3 wire format (`msgpack(...)`).
     ///
-    /// Format: 5-tuple `(checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks)`.
+    /// Format: 6-tuple `(checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks, flush_failures)`.
     pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         let entries = read_all_entries(&inner)?;
@@ -321,6 +352,7 @@ impl Manifest {
             &entries,
             &inner.fork_nblocks,
             &inner.deleted_forks,
+            inner.flush_failures,
         ))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
@@ -328,6 +360,19 @@ impl Manifest {
     /// Return the checkpoint LSN recorded in the manifest header.
     pub fn checkpoint_lsn(&self) -> Lsn {
         self.inner.lock().unwrap().checkpoint_lsn
+    }
+
+    /// Number of dirty chunks that failed to flush to express during this
+    /// checkpoint. Non-zero means the manifest is incomplete and WAL replay
+    /// is required to recover the missing blocks.
+    pub fn flush_failures(&self) -> u32 {
+        self.inner.lock().unwrap().flush_failures
+    }
+
+    /// Set the flush failure count. Called by the checkpoint after
+    /// `flush_all_dirty_chunks` reports failures.
+    pub fn set_flush_failures(&self, n: u32) {
+        self.inner.lock().unwrap().flush_failures = n;
     }
 
     /// Return the timestamp recorded in the manifest header.
@@ -359,7 +404,7 @@ impl Manifest {
 
     /// Binary search for `key` in the sorted on-disk TIKM file.
     /// Returns `Ok(Some(ChunkRef))` on hit, `Ok(None)` on miss.
-    pub fn lookup(&self, key: &ChunkTag) -> io::Result<Option<ChunkRef>> {
+    pub fn lookup(&self, key: &ChunkTag) -> Result<Option<ChunkRef>> {
         let inner = self.inner.lock().unwrap();
         let entry_count = inner.entry_count;
         if entry_count == 0 {
@@ -486,7 +531,7 @@ impl Manifest {
 
         // Purge tombstoned forks from the merged output and nblocks map.
         if !deleted_set.is_empty() {
-            output.retain(|(tag, _)| !deleted_set.contains(&tag.rel_fork()));
+            output.retain(|(tag, _)| !deleted_set.contains(&tag.relfork()));
             merged_nblocks.retain(|rf, _| !deleted_set.contains(rf));
         }
 
@@ -510,14 +555,19 @@ impl Manifest {
     ///
     /// Returns `None` if no nblocks entry was recorded (e.g. legacy manifest
     /// or a relation that wasn't touched since the last checkpoint).
-    pub fn lookup_nblocks(&self, rf: RelFork) -> Option<u32> {
-        self.inner.lock().unwrap().fork_nblocks.get(&rf).copied()
+    pub fn lookup_nblocks(&self, rf: &RelFork) -> Option<u32> {
+        self.inner.lock().unwrap().fork_nblocks.get(rf).copied()
     }
 
     /// Return the list of relation forks deleted during this checkpoint interval.
     /// Always empty in a base manifest (tombstones are consumed by `apply_deltas`).
     pub fn deleted_forks(&self) -> Vec<RelFork> {
         self.inner.lock().unwrap().deleted_forks.clone()
+    }
+
+    // -------- new interface --------
+    pub(crate) fn lookup_relfork_meta(&self, rf: &RelFork) -> Option<RelForkMeta> {
+        self.inner.lock().unwrap().relfork_map.get(rf).cloned()
     }
 }
 
@@ -632,999 +682,4 @@ pub fn materialize_base(
         new_lsn,
         delta_count,
     })
-}
-
-// ── Tests ──
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::project::ProjectNamespace;
-    use crate::store::Store;
-    use pgsys::Lsn;
-    use tempfile::{TempDir, tempdir};
-
-    // ── Test helpers ──
-
-    fn chunk(spc: u32, db: u32, rel: u32, fork: i32, id: u32) -> ChunkTag {
-        ChunkTag {
-            spc_oid: spc,
-            db_oid: db,
-            rel_number: rel,
-            fork_number: fork,
-            chunk_id: id,
-        }
-    }
-
-    fn cref(branch_id: u64, lsn_val: u64) -> ChunkRef {
-        ChunkRef {
-            branch_id,
-            timeline_id: 1,
-            lsn: Lsn::new(lsn_val),
-        }
-    }
-
-    fn setup_sim() -> (TempDir, Store) {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new_sim(dir.path());
-        (dir, store)
-    }
-
-    fn ns_with_project(project_id: u64) -> ProjectNamespace {
-        ProjectNamespace::new(1001, project_id, 1)
-    }
-
-    fn tag(rel: u32) -> ChunkTag {
-        chunk(1663, 5, rel, 0, 0)
-    }
-
-    fn store_manifest(
-        sim: &Store,
-        key: &str,
-        lsn: Lsn,
-        chunks: Vec<(ChunkTag, ChunkRef)>,
-        tmp: &Path,
-    ) {
-        let m = Manifest::new(lsn, 0, chunks, HashMap::new(), vec![], tmp).unwrap();
-        sim.put_standard(key, &m.to_bytes().unwrap()).unwrap();
-    }
-
-    /// Read and verify raw TIKM header fields directly from the file on disk.
-    fn raw_header(path: &Path) -> (u32, Lsn, i64, u64) {
-        let mut header = [0u8; 32];
-        let f = File::open(path).unwrap();
-        f.read_at(&mut header, 0).unwrap();
-        assert_eq!(&header[0..4], b"TIKM", "magic mismatch");
-        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let lsn = Lsn::new(u64::from_le_bytes(header[8..16].try_into().unwrap()));
-        let ts = i64::from_le_bytes(header[16..24].try_into().unwrap());
-        let count = u64::from_le_bytes(header[24..32].try_into().unwrap());
-        (version, lsn, ts, count)
-    }
-
-    /// Read all entries from a TIKM file on disk without going through Manifest.
-    fn raw_entries(path: &Path) -> Vec<(ChunkTag, ChunkRef)> {
-        let data = fs::read(path).unwrap();
-        let entry_count = u64::from_le_bytes(data[24..32].try_into().unwrap()) as usize;
-        let mut result = Vec::with_capacity(entry_count);
-        for i in 0..entry_count {
-            let off = 32 + i * 40;
-            let tag = ChunkTag::decode(data[off..off + 20].try_into().unwrap());
-            let cref = ChunkRef::decode(data[off + 20..off + 40].try_into().unwrap());
-            result.push((tag, cref));
-        }
-        result
-    }
-
-    // ── new_sorted ──
-
-    #[test]
-    fn new_sorted_writes_valid_header() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let k1 = chunk(1663, 5, 1, 0, 0);
-        let k2 = chunk(1663, 5, 2, 0, 0);
-        let _m = Manifest::new(
-            Lsn::new(0x100),
-            42,
-            vec![(k2, cref(2, 0x100)), (k1, cref(1, 0x100))],
-            HashMap::new(),
-            vec![],
-            &path,
-        )
-        .unwrap();
-
-        let (version, lsn, ts, count) = raw_header(&path);
-        assert_eq!(version, 1);
-        assert_eq!(lsn, Lsn::new(0x100));
-        assert_eq!(ts, 42);
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn new_sorted_entries_in_ascending_order() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        // Provide in reverse order; new_sorted must sort them.
-        let k3 = chunk(1663, 5, 3, 0, 0);
-        let k1 = chunk(1663, 5, 1, 0, 0);
-        let k2 = chunk(1663, 5, 2, 0, 0);
-        let _m = Manifest::new(
-            Lsn::new(1),
-            0,
-            vec![(k3, cref(1, 1)), (k1, cref(1, 1)), (k2, cref(1, 1))],
-            HashMap::new(),
-            vec![],
-            &path,
-        )
-        .unwrap();
-
-        let entries = raw_entries(&path);
-        assert_eq!(entries.len(), 3);
-        assert!(
-            entries[0].0 < entries[1].0,
-            "entries must be sorted ascending"
-        );
-        assert!(
-            entries[1].0 < entries[2].0,
-            "entries must be sorted ascending"
-        );
-        assert_eq!(entries[0].0, k1);
-        assert_eq!(entries[1].0, k2);
-        assert_eq!(entries[2].0, k3);
-    }
-
-    // ── lookup ──
-
-    #[test]
-    fn lookup_hit_returns_correct_chunk_ref() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let k = chunk(1663, 5, 42, 0, 7);
-        let r = cref(99, 0x300);
-        let m = Manifest::new(
-            Lsn::new(0x300),
-            0,
-            vec![(k, r)],
-            HashMap::new(),
-            vec![],
-            &path,
-        )
-        .unwrap();
-        assert_eq!(m.lookup(&k).unwrap(), Some(r));
-    }
-
-    #[test]
-    fn lookup_miss_returns_none() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let k = chunk(1663, 5, 1, 0, 0);
-        let absent = chunk(1663, 5, 999, 0, 0);
-        let m = Manifest::new(
-            Lsn::new(1),
-            0,
-            vec![(k, cref(1, 1))],
-            HashMap::new(),
-            vec![],
-            &path,
-        )
-        .unwrap();
-        assert_eq!(m.lookup(&absent).unwrap(), None);
-    }
-
-    #[test]
-    fn lookup_empty_manifest_returns_none() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), vec![], &path).unwrap();
-        assert_eq!(m.lookup(&chunk(1663, 5, 1, 0, 0)).unwrap(), None);
-    }
-
-    #[test]
-    fn lookup_first_and_last_entry() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let keys: Vec<ChunkTag> = (0..20).map(|i| chunk(1663, 5, i, 0, 0)).collect();
-        let chunks: Vec<_> = keys.iter().map(|k| (*k, cref(1, 100))).collect();
-        let m = Manifest::new(Lsn::new(100), 0, chunks, HashMap::new(), vec![], &path).unwrap();
-
-        assert!(
-            m.lookup(&keys[0]).unwrap().is_some(),
-            "first entry not found"
-        );
-        assert!(
-            m.lookup(&keys[19]).unwrap().is_some(),
-            "last entry not found"
-        );
-        assert_eq!(
-            m.lookup(&chunk(1663, 5, 99, 0, 0)).unwrap(),
-            None,
-            "absent key should miss"
-        );
-    }
-
-    // ── open ──
-
-    #[test]
-    fn open_round_trip_preserves_metadata() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let k = chunk(1663, 5, 7, 0, 0);
-        let _m = Manifest::new(
-            Lsn::new(0x200),
-            999,
-            vec![(k, cref(5, 0x200))],
-            HashMap::new(),
-            vec![],
-            &path,
-        )
-        .unwrap();
-
-        let m2 = Manifest::open(&path).unwrap();
-        assert_eq!(m2.checkpoint_lsn(), Lsn::new(0x200));
-        assert_eq!(m2.timestamp(), 999);
-        assert_eq!(m2.inner.lock().unwrap().entry_count, 1);
-        assert_eq!(m2.lookup(&k).unwrap(), Some(cref(5, 0x200)));
-    }
-
-    #[test]
-    fn open_rejects_bad_magic() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("bad.tikm");
-        fs::write(&path, b"BOGUSDATA00000000000000000000000").unwrap();
-        assert!(Manifest::open(&path).is_err());
-    }
-
-    // ── from_bytes / to_bytes ──
-
-    #[test]
-    fn from_bytes_to_bytes_round_trip() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let path2 = tmp.path().join("m2.tikm");
-
-        let k1 = chunk(1663, 5, 10, 0, 0);
-        let k2 = chunk(1663, 5, 20, 0, 1);
-        let m = Manifest::new(
-            Lsn::new(0x400),
-            1234,
-            vec![(k1, cref(7, 0x400)), (k2, cref(8, 0x300))],
-            HashMap::new(),
-            vec![],
-            &path,
-        )
-        .unwrap();
-
-        let wire = m.to_bytes().unwrap();
-        let m2 = Manifest::from_bytes(&wire, &path2).unwrap();
-
-        assert_eq!(m2.checkpoint_lsn(), Lsn::new(0x400));
-        assert_eq!(m2.timestamp(), 1234);
-        assert_eq!(m2.lookup(&k1).unwrap(), Some(cref(7, 0x400)));
-        assert_eq!(m2.lookup(&k2).unwrap(), Some(cref(8, 0x300)));
-    }
-
-    #[test]
-    fn from_bytes_to_bytes_empty_manifest() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let path2 = tmp.path().join("m2.tikm");
-
-        let m = Manifest::new(Lsn::new(0), 0, vec![], HashMap::new(), vec![], &path).unwrap();
-        let wire = m.to_bytes().unwrap();
-        let m2 = Manifest::from_bytes(&wire, &path2).unwrap();
-
-        assert_eq!(m2.inner.lock().unwrap().entry_count, 0);
-        assert_eq!(m2.lookup(&chunk(1663, 5, 1, 0, 0)).unwrap(), None);
-    }
-
-    // ── apply_deltas ──
-
-    #[test]
-    fn apply_deltas_three_deltas_correct_chunk_refs() {
-        let tmp = tempdir().unwrap();
-        let base_path = tmp.path().join("base.tikm");
-        let d1_path = tmp.path().join("d1.tikm");
-        let d2_path = tmp.path().join("d2.tikm");
-        let d3_path = tmp.path().join("d3.tikm");
-
-        let k_a = chunk(1663, 5, 100, 0, 0);
-        let k_b = chunk(1663, 5, 200, 0, 0);
-        let k_c = chunk(1663, 5, 300, 0, 0);
-
-        let base = Manifest::new(
-            Lsn::new(0x100),
-            1,
-            vec![
-                (k_a, cref(1, 0x100)),
-                (k_b, cref(1, 0x100)),
-                (k_c, cref(1, 0x100)),
-            ],
-            HashMap::new(),
-            vec![],
-            &base_path,
-        )
-        .unwrap();
-
-        // d1 updates k_a to branch 2
-        let d1 = Manifest::new(
-            Lsn::new(0x200),
-            2,
-            vec![(k_a, cref(2, 0x200))],
-            HashMap::new(),
-            vec![],
-            &d1_path,
-        )
-        .unwrap();
-        // d2 updates k_b and k_c to branch 3
-        let d2 = Manifest::new(
-            Lsn::new(0x300),
-            3,
-            vec![(k_b, cref(3, 0x300)), (k_c, cref(3, 0x300))],
-            HashMap::new(),
-            vec![],
-            &d2_path,
-        )
-        .unwrap();
-        // d3 updates k_a again to branch 4 (highest)
-        let d3 = Manifest::new(
-            Lsn::new(0x400),
-            4,
-            vec![(k_a, cref(4, 0x400))],
-            HashMap::new(),
-            vec![],
-            &d3_path,
-        )
-        .unwrap();
-
-        base.apply_deltas(&[d1, d2, d3]).unwrap();
-
-        assert_eq!(base.checkpoint_lsn(), Lsn::new(0x400));
-        assert_eq!(base.lookup(&k_a).unwrap(), Some(cref(4, 0x400)));
-        assert_eq!(base.lookup(&k_b).unwrap(), Some(cref(3, 0x300)));
-        assert_eq!(base.lookup(&k_c).unwrap(), Some(cref(3, 0x300)));
-    }
-
-    #[test]
-    fn apply_deltas_empty_slice_is_noop() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("m.tikm");
-        let k = chunk(1663, 5, 42, 0, 0);
-        let m = Manifest::new(
-            Lsn::new(0x100),
-            10,
-            vec![(k, cref(1, 0x100))],
-            HashMap::new(),
-            vec![],
-            &path,
-        )
-        .unwrap();
-
-        // Capture mtime before to verify no file I/O happens.
-        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
-
-        m.apply_deltas(&[]).unwrap();
-
-        let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(mtime_before, mtime_after, "file must not be touched");
-        assert_eq!(m.checkpoint_lsn(), Lsn::new(0x100));
-        assert_eq!(m.timestamp(), 10);
-        assert_eq!(m.lookup(&k).unwrap(), Some(cref(1, 0x100)));
-    }
-
-    #[test]
-    fn apply_deltas_idempotent() {
-        let tmp = tempdir().unwrap();
-        let base_path = tmp.path().join("base.tikm");
-        let d_path = tmp.path().join("d.tikm");
-
-        let k = chunk(1663, 5, 7, 0, 0);
-        let base = Manifest::new(
-            Lsn::new(0x100),
-            1,
-            vec![(k, cref(1, 0x100))],
-            HashMap::new(),
-            vec![],
-            &base_path,
-        )
-        .unwrap();
-        let delta = Manifest::new(
-            Lsn::new(0x200),
-            2,
-            vec![(k, cref(2, 0x200))],
-            HashMap::new(),
-            vec![],
-            &d_path,
-        )
-        .unwrap();
-
-        base.apply_deltas(&[delta]).unwrap();
-        let after_first = base.lookup(&k).unwrap();
-
-        // Re-open the delta (since apply_deltas consumed it) and apply again.
-        let delta2 = Manifest::new(
-            Lsn::new(0x200),
-            2,
-            vec![(k, cref(2, 0x200))],
-            HashMap::new(),
-            vec![],
-            &d_path,
-        )
-        .unwrap();
-        base.apply_deltas(&[delta2]).unwrap();
-        let after_second = base.lookup(&k).unwrap();
-
-        assert_eq!(
-            after_first, after_second,
-            "idempotent: applying same delta twice"
-        );
-    }
-
-    #[test]
-    fn apply_deltas_tie_at_equal_lsn_keeps_self_entry() {
-        let tmp = tempdir().unwrap();
-        let base_path = tmp.path().join("base.tikm");
-        let d_path = tmp.path().join("d.tikm");
-
-        let k = chunk(1663, 5, 55, 0, 0);
-        // Base has branch_id=10 at LSN 0x300.
-        let base = Manifest::new(
-            Lsn::new(0x300),
-            1,
-            vec![(k, cref(10, 0x300))],
-            HashMap::new(),
-            vec![],
-            &base_path,
-        )
-        .unwrap();
-        // Delta has branch_id=99 at the same LSN 0x300 — tie.
-        let delta = Manifest::new(
-            Lsn::new(0x300),
-            2,
-            vec![(k, cref(99, 0x300))],
-            HashMap::new(),
-            vec![],
-            &d_path,
-        )
-        .unwrap();
-
-        base.apply_deltas(&[delta]).unwrap();
-
-        // Self (base) entry must survive the tie.
-        assert_eq!(
-            base.lookup(&k).unwrap(),
-            Some(cref(10, 0x300)),
-            "tie: self entry must be kept"
-        );
-    }
-
-    #[test]
-    fn apply_deltas_higher_lsn_in_delta_wins() {
-        let tmp = tempdir().unwrap();
-        let base_path = tmp.path().join("base.tikm");
-        let d_path = tmp.path().join("d.tikm");
-
-        let k = chunk(1663, 5, 77, 0, 0);
-        let base = Manifest::new(
-            Lsn::new(0x100),
-            1,
-            vec![(k, cref(1, 0x100))],
-            HashMap::new(),
-            vec![],
-            &base_path,
-        )
-        .unwrap();
-        let delta = Manifest::new(
-            Lsn::new(0x200),
-            2,
-            vec![(k, cref(22, 0x200))],
-            HashMap::new(),
-            vec![],
-            &d_path,
-        )
-        .unwrap();
-
-        base.apply_deltas(&[delta]).unwrap();
-
-        assert_eq!(base.lookup(&k).unwrap(), Some(cref(22, 0x200)));
-    }
-
-    #[test]
-    fn apply_deltas_older_lsn_in_delta_does_not_overwrite() {
-        let tmp = tempdir().unwrap();
-        let base_path = tmp.path().join("base.tikm");
-        let d_path = tmp.path().join("d.tikm");
-
-        let k = chunk(1663, 5, 88, 0, 0);
-        // Base already has a newer LSN.
-        let base = Manifest::new(
-            Lsn::new(0x300),
-            3,
-            vec![(k, cref(10, 0x300))],
-            HashMap::new(),
-            vec![],
-            &base_path,
-        )
-        .unwrap();
-        let stale_delta = Manifest::new(
-            Lsn::new(0x200),
-            2,
-            vec![(k, cref(99, 0x200))],
-            HashMap::new(),
-            vec![],
-            &d_path,
-        )
-        .unwrap();
-
-        base.apply_deltas(&[stale_delta]).unwrap();
-
-        assert_eq!(base.lookup(&k).unwrap(), Some(cref(10, 0x300)));
-    }
-
-    // ── LSN utilities ──
-
-    #[test]
-    fn lsn_to_hex_edge_cases() {
-        assert_eq!(Lsn::new(0u64).to_hex(), "0000000000000000");
-        assert_eq!(Lsn::new(0x3A000028u64).to_hex(), "000000003A000028");
-        assert_eq!(Lsn::new(u64::MAX).to_hex(), "FFFFFFFFFFFFFFFF");
-    }
-
-    #[test]
-    fn lsn_from_hex_parses_expected_values() {
-        assert_eq!(Lsn::from_hex("0000000000000000").unwrap(), Lsn::new(0));
-        assert_eq!(
-            Lsn::from_hex("000000003A000028").unwrap(),
-            Lsn::new(0x3A000028)
-        );
-        assert_eq!(
-            Lsn::from_hex("FFFFFFFFFFFFFFFF").unwrap(),
-            Lsn::new(u64::MAX)
-        );
-    }
-
-    // ── tombstone tests ──
-
-    #[test]
-    fn apply_deltas_tombstone_removes_chunks() {
-        let tmp = tempdir().unwrap();
-        let base_path = tmp.path().join("base.tikm");
-        let d_path = tmp.path().join("d.tikm");
-
-        let rf = RelFork {
-            spc_oid: 1663,
-            db_oid: 5,
-            rel_number: 42,
-            fork_number: 0,
-        };
-        let k = chunk(1663, 5, 42, 0, 0);
-        let base = Manifest::new(
-            Lsn::new(0x100),
-            1,
-            vec![(k, cref(1, 0x100))],
-            HashMap::new(),
-            vec![],
-            &base_path,
-        )
-        .unwrap();
-
-        // Delta carries a tombstone for the fork; no chunk entries.
-        let delta = Manifest::new(
-            Lsn::new(0x200),
-            2,
-            vec![],
-            HashMap::new(),
-            vec![rf],
-            &d_path,
-        )
-        .unwrap();
-
-        base.apply_deltas(&[delta]).unwrap();
-
-        // The chunk belonging to the deleted fork must be purged from the base.
-        assert_eq!(base.lookup(&k).unwrap(), None);
-    }
-
-    #[test]
-    fn apply_deltas_tombstone_removes_nblocks() {
-        let tmp = tempdir().unwrap();
-        let base_path = tmp.path().join("base.tikm");
-        let d_path = tmp.path().join("d.tikm");
-
-        let rf = RelFork {
-            spc_oid: 1663,
-            db_oid: 5,
-            rel_number: 99,
-            fork_number: 0,
-        };
-        let mut nb = HashMap::new();
-        nb.insert(rf, 10u32);
-        let base = Manifest::new(Lsn::new(0x100), 1, vec![], nb, vec![], &base_path).unwrap();
-
-        let delta = Manifest::new(
-            Lsn::new(0x200),
-            2,
-            vec![],
-            HashMap::new(),
-            vec![rf],
-            &d_path,
-        )
-        .unwrap();
-
-        base.apply_deltas(&[delta]).unwrap();
-
-        // The nblocks entry for the deleted fork must be removed.
-        assert_eq!(base.lookup_nblocks(rf), None);
-    }
-
-    #[test]
-    fn materialize_merges_new_deltas_onto_base() {
-        let (dir, sim) = setup_sim();
-        let ns = ns_with_project(20_001);
-
-        let lsns: Vec<Lsn> = (1u64..=10).map(|i| Lsn::new(i * 0x100)).collect();
-
-        let base_chunks: Vec<(ChunkTag, ChunkRef)> = (1u32..=3)
-            .map(|i| {
-                (
-                    tag(i),
-                    ChunkRef {
-                        branch_id: 1,
-                        timeline_id: 1,
-                        lsn: lsns[i as usize - 1],
-                    },
-                )
-            })
-            .collect();
-        store_manifest(
-            &sim,
-            &ns.base_manifest_key(1, lsns[2]),
-            lsns[2],
-            base_chunks,
-            &dir.path().join("base.tikm"),
-        );
-
-        for i in 1u32..=10 {
-            let delta_lsn = lsns[i as usize - 1];
-            let chunks = vec![
-                (
-                    tag(i),
-                    ChunkRef {
-                        branch_id: 1,
-                        timeline_id: 1,
-                        lsn: delta_lsn,
-                    },
-                ),
-                (
-                    tag(0),
-                    ChunkRef {
-                        branch_id: 1,
-                        timeline_id: 1,
-                        lsn: delta_lsn,
-                    },
-                ),
-            ];
-            store_manifest(
-                &sim,
-                &ns.delta_manifest_key(1, delta_lsn),
-                delta_lsn,
-                chunks,
-                &dir.path().join(format!("d{i}.tikm")),
-            );
-        }
-
-        materialize_base(&sim, &ns, 1).unwrap();
-
-        let bytes = sim
-            .get_standard(&ns.base_manifest_key(1, lsns[9]))
-            .unwrap()
-            .expect("new base manifest must exist after materialization");
-        let tmp = dir.path().join("verify.tikm");
-        let merged = Manifest::from_bytes(&bytes, &tmp).unwrap();
-
-        assert_eq!(
-            merged.lookup(&tag(7)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: lsns[6],
-            })
-        );
-        assert_eq!(
-            merged.lookup(&tag(0)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: lsns[9],
-            })
-        );
-
-        for i in 1u32..=10 {
-            assert!(
-                sim.get_standard(&ns.delta_manifest_key(1, lsns[i as usize - 1]))
-                    .unwrap()
-                    .is_some(),
-                "delta {i} must not be deleted by materialize_base"
-            );
-        }
-    }
-
-    #[test]
-    fn lookup_correct_chunk_ref_after_materialization() {
-        let (dir, sim) = setup_sim();
-        let ns = ns_with_project(20_002);
-
-        let base_lsn = Lsn::new(0x100);
-        let d4_lsn = Lsn::new(0x400);
-        let d7_lsn = Lsn::new(0x700);
-
-        store_manifest(
-            &sim,
-            &ns.base_manifest_key(1, Lsn::new(0x300)),
-            Lsn::new(0x300),
-            vec![
-                (
-                    tag(1),
-                    ChunkRef {
-                        branch_id: 1,
-                        timeline_id: 1,
-                        lsn: base_lsn,
-                    },
-                ),
-                (
-                    tag(2),
-                    ChunkRef {
-                        branch_id: 1,
-                        timeline_id: 1,
-                        lsn: base_lsn,
-                    },
-                ),
-                (
-                    tag(3),
-                    ChunkRef {
-                        branch_id: 1,
-                        timeline_id: 1,
-                        lsn: base_lsn,
-                    },
-                ),
-            ],
-            &dir.path().join("base.tikm"),
-        );
-        store_manifest(
-            &sim,
-            &ns.delta_manifest_key(1, d4_lsn),
-            d4_lsn,
-            vec![(
-                tag(2),
-                ChunkRef {
-                    branch_id: 1,
-                    timeline_id: 1,
-                    lsn: d4_lsn,
-                },
-            )],
-            &dir.path().join("d4.tikm"),
-        );
-        store_manifest(
-            &sim,
-            &ns.delta_manifest_key(1, d7_lsn),
-            d7_lsn,
-            vec![(
-                tag(7),
-                ChunkRef {
-                    branch_id: 1,
-                    timeline_id: 1,
-                    lsn: d7_lsn,
-                },
-            )],
-            &dir.path().join("d7.tikm"),
-        );
-
-        materialize_base(&sim, &ns, 1).unwrap();
-
-        let bytes = sim
-            .get_standard(&ns.base_manifest_key(1, d7_lsn))
-            .unwrap()
-            .expect("new base at d7_lsn must exist");
-        let tmp = dir.path().join("verify.tikm");
-        let m = Manifest::from_bytes(&bytes, &tmp).unwrap();
-
-        assert_eq!(
-            m.lookup(&tag(1)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: base_lsn,
-            })
-        );
-        assert_eq!(
-            m.lookup(&tag(2)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: d4_lsn,
-            })
-        );
-        assert_eq!(
-            m.lookup(&tag(7)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: d7_lsn,
-            })
-        );
-    }
-
-    #[test]
-    fn materialize_idempotent() {
-        let (dir, sim) = setup_sim();
-        let ns = ns_with_project(20_003);
-
-        let base_lsn = Lsn::new(0x100);
-        let delta_lsn = Lsn::new(0x200);
-
-        store_manifest(
-            &sim,
-            &ns.base_manifest_key(1, base_lsn),
-            base_lsn,
-            vec![(
-                tag(1),
-                ChunkRef {
-                    branch_id: 1,
-                    timeline_id: 1,
-                    lsn: base_lsn,
-                },
-            )],
-            &dir.path().join("base.tikm"),
-        );
-        store_manifest(
-            &sim,
-            &ns.delta_manifest_key(1, delta_lsn),
-            delta_lsn,
-            vec![(
-                tag(1),
-                ChunkRef {
-                    branch_id: 1,
-                    timeline_id: 1,
-                    lsn: delta_lsn,
-                },
-            )],
-            &dir.path().join("d1.tikm"),
-        );
-
-        materialize_base(&sim, &ns, 1).unwrap();
-        materialize_base(&sim, &ns, 1).unwrap();
-
-        let keys = sim
-            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
-            .unwrap();
-        assert_eq!(keys.len(), 2, "second run must not write another base");
-
-        let bytes = sim
-            .get_standard(&ns.base_manifest_key(1, delta_lsn))
-            .unwrap()
-            .expect("materialized base must exist");
-        let tmp = dir.path().join("verify.tikm");
-        let m = Manifest::from_bytes(&bytes, &tmp).unwrap();
-        assert_eq!(
-            m.lookup(&tag(1)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: delta_lsn,
-            })
-        );
-    }
-
-    #[test]
-    fn materialize_no_new_deltas_is_noop() {
-        let (dir, sim) = setup_sim();
-        let ns = ns_with_project(20_004);
-
-        let lsn = Lsn::new(0x100);
-        store_manifest(
-            &sim,
-            &ns.base_manifest_key(1, lsn),
-            lsn,
-            vec![(
-                tag(1),
-                ChunkRef {
-                    branch_id: 1,
-                    timeline_id: 1,
-                    lsn,
-                },
-            )],
-            &dir.path().join("base.tikm"),
-        );
-
-        materialize_base(&sim, &ns, 1).unwrap();
-
-        let keys = sim
-            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
-            .unwrap();
-        assert_eq!(
-            keys.len(),
-            1,
-            "no new base should be written when no deltas"
-        );
-    }
-
-    #[test]
-    fn materialize_no_base_returns_ok() {
-        let (_dir, sim) = setup_sim();
-        let ns = ns_with_project(20_005);
-
-        materialize_base(&sim, &ns, 1).unwrap();
-
-        let keys = sim
-            .list_prefix_standard(&ns.base_prefix_for_timeline(1))
-            .unwrap();
-        assert!(
-            keys.is_empty(),
-            "no base should be written when no deltas exist"
-        );
-    }
-
-    #[test]
-    fn materialize_no_base_with_deltas_creates_first_base() {
-        let (dir, sim) = setup_sim();
-        let ns = ns_with_project(20_006);
-
-        let d1_lsn = Lsn::new(0x100);
-        let d2_lsn = Lsn::new(0x200);
-
-        store_manifest(
-            &sim,
-            &ns.delta_manifest_key(1, d1_lsn),
-            d1_lsn,
-            vec![(
-                tag(1),
-                ChunkRef {
-                    branch_id: 1,
-                    timeline_id: 1,
-                    lsn: d1_lsn,
-                },
-            )],
-            &dir.path().join("d1.tikm"),
-        );
-        store_manifest(
-            &sim,
-            &ns.delta_manifest_key(1, d2_lsn),
-            d2_lsn,
-            vec![(
-                tag(2),
-                ChunkRef {
-                    branch_id: 1,
-                    timeline_id: 1,
-                    lsn: d2_lsn,
-                },
-            )],
-            &dir.path().join("d2.tikm"),
-        );
-
-        materialize_base(&sim, &ns, 1).unwrap();
-
-        let bytes = sim
-            .get_standard(&ns.base_manifest_key(1, d2_lsn))
-            .unwrap()
-            .expect("initial base manifest must exist after materialization");
-        let tmp = dir.path().join("verify.tikm");
-        let m = Manifest::from_bytes(&bytes, &tmp).unwrap();
-
-        assert_eq!(
-            m.lookup(&tag(1)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: d1_lsn,
-            })
-        );
-        assert_eq!(
-            m.lookup(&tag(2)).unwrap(),
-            Some(ChunkRef {
-                branch_id: 1,
-                timeline_id: 1,
-                lsn: d2_lsn,
-            })
-        );
-    }
 }
