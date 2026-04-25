@@ -10,10 +10,18 @@ use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pip
 /// **MUST NOT** call `elog(ERROR)` / `pg_log_error` — that would PANIC.
 ///
 /// Walks the iovec entries (each a contiguous buffer range). Under the
-/// postmaster with s3worker alive, submits each entry through the s3worker
+/// postmaster with worker alive, submits each entry through the worker
 /// async pipeline via `submit_and_wait_raw`. When the pipeline is unavailable
-/// (initdb, shutdown checkpoint, s3worker crash), performs direct
-/// `ops::read_blocks` / `write_blocks` calls instead.
+/// (initdb, shutdown checkpoint, worker crash), OR when the IO targets a
+/// local (temp-table) buffer, performs direct `ops::read_blocks` /
+/// `write_blocks` calls instead.
+///
+/// Local buffers (`is_local_buffer = true`) MUST bypass the pipeline: they
+/// live in backend-local memory (`LocalBufferBlockPointers`), which is not
+/// mapped in worker's address space. Sending the pointer cross-process
+/// causes worker to write into its own copy-on-write fork page, leaving
+/// the backend's local buffer zero — producing the
+/// "unexpected zero page" error on the next B-tree read.
 ///
 /// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
 unsafe fn perform_io(
@@ -26,6 +34,7 @@ unsafe fn perform_io(
     fork_number: ForkNumber,
     block_number: BlockNumber,
     _nblocks: i32,
+    is_local_buffer: bool,
     wait_event: u32,
     label: &str,
 ) -> isize {
@@ -36,7 +45,8 @@ unsafe fn perform_io(
             let entry = &*iov.add(i);
             let entry_nblocks = (entry.iov_len / BLCKSZ) as u32;
 
-            let result = if use_pipeline() {
+            // Local buffers are backend-local memory: never send to worker.
+            let result = if use_pipeline() && !is_local_buffer {
                 // Normal: submit to worker pipeline and wait for completion
                 pipeline::submit_and_wait_raw(
                     op,
@@ -106,6 +116,7 @@ pub extern "C-unwind" fn tiko_io_perform_read(
     fork_number: ForkNumber,
     block_number: BlockNumber,
     nblocks: i32,
+    is_local_buffer: bool,
 ) -> isize {
     unsafe {
         perform_io(
@@ -118,6 +129,7 @@ pub extern "C-unwind" fn tiko_io_perform_read(
             fork_number,
             block_number,
             nblocks,
+            is_local_buffer,
             WAIT_EVENT_TIKO_IO_READ,
             "tiko_io_perform_read",
         )
@@ -146,6 +158,7 @@ pub extern "C-unwind" fn tiko_io_perform_write(
             fork_number,
             block_number,
             nblocks,
+            false, /* writes always target shared buffers */
             WAIT_EVENT_TIKO_IO_WRITE,
             "tiko_io_perform_write",
         )

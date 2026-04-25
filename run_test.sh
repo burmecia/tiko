@@ -22,34 +22,34 @@ POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 EXTENSION_DIR="${POSTGRES_INSTALL}/share/postgresql/extension"
 
 echo "Building Tiko smgr..."
-if ! (cargo build -p smgr --release) >/dev/null; then
+if ! (cargo build -p smgr) >/dev/null; then
   echo "Tiko smgr build failed" >&2
   exit 1
 fi
 
 echo "Verifying Rust library exists..."
-if [ ! -f "${TARGET_DIR}/release/libtikosmgr.a" ]; then
+if [ ! -f "${TARGET_DIR}/debug/libtikosmgr.a" ]; then
     echo "ERROR: Rust library libtikosmgr.a not found!"
     exit 1
 fi
 
 echo "Building PostgreSQL..."
 rm -f postgres/src/backend/postgres
-if ! (cd postgres && make -j4) >/dev/null; then
+if ! (cd postgres && make -j4 && make install) >/dev/null; then
   echo "Postgres build/install failed" >&2
   exit 1
 fi
 
 echo "Building Tiko Worker..."
-if ! (cargo build -p worker --release) >/dev/null; then
+if ! (cargo build -p worker) >/dev/null; then
   echo "Tiko Worker build failed" >&2
   exit 1
 fi
 
 # Copy the compiled library to the test directory for use in tests
-if [ -f "${TARGET_DIR}/release/libtikoworker.dylib" ]; then
+if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
     echo "Copying Tiko Worker extension files ..."
-    cp "${TARGET_DIR}/release/libtikoworker.dylib" "${TEST_DIR}/worker"
+    cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${TEST_DIR}/worker"
 fi
 
 echo "Running tests..."
