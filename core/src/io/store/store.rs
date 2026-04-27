@@ -1,11 +1,13 @@
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use super::{backend::ObjectStore, s3_sim::S3Sim};
+use crate::checkpoint_history::{CheckpointHistory, CheckpointVersion};
 use crate::{
     chunk::{CHUNK_SIZE, ChunkTag, RelFork},
     db::{DbMeta, DbNamespace},
     error::{Error, Result},
+    io::checkpoint_history::CkptHistSnapshot,
     io_control::IoControl,
     manifest::Manifest,
     relfork::RelForkMeta,
@@ -13,6 +15,7 @@ use crate::{
 };
 use pgsys::Lsn;
 use pgsys::common::{BLCKSZ, BlockNumber};
+use pgsys::logging::{pg_log_debug1};
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
@@ -26,8 +29,14 @@ static STORE: OnceLock<Store> = OnceLock::new();
 /// - A process-global singleton (`init` / `get` / `try_get`).
 pub struct Store {
     backend: Box<dyn ObjectStore + Send + Sync>,
+    ns: DbNamespace,
     db: DbMeta,
     base_manifest: Manifest,
+    /// Per-backend cache of the shared checkpoint version list.
+    /// `Mutex` satisfies the `Sync` bound required by `static STORE`.
+    /// Only the owning backend process acquires this lock; it is never
+    /// contended within a single process.
+    ckpt_hist: Mutex<CkptHistSnapshot>,
 }
 
 impl Store {
@@ -35,13 +44,101 @@ impl Store {
     fn new(root_path: &Path, ns: DbNamespace) -> Self {
         Store {
             backend: Box::new(S3Sim::new(root_path)),
+            ns: ns.clone(),
             db: DbMeta::new(ns),
             base_manifest: Manifest::empty(&root_path.join("base_manifest")).unwrap(),
+            ckpt_hist: Mutex::new(CkptHistSnapshot::default()),
         }
     }
 
-    pub fn do_checkpoint(&self, lsn: Lsn) -> Result<()> {
-        self.db.set_checkpoint_lsn(lsn);
+    /// Scan the express bucket for existing checkpoint folders and populate
+    /// `target` with them, oldest-first, so the ring
+    /// buffer ends up with the newest entry at the logical top.
+    ///
+    /// Key structure: `{ns}/chunks/{tl}/{lsn_hex}/…`
+    /// We extract the `{tl}` and `{lsn_hex}` segments (indices 2 and 3 of
+    /// the `/`-split, relative to `ns`).
+    ///
+    /// Called once from `Store::init()` after `IoControl` has been
+    /// initialised, so `IoControl::is_initialized()` is guaranteed true.
+    pub(crate) fn load_checkpoint_history(&self, target: &mut CheckpointHistory) {
+        let ns = self.db.namespace_str();
+        let prefix = format!("{ns}/chunks/");
+
+        let keys = match self.backend.list_prefix_express(&prefix) {
+            Ok(k) => k,
+            Err(_) => return, // storage not reachable; history starts empty
+        };
+
+        // Collect unique (tl, lsn) pairs from `{ns}/chunks/{tl}/{lsn_hex}/…`
+        let mut versions: Vec<(u32, Lsn)> = {
+            use std::collections::BTreeMap;
+            let mut seen: BTreeMap<u64, (u32, Lsn)> = BTreeMap::new();
+            for key in &keys {
+                // Strip the namespace prefix; remaining: `chunks/{tl}/{lsn_hex}/…`
+                let rel = key.strip_prefix(&prefix).unwrap_or(key.as_str());
+                let mut parts = rel.splitn(3, '/');
+                let tl_str = match parts.next() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let lsn_hex = match parts.next() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let tl: u32 = match tl_str.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let lsn: Lsn = match Lsn::from_hex(lsn_hex) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // Deduplicate by raw LSN value; BTreeMap keeps insertion order by key.
+                seen.entry(lsn.into()).or_insert((tl, lsn));
+            }
+            seen.into_values().collect()
+        };
+
+        // Sort oldest-first so successive push() calls build up newest-at-top.
+        versions.sort_by_key(|(_, lsn)| *lsn);
+
+        // Push each version into the target history.
+        for (tl, lsn) in &versions {
+            target.push(*tl, *lsn);
+        }
+
+        pg_log_debug1(format!(
+            "tiko: load_checkpoint_history loaded {} versions: {:?}",
+            versions.len(),
+            versions
+        ));
+    }
+
+    pub fn perform_checkpoint(&self, timeline_id: u32, lsn: Lsn) -> Result<()> {
+        let db = DbMeta::new(self.ns.clone());
+        let key = db.meta_key();
+
+        // Load existing DbMeta if it exists.
+        match self.get_express(&[key]) {
+            Ok(json_bytes) => db.load_from_json_bytes(&json_bytes),
+            Err(err) if err.is_not_found() => {} // no existing meta; treat as default
+            Err(err) => return Err(err),
+        }
+
+        db.set_checkpoint_lsn(timeline_id, lsn);
+
+        // Write DbMeta json file
+        let key = db.meta_key();
+        let json_bytes = db.to_json_bytes();
+        self.put_express(&key, &json_bytes)?;
+
+        // Append to the shared versioned history so all backends can find
+        // chunks written in this checkpoint via the express-bucket read path.
+        if let Some(io_control) = IoControl::try_get() {
+            io_control.ckpt_hist.push(timeline_id, lsn);
+        }
+
         Ok(())
     }
 
@@ -72,11 +169,75 @@ impl Store {
         STORE.get().ok_or_else(|| Error::StoreNotAvailable)
     }
 
+    // ── Version-scanning helpers ──────────────────────────────────────────────
+
+    /// Build an ordered list of express keys for a relfork meta object,
+    /// newest checkpoint first. Falls back to a single key using `DbMeta`'s
+    /// current checkpoint when shared memory is not yet initialised (e.g. tests).
+    fn express_meta_keys(&self, rf: &RelFork) -> Vec<String> {
+        self.versioned_keys(|versions: &[CheckpointVersion]| {
+            self.db.versioned_relfork_meta_keys(rf, versions)
+        })
+    }
+
+    fn express_meta_latest_key(&self, rf: &RelFork) -> String {
+        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+            debug_assert!(!versions.is_empty());
+            self.db.versioned_relfork_meta_keys(rf, &versions[..1])
+        });
+        keys.first()
+            .cloned()
+            .expect("express_meta_latest_key must return at least one key")
+    }
+
+    /// Build an ordered list of express keys for a chunk object,
+    /// newest checkpoint first.
+    fn express_chunk_keys(&self, tag: &ChunkTag) -> Vec<String> {
+        self.versioned_keys(|versions: &[CheckpointVersion]| {
+            self.db.versioned_chunk_keys(tag, versions)
+        })
+    }
+
+    fn express_chunk_latest_key(&self, tag: &ChunkTag) -> String {
+        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+            debug_assert!(!versions.is_empty());
+            self.db.versioned_chunk_keys(tag, &versions[..1])
+        });
+        keys.first()
+            .cloned()
+            .expect("express_chunk_latest_key must return at least one key")
+    }
+
+    /// Core helper: iterate checkpoint versions newest-first and map each to
+    /// an S3 key string via `f(namespace, timeline_id, lsn_hex)`.
+    ///
+    /// When `IoControl` is not yet initialised (unit tests, initdb), falls back
+    /// to a single key derived from `DbMeta`'s current checkpoint LSN.
+    fn versioned_keys<F>(&self, f: F) -> Vec<String>
+    where
+        F: Fn(&[CheckpointVersion]) -> Vec<String>,
+    {
+        if IoControl::is_initialized() {
+            let shared_ckpt_hist = &IoControl::get().ckpt_hist;
+            let mut ckpt_hist = self.ckpt_hist.lock().unwrap();
+            let versions = ckpt_hist.get_or_refresh(shared_ckpt_hist);
+            if versions.is_empty() {
+                f(&[CheckpointVersion::default()])
+            } else {
+                f(versions)
+            }
+        } else {
+            // Fallback: default checkpoint version (no shared memory or empty history).
+            f(&[CheckpointVersion::default()])
+        }
+    }
+
     // ── RelFork meta operations ──────────────────────────────────────────────────
 
     pub(crate) fn get_meta(&self, rf: &RelFork) -> Result<RelForkMeta> {
-        let key = self.db.relfork_meta_key(rf);
-        match self.get_express(&(vec![key][..])) {
+        // Build the list of express keys to probe, newest checkpoint first.
+        let keys = self.express_meta_keys(rf);
+        match self.get_express(&keys) {
             Ok(bytes) => {
                 let meta = serde_json::from_slice::<RelForkMeta>(&bytes)?;
                 Ok(meta)
@@ -90,7 +251,8 @@ impl Store {
     }
 
     pub(crate) fn put_meta(&self, rf: &RelFork, meta: &RelForkMeta) -> Result<()> {
-        let key = self.db.relfork_meta_key(rf);
+        // Always write to the current checkpoint version.
+        let key = self.express_meta_latest_key(rf);
         let json_bytes = meta.to_json_bytes();
         self.put_express(&key, &json_bytes)
     }
@@ -144,8 +306,8 @@ impl Store {
     pub(crate) fn get_chunk(&self, tag: &ChunkTag, dst: &mut [u8]) -> Result<()> {
         debug_assert_eq!(dst.len(), CHUNK_SIZE);
 
-        let key = self.db.relfork_chunk_key(tag);
-        match self.get_express(&(vec![key][..])) {
+        let keys = self.express_chunk_keys(tag);
+        match self.get_express(&keys) {
             Ok(src) => {
                 dst.copy_from_slice(&src);
                 Ok(())
@@ -171,7 +333,7 @@ impl Store {
         let byte_offset = block_offset as usize * BLCKSZ;
         debug_assert!(byte_offset + data.len() <= CHUNK_SIZE);
         let is_full_chunk = byte_offset == 0 && data.len() == CHUNK_SIZE;
-        let key = self.db.relfork_chunk_key(tag);
+        let key = self.express_chunk_latest_key(tag);
 
         if is_full_chunk {
             self.put_express(&key, data)
@@ -187,30 +349,50 @@ impl Store {
         }
     }
 
+    // ── Primitive forwarding methods ──────────────────────────────────────
+
     pub fn get_express(&self, keys: &[String]) -> Result<Vec<u8>> {
         for key in keys {
-            let data = self.backend.get_express(key)?;
-            IoControl::get().stats.store_express.inc_gets(data.len());
-            return Ok(data);
+            match self.backend.get_express(key) {
+                Ok(data) => {
+                    IoControl::try_get().map(|io_control| {
+                        io_control.stats.store_express.inc_gets(data.len());
+                    });
+                    return Ok(data);
+                }
+                Err(err) if err.is_not_found() => {
+                    IoControl::try_get().map(|io_control| {
+                        io_control.stats.store_express.inc_gets(0);
+                    });
+                    // try the next key in next loop iteration
+                }
+                Err(err) => return Err(err),
+            }
         }
         Err(Error::not_found("not found in express bucket"))
     }
 
     pub fn put_express(&self, key: &str, data: &[u8]) -> Result<()> {
         self.backend.put_express(key, data)?;
-        IoControl::get().stats.store_express.inc_puts(data.len());
+        IoControl::try_get().map(|io_control| {
+            io_control.stats.store_express.inc_puts(data.len());
+        });
         Ok(())
     }
 
     pub fn get_standard(&self, key: &str) -> Result<Vec<u8>> {
         let data = self.backend.get_standard(key)?;
-        IoControl::get().stats.store_standard.inc_gets(data.len());
+        IoControl::try_get().map(|io_control| {
+            io_control.stats.store_standard.inc_gets(data.len());
+        });
         Ok(data)
     }
 
     pub fn put_standard(&self, key: &str, data: &[u8]) -> Result<()> {
         self.backend.put_standard(key, data)?;
-        IoControl::get().stats.store_standard.inc_puts(data.len());
+        IoControl::try_get().map(|io_control| {
+            io_control.stats.store_standard.inc_puts(data.len());
+        });
         Ok(())
     }
 

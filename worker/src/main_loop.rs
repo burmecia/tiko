@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dispatcher::Dispatcher;
 use crate::log_relay;
-use core::{io_control::IoControl, store::Store};
+use core::io_control::IoControl;
 use pgsys::{
     common::{MyProcPid, SIGHUP, SIGTERM},
     cshim::check_for_interrupts,
@@ -59,11 +59,6 @@ static mut WAIT_EVENT_TIKO_WORKER_MAIN: u32 = 0;
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     pg_log_info("tiko: main loop starting");
-
-    // Initialize the worker cdylib's own copy of Store. The smgr staticlib
-    // has a separate copy (initialized by tiko_init) that Tokio threads here
-    // cannot see — each linked copy of core has its own STORE OnceLock.
-    Store::init();
 
     setup_signal_handlers();
 

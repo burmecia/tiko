@@ -10,7 +10,6 @@
 mod chunk;
 mod control;
 mod meta;
-pub(super) mod rwlock;
 
 pub use chunk::CHUNK_NUM_SLOTS;
 pub(crate) use chunk::{CHUNK_NUM_BUCKETS, ChunkCache, ChunkSlot};

@@ -4,7 +4,7 @@ use super::{ChunkCache, ChunkSlot, MetaCache, MetaSlot};
 use crate::{
     chunk::{CHUNK_SIZE, ChunkTag, RelFork},
     error::Result,
-    io::cache::rwlock::AtomicRWLock,
+    io::rwlock::AtomicRWLock,
 };
 use pgsys::common::BlockNumber;
 

@@ -13,6 +13,7 @@ mod main_loop;
 mod shmem;
 mod thread_pool;
 
+use core::io::store::Store;
 use pgsys::{
     bgworker::*,
     common::{FLOAT8PASSBYVAL, FUNC_MAX_ARGS, INDEX_MAX_KEYS, NAMEDATALEN, PG_VERSION_NUM},
@@ -54,6 +55,11 @@ pub extern "C-unwind" fn _PG_init() {
     if unsafe { !pgsys::shmem::process_shared_preload_libraries_in_progress } {
         return;
     }
+
+    // Initialize the worker cdylib's own copy of Store. The smgr staticlib
+    // has a separate copy (initialized by tiko_init) that Tokio threads here
+    // cannot see — each linked copy of core has its own STORE OnceLock.
+    Store::init();
 
     // install hooks for shared memory initialization
     shmem::init_shared_memory();

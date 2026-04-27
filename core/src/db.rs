@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Mutex};
 
 use crate::env;
+use crate::io::checkpoint_history::CheckpointVersion;
 use crate::manifest::ChunkRef;
 use crate::{ChunkTag, chunk::RelFork};
 use pgsys::Lsn;
@@ -63,6 +64,7 @@ impl DbMeta {
             parent_timeline_id: None,
             timeline_id: 1,
             checkpoint_lsn: Lsn::default(),
+            // created_at: chrono::Utc::now().timestamp(),
             created_at: 0,
             status: "active".to_string(),
             deleted_at: None,
@@ -72,30 +74,77 @@ impl DbMeta {
         }
     }
 
-    pub(crate) fn set_checkpoint_lsn(&self, lsn: Lsn) {
-        self.inner.lock().unwrap().checkpoint_lsn = lsn;
+    pub(crate) fn load_from_json_bytes(&self, bytes: &[u8]) {
+        let inner: DbMetaInner = serde_json::from_slice(bytes).expect("failed to load DbMetaInner");
+        let mut guard = self.inner.lock().unwrap();
+        *guard = inner;
     }
 
-    pub(crate) fn relfork_meta_key(&self, rf: &RelFork) -> String {
+    pub(crate) fn set_checkpoint_lsn(&self, timeline_id: u32, lsn: Lsn) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.timeline_id = timeline_id;
+        inner.checkpoint_lsn = lsn;
+    }
+
+    /// Namespace as a display string (e.g. `"{org_id}/{db_id}"`).
+    pub(crate) fn namespace_str(&self) -> String {
+        self.inner.lock().unwrap().ns.to_string()
+    }
+
+    pub(crate) fn to_json_bytes(&self) -> Vec<u8> {
         let inner = self.inner.lock().unwrap();
+        serde_json::to_vec(&*inner).expect("failed to serialize DbMetaInner")
+    }
+
+    // ── Key construction ───────────────────────────────────────────────────────────
+
+    pub(crate) fn meta_key(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        format!("{}/db_meta.json", inner.ns)
+    }
+
+    fn make_relfork_meta_key(ns: &DbNamespace, rf: &RelFork, timeline_id: u32, lsn: Lsn) -> String {
         format!(
-            "{}/chunks/{}/{}/{rf}/meta.json",
-            inner.ns,
-            inner.timeline_id,
-            inner.checkpoint_lsn.to_hex()
+            "{}/chunks/{}/{}/{rf}/relfork_meta.json",
+            ns,
+            timeline_id,
+            lsn.to_hex()
         )
     }
 
-    pub(crate) fn relfork_chunk_key(&self, tag: &ChunkTag) -> String {
+    pub(crate) fn versioned_relfork_meta_keys(
+        &self,
+        rf: &RelFork,
+        versions: &[CheckpointVersion],
+    ) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
+        versions
+            .iter()
+            .map(|version| {
+                Self::make_relfork_meta_key(&inner.ns, rf, version.timeline_id, version.lsn)
+            })
+            .collect()
+    }
+
+    fn make_chunk_key(ns: &DbNamespace, tag: &ChunkTag, timeline_id: u32, lsn: Lsn) -> String {
         let rf = tag.relfork();
         format!(
-            "{}/chunks/{}/{}/{rf}/{}",
-            inner.ns,
-            inner.timeline_id,
-            inner.checkpoint_lsn.to_hex(),
+            "{ns}/chunks/{timeline_id}/{}/{rf}/{}",
+            lsn.to_hex(),
             tag.chunk_id
         )
+    }
+
+    pub(crate) fn versioned_chunk_keys(
+        &self,
+        tag: &ChunkTag,
+        versions: &[CheckpointVersion],
+    ) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        versions
+            .iter()
+            .map(|version| Self::make_chunk_key(&inner.ns, tag, version.timeline_id, version.lsn))
+            .collect()
     }
 
     pub(crate) fn chunk_key_standard(&self, tag: &ChunkTag, _chunk_ref: &ChunkRef) -> String {

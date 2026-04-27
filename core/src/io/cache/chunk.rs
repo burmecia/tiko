@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
-use super::{CHAIN_NIL, MAX_USAGE_COUNT, rwlock::AtomicRWLock};
+use super::{CHAIN_NIL, MAX_USAGE_COUNT};
+use crate::io::rwlock::AtomicRWLock;
 use crate::{
     chunk::{CHUNK_SIZE, ChunkTag, RelFork},
     error::{Error, Result},

@@ -39,16 +39,17 @@
 //! ├── num_backend_pools, worker_pid, worker_latch
 //! ├── submit_queue (SubmitQueue)
 //! ├── stats (IoStats)
-//! └── cache (CacheControl)
+//! ├── cache (CacheControl)
+//! └── ckpt_hist (CheckpointHistory)  ← versioned express-bucket history
 //! BackendSlotPool[0]  ← immediately after IoControl (aligned)
 //! BackendSlotPool[1]
 //! ...
 //! BackendSlotPool[MaxBackends-1]
-//! ChunkSlot[0..1024]         ← cache chunk slot metadata (~36 KB)
+//! ChunkSlot[0..1024]          ← cache chunk slot metadata (~36 KB)
 //! AtomicU32[0..2048]          ← cache bucket heads (~8 KB)
 //! AtomicRWLock[0..2048]       ← cache bucket locks (~8 KB, one per bucket)
 //! AtomicRWLock[0..1024]       ← per-slot I/O locks (~4 KB, one per chunk slot)
-//! MetaSlot[0..1024]      ← fork metadata table (~28 KB)
+//! MetaSlot[0..1024]           ← fork metadata table (~28 KB)
 //! AtomicU32[0..2048]          ← fork meta bucket heads (~8 KB)
 //! AtomicRWLock[0..2048]       ← fork meta bucket locks (~8 KB)
 //! AtomicRWLock[0..1024]       ← per-slot I/O locks (~4 KB, one per meta slot)
@@ -69,9 +70,12 @@ use tokio::sync::mpsc::error::TrySendError;
 use super::{
     cache::{
         CHUNK_NUM_BUCKETS, CHUNK_NUM_SLOTS, CacheControl, ChunkSlot, META_NUM_BUCKETS,
-        META_NUM_SLOTS, MetaSlot, rwlock::AtomicRWLock,
+        META_NUM_SLOTS, MetaSlot,
     },
+    checkpoint_history::CheckpointHistory,
+    rwlock::AtomicRWLock,
     stats::IoStats,
+    store::Store,
 };
 
 // ── Constants ──
@@ -484,6 +488,11 @@ pub struct IoControl {
 
     /// I/O statistics
     pub stats: IoStats,
+
+    /// Versioned checkpoint history for express-bucket read path.
+    /// Newest-first list of (timeline_id, lsn) pairs written at each checkpoint.
+    /// Single writer (s3worker); all backends read via `LocalHistoryCache`.
+    pub ckpt_hist: CheckpointHistory,
 }
 
 impl IoControl {
@@ -529,6 +538,10 @@ impl IoControl {
         }
 
         self.stats.init();
+        self.ckpt_hist.init();
+
+        // Load checkpoint history from the store into shared memory.
+        Store::get().load_checkpoint_history(&mut self.ckpt_hist);
     }
 
     /// Byte offset from the start of IoControl to the first BackendSlotPool.
@@ -649,11 +662,12 @@ impl IoControl {
         }
     }
 
+    pub fn try_get() -> Option<&'static Self> {
+        IO_CONTROL.get().map(|wrapper| unsafe { &*wrapper.0 })
+    }
+
     pub fn get() -> &'static Self {
-        IO_CONTROL
-            .get()
-            .map(|wrapper| unsafe { &*wrapper.0 })
-            .expect("IoControl::get() called before init_or_attach()")
+        Self::try_get().expect("IoControl::get() called before init_or_attach()")
     }
 
     pub fn get_cache() -> &'static CacheControl {

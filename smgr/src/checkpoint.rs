@@ -62,8 +62,8 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
         Err(_) => return,
     };
 
+    let timeline_id = timeline_id;
     let lsn = Lsn::new(checkpoint_lsn);
-    let _timeline = timeline_id;
     let _root_dir = tiko_root_path();
     let pgdata_dir = data_dir_path();
 
@@ -89,7 +89,7 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
         }
     }
 
-    store.do_checkpoint(lsn).ok();
+    store.perform_checkpoint(timeline_id, lsn).ok();
 
     // Capture pg_state archive bytes — so the
     // archive reflects pg_control / pg_xact / etc. at the start of the

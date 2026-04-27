@@ -23,7 +23,7 @@ const READER_MASK: i32 = 0x3FFF_FFFF; // bits 0-29
 
 /// RAII read guard. Releases the read lock on drop.
 #[must_use = "lock guard dropped immediately — use `let _guard = lock.read()` to hold it"]
-pub(super) struct ReadGuard<'a> {
+pub(crate) struct ReadGuard<'a> {
     lock: &'a AtomicRWLock,
 }
 
@@ -35,7 +35,7 @@ impl Drop for ReadGuard<'_> {
 
 /// RAII write guard. Releases the write lock on drop.
 #[must_use = "lock guard dropped immediately — use `let _guard = lock.write()` to hold it"]
-pub(super) struct WriteGuard<'a> {
+pub(crate) struct WriteGuard<'a> {
     lock: &'a AtomicRWLock,
 }
 
@@ -46,11 +46,11 @@ impl Drop for WriteGuard<'_> {
 }
 
 impl AtomicRWLock {
-    pub(super) fn init(&self) {
+    pub(crate) fn init(&self) {
         self.state.store(0, Ordering::Relaxed);
     }
 
-    pub(super) fn read(&self) -> ReadGuard<'_> {
+    pub(crate) fn read(&self) -> ReadGuard<'_> {
         loop {
             let s = self.state.load(Ordering::Relaxed);
             // Only attempt CAS when not write-locked and no writer is pending.
@@ -69,7 +69,7 @@ impl AtomicRWLock {
         ReadGuard { lock: self }
     }
 
-    pub(super) fn write(&self) -> WriteGuard<'_> {
+    pub(crate) fn write(&self) -> WriteGuard<'_> {
         loop {
             // Fast path: unlocked → exclusive.
             if self
@@ -122,7 +122,7 @@ impl AtomicRWLock {
         WriteGuard { lock: self }
     }
 
-    pub(super) fn is_in_write(&self) -> bool {
+    pub(crate) fn is_in_write(&self) -> bool {
         self.state.load(Ordering::Relaxed) == EXCLUSIVE
     }
 }

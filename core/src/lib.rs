@@ -15,7 +15,7 @@ pub use error::{Error, Result};
 pub use io::store;
 pub use io::store::Store;
 pub use io::store::{backend, s3, s3_sim};
-pub use io::{cache, io_control};
+pub use io::{cache, checkpoint_history, io_control};
 
 use std::path::PathBuf;
 
