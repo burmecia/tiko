@@ -15,7 +15,7 @@ use crate::{
 };
 use pgsys::Lsn;
 use pgsys::common::{BLCKSZ, BlockNumber};
-use pgsys::logging::{pg_log_debug1};
+use pgsys::logging::pg_log_debug1;
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
