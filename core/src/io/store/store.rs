@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use super::{backend::ObjectStore, s3_sim::S3Sim};
-use crate::checkpoint_history::{CheckpointHistory, CheckpointVersion};
+use super::{backend::ObjectStore, locator::Locator, s3_sim::S3Sim};
 use crate::{
+    checkpoint_history::{CheckpointHistory, CheckpointVersion},
     chunk::{CHUNK_SIZE, ChunkTag, RelFork},
     db::{DbMeta, DbNamespace},
     error::{Error, Result},
@@ -13,9 +13,11 @@ use crate::{
     relfork::RelForkMeta,
     tiko_root_path,
 };
-use pgsys::Lsn;
-use pgsys::common::{BLCKSZ, BlockNumber};
-use pgsys::logging::pg_log_debug1;
+use pgsys::{
+    common::{BLCKSZ, BlockNumber},
+    logging::pg_log_debug1,
+    lsn::Lsn,
+};
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
@@ -30,7 +32,7 @@ static STORE: OnceLock<Store> = OnceLock::new();
 pub struct Store {
     backend: Box<dyn ObjectStore + Send + Sync>,
     ns: DbNamespace,
-    db: DbMeta,
+    loc: Locator,
     base_manifest: Manifest,
     /// Per-backend cache of the shared checkpoint version list.
     /// `Mutex` satisfies the `Sync` bound required by `static STORE`.
@@ -45,7 +47,7 @@ impl Store {
         Store {
             backend: Box::new(S3Sim::new(root_path)),
             ns: ns.clone(),
-            db: DbMeta::new(ns),
+            loc: Locator::new(ns.clone()),
             base_manifest: Manifest::empty(&root_path.join("base_manifest")).unwrap(),
             ckpt_hist: Mutex::new(CkptHistSnapshot::default()),
         }
@@ -116,10 +118,10 @@ impl Store {
 
     pub fn perform_checkpoint(&self, timeline_id: u32, lsn: Lsn) -> Result<()> {
         let db = DbMeta::new(self.ns.clone());
-        let key = db.meta_key();
+        let key = self.loc.db_meta();
 
         // Load existing DbMeta if it exists.
-        match self.get_express(&[key]) {
+        match self.get_express(&[key.clone()]) {
             Ok(json_bytes) => db.load_from_json_bytes(&json_bytes),
             Err(err) if err.is_not_found() => {} // no existing meta; treat as default
             Err(err) => return Err(err),
@@ -128,7 +130,6 @@ impl Store {
         db.set_checkpoint_lsn(timeline_id, lsn);
 
         // Write DbMeta json file
-        let key = db.meta_key();
         let json_bytes = db.to_json_bytes();
         self.put_express(&key, &json_bytes)?;
 
@@ -170,43 +171,6 @@ impl Store {
 
     // ── Version-scanning helpers ──────────────────────────────────────────────
 
-    /// Build an ordered list of express keys for a relfork meta object,
-    /// newest checkpoint first. Falls back to a single key using `DbMeta`'s
-    /// current checkpoint when shared memory is not yet initialised (e.g. tests).
-    fn express_meta_keys(&self, rf: &RelFork) -> Vec<String> {
-        self.versioned_keys(|versions: &[CheckpointVersion]| {
-            self.db.versioned_relfork_meta_keys(rf, versions)
-        })
-    }
-
-    fn express_meta_latest_key(&self, rf: &RelFork) -> String {
-        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
-            debug_assert!(!versions.is_empty());
-            self.db.versioned_relfork_meta_keys(rf, &versions[..1])
-        });
-        keys.first()
-            .cloned()
-            .expect("express_meta_latest_key must return at least one key")
-    }
-
-    /// Build an ordered list of express keys for a chunk object,
-    /// newest checkpoint first.
-    fn express_chunk_keys(&self, tag: &ChunkTag) -> Vec<String> {
-        self.versioned_keys(|versions: &[CheckpointVersion]| {
-            self.db.versioned_chunk_keys(tag, versions)
-        })
-    }
-
-    fn express_chunk_latest_key(&self, tag: &ChunkTag) -> String {
-        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
-            debug_assert!(!versions.is_empty());
-            self.db.versioned_chunk_keys(tag, &versions[..1])
-        });
-        keys.first()
-            .cloned()
-            .expect("express_chunk_latest_key must return at least one key")
-    }
-
     /// Core helper: iterate checkpoint versions newest-first and map each to
     /// an S3 key string via `f(namespace, timeline_id, lsn_hex)`.
     ///
@@ -235,7 +199,9 @@ impl Store {
 
     pub(crate) fn get_meta(&self, rf: &RelFork) -> Result<RelForkMeta> {
         // Build the list of express keys to probe, newest checkpoint first.
-        let keys = self.express_meta_keys(rf);
+        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+            self.loc.relfork_meta_versioned(rf, versions)
+        });
         match self.get_express(&keys) {
             Ok(bytes) => {
                 let meta = serde_json::from_slice::<RelForkMeta>(&bytes)?;
@@ -251,7 +217,14 @@ impl Store {
 
     pub(crate) fn put_meta(&self, rf: &RelFork, meta: &RelForkMeta) -> Result<()> {
         // Always write to the current checkpoint version.
-        let key = self.express_meta_latest_key(rf);
+        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+            debug_assert!(
+                !versions.is_empty(),
+                "put_meta requires at least one checkpoint version"
+            );
+            self.loc.relfork_meta_versioned(rf, &versions[..1])
+        });
+        let key = keys.first().cloned().unwrap();
         let json_bytes = meta.to_json_bytes();
         self.put_express(&key, &json_bytes)
     }
@@ -305,7 +278,9 @@ impl Store {
     pub(crate) fn get_chunk(&self, tag: &ChunkTag, dst: &mut [u8]) -> Result<()> {
         debug_assert_eq!(dst.len(), CHUNK_SIZE);
 
-        let keys = self.express_chunk_keys(tag);
+        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+            self.loc.chunk_versioned(tag, versions)
+        });
         match self.get_express(&keys) {
             Ok(src) => {
                 dst.copy_from_slice(&src);
@@ -314,7 +289,7 @@ impl Store {
             Err(err) if err.is_not_found() => {
                 let chunk_ref = self.base_manifest.lookup(tag)?;
                 if let Some(chunk_ref) = chunk_ref {
-                    let key = self.db.chunk_key_standard(tag, &chunk_ref);
+                    let key = self.loc.chunk_base(tag, &chunk_ref);
                     let src = self.get_standard(&key)?;
                     dst.copy_from_slice(&src);
                     Ok(())
@@ -332,7 +307,15 @@ impl Store {
         let byte_offset = block_offset as usize * BLCKSZ;
         debug_assert!(byte_offset + data.len() <= CHUNK_SIZE);
         let is_full_chunk = byte_offset == 0 && data.len() == CHUNK_SIZE;
-        let key = self.express_chunk_latest_key(tag);
+
+        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+            debug_assert!(
+                !versions.is_empty(),
+                "patch_chunk requires at least one checkpoint version"
+            );
+            self.loc.chunk_versioned(tag, &versions[..1])
+        });
+        let key = keys.first().cloned().unwrap();
 
         if is_full_chunk {
             self.put_express(&key, data)
