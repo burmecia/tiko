@@ -62,8 +62,7 @@ impl Store {
     /// Called once from `Store::init()` after `IoControl` has been
     /// initialised, so `IoControl::is_initialized()` is guaranteed true.
     pub(crate) fn load_checkpoint_history(&self, target: &mut CheckpointHistory) {
-        let ns = self.db.namespace_str();
-        let prefix = format!("{ns}/chunks/");
+        let prefix = format!("{}/chunks/", self.ns);
 
         let keys = match self.backend.list_prefix_express(&prefix) {
             Ok(k) => k,

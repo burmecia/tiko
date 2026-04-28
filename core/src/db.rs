@@ -86,11 +86,6 @@ impl DbMeta {
         inner.checkpoint_lsn = lsn;
     }
 
-    /// Namespace as a display string (e.g. `"{org_id}/{db_id}"`).
-    pub(crate) fn namespace_str(&self) -> String {
-        self.inner.lock().unwrap().ns.to_string()
-    }
-
     pub(crate) fn to_json_bytes(&self) -> Vec<u8> {
         let inner = self.inner.lock().unwrap();
         serde_json::to_vec(&*inner).expect("failed to serialize DbMetaInner")
