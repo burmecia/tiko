@@ -530,6 +530,35 @@ impl ChunkCache {
         }
     }
 
+    /// Find a victim slot, flush it (in place, without unlinking) if dirty,
+    /// then unlink and clear it for reuse. Returns the cleared slot pinned.
+    ///
+    /// The flush happens while the slot is **still in the bucket chain** so
+    /// concurrent `lookup_and_pin` callers can hit the cache during the
+    /// flush rather than falling through to the store. Their `io_lock.read`
+    /// (in `get_chunk`) blocks behind `try_flush_dirty_chunk`'s
+    /// `io_lock.write` and proceeds with the cached chunk once the flush
+    /// returns. This closes a race where a chunk that has only ever lived
+    /// in the cache (newly written, never flushed) would surface to readers
+    /// as `chunk not found in store` while its first flush was in flight.
+    /// Important here because chunks are 256 KB — the flush window over the
+    /// store is wider than for meta.
+    ///
+    /// Lock-order invariant `bucket -> io_lock` is preserved: we never hold
+    /// `io_lock` while acquiring a `bucket` lock. The bucket lock is taken,
+    /// then released, before each `io_lock`-using step.
+    ///
+    /// Three phases:
+    ///   1. Pin the candidate under `bucket.write` (slot stays in chain).
+    ///   2. Flush dirty (if any) via `try_flush_dirty_chunk` — `io_lock.write`
+    ///      only, no bucket lock held.
+    ///   3. Re-acquire `bucket.write`, verify nothing else pinned the slot or
+    ///      re-dirtied it, unlink, then `clear()` under `io_lock.write`.
+    ///
+    /// On any abort (flush failure, concurrent pin, slot re-dirtied), the slot
+    /// is left in the chain with its current contents and the sweep moves on.
+    /// No data loss path remains — the previous "evict-then-relink-on-failure"
+    /// dance with duplicate detection is gone.
     fn evict_and_pin(&self) -> Result<u32> {
         let start = LOCAL_CHUNK_CLOCK_HAND.with(|h| h.get());
 
@@ -537,129 +566,103 @@ impl ChunkCache {
             let slot_index = (start + i) % CHUNK_NUM_SLOTS;
             let slot = self.slot(slot_index);
 
-            // Early check pin count before acquiring the lock to avoid unnecessary locking of hot slots,
-            // but verify it again after acquiring the lock to ensure it hasn't changed
+            // Early check pin count before acquiring the lock to avoid
+            // unnecessary locking of hot slots; re-verified under the lock.
             if slot.pin_count.load(Ordering::Relaxed) != 0 {
                 continue;
             }
 
-            // Decrement usage count
+            // Decrement usage count; only consider slots that aged to 0.
             if self.untouch(slot_index) != 0 {
                 continue;
             }
 
-            // Optimistic read without a lock. The returned tag may mix fields
-            // from different writer generations if a concurrent insert is
-            // running; we re-verify under the bucket write lock below before
-            // acting.
+            // Optimistic tag read; re-verified under bucket.write below.
             let tag = slot.read_tag();
-
             let (bucket, lock) = self.bucket(&tag);
 
+            // ── Phase 1: claim the slot (pin) under bucket.write. Slot
+            //    remains linked in the bucket chain. ──────────────────────
             {
                 let _guard = lock.write();
 
-                // Re-check pin_count. This excludes pins from lookup_and_pin
-                // (which holds the bucket read lock) but NOT pins from
-                // flush_dirty_chunks (which doesn't take any bucket lock). If
-                // flush pins concurrently here or after line 462, both sides
-                // serialise on io_lock inside try_flush_dirty_chunk.
                 if slot.pin_count.load(Ordering::Relaxed) != 0 {
                     continue;
                 }
-
-                // Re-verify the tag under the lock — another thread may have evicted
-                // and reused this slot since the optimistic read above.
-                // Safety: bucket write lock is held.
                 if slot.read_tag() != tag {
                     continue;
                 }
-
-                // Claim the slot for eviction, which prevents other threads from evicting it or inserting into it
                 slot.pin_count.fetch_add(1, Ordering::Relaxed);
-                self.unlink_from_chain(slot_index, bucket);
             }
 
-            // If the evicted slot held real chunk data, flush any dirty blocks and count the eviction.
-            // A slot with a default (zeroed) tag is an empty/uninitialized slot — skip flush and stats.
-            // Safety: slot is pinned (pin_count > 0) and unlinked from the chain.
-            if slot.is_occupied() {
-                match self.try_flush_dirty_chunk(slot_index) {
-                    Ok(true) => {
-                        IoControl::get().stats.chunk_cache.inc_dirty_evictions();
-                    }
-                    Ok(false) => {
-                        // dirty_blocks was already 0 — nothing to flush.
-                    }
-                    Err(e) => {
-                        // Flush failed — try to re-link the slot back into the bucket
-                        // chain so the dirty data is preserved for a future checkpoint
-                        // or eviction retry.
-                        //
-                        // We must check for a duplicate first: while our slot was
-                        // unlinked, another thread may have inserted a new slot with
-                        // the same tag (via cache-miss get_chunk or put_chunk).
-                        // Re-linking blindly would create two slots for the same tag.
-                        let relinked = {
-                            let _guard = lock.write();
-                            let mut cur = self.bucket_head(bucket).load(Ordering::Acquire);
-                            let mut has_dup = false;
-                            while cur != CHAIN_NIL {
-                                if self.slot(cur).read_tag() == tag {
-                                    has_dup = true;
-                                    break;
-                                }
-                                cur = self.slot(cur).next.load(Ordering::Acquire);
-                            }
-                            if !has_dup {
-                                let old_head = self.bucket_head(bucket).load(Ordering::Acquire);
-                                slot.next.store(old_head, Ordering::Release);
-                                self.bucket_head(bucket)
-                                    .store(slot_index, Ordering::Release);
-                                true
-                            } else {
-                                false
-                            }
-                        };
+            // ── Phase 2: flush dirty (if any) WITHOUT holding any bucket
+            //    lock. try_flush_dirty_chunk takes io_lock.write itself.
+            //    Concurrent readers can pin via lookup_and_pin and will
+            //    block on io_lock.read until the flush returns, then read
+            //    the still-valid cached chunk. ────────────────────────────
+            let flush_result = if slot.is_occupied() {
+                self.try_flush_dirty_chunk(slot_index)
+            } else {
+                Ok(false)
+            };
 
-                        if relinked {
-                            // Bump usage so the slot isn't immediately re-evicted
-                            // into the same failing flush loop.
-                            self.touch(slot_index);
-                            self.unpin(slot_index);
-                            pg_log_warning(&format!(
-                                "tiko: evict flush failed for slot {slot_index}, \
-                                 re-linked for retry: {e}"
-                            ));
-                        } else {
-                            // A duplicate was inserted while we were unlinked.
-                            // We must discard this slot (can't have two slots
-                            // with the same tag). try_flush_dirty_chunk restored
-                            // dirty=true on failure, but clear() drops it —
-                            // meaning any UNFLUSHED DIRTY DATA in this slot is
-                            // lost. This is a rare case; upper layers must
-                            // handle the error by retrying the operation.
-                            //
-                            // clear() runs under io_lock to serialise against
-                            // any concurrent flush_dirty_chunks on this slot.
-                            {
-                                let _io_guard = self.io_lock(slot_index).write();
-                                slot.clear();
-                            }
-                            self.unpin(slot_index);
-                            return Err(e);
-                        }
-                        continue;
-                    }
+            match flush_result {
+                Ok(true) => {
+                    IoControl::get().stats.chunk_cache.inc_dirty_evictions();
                 }
+                Ok(false) => {
+                    // Empty slot, or dirty was already false.
+                }
+                Err(e) => {
+                    // Flush failed. try_flush_dirty_chunk restored dirty=true.
+                    // Slot stays linked with its current contents — no data
+                    // loss. Bump usage so the next sweep doesn't immediately
+                    // retry the same failing slot, then move on.
+                    self.touch(slot_index);
+                    self.unpin(slot_index);
+                    pg_log_warning(&format!(
+                        "tiko: evict flush failed for slot {slot_index}, \
+                         leaving in-chain for retry: {e}"
+                    ));
+                    continue;
+                }
+            }
 
+            // ── Phase 3: re-acquire bucket.write, verify nothing
+            //    interfered with the slot during phase 2, then unlink. ────
+            let unlinked = {
+                let _guard = lock.write();
+
+                // Concurrent readers may have pinned the slot while we
+                // flushed. If still pinned by anyone other than us, abort —
+                // a future sweep can evict the slot for free (it's clean).
+                if slot.pin_count.load(Ordering::Relaxed) != 1 {
+                    false
+                }
+                // A concurrent patch_chunk (cache hit on this tag) may have
+                // re-set dirty=true after our flush. Don't drop that data:
+                // leave the slot in-chain.
+                else if slot.dirty.load(Ordering::Acquire) {
+                    false
+                } else {
+                    self.unlink_from_chain(slot_index, bucket);
+                    true
+                }
+            };
+
+            if !unlinked {
+                self.touch(slot_index);
+                self.unpin(slot_index);
+                continue;
+            }
+
+            if slot.is_occupied() {
                 IoControl::get().stats.chunk_cache.inc_evictions();
             }
 
-            // Clear the slot for reuse. This keeps the pin_count.
-            // io_lock serialises against a concurrent flush_dirty_chunks that
-            // may still hold io_lock on this slot after its own
-            // try_flush_dirty_chunk lost the dirty.swap race.
+            // Clear the slot for reuse. io_lock serialises against any
+            // concurrent flush_dirty_chunks that may still hold io_lock on
+            // this slot after losing its own dirty.swap race.
             {
                 let _io_guard = self.io_lock(slot_index).write();
                 slot.clear();
@@ -670,7 +673,7 @@ impl ChunkCache {
             return Ok(slot_index);
         }
 
-        return Err(Error::EvictionSweepExhausted);
+        Err(Error::EvictionSweepExhausted)
     }
 
     /// Insert `tag` with `chunk_data` into the cache atomically.
