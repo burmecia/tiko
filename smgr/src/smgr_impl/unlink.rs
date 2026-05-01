@@ -1,10 +1,14 @@
 use core::chunk::RelFork;
 use core::ops;
 use pgsys::{
-    common::{ForkNumber, INVALID_FORK_NUMBER, MAX_FORKNUM},
+    common::{
+        DEFAULTTABLESPACE_OID, ForkNumber, GLOBALTABLESPACE_OID, INVALID_FORK_NUMBER, MAX_FORKNUM,
+    },
     logging::pg_log_warning,
     smgr::*,
 };
+
+use super::marker_path;
 
 /// Delete a relation's physical storage.
 ///
@@ -30,6 +34,20 @@ pub extern "C-unwind" fn tiko_unlink(
         }
     } else {
         unlink_fork(&rlocator, forknum);
+    }
+
+    // Remove the tablespace marker file when unlinking a non-default tablespace
+    // relation. We create one marker per relation (not per fork), so remove it
+    // when the main fork goes away (rewrite/move) or on full relation unlink.
+    let rloc = &rlocator.locator;
+    if rloc.spc_oid != DEFAULTTABLESPACE_OID
+        && rloc.spc_oid != GLOBALTABLESPACE_OID
+        && (forknum == INVALID_FORK_NUMBER || forknum == pgsys::common::MAIN_FORKNUM)
+    {
+        let path = marker_path(rloc.spc_oid, rloc.db_oid, rloc.rel_number);
+        // Ignore ENOENT — the marker may not exist if the relation was created
+        // before this fix was applied or in a non-tablespace context.
+        let _ = std::fs::remove_file(&path);
     }
 }
 

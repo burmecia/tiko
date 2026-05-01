@@ -27,6 +27,17 @@ pub const INDEX_MAX_KEYS: c_int = 32;
 pub const NAMEDATALEN: c_int = 64;
 pub const FLOAT8PASSBYVAL: c_int = 1;
 
+/// OID of the default tablespace (pg_default / base/).
+pub const DEFAULTTABLESPACE_OID: Oid = 1663;
+
+/// OID of the global tablespace (pg_global / global/).
+pub const GLOBALTABLESPACE_OID: Oid = 1664;
+
+/// Version-specific subdirectory name inside pg_tblspc/<spc_oid>/.
+/// Matches TABLESPACE_VERSION_DIRECTORY in relpath.h:
+///   "PG_" PG_MAJORVERSION "_" CATALOG_VERSION_NO
+pub const TABLESPACE_VERSION_DIRECTORY: &str = "PG_18_202506291";
+
 /// PostgreSQL block size in bytes
 pub const BLCKSZ: usize = 8192;
 

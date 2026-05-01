@@ -37,6 +37,13 @@ pub struct PgAioHandle {
     _private: [u8; 0],
 }
 
+// Tablespace management functions (commands/tablespace.h)
+unsafe extern "C" {
+    /// Create the per-database subdirectory inside a tablespace if it doesn't exist.
+    /// Must be called before creating any files in a non-default tablespace.
+    pub fn TablespaceCreateDbspace(spcOid: Oid, dbOid: Oid, isRedo: bool);
+}
+
 // External C functions from the MD (magnetic disk) storage manager
 unsafe extern "C" {
 
