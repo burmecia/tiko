@@ -3,11 +3,10 @@ use std::sync::{Mutex, OnceLock};
 
 use super::{backend::ObjectStore, locator::Locator, s3_sim::S3Sim};
 use crate::{
-    checkpoint_history::{CheckpointHistory, CheckpointVersion},
     chunk::{CHUNK_SIZE, ChunkTag, RelFork},
     db::{DbMeta, DbNamespace},
     error::{Error, Result},
-    io::checkpoint_history::CkptHistSnapshot,
+    io::checkpoints::{CkptHistSnapshot, CkptHistory, CkptVersion},
     io_control::IoControl,
     manifest::Manifest,
     relfork::RelForkMeta,
@@ -63,7 +62,7 @@ impl Store {
     ///
     /// Called once from `Store::init()` after `IoControl` has been
     /// initialised, so `IoControl::is_initialized()` is guaranteed true.
-    pub(crate) fn load_checkpoint_history(&self, target: &mut CheckpointHistory) {
+    pub(crate) fn load_checkpoint_history(&self, target: &mut CkptHistory) {
         let prefix = format!("{}/chunks/", self.ns);
 
         let keys = match self.backend.list_prefix_express(&prefix) {
@@ -178,20 +177,20 @@ impl Store {
     /// to a single key derived from `DbMeta`'s current checkpoint LSN.
     fn versioned_keys<F>(&self, f: F) -> Vec<String>
     where
-        F: Fn(&[CheckpointVersion]) -> Vec<String>,
+        F: Fn(&[CkptVersion]) -> Vec<String>,
     {
         if IoControl::is_initialized() {
             let shared_ckpt_hist = &IoControl::get().ckpt_hist;
             let mut ckpt_hist = self.ckpt_hist.lock().unwrap();
             let versions = ckpt_hist.get_or_refresh(shared_ckpt_hist);
             if versions.is_empty() {
-                f(&[CheckpointVersion::default()])
+                f(&[CkptVersion::default()])
             } else {
                 f(versions)
             }
         } else {
             // Fallback: default checkpoint version (no shared memory or empty history).
-            f(&[CheckpointVersion::default()])
+            f(&[CkptVersion::default()])
         }
     }
 
@@ -199,7 +198,7 @@ impl Store {
 
     pub(crate) fn get_meta(&self, rf: &RelFork) -> Result<RelForkMeta> {
         // Build the list of express keys to probe, newest checkpoint first.
-        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+        let keys = self.versioned_keys(|versions: &[CkptVersion]| {
             self.loc.relfork_meta_versioned(rf, versions)
         });
         match self.get_express(&keys) {
@@ -217,7 +216,7 @@ impl Store {
 
     pub(crate) fn put_meta(&self, rf: &RelFork, meta: &RelForkMeta) -> Result<()> {
         // Always write to the current checkpoint version.
-        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+        let keys = self.versioned_keys(|versions: &[CkptVersion]| {
             debug_assert!(
                 !versions.is_empty(),
                 "put_meta requires at least one checkpoint version"
@@ -278,9 +277,8 @@ impl Store {
     pub(crate) fn get_chunk(&self, tag: &ChunkTag, dst: &mut [u8]) -> Result<()> {
         debug_assert_eq!(dst.len(), CHUNK_SIZE);
 
-        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
-            self.loc.chunk_versioned(tag, versions)
-        });
+        let keys =
+            self.versioned_keys(|versions: &[CkptVersion]| self.loc.chunk_versioned(tag, versions));
         match self.get_express(&keys) {
             Ok(src) => {
                 dst.copy_from_slice(&src);
@@ -308,7 +306,7 @@ impl Store {
         debug_assert!(byte_offset + data.len() <= CHUNK_SIZE);
         let is_full_chunk = byte_offset == 0 && data.len() == CHUNK_SIZE;
 
-        let keys = self.versioned_keys(|versions: &[CheckpointVersion]| {
+        let keys = self.versioned_keys(|versions: &[CkptVersion]| {
             debug_assert!(
                 !versions.is_empty(),
                 "patch_chunk requires at least one checkpoint version"

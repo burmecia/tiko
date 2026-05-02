@@ -6,7 +6,7 @@
 //!
 //! # Shared memory layout
 //!
-//! `CheckpointHistory` lives inside `IoControl` in PostgreSQL shared memory,
+//! `CkptHistory` lives inside `IoControl` in PostgreSQL shared memory,
 //! so all backends and s3worker see the same list without copying on every read.
 //!
 //! # Concurrency
@@ -57,22 +57,22 @@ const _: () = assert!(
 
 /// Trigger a base-manifest rebase when the history reaches this many entries
 /// (80% of capacity). Keeps the eviction path as a safety valve only.
-const REBASE_THRESHOLD: usize = MAX_CHECKPOINT_VERSIONS * 4 / 5; // 204
+//const REBASE_THRESHOLD: usize = MAX_CHECKPOINT_VERSIONS * 4 / 5; // 204
 
-// ── CheckpointVersion ────────────────────────────────────────────────────────
+// ── CkptVersion ────────────────────────────────────────────────────────
 
 /// One entry in the checkpoint version list.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct CheckpointVersion {
+pub struct CkptVersion {
     pub timeline_id: u32,
     _pad: [u8; 4],
     pub lsn: Lsn,
 }
 
-const _: () = assert!(std::mem::size_of::<CheckpointVersion>() == 16);
+const _: () = assert!(std::mem::size_of::<CkptVersion>() == 16);
 
-impl CheckpointVersion {
+impl CkptVersion {
     fn new(timeline_id: u32, lsn: Lsn) -> Self {
         Self {
             timeline_id,
@@ -82,7 +82,7 @@ impl CheckpointVersion {
     }
 }
 
-impl Default for CheckpointVersion {
+impl Default for CkptVersion {
     fn default() -> Self {
         Self {
             timeline_id: 1,
@@ -92,13 +92,13 @@ impl Default for CheckpointVersion {
     }
 }
 
-impl std::fmt::Display for CheckpointVersion {
+impl std::fmt::Display for CkptVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "tl {} @ {}", self.timeline_id, self.lsn)
     }
 }
 
-// ── CheckpointHistory ────────────────────────────────────────────────────────
+// ── CkptHistory ────────────────────────────────────────────────────────
 
 /// Versioned checkpoint list in shared memory, stored as a ring buffer.
 ///
@@ -110,7 +110,7 @@ impl std::fmt::Display for CheckpointVersion {
 /// `generation` is bumped on every `push()`. Backends compare their cached
 /// generation against this value to skip lock acquisition when nothing changed.
 #[repr(C)]
-pub struct CheckpointHistory {
+pub(crate) struct CkptHistory {
     lock: AtomicRWLock,
     /// Monotonically increasing. Exposed solely for the lock-free staleness
     /// check in `LocalHistoryCache`.
@@ -119,10 +119,10 @@ pub struct CheckpointHistory {
     head: AtomicU32,
     /// Number of valid entries (0..=MAX_CHECKPOINT_VERSIONS).
     count: AtomicU32,
-    pub versions: [CheckpointVersion; MAX_CHECKPOINT_VERSIONS],
+    pub versions: [CkptVersion; MAX_CHECKPOINT_VERSIONS],
 }
 
-impl CheckpointHistory {
+impl CkptHistory {
     /// Initialise all fields to zero / empty.
     pub fn init(&self) {
         self.lock.init();
@@ -143,9 +143,8 @@ impl CheckpointHistory {
         debug_assert!(head < MAX_CHECKPOINT_VERSIONS);
         // SAFETY: head is always in 0..MAX_CHECKPOINT_VERSIONS.
         unsafe {
-            let ptr = self.versions.as_ptr() as *mut CheckpointVersion;
-            ptr.add(head)
-                .write(CheckpointVersion::new(timeline_id, lsn));
+            let ptr = self.versions.as_ptr() as *mut CkptVersion;
+            ptr.add(head).write(CkptVersion::new(timeline_id, lsn));
         }
 
         let new_head = (head + 1) % MAX_CHECKPOINT_VERSIONS;
@@ -186,10 +185,10 @@ impl CheckpointHistory {
         }
     }
 
-    /// Returns true when `REBASE_THRESHOLD` has been reached.
-    pub fn needs_rebase(&self) -> bool {
-        self.count.load(Ordering::Relaxed) as usize >= REBASE_THRESHOLD
-    }
+    // Returns true when `REBASE_THRESHOLD` has been reached.
+    // pub fn needs_rebase(&self) -> bool {
+    //     self.count.load(Ordering::Relaxed) as usize >= REBASE_THRESHOLD
+    // }
 }
 
 // ── Local Checkpoint History Cache ────────────────────────────────────────────────────────
@@ -199,20 +198,17 @@ impl CheckpointHistory {
 /// Refreshed lazily: a single `AtomicU64` load detects staleness; the full
 /// lock + copy only runs after a checkpoint (~every 5 min).
 #[derive(Debug, Default)]
-pub struct CkptHistSnapshot {
+pub(crate) struct CkptHistSnapshot {
     /// Generation at which `versions` was captured.
     generation: u64,
     /// Private copy of the version list, newest-first.
-    pub versions: Vec<CheckpointVersion>,
+    pub versions: Vec<CkptVersion>,
 }
 
 impl CkptHistSnapshot {
     /// Return an up-to-date slice of checkpoint versions, refreshing from
     /// shared memory if the generation has advanced.
-    pub fn get_or_refresh<'a>(
-        &'a mut self,
-        shared_ckpt_hist: &CheckpointHistory,
-    ) -> &'a [CheckpointVersion] {
+    pub fn get_or_refresh<'a>(&'a mut self, shared_ckpt_hist: &CkptHistory) -> &'a [CkptVersion] {
         let shared_gen = shared_ckpt_hist.generation.load(Ordering::Acquire);
         if self.generation != shared_gen {
             *self = shared_ckpt_hist.snapshot();

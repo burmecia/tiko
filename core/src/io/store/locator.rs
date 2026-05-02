@@ -1,5 +1,5 @@
 use crate::{
-    checkpoint_history::CheckpointVersion, chunk::ChunkTag, db::DbNamespace, manifest::ChunkRef,
+    checkpoints::CkptVersion, chunk::ChunkTag, db::DbNamespace, manifest::ChunkRef,
     relfork::RelFork,
 };
 use pgsys::Lsn;
@@ -30,7 +30,7 @@ impl Locator {
     pub(super) fn relfork_meta_versioned(
         &self,
         rf: &RelFork,
-        versions: &[CheckpointVersion],
+        versions: &[CkptVersion],
     ) -> Vec<String> {
         versions
             .iter()
@@ -50,11 +50,7 @@ impl Locator {
         )
     }
 
-    pub(super) fn chunk_versioned(
-        &self,
-        tag: &ChunkTag,
-        versions: &[CheckpointVersion],
-    ) -> Vec<String> {
+    pub(super) fn chunk_versioned(&self, tag: &ChunkTag, versions: &[CkptVersion]) -> Vec<String> {
         versions
             .iter()
             .map(|version| self.chunk_key(tag, version.timeline_id, version.lsn))

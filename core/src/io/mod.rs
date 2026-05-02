@@ -1,5 +1,5 @@
 pub mod cache;
-pub mod checkpoint_history;
+pub mod checkpoints;
 pub mod io_control;
 pub(crate) mod rwlock;
 mod stats;

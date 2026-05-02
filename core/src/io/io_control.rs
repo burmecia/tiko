@@ -40,7 +40,7 @@
 //! ├── submit_queue (SubmitQueue)
 //! ├── stats (IoStats)
 //! ├── cache (CacheControl)
-//! └── ckpt_hist (CheckpointHistory)  ← versioned express-bucket history
+//! └── ckpt_hist (CkptHistory)  ← versioned express-bucket history
 //! BackendSlotPool[0]  ← immediately after IoControl (aligned)
 //! BackendSlotPool[1]
 //! ...
@@ -72,7 +72,7 @@ use super::{
         CHUNK_NUM_BUCKETS, CHUNK_NUM_SLOTS, CacheControl, ChunkSlot, META_NUM_BUCKETS,
         META_NUM_SLOTS, MetaSlot,
     },
-    checkpoint_history::CheckpointHistory,
+    checkpoints::CkptHistory,
     rwlock::AtomicRWLock,
     stats::IoStats,
     store::Store,
@@ -484,7 +484,7 @@ pub struct IoControl {
     pub submit_queue: SubmitQueue,
 
     /// Local cache control (slot count, clock hand for eviction)
-    pub cache: CacheControl,
+    pub(crate) cache: CacheControl,
 
     /// I/O statistics
     pub stats: IoStats,
@@ -492,7 +492,7 @@ pub struct IoControl {
     /// Versioned checkpoint history for express-bucket read path.
     /// Newest-first list of (timeline_id, lsn) pairs written at each checkpoint.
     /// Single writer (s3worker); all backends read via `LocalHistoryCache`.
-    pub ckpt_hist: CheckpointHistory,
+    pub(crate) ckpt_hist: CkptHistory,
 }
 
 impl IoControl {
