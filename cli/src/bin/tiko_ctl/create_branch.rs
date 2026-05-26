@@ -35,7 +35,7 @@ pub fn run(
     let branch_lsn = if parent_project == 0 && parent_branch == 0 {
         // Root project: latest base manifest LSN (shutdown checkpoint).
         let base_prefix = parent_ns.base_prefix_for_timeline(tl);
-        let base_keys = sim.list_prefix_standard(&base_prefix).unwrap_or_else(|e| {
+        let base_keys = sim.storage_list_prefix(&base_prefix).unwrap_or_else(|e| {
             eprintln!("error: failed to list parent base manifests: {e}");
             std::process::exit(1);
         });
@@ -54,7 +54,7 @@ pub fn run(
     } else {
         // Non-root project: latest delta manifest LSN (online checkpoint).
         let delta_prefix = parent_ns.delta_prefix_for_timeline(tl);
-        let delta_keys = sim.list_prefix_standard(&delta_prefix).unwrap_or_else(|e| {
+        let delta_keys = sim.storage_list_prefix(&delta_prefix).unwrap_or_else(|e| {
             eprintln!("error: failed to list parent delta manifests: {e}");
             std::process::exit(1);
         });
@@ -84,7 +84,7 @@ pub fn run(
         } else {
             parent_ns.delta_manifest_key(tl, branch_lsn)
         };
-        if let Ok(Some(bytes)) = sim.get_standard(&manifest_key) {
+        if let Ok(Some(bytes)) = sim.storage_get(&manifest_key) {
             let tmp = tempfile::NamedTempFile::new().unwrap_or_else(|e| {
                 eprintln!("error: failed to create temp file: {e}");
                 std::process::exit(1);
@@ -150,7 +150,7 @@ pub fn run(
         // the child's namespace, then start PostgreSQL normally (no recovery.signal).
         let manifest_key = parent_ns.base_manifest_key(tl, branch_lsn);
         let manifest_bytes = sim
-            .get_standard(&manifest_key)
+            .storage_get(&manifest_key)
             .unwrap_or_else(|e| {
                 eprintln!("error: failed to read parent base manifest: {e}");
                 std::process::exit(1);
@@ -160,7 +160,7 @@ pub fn run(
                 std::process::exit(1);
             });
 
-        sim.put_standard(&ns.base_manifest_key(1, branch_lsn), &manifest_bytes)
+        sim.storage_put(&ns.base_manifest_key(1, branch_lsn), &manifest_bytes)
             .unwrap_or_else(|e| {
                 eprintln!("error: failed to upload initial base manifest: {e}");
                 std::process::exit(1);
@@ -170,7 +170,7 @@ pub fn run(
         // into pgdata so PostgreSQL starts with a consistent control file.
         let pg_state_key = parent_ns.pg_state_key(tl, branch_lsn);
         let pg_state_bytes = sim
-            .get_standard(&pg_state_key)
+            .storage_get(&pg_state_key)
             .unwrap_or_else(|e| {
                 eprintln!("error: failed to read pg_state: {e}");
                 std::process::exit(1);

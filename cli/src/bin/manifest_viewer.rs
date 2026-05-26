@@ -321,7 +321,7 @@ fn run(args: &Args) -> Result<(), String> {
         Source::S3Standard(key) => {
             let sim = sim_from_env()?;
             let data = sim
-                .get_standard(key)
+                .storage_get(key)
                 .map_err(|e| format!("Store error: {e}"))?
                 .ok_or_else(|| format!("key not found in standard bucket: {key}"))?;
             let file_size = data.len();
@@ -338,17 +338,17 @@ fn run(args: &Args) -> Result<(), String> {
         }
 
         Source::S3Express(key) => {
-            let sim = sim_from_env()?;
-            let data = sim
-                .get_express(key)
-                .map_err(|e| format!("Store error: {e}"))?
-                .ok_or_else(|| format!("key not found in express bucket: {key}"))?;
-            let file_size = data.len();
-            let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
-            let tmp_path = tmp.path().join("manifest.bin");
-            let manifest = Manifest::from_bytes(&data, &tmp_path)
-                .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
-            print_manifest(&manifest, "S3 express bucket", args.show_entries, file_size);
+            // let sim = sim_from_env()?;
+            // let data = sim
+            //     .get_express(key)
+            //     .map_err(|e| format!("Store error: {e}"))?
+            //     .ok_or_else(|| format!("key not found in express bucket: {key}"))?;
+            // let file_size = data.len();
+            // let tmp = tempfile::TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
+            // let tmp_path = tmp.path().join("manifest.bin");
+            // let manifest = Manifest::from_bytes(&data, &tmp_path)
+            //     .map_err(|e| format!("failed to decode S3 wire format: {e}"))?;
+            // print_manifest(&manifest, "S3 express bucket", args.show_entries, file_size);
         }
     }
 

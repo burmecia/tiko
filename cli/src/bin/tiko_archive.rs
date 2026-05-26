@@ -72,7 +72,7 @@ fn upload_wal_segment(
     path: &Path,
 ) -> std::io::Result<()> {
     let bytes = std::fs::read(path)?;
-    sim.put_standard(&ns.wal_key(timeline, segment), &bytes)
+    sim.storage_put(&ns.wal_key(timeline, segment), &bytes)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ mod tests {
 
         // Verify it lives at the expected standard-bucket key.
         let key = ns.wal_key(timeline, segment);
-        let stored = sim.get_standard(&key).unwrap();
+        let stored = sim.storage_get(&key).unwrap();
         assert_eq!(stored, Some(b"fake_wal_data_archive".to_vec()));
     }
 

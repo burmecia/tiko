@@ -321,7 +321,7 @@ async fn handle_xlogdata(
         let name = seg_name(timeline, state.seg_no);
         let key = ns.wal_chunk_key(timeline, &name, offset);
         state.chunk_tasks.spawn(async move {
-            tokio::task::spawn_blocking(move || sim.put_standard(&key, &slice))
+            tokio::task::spawn_blocking(move || sim.storage_put(&key, &slice))
                 .await
                 .map_err(|e| format!("chunk task panicked: {e}"))?
                 .map_err(|e| format!("chunk PUT failed: {e}"))
@@ -362,7 +362,7 @@ async fn seal_segment(
     if state.buf.len() > chunks_uploaded {
         let tail = state.buf[chunks_uploaded..].to_vec();
         let tail_key = ns.wal_chunk_key(timeline, &name, chunks_uploaded);
-        tokio::task::spawn_blocking(move || sim.put_standard(&tail_key, &tail))
+        tokio::task::spawn_blocking(move || sim.storage_put(&tail_key, &tail))
             .await
             .map_err(|e| format!("tail spawn_blocking panicked: {e}"))?
             .map_err(|e| format!("tail PUT failed for {name}: {e}"))?;
@@ -373,7 +373,7 @@ async fn seal_segment(
     let sealed = state.buf;
     let seg_key = ns.wal_key(timeline, &name);
     let name_log = name.clone();
-    tokio::task::spawn_blocking(move || sim.put_standard(&seg_key, &sealed))
+    tokio::task::spawn_blocking(move || sim.storage_put(&seg_key, &sealed))
         .await
         .map_err(|e| format!("seal spawn_blocking panicked: {e}"))?
         .map_err(|e| format!("sealed PUT failed for {name_log}: {e}"))?;
@@ -388,7 +388,7 @@ async fn seal_segment(
     //    Stranded chunks are harmless — tiko_restore prefers the sealed object.
     let chunk_prefix = ns.wal_chunk_prefix(timeline, &name);
     tokio::task::spawn_blocking(move || {
-        if let Ok(keys) = sim.list_prefix_standard(&chunk_prefix) {
+        if let Ok(keys) = sim.storage_list_prefix(&chunk_prefix) {
             for key in keys {
                 let _ = sim.delete_standard(&key);
             }

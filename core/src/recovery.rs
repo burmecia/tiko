@@ -212,7 +212,7 @@ pub fn prepare_recovery(
     // ── 1. Validate target ────────────────────────────────────────────────────
     // let delta_key = ns.delta_manifest_key(target_tl, target_lsn);
     // if sim
-    //     .get_standard(&delta_key)
+    //     .storage_get(&delta_key)
     //     .map_err(Error::Store)?
     //     .is_error()
     // {
@@ -224,7 +224,7 @@ pub fn prepare_recovery(
 
     // ── 2. pg_state ───────────────────────────────────────────────────────────
     let pg_state_key = ns.pg_state_key(target_tl, target_lsn);
-    let pg_state_bytes = sim.get_standard(&pg_state_key).map_err(Error::Store)?;
+    let pg_state_bytes = sim.storage_get(&pg_state_key).map_err(Error::Store)?;
 
     let pg_state_tmp = work.path().join("pg_state.tar.zst");
     fs::write(&pg_state_tmp, &pg_state_bytes)?;
@@ -290,7 +290,7 @@ fn load_base_manifest(
     manifest_path: &Path,
 ) -> Result<Manifest> {
     let prefix = ns.base_prefix_for_timeline(target_tl);
-    let keys = sim.list_prefix_standard(&prefix).map_err(Error::Store)?;
+    let keys = sim.storage_list_prefix(&prefix).map_err(Error::Store)?;
 
     // After stripping prefix: "{lsn_hex}/manifest.bin"
     let best_key = keys
@@ -305,7 +305,7 @@ fn load_base_manifest(
         .map(|(_, k)| k)
         .ok_or(Error::NoCheckpoint)?;
 
-    let bytes = sim.get_standard(best_key).map_err(Error::Store)?;
+    let bytes = sim.storage_get(best_key).map_err(Error::Store)?;
 
     Manifest::from_bytes(&bytes, manifest_path)
         .map_err(crate::Error::Io)
@@ -325,7 +325,7 @@ fn apply_deltas_up_to(
 ) -> Result<()> {
     let base_lsn = base.checkpoint_lsn();
     let prefix = ns.delta_prefix_for_timeline(target_tl);
-    let mut keys = sim.list_prefix_standard(&prefix).map_err(Error::Store)?;
+    let mut keys = sim.storage_list_prefix(&prefix).map_err(Error::Store)?;
     keys.sort();
 
     let mut deltas: Vec<Manifest> = Vec::new();
@@ -343,7 +343,7 @@ fn apply_deltas_up_to(
         if lsn <= base_lsn || lsn > target_lsn {
             continue;
         }
-        let bytes = sim.get_standard(key).map_err(Error::Store)?;
+        let bytes = sim.storage_get(key).map_err(Error::Store)?;
         let path = work_dir.join(format!("delta_{lsn_hex}.tikm"));
         let m = Manifest::from_bytes(&bytes, &path)
             .map_err(crate::Error::Io)

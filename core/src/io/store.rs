@@ -90,7 +90,7 @@ impl Store {
 
         db.set_checkpoint_lsn(ckpt);
         let json_bytes = db.to_json_bytes();
-        self.put_express(&key, &json_bytes)?;
+        self.storage_put(&key, &json_bytes)?;
 
         Ok(())
     }
@@ -128,7 +128,7 @@ impl Store {
                 manifest
             }
             Err(_) => {
-                let mut bases = storage.list_prefix(&lctr.bases_dir())?;
+                let mut bases = storage.storage_list_prefix(&lctr.bases_dir())?;
                 bases.sort_unstable();
                 if let Some(key) = bases.last() {
                     let bytes = storage.get(key)?;
@@ -429,7 +429,7 @@ impl Store {
         let chunk_ref = self.base_manifest()?.lookup(tag)?;
         if let Some(chunk_ref) = chunk_ref {
             let key = self.lctr.chunk_base(tag, &chunk_ref);
-            let src = self.get_standard(&key)?;
+            let src = self.storage_get(&key)?;
             dst.copy_from_slice(&src);
             return Ok(());
         }
@@ -460,7 +460,7 @@ impl Store {
         let key = self.lctr.chunk(tag, &head_ckpt);
 
         if is_full_chunk {
-            self.put_express(&key, data)?;
+            self.storage_put(&key, data)?;
         } else {
             let mut merged = vec![0u8; CHUNK_SIZE];
             match self.get_chunk(tag, &mut merged) {
@@ -469,7 +469,7 @@ impl Store {
                 Err(e) => return Err(e),
             }
             merged[byte_offset..byte_offset + data.len()].copy_from_slice(data);
-            self.put_express(&key, &merged)?;
+            self.storage_put(&key, &merged)?;
         };
 
         self.record_chunk_eviction(*tag);
@@ -478,53 +478,28 @@ impl Store {
 
     // ── Primitive forwarding methods ──────────────────────────────────────
 
-    pub fn get_express(&self, keys: &[String]) -> Result<Vec<u8>> {
-        for key in keys {
-            match self.storage.get(key) {
-                Ok(data) => {
-                    IoControl::try_get().map(|io_control| {
-                        io_control.stats.store_express.inc_gets(data.len());
-                    });
-                    return Ok(data);
-                }
-                Err(err) if err.is_not_found() => {
-                    IoControl::try_get().map(|io_control| {
-                        io_control.stats.store_express.inc_gets(0);
-                    });
-                    // try the next key in next loop iteration
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        Err(Error::not_found("not found in express bucket"))
-    }
-
-    pub fn put_express(&self, key: &str, data: &[u8]) -> Result<()> {
+    pub fn storage_put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.storage.put(key, data)?;
         IoControl::try_get().map(|io_control| {
-            io_control.stats.store_express.inc_puts(data.len());
+            io_control.stats.storage.inc_puts(data.len());
         });
         Ok(())
     }
 
-    pub fn get_standard(&self, key: &str) -> Result<Vec<u8>> {
+    pub fn storage_get(&self, key: &str) -> Result<Vec<u8>> {
         let data = self.storage.get(key)?;
         IoControl::try_get().map(|io_control| {
-            io_control.stats.store_standard.inc_gets(data.len());
+            io_control.stats.storage.inc_gets(data.len());
         });
         Ok(data)
     }
 
-    pub fn put_standard(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.storage.put(key, data)?;
+    pub fn storage_list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let ret = self.storage.storage_list_prefix(prefix)?;
         IoControl::try_get().map(|io_control| {
-            io_control.stats.store_standard.inc_puts(data.len());
+            io_control.stats.storage.inc_lists();
         });
-        Ok(())
-    }
-
-    pub fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        self.storage.list_prefix(prefix)
+        Ok(ret)
     }
 
     // ── Backend draft (eviction-flush recording) ──────────────────────────
@@ -563,7 +538,7 @@ impl Store {
     /// not exist yet.
     fn list_all_segments(&self) -> Result<Vec<SegmentId>> {
         let prefix = self.lctr.timeline_segments_dir();
-        let keys = match self.storage.list_prefix(&prefix) {
+        let keys = match self.storage.storage_list_prefix(&prefix) {
             Ok(k) => k,
             Err(e) if e.is_not_found() => return Ok(Vec::new()),
             Err(e) => return Err(e),

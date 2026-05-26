@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::storage::Store;
+use crate::io::store::Store;
 //use crate::project::{ProjectMeta, ProjectNamespace};
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ impl OrgMeta {
 
     pub fn ensure_org_meta(sim: &Store, org_id: u64) -> Result<()> {
         let key = format!("{}/metadata/org.json", org_id);
-        if sim.get_standard(&key).map_err(Error::Store).is_err() {
+        if sim.storage_get(&key).map_err(Error::Store).is_err() {
             // No org.json exists — create root org and project.
             Self::create(sim, org_id)?;
         }
@@ -88,7 +88,7 @@ impl OrgMeta {
             deleted_at: None,
         };
         let json = serde_json::to_vec(&meta).map_err(|e| Error::Serialize(e.to_string()))?;
-        sim.put_standard(&meta.meta_key(), &json)
+        sim.storage_put(&meta.meta_key(), &json)
             .map_err(Error::Store)?;
 
         // Write root project.json (no parent fields — this is the origin project).
@@ -105,7 +105,7 @@ impl OrgMeta {
     /// Read `org.json` without modifying it.
     pub fn get(sim: &Store, org_id: u64) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
-        let bytes = sim.get_standard(&key).map_err(Error::Store)?;
+        let bytes = sim.storage_get(&key).map_err(Error::Store)?;
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))
     }
 
@@ -116,7 +116,7 @@ impl OrgMeta {
     /// `deleted_at` is already set.
     pub fn delete(sim: &Store, org_id: u64, force: bool) -> Result<OrgMeta> {
         let key = format!("{}/metadata/org.json", org_id);
-        let bytes = sim.get_standard(&key).map_err(Error::Store)?;
+        let bytes = sim.storage_get(&key).map_err(Error::Store)?;
         let mut meta: OrgMeta =
             serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
 
@@ -126,7 +126,7 @@ impl OrgMeta {
 
         meta.deleted_at = Some(now_secs());
         let json = serde_json::to_vec(&meta).map_err(|e| Error::Serialize(e.to_string()))?;
-        sim.put_standard(&key, &json).map_err(Error::Store)?;
+        sim.storage_put(&key, &json).map_err(Error::Store)?;
         Ok(meta)
     }
 }

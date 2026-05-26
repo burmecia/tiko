@@ -177,7 +177,7 @@ fn download_wal_segment(
     segment: &str,
     dest: &Path,
 ) -> std::io::Result<bool> {
-    match sim.get_standard(&ns.wal_key(timeline, segment))? {
+    match sim.storage_get(&ns.wal_key(timeline, segment))? {
         Some(bytes) => {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -244,7 +244,7 @@ mod tests {
     fn seed_wal(sim: &Store, ns: &ProjectNamespace, segment: &str, data: &[u8]) {
         let timeline = parse_timeline(segment).unwrap();
         let key = ns.wal_key(timeline, segment);
-        sim.put_standard(&key, data).unwrap();
+        sim.storage_put(&key, data).unwrap();
     }
 
     const SEG1: &str = "000000010000000000000001"; // lsn = 0x1000000  (16 MB)

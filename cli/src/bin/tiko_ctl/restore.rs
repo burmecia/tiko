@@ -38,7 +38,7 @@ pub fn run(sim: &Store, org: u64, project: u64, branch: u64, lsn: &str) {
         eprintln!("error: failed to serialize manifest: {e}");
         std::process::exit(1);
     });
-    sim.put_standard(
+    sim.storage_put(
         &ns.base_manifest_key(new_timeline, restore_lsn),
         &manifest_bytes,
     )
@@ -50,7 +50,7 @@ pub fn run(sim: &Store, org: u64, project: u64, branch: u64, lsn: &str) {
     // Clear express-bucket hot data — stale after restore.
     let express_prefix = format!("{}/{}/", ns.org_id, ns.project_id);
     let express_keys = sim
-        .list_prefix_express(&express_prefix)
+        .storage_list_prefix(&express_prefix)
         .unwrap_or_else(|e| {
             eprintln!("error: failed to list express keys: {e}");
             std::process::exit(1);
@@ -64,7 +64,7 @@ pub fn run(sim: &Store, org: u64, project: u64, branch: u64, lsn: &str) {
 
     // Update project.json with the new timeline ID.
     meta.current_timeline_id = new_timeline;
-    sim.put_standard(
+    sim.storage_put(
         &ns.project_meta_key(),
         &serde_json::to_vec(&meta).unwrap_or_else(|e| {
             eprintln!("error: failed to serialize project meta: {e}");
