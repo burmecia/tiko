@@ -128,7 +128,7 @@ impl Store {
                 manifest
             }
             Err(_) => {
-                let mut bases = storage.storage_list_prefix(&lctr.bases_dir())?;
+                let mut bases = storage.list_prefix(&lctr.bases_dir())?;
                 bases.sort_unstable();
                 if let Some(key) = bases.last() {
                     let bytes = storage.get(key)?;
@@ -495,7 +495,7 @@ impl Store {
     }
 
     pub fn storage_list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        let ret = self.storage.storage_list_prefix(prefix)?;
+        let ret = self.storage.list_prefix(prefix)?;
         IoControl::try_get().map(|io_control| {
             io_control.stats.storage.inc_lists();
         });
@@ -538,7 +538,7 @@ impl Store {
     /// not exist yet.
     fn list_all_segments(&self) -> Result<Vec<SegmentId>> {
         let prefix = self.lctr.timeline_segments_dir();
-        let keys = match self.storage.storage_list_prefix(&prefix) {
+        let keys = match self.storage.list_prefix(&prefix) {
             Ok(k) => k,
             Err(e) if e.is_not_found() => return Ok(Vec::new()),
             Err(e) => return Err(e),
