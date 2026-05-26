@@ -40,56 +40,55 @@
 
 use std::path::Path;
 
-use core::{error::Result, io_control::IoControl, store::Store, tiko_root_path};
-use pgsys::{Lsn, common::data_dir_path, logging::*};
+use core::{error::Result, io::store::Store, io::timeline::Checkpoint};
+use pgsys::{Lsn, common::data_dir_path, logging::*, timeline_id::TimelineId};
 
-/// Called from `CheckPointGuts()` after `CheckPointBuffers()`.
-///
-/// `checkpoint_lsn` is the `XLogRecPtr checkPointRedo` argument passed by PG.
-/// It is `0` (`InvalidXLogRecPtr`) during `--boot`/`--single` phases where
-/// `IoControl::is_initialized()` will also be false, so the early-return
-/// guard handles both cases.
+/// Called from Postgres `CreateCheckPoint()`.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn: u64) {
-    // During --boot (BOOTSTRAP_PROCESSING), checkpoint_lsn is 0 and neither
-    // S3Sim nor ProjectCtx are initialised — nothing to do.
-    if checkpoint_lsn == 0 {
-        return;
-    }
+pub extern "C-unwind" fn tiko_perform_checkpoint(
+    timeline_id: u32,
+    checkpoint_lsn: u64,
+    redo_lsn: u64,
+    is_shutdown: bool,
+) {
+    let ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(checkpoint_lsn));
+    let redo_ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(redo_lsn));
+
+    pg_log_info(format!(
+        "tiko: tiko_perform_checkpoint: checkpoint {ckpt}, redo {redo_ckpt}, is_shutdown {is_shutdown}"
+    ));
 
     let store = match Store::try_get() {
         Ok(s) => s,
         Err(_) => return,
     };
 
-    let timeline_id = timeline_id;
-    let lsn = Lsn::new(checkpoint_lsn);
-    let _root_dir = tiko_root_path();
     let pgdata_dir = data_dir_path();
 
-    if IoControl::cache_is_available() {
-        // Normal path (server running under postmaster). Best-effort: a flush
-        // failure is logged as a warning but does not abort the checkpoint.
-        // Chunks that fail to reach the store will be absent from this
-        // checkpoint's delta manifest. PITR recovery for this interval will
-        // depend on WAL replay to reconstruct those blocks. If WAL is deleted
-        // before a later checkpoint captures them, those blocks become
-        // unrecoverable via PITR.
-        match IoControl::get_cache().flush_dirty() {
-            Ok((flushed_chunks, flushed_metas)) => {
-                pg_log_info(&format!(
-                    "tiko_checkpoint_flush: flushed {flushed_chunks} chunks and {flushed_metas} metas at lsn={lsn}"
-                ));
-            }
-            Err(e) => {
-                pg_log_warning(&format!(
-                    "tiko_checkpoint_flush: flush failed at lsn={lsn}: {e}"
-                ));
-            }
-        }
+    // Segment-based commit protocol: flush dirty chunks, write-lock fence,
+    // set redo_ckpt, drain backend drafts, write segment, advance active
+    // window, persist DbMeta.
+    if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt) {
+        pg_log_error(&format!(
+            "tiko: tiko_perform_checkpoint: run_commit_protocol failed at {ckpt}, redo {redo_ckpt}: {e}"
+        ));
     }
 
-    store.perform_checkpoint(timeline_id, lsn).ok();
+    // Shutdown checkpoint: fold accumulated segments into the base manifest
+    // inline. The Tiko bgworker (which normally runs compaction) is killed
+    // in `PM_STOP_BACKENDS` before the checkpointer reaches
+    // `PM_WAIT_XLOG_SHUTDOWN`, so there is no in-process compactor to race
+    // with. Cross-process compactors are handled by the existing
+    // `CompactionResult::Raced` detection inside `run_compaction`. Failure
+    // is non-fatal — shutdown still completes; the next startup picks up
+    // the extra segments via the normal hydrate path.
+    if is_shutdown {
+        if let Err(e) = store.run_compaction() {
+            pg_log_warning(format!(
+                "tiko: tiko_perform_checkpoint: shutdown compaction failed: {e}"
+            ));
+        }
+    }
 
     // Capture pg_state archive bytes — so the
     // archive reflects pg_control / pg_xact / etc. at the start of the
@@ -97,7 +96,7 @@ pub extern "C-unwind" fn tiko_checkpoint_flush(timeline_id: u32, checkpoint_lsn:
     if let Ok(_pg_state_bytes) = build_pg_state_archive(&pgdata_dir) {
         //upload_pg_state(store, ns, timeline, lsn, &pg_state_bytes)?;
     } else {
-        pg_log_error("Failed to build pg_state archive");
+        pg_log_error("tiko: tiko_perform_checkpoint: Failed to build pg_state archive");
     }
 }
 

@@ -40,7 +40,7 @@
 //! ├── submit_queue (SubmitQueue)
 //! ├── stats (IoStats)
 //! ├── cache (CacheControl)
-//! └── ckpt_hist (CkptHistory)  ← versioned express-bucket history
+//! └── timeline (TimelineState)        ← active window + base/head/redo + live-interval draft buffer
 //! BackendSlotPool[0]  ← immediately after IoControl (aligned)
 //! BackendSlotPool[1]
 //! ...
@@ -55,13 +55,6 @@
 //! AtomicRWLock[0..1024]       ← per-slot I/O locks (~4 KB, one per meta slot)
 //! ```
 
-use pgsys::{
-    common::{BlockNumber, ForkNumber, Oid, RelFileNumber, is_under_postmaster},
-    latch::{Latch, SetLatch},
-    logging::*,
-    lwlock::*,
-    shmem::{ShmemInitStruct, rust_get_addin_shmem_init_lock},
-};
 use std::mem::{align_of, size_of};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -72,10 +65,17 @@ use super::{
         CHUNK_NUM_BUCKETS, CHUNK_NUM_SLOTS, CacheControl, ChunkSlot, META_NUM_BUCKETS,
         META_NUM_SLOTS, MetaSlot,
     },
-    checkpoints::CkptHistory,
-    rwlock::AtomicRWLock,
     stats::IoStats,
-    store::Store,
+    timeline::TimelineState,
+    utils::rw_lock::AtomicRWLock,
+};
+use crate::error::{Error, Result};
+use pgsys::{
+    common::{BlockNumber, ForkNumber, Oid, RelFileNumber, is_under_postmaster},
+    latch::{Latch, SetLatch},
+    logging::*,
+    lwlock::*,
+    shmem::{ShmemInitStruct, rust_get_addin_shmem_init_lock},
 };
 
 // ── Constants ──
@@ -249,7 +249,7 @@ impl IoSlot {
     }
 
     /// Validate slot data before dispatching to Tokio.
-    pub fn validate(&self) -> Result<(), i32> {
+    pub fn validate(&self) -> std::result::Result<(), i32> {
         if self.op == IoOpKind::Invalid {
             return Err(libc::EINVAL);
         }
@@ -489,10 +489,11 @@ pub struct IoControl {
     /// I/O statistics
     pub stats: IoStats,
 
-    /// Versioned checkpoint history for express-bucket read path.
-    /// Newest-first list of (timeline_id, lsn) pairs written at each checkpoint.
-    /// Single writer (s3worker); all backends read via `LocalHistoryCache`.
-    pub(crate) ckpt_hist: CkptHistory,
+    /// Consolidated timeline state: active window + base/head/redo
+    /// checkpoints + generation counter + live-interval [`DraftBuffer`],
+    /// all under a shared/exclusive RWLock. See [`TimelineState`] for the
+    /// fencing model between record/drain and `head_ckpt` advances.
+    pub timeline: TimelineState,
 }
 
 impl IoControl {
@@ -538,10 +539,7 @@ impl IoControl {
         }
 
         self.stats.init();
-        self.ckpt_hist.init();
-
-        // Load checkpoint history from the store into shared memory.
-        Store::get().load_checkpoint_history(&mut self.ckpt_hist);
+        self.timeline.init();
     }
 
     /// Byte offset from the start of IoControl to the first BackendSlotPool.
@@ -618,8 +616,9 @@ impl IoControl {
 
     /// Total shared memory size for the control structure + backend pools + all arrays.
     pub fn shmem_size(max_backends: usize) -> usize {
+        // The last region is META per-slot I/O locks (one per meta slot).
         Self::meta_io_locks_offset(max_backends)
-            + CHUNK_NUM_SLOTS as usize * size_of::<AtomicRWLock>()
+            + META_NUM_SLOTS as usize * size_of::<AtomicRWLock>()
     }
 
     /// Get the backend slot pool for a given proc number.
@@ -708,9 +707,9 @@ impl IoControl {
     /// transitions Submitted → InProgress, validates, and dispatches.
     ///
     /// Returns the number of requests dispatched, or Err(()) on fatal error.
-    pub fn poll_submit_queue<F>(&self, mut dispatch: F) -> Result<u64, ()>
+    pub fn poll_submit_queue<F>(&self, mut dispatch: F) -> Result<u64>
     where
-        F: FnMut(IoWorkRequest) -> Result<(), TrySendError<IoWorkRequest>>,
+        F: FnMut(IoWorkRequest) -> Result<()>,
     {
         let mut dispatched_count = 0u64;
         let head = self.submit_queue.head.load(Ordering::Acquire);
@@ -775,7 +774,7 @@ impl IoControl {
                     entry.store(0, Ordering::Relaxed);
                     tail = tail.wrapping_add(1);
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(Error::TrySendError(err)) if matches!(err, TrySendError::Full(_)) => {
                     // Channel full — slot is InProgress but we can't dispatch yet.
                     // Revert to Submitted, leave entry in place for next poll.
                     slot.state
@@ -786,17 +785,17 @@ impl IoControl {
                     ));
                     break;
                 }
-                Err(TrySendError::Closed(_)) => {
+                Err(err) => {
                     // Fatal — fail the slot so the backend doesn't hang forever
                     pg_log_warning(&format!(
-                        "tiko: dispatcher disconnected, failing backend={} slot={}",
+                        "tiko: dispatcher failed, failing backend={} slot={}",
                         backend_id, slot_idx
                     ));
                     slot.fail_with_error(libc::EIO);
                     entry.store(0, Ordering::Relaxed);
                     tail = tail.wrapping_add(1);
                     self.submit_queue.tail.store(tail, Ordering::Release);
-                    return Err(());
+                    return Err(err);
                 }
             }
         }

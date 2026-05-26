@@ -8,8 +8,8 @@ pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";
 pub const ENV_DB_ID: &str = "TIKO_DB_ID";
 pub const ENV_PROJECT_ID: &str = "TIKO_PROJECT_ID";
 
-/// Environment variable for how often the PITR worker should materialize a new base manifest, in seconds (default: 3600).
-pub const ENV_PITR_INTERVAL_SECS: &str = "TIKO_PITR_INTERVAL_SECS";
+/// Environment variable for how often the compactor worker should materialize a new base manifest, in seconds (default: 3600).
+pub const ENV_COMPACT_INTERVAL_SECS: &str = "TIKO_COMPACT_INTERVAL_SECS";
 
 pub fn read_u64(name: &str) -> u64 {
     env::var(name)

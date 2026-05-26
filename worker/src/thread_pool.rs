@@ -9,11 +9,11 @@
 use pgsys::logging::*;
 use std::sync::{Once, OnceLock};
 
-use crate::tasks::compactor::{CompactorConfig, compactor_task};
-use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
+use crate::tasks::compactor::compactor_task;
+//use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
 use core::{
-    project::{ProjectCtx, ProjectNamespace},
-    store::Store,
+    //project::{ProjectCtx, ProjectNamespace},
+    io::store::Store,
 };
 
 /// Spawn the PITR background task on the Tokio runtime.
@@ -31,44 +31,35 @@ pub fn spawn_compactor_task() {
         return;
     };
 
-    let Some(ctx) = ProjectCtx::try_get() else {
-        pg_log_info("tiko: ProjectCtx not initialised; skipping compactor task");
-        return;
-    };
-
-    let Ok(sim) = Store::try_get() else {
+    let Ok(store) = Store::try_get() else {
         pg_log_warning("tiko: Store not initialised; skipping compactor task");
         return;
     };
 
-    let ns: ProjectNamespace = ctx.ns().clone();
-    let cfg = CompactorConfig::from_env();
-
-    runtime.spawn(compactor_task(sim, ns, cfg));
-    pg_log_info("tiko: compactor task spawned");
+    runtime.spawn(compactor_task(store));
 }
 
 /// Spawn the WAL receiver task on the Tokio runtime.
 ///
 /// Does nothing if the runtime, `ProjectCtx`, or `S3Sim` are not yet initialised.
 pub fn spawn_wal_receiver_task() {
-    let Some(runtime) = TOKIO_RUNTIME.get() else {
+    let Some(_runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_wal_receiver_task called before runtime init; skipping");
         return;
     };
 
-    let Some(ctx) = ProjectCtx::try_get() else {
-        pg_log_info("tiko: ProjectCtx not initialised; skipping WAL receiver task");
-        return;
-    };
+    // let Some(ctx) = ProjectCtx::try_get() else {
+    //     pg_log_info("tiko: ProjectCtx not initialised; skipping WAL receiver task");
+    //     return;
+    // };
 
-    let Ok(sim) = Store::try_get() else {
+    let Ok(_sim) = Store::try_get() else {
         pg_log_warning("tiko: Store not initialised; skipping WAL receiver task");
         return;
     };
 
-    let ns = ctx.ns().clone();
-    runtime.spawn(wal_receiver_task(sim, ns, WalReceiverConfig::default()));
+    // let ns = ctx.ns().clone();
+    //runtime.spawn(wal_receiver_task(sim, ns, WalReceiverConfig::default()));
     pg_log_info("tiko: WAL receiver task spawned");
 }
 

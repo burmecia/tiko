@@ -11,7 +11,7 @@ unset TIKO_ROOT_PATH
 TIKO_ORG_ID="12"
 TIKO_DB_ID="34"
 TIKO_PROJECT_ID="56"
-TIKO_PITR_INTERVAL_SECS="300"
+#TIKO_PITR_INTERVAL_SECS="300"
 
 rm -rf tt log.log
 ./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin/initdb -D tt

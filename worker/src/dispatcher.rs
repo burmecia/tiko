@@ -4,9 +4,10 @@
 //! The receiver half is returned from `Dispatcher::new()` and passed to
 //! `io_worker_loop`.
 
-use core::io_control::IoWorkRequest;
-use pgsys::logging::*;
 use tokio::sync::mpsc;
+
+use core::{error::Result, io_control::IoWorkRequest};
+use pgsys::logging::*;
 
 /// Dispatcher state — holds the sender half of a bounded tokio mpsc channel.
 pub struct Dispatcher {
@@ -31,10 +32,8 @@ impl Dispatcher {
     /// Send a work request to the Tokio thread pool.
     ///
     /// Returns `Err` with the request if the bounded queue is full or closed.
-    pub fn send_work(
-        &self,
-        request: IoWorkRequest,
-    ) -> Result<(), mpsc::error::TrySendError<IoWorkRequest>> {
-        self.work_sender.try_send(request)
+    pub fn send_work(&self, request: IoWorkRequest) -> Result<()> {
+        self.work_sender.try_send(request)?;
+        Ok(())
     }
 }

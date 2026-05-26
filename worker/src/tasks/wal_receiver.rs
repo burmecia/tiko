@@ -22,7 +22,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use core::{project::ProjectNamespace, store::Store};
+//use core::{project::ProjectNamespace, store::Store};
 use pgsys::common::XLOG_SEG_SIZE;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -65,7 +65,7 @@ impl Default for WalReceiverConfig {
 /// Never returns.  Reconnects with exponential backoff on any error.
 pub async fn wal_receiver_task(
     sim: &'static Store,
-    ns: ProjectNamespace,
+    //ns: ProjectNamespace,
     config: WalReceiverConfig,
 ) {
     tracing::info!(
@@ -75,7 +75,7 @@ pub async fn wal_receiver_task(
     );
     let mut backoff = Duration::from_secs(1);
     loop {
-        match run_streaming(sim, &ns, &config).await {
+        match run_streaming(sim,  &config).await {
             Ok(()) => {
                 tracing::info!("tiko: wal_receiver: connection closed, reconnecting");
                 backoff = Duration::from_secs(1);
@@ -284,7 +284,7 @@ async fn run_streaming(
 async fn handle_xlogdata(
     msg: &[u8],
     sim: &'static Store,
-    ns: &ProjectNamespace,
+    //ns: &ProjectNamespace,
     timeline: u32,
     cur_seg: &mut Option<SegState>,
     confirmed_lsn: &mut u64,
@@ -307,7 +307,7 @@ async fn handle_xlogdata(
     if let Some(state) = cur_seg.as_ref() {
         if state.seg_no != seg_no_new {
             let old = cur_seg.take().unwrap();
-            seal_segment(old, sim, ns, timeline, confirmed_lsn, conn).await?;
+            seal_segment(old, sim, timeline, confirmed_lsn, conn).await?;
         }
     }
 
@@ -344,7 +344,7 @@ async fn handle_xlogdata(
 async fn seal_segment(
     mut state: SegState,
     sim: &'static Store,
-    ns: &ProjectNamespace,
+    //ns: &ProjectNamespace,
     timeline: u32,
     confirmed_lsn: &mut u64,
     conn: &mut ReplConn,

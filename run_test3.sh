@@ -11,7 +11,7 @@ TIKO_ROOT_PATH="/Users/bolu/.tiko"
 TIKO_ORG_ID="456"
 TIKO_PROJECT_ID="42"
 TIKO_BRANCH_ID="1"
-TIKO_PITR_INTERVAL_SECS="300"
+#TIKO_PITR_INTERVAL_SECS="300"
 
 PG_BIN_DIR="./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin"
 

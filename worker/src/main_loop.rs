@@ -72,7 +72,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     let log_rx = log_relay::init();
 
     // Initialize Tokio runtime for async I/O
-    if let Err(e) = crate::thread_pool::init_tokio_runtime() {
+    if let Err(e) = thread_pool::init_tokio_runtime() {
         pg_log_error(&format!(
             "tiko: failed to initialize Tokio runtime: {:?}",
             e
@@ -86,8 +86,8 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     // Spawn io_worker_loop on Tokio — receives requests and spawns per-request tasks
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
 
-    // Spawn the PITR background task now that the runtime and ProjectCtx are initialised.
-    //thread_pool::spawn_compactor_task();
+    // Spawn the compactor background task now that the runtime and ProjectCtx are initialised.
+    thread_pool::spawn_compactor_task();
 
     // Spawn WAL streaming task.
     //thread_pool::spawn_wal_receiver_task();
@@ -122,7 +122,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         // Pop from submit queue and dispatch to Tokio
         match io_control.poll_submit_queue(|request| dispatcher.send_work(request)) {
             Ok(dispatched) => requests_processed += dispatched,
-            Err(()) => break, // fatal: dispatcher disconnected
+            Err(_) => break, // fatal: dispatcher disconnected
         }
 
         // Periodic logging

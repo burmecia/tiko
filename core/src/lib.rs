@@ -6,16 +6,15 @@ pub mod io;
 pub mod manifest;
 pub mod ops;
 pub mod org;
-pub mod project;
-pub mod recovery;
+//pub mod recovery;
 pub mod relfork;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag, RelFork};
 pub use error::{Error, Result};
-pub use io::store;
+pub use io::storage;
+pub use io::storage::{s3, s3_sim};
 pub use io::store::Store;
-pub use io::store::{backend, s3, s3_sim};
-pub use io::{cache, checkpoints, io_control};
+pub use io::{cache, io_control};
 
 use std::path::PathBuf;
 

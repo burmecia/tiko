@@ -6,7 +6,7 @@ use super::{CHAIN_NIL, MAX_USAGE_COUNT};
 use crate::{
     chunk::RelFork,
     error::{Error, Result},
-    io::{io_control::IoControl, rwlock::AtomicRWLock, store::Store},
+    io::{io_control::IoControl, store::Store, utils::rw_lock::AtomicRWLock},
     relfork::RelForkMeta,
 };
 use pgsys::common::BlockNumber;

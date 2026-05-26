@@ -125,6 +125,21 @@ impl AtomicRWLock {
     pub(crate) fn is_in_write(&self) -> bool {
         self.state.load(Ordering::Relaxed) == EXCLUSIVE
     }
+
+    /// Non-blocking write lock attempt. Returns `Some(guard)` if the lock
+    /// was acquired immediately, `None` if any other thread holds the lock
+    /// (read or write) or a writer is pending.
+    pub(crate) fn try_write(&self) -> Option<WriteGuard<'_>> {
+        if self
+            .state
+            .compare_exchange(0, EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(WriteGuard { lock: self })
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

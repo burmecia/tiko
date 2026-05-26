@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::store::Store;
-use crate::project::{ProjectMeta, ProjectNamespace};
+use crate::io::storage::Store;
+//use crate::project::{ProjectMeta, ProjectNamespace};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -80,7 +80,7 @@ impl OrgMeta {
     /// Both `org.json` and `project.json` are written in a single logical step —
     /// an org without a root project is an invalid state.
     pub fn create(sim: &Store, org_id: u64) -> Result<OrgMeta> {
-        let ns = ProjectNamespace::new(org_id, 0, 0);
+        // let ns = ProjectNamespace::new(org_id, 0, 0);
 
         let meta = OrgMeta {
             org_id,
@@ -92,12 +92,12 @@ impl OrgMeta {
             .map_err(Error::Store)?;
 
         // Write root project.json (no parent fields — this is the origin project).
-        ProjectMeta::create_root(sim, &ns).map_err(|e| {
-            Error::Store(crate::Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                e.to_string(),
-            )))
-        })?;
+        // ProjectMeta::create_root(sim, &ns).map_err(|e| {
+        //     Error::Store(crate::Error::Io(io::Error::new(
+        //         io::ErrorKind::Other,
+        //         e.to_string(),
+        //     )))
+        // })?;
 
         Ok(meta)
     }

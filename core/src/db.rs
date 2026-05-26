@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Mutex};
 
 use crate::env;
+use crate::io::timeline::Checkpoint;
 use pgsys::Lsn;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -41,8 +42,7 @@ struct DbMetaInner {
     parent_db_id: Option<u64>,
     parent_checkpoint_lsn: Option<Lsn>,
     parent_timeline_id: Option<u32>,
-    timeline_id: u32,
-    checkpoint_lsn: Lsn,
+    checkpoint: Checkpoint,
     created_at: i64,
     status: String,
     deleted_at: Option<i64>,
@@ -59,8 +59,7 @@ impl DbMeta {
             parent_db_id: None,
             parent_checkpoint_lsn: None,
             parent_timeline_id: None,
-            timeline_id: 1,
-            checkpoint_lsn: Lsn::default(),
+            checkpoint: Checkpoint::default(),
             // created_at: chrono::Utc::now().timestamp(),
             created_at: 0,
             status: "active".to_string(),
@@ -71,10 +70,9 @@ impl DbMeta {
         }
     }
 
-    pub(crate) fn set_checkpoint_lsn(&self, timeline_id: u32, lsn: Lsn) {
+    pub(crate) fn set_checkpoint_lsn(&self, ckpt: &Checkpoint) {
         let mut inner = self.inner.lock().unwrap();
-        inner.timeline_id = timeline_id;
-        inner.checkpoint_lsn = lsn;
+        inner.checkpoint = *ckpt;
     }
 
     pub(crate) fn load_from_json_bytes(&self, bytes: &[u8]) {

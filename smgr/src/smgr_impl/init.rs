@@ -1,5 +1,5 @@
+use core::io::store::Store;
 use core::io_control::IoControl;
-use core::store::Store;
 use pgsys::{
     common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number},
     logging::*,
@@ -14,12 +14,11 @@ pub extern "C-unwind" fn tiko_init() {
         crate::WAIT_EVENT_TIKO_IO_WRITE = new_wait_event(c"TikoIOWrite".as_ptr());
     }
 
-    // Initialize Store unconditionally — needed for both initdb and normal run.
-    Store::init();
-
     unsafe {
         // Explicitly attach to shared memory in this backend process.
         // ShmemInitStruct looks up the existing block (found=true), no reinitialization.
+        // Must run before `Store::init` so `hydrate_timeline_state` inside
+        // `Store::init` can consult `IoControl`.
         let total_procs = (MaxBackends + NUM_AUXILIARY_PROCS) as usize;
         let control = IoControl::init_or_attach(total_procs);
 
@@ -29,5 +28,11 @@ pub extern "C-unwind" fn tiko_init() {
         pool.attach();
 
         pg_log_debug1(&format!("tiko_init: backend {} pool attached", proc_num));
+    }
+
+    // Initialize Store — needed for both initdb and normal run. Also hydrates
+    // the timeline state from existing segments on its first call.
+    if let Err(e) = Store::init() {
+        pg_log_warning(&format!("tiko_init: Store::init failed: {e}"));
     }
 }

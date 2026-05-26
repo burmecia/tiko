@@ -13,18 +13,37 @@
 //! # TIKM file format
 //!
 //! ```text
-//! Header (32 bytes):
+//! Header (40 bytes):
 //!   magic:          [u8; 4] = b"TIKM"
 //!   version:        u32 = 1            (little-endian)
-//!   checkpoint_lsn: u64                (little-endian)
+//!   timeline_id:    u32                (little-endian)   ┐
+//!   _pad:           [u8; 4] = 0                          │ checkpoint
+//!   lsn:            u64                (little-endian)   ┘
 //!   timestamp:      i64 (unix secs)    (little-endian)
-//!   entry_count:    u64                (little-endian)
+//!   entry_count:    u64                (little-endian)   chunk count
 //!
-//! Body (entry_count × 40 bytes, sorted ascending by ChunkTag):
+//! Chunk body (entry_count × 40 bytes, sorted ascending by ChunkTag):
 //!   ChunkTag  20 bytes  (spc_oid u32, db_oid u32, rel_number u32,
 //!                         fork_number i32, chunk_id u32 — all LE)
-//!   ChunkRef  20 bytes  (branch_id u64, timeline_id u32, lsn u64 — all LE)
+//!   ChunkRef  20 bytes  (db_id u64, timeline_id u32, lsn u64 — all LE)
+//!
+//! Meta header (8 bytes):
+//!   meta_count:     u64                (little-endian)
+//!
+//! Meta body (meta_count × 24 bytes, sorted ascending by RelFork):
+//!   RelFork   16 bytes  (spc_oid u32, db_oid u32, rel_number u32,
+//!                         fork_number i32 — all LE)
+//!   nblocks   u32       (little-endian)
+//!   deleted   u8        (0 = false, nonzero = true)
+//!   _pad      3 bytes   (zero)
 //! ```
+//!
+//! Both lookups (chunks and relfork meta) are O(log N) `pread` binary
+//! searches over the sorted on-disk sections — no in-memory copies.
+//!
+//! The file is published via per-PID tmp + atomic `rename`, so concurrent
+//! writers from multiple processes never tear the visible file. Readers
+//! attach to an existing file with [`Manifest::open_local`] without writing.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -32,25 +51,30 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use pgsys::Lsn;
+use pgsys::timeline_id::TimelineId;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
-use crate::error::Result;
-use crate::io::store::Store;
-use crate::project::{ProjectCtx, ProjectNamespace};
-use crate::relfork::RelForkMeta;
+use crate::error::{Error, Result};
+use crate::io::timeline::{Checkpoint, SegmentCheckpoint};
+use crate::relfork::{REL_FORK_SIZE, RelForkMeta};
 
 // ── TIKM constants ──
 
 const TIKM_MAGIC: [u8; 4] = *b"TIKM";
 const TIKM_VERSION: u32 = 1;
+/// Filename of the local TIKM cache file under the tiko root path.
+const BASE_MANIFEST_FILE_NAME: &str = "base_manifest.tikm";
 /// Header size in bytes.
-const HEADER_SIZE: usize = 32;
-/// Entry size in bytes (ChunkTag[20] + ChunkRef[20]).
+const HEADER_SIZE: usize = 40;
+/// Chunk-entry size in bytes (ChunkTag[20] + ChunkRef[20]).
 const ENTRY_SIZE: usize = CHUNK_TAG_SIZE + CHUNK_REF_SIZE;
+/// Meta-entry size in bytes (RelFork[16] + nblocks[4] + deleted[1] + pad[3]).
+const META_ENTRY_SIZE: usize = REL_FORK_SIZE + 8;
+/// Size of the meta-section header (`meta_count` u64).
+const META_HEADER_SIZE: usize = 8;
 
 // ── ChunkRef ──
 
@@ -61,12 +85,12 @@ const ENTRY_SIZE: usize = CHUNK_TAG_SIZE + CHUNK_REF_SIZE;
 /// between `timeline_id: u32` and `lsn: u64`), while the wire encoding is 20
 /// bytes. The wire size is enforced by `encode() -> [u8; 20]`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct ChunkRef {
-    /// Branch-scoped id: selects `{org}/chunks/{branch_id}/` in the standard bucket.
-    pub branch_id: u64,
+pub(crate) struct ChunkRef {
+    /// Branch-scoped id: selects `{org}/chunks/{db_id}/` in the standard bucket.
+    pub db_id: u64,
     /// Timeline on which this chunk version was written.
-    /// Together with `branch_id` and `lsn`, uniquely identifies the S3 object:
-    /// `{org}/chunks/{branch_id}/{tag}/{timeline_id:08X}/{lsn_hex}`.
+    /// Together with `db_id` and `lsn`, uniquely identifies the S3 object:
+    /// `{org}/chunks/{db_id}/{tag}/{timeline_id:08X}/{lsn_hex}`.
     pub timeline_id: u32,
     /// Checkpoint LSN at which this chunk version was sealed.
     pub lsn: Lsn,
@@ -75,7 +99,7 @@ pub struct ChunkRef {
 impl ChunkRef {
     fn encode(&self) -> [u8; 20] {
         let mut buf = [0u8; 20];
-        buf[0..8].copy_from_slice(&self.branch_id.to_le_bytes());
+        buf[0..8].copy_from_slice(&self.db_id.to_le_bytes());
         buf[8..12].copy_from_slice(&self.timeline_id.to_le_bytes());
         buf[12..20].copy_from_slice(&self.lsn.as_u64().to_le_bytes());
         buf
@@ -83,7 +107,7 @@ impl ChunkRef {
 
     fn decode(buf: &[u8; 20]) -> Self {
         ChunkRef {
-            branch_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            db_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             timeline_id: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
             lsn: Lsn::new(u64::from_le_bytes(buf[12..20].try_into().unwrap())),
         }
@@ -96,42 +120,44 @@ const CHUNK_REF_SIZE: usize = 20;
 // encoding is 20 (explicit encode/decode, no padding). Catches accidental layout changes.
 const _: () = assert!(std::mem::size_of::<ChunkRef>() == 24);
 
-// ── ManifestInner ──
-
-struct ManifestInner {
-    checkpoint_lsn: Lsn,
-    timestamp: i64,
-    /// Path to the local TIKM binary file.
-    path: PathBuf,
-    /// Read handle; replaced on `apply_deltas` (new file, same path after rename).
-    file: File,
-    /// Total number of 36-byte entries in the current file.
-    entry_count: u64,
-    /// Block count per relation fork: `RelFork → nblocks`.
-    /// Carried in the msgpack wire format only; not stored in the TIKM binary.
-    fork_nblocks: HashMap<RelFork, u32>,
-    /// Relation forks dropped during this checkpoint interval.
-    /// Carried in the msgpack wire format only; always empty in a base manifest.
-    deleted_forks: Vec<RelFork>,
-    /// Number of dirty chunks that failed to flush to express during this
-    /// checkpoint. Non-zero means the manifest is incomplete: those chunks
-    /// are absent and recovery via WAL replay is required to reconstruct them.
-    /// Carried in the msgpack wire format only; always 0 in a base manifest.
-    flush_failures: u32,
-
-    relfork_map: HashMap<RelFork, RelForkMeta>,
-}
-
 // ── Manifest ──
 
 /// File-backed sorted manifest for chunk lookup and PITR merge operations.
 ///
-/// Invariant: the local TIKM file at `path` is always valid with entries sorted
-/// ascending by `ChunkTag`. Only `new`, `from_bytes`, and `apply_deltas`
-/// may create or overwrite this file.
-pub struct Manifest {
-    /// All mutable state; replaced atomically on `apply_deltas`.
-    inner: Mutex<ManifestInner>,
+/// An immutable snapshot of one TIKM file. All public methods take `&self`
+/// and read from `file` via `pread`, which is safe for concurrent use on a
+/// shared FD. The compactor produces a new `Manifest` by calling
+/// [`Self::apply_segments`] followed by [`Self::commit_applied`]; the caller
+/// then swaps the new value in (typically behind an `Arc` on `Store`).
+///
+/// Invariant: the local TIKM file at `path` is always valid with entries
+/// sorted ascending by `ChunkTag`.
+pub(crate) struct Manifest {
+    checkpoint: Checkpoint,
+    timestamp: i64,
+    /// Path to the local TIKM binary file.
+    path: PathBuf,
+    /// Read handle. Multiple `Arc<Manifest>` readers can `pread` the same
+    /// FD concurrently. When a new `Manifest` replaces this one, this FD
+    /// keeps pointing at the now-unlinked old inode for as long as any
+    /// `Arc` reference is alive.
+    file: File,
+    /// Number of chunk entries in the chunk body.
+    entry_count: u64,
+    /// Number of meta entries in the meta body.
+    meta_count: u64,
+}
+
+impl Manifest {
+    /// Byte offset of the meta-section header inside the file.
+    fn meta_header_offset(&self) -> u64 {
+        HEADER_SIZE as u64 + self.entry_count * ENTRY_SIZE as u64
+    }
+
+    /// Byte offset of the first meta-entry in the file.
+    fn meta_body_offset(&self) -> u64 {
+        self.meta_header_offset() + META_HEADER_SIZE as u64
+    }
 }
 
 // ── Low-level file I/O ──
@@ -152,59 +178,89 @@ fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Write a TIKM file from a **pre-sorted** `chunks` slice. Returns an open
-/// read handle to the written file.
+/// Write a TIKM file from pre-sorted `chunks` and `meta` slices. Returns an
+/// open read handle to the published file.
 ///
+/// Atomicity: writes to a per-PID tmp path, then renames over `path`.
+/// Concurrent writers from other processes cannot tear the visible file.
 /// Creates parent directories as needed.
 fn write_tikm(
     path: &Path,
-    checkpoint_lsn: Lsn,
+    checkpoint: Checkpoint,
     timestamp: i64,
     chunks: &[(ChunkTag, ChunkRef)],
-) -> io::Result<File> {
+    meta: &[(RelFork, RelForkMeta)],
+) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
+    let tmp_path = path.with_extension(format!("tikm.{}.tmp", std::process::id()));
     let mut f = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)?;
+        .open(&tmp_path)?;
 
-    // Header (32 bytes): magic[4] + version[4] + checkpoint_lsn[8] +
-    //                    timestamp[8] + entry_count[8]
-    let mut header = [0u8; 32];
+    // Header (40 bytes): magic[4] + version[4] + timeline_id[4] + _pad[4] +
+    //                    lsn[8] + timestamp[8] + entry_count[8]
+    let mut header = [0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(&TIKM_MAGIC);
     header[4..8].copy_from_slice(&TIKM_VERSION.to_le_bytes());
-    header[8..16].copy_from_slice(&checkpoint_lsn.as_u64().to_le_bytes());
-    header[16..24].copy_from_slice(&timestamp.to_le_bytes());
-    header[24..32].copy_from_slice(&(chunks.len() as u64).to_le_bytes());
+    header[8..12].copy_from_slice(&checkpoint.timeline_id.as_u32().to_le_bytes());
+    // header[12..16] = padding (already zero)
+    header[16..24].copy_from_slice(&checkpoint.lsn.as_u64().to_le_bytes());
+    header[24..32].copy_from_slice(&timestamp.to_le_bytes());
+    header[32..40].copy_from_slice(&(chunks.len() as u64).to_le_bytes());
     f.write_all(&header)?;
 
-    // Entries (sorted ascending by ChunkTag)
+    // Chunk body (sorted ascending by ChunkTag).
     for (tag, cref) in chunks {
         f.write_all(&tag.encode())?;
         f.write_all(&cref.encode())?;
     }
+
+    // Meta header: count.
+    f.write_all(&(meta.len() as u64).to_le_bytes())?;
+    // Meta body (sorted ascending by RelFork).
+    let mut entry = [0u8; META_ENTRY_SIZE];
+    for (rf, m) in meta {
+        entry.fill(0);
+        entry[0..REL_FORK_SIZE].copy_from_slice(&rf.encode());
+        entry[REL_FORK_SIZE..REL_FORK_SIZE + 4].copy_from_slice(&m.nblocks.to_le_bytes());
+        entry[REL_FORK_SIZE + 4] = m.deleted as u8;
+        f.write_all(&entry)?;
+    }
+
     f.flush()?;
     drop(f);
 
-    // Reopen read-only for the handle stored in ManifestInner
-    File::open(path)
+    fs::rename(&tmp_path, path)?;
+
+    // Reopen read-only for the handle stored in ManifestInner.
+    let file = File::open(path)?;
+    Ok(file)
+}
+
+/// Decode one meta entry from a fixed-size buffer.
+fn decode_meta_entry(buf: &[u8; META_ENTRY_SIZE]) -> (RelFork, RelForkMeta) {
+    let rf = RelFork::decode(buf[0..REL_FORK_SIZE].try_into().unwrap());
+    let nblocks = u32::from_le_bytes(buf[REL_FORK_SIZE..REL_FORK_SIZE + 4].try_into().unwrap());
+    let deleted = buf[REL_FORK_SIZE + 4] != 0;
+    (rf, RelForkMeta { nblocks, deleted })
 }
 
 // ── Private helpers ──
 
-/// Sequential `pread` of all entries starting at HEADER_SIZE.
-fn read_all_entries(inner: &ManifestInner) -> io::Result<Vec<(ChunkTag, ChunkRef)>> {
-    let n = inner.entry_count as usize;
+/// Sequential `pread` of all chunk entries starting at `HEADER_SIZE`.
+fn read_all_entries(manifest: &Manifest) -> io::Result<Vec<(ChunkTag, ChunkRef)>> {
+    let n = manifest.entry_count as usize;
     if n == 0 {
         return Ok(Vec::new());
     }
     let byte_len = n * ENTRY_SIZE;
     let mut buf = vec![0u8; byte_len];
-    pread_exact(&inner.file, &mut buf, HEADER_SIZE as _)?;
+    pread_exact(&manifest.file, &mut buf, HEADER_SIZE as _)?;
 
     let mut entries = Vec::with_capacity(n);
     for i in 0..n {
@@ -220,6 +276,25 @@ fn read_all_entries(inner: &ManifestInner) -> io::Result<Vec<(ChunkTag, ChunkRef
     Ok(entries)
 }
 
+/// Sequential `pread` of all meta entries (sorted ascending by `RelFork`).
+fn read_all_meta_entries(manifest: &Manifest) -> io::Result<Vec<(RelFork, RelForkMeta)>> {
+    let n = manifest.meta_count as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let byte_len = n * META_ENTRY_SIZE;
+    let mut buf = vec![0u8; byte_len];
+    pread_exact(&manifest.file, &mut buf, manifest.meta_body_offset())?;
+
+    let mut entries = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = i * META_ENTRY_SIZE;
+        let slice: &[u8; META_ENTRY_SIZE] = buf[off..off + META_ENTRY_SIZE].try_into().unwrap();
+        entries.push(decode_meta_entry(slice));
+    }
+    Ok(entries)
+}
+
 // ── Manifest impl ──
 
 impl Manifest {
@@ -228,197 +303,112 @@ impl Manifest {
     ///
     /// `fork_nblocks` is carried in the msgpack wire format (`to_bytes`) but not
     /// in the local TIKM binary. Pass `HashMap::new()` when nblocks are unknown.
-    /// Create a zero-entry manifest at `Lsn::INVALID` (used as a bootstrap
-    /// starting point before the first real base exists).
-    pub fn empty(path: &Path) -> io::Result<Self> {
-        Self::new(Lsn::INVALID, 0, vec![], HashMap::new(), vec![], path)
+    /// Create a zero-entry manifest at the default checkpoint (used as a
+    /// bootstrap starting point before the first real base exists).
+    pub fn empty(root_path: &Path) -> Result<Self> {
+        Self::new(Checkpoint::default(), 0, vec![], HashMap::new(), root_path)
     }
 
     pub fn new(
-        checkpoint_lsn: Lsn,
+        checkpoint: Checkpoint,
         timestamp: i64,
         mut chunks: Vec<(ChunkTag, ChunkRef)>,
-        fork_nblocks: HashMap<RelFork, u32>,
-        deleted_forks: Vec<RelFork>,
-        path: &Path,
-    ) -> io::Result<Self> {
+        meta_map: HashMap<RelFork, RelForkMeta>,
+        root_path: &Path,
+    ) -> Result<Self> {
         chunks.sort_unstable_by_key(|(tag, _)| *tag);
-        let file = write_tikm(path, checkpoint_lsn, timestamp, &chunks)?;
+        let mut meta: Vec<(RelFork, RelForkMeta)> = meta_map.into_iter().collect();
+        meta.sort_unstable_by_key(|(rf, _)| *rf);
+        let path = root_path.join(BASE_MANIFEST_FILE_NAME);
+        let file = write_tikm(&path, checkpoint, timestamp, &chunks, &meta)?;
         Ok(Manifest {
-            inner: Mutex::new(ManifestInner {
-                checkpoint_lsn,
-                timestamp,
-                path: path.to_path_buf(),
-                file,
-                entry_count: chunks.len() as u64,
-                fork_nblocks,
-                deleted_forks,
-                flush_failures: 0,
-                relfork_map: HashMap::new(),
-            }),
+            checkpoint,
+            timestamp,
+            path: path.to_path_buf(),
+            file,
+            entry_count: chunks.len() as u64,
+            meta_count: meta.len() as u64,
         })
     }
 
-    /// Open an existing local TIKM file; validate `magic` + `version`; read
-    /// header metadata. Used at startup to avoid re-downloading from S3.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let mut header = [0u8; 32];
+    /// Open the existing local TIKM file under `root_path` in-place — read
+    /// the header, validate magic + version, and attach to the file without
+    /// rewriting it. Used by [`crate::io::store::Store::load_manifest_at`]
+    /// when a sibling process already published the canonical file (e.g.
+    /// the compactor).
+    pub fn open_local(root_path: &Path) -> Result<Self> {
+        let path = root_path.join(BASE_MANIFEST_FILE_NAME);
+        let file = File::open(&path)?;
+        let mut header = [0u8; HEADER_SIZE];
         pread_exact(&file, &mut header, 0)?;
 
         if header[0..4] != TIKM_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid TIKM magic",
-            ));
+            return Err(Error::invalid_data("invalid TIKM magic"));
         }
         let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
         if version != TIKM_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported TIKM version: {version}"),
-            ));
+            return Err(Error::invalid_data(format!(
+                "unsupported TIKM version: {version}"
+            )));
         }
-        let checkpoint_lsn = Lsn::new(u64::from_le_bytes(header[8..16].try_into().unwrap()));
-        let timestamp = i64::from_le_bytes(header[16..24].try_into().unwrap());
-        let entry_count = u64::from_le_bytes(header[24..32].try_into().unwrap());
+
+        let timeline_id = TimelineId::new(u32::from_le_bytes(header[8..12].try_into().unwrap()));
+        let lsn = Lsn::new(u64::from_le_bytes(header[16..24].try_into().unwrap()));
+        let timestamp = i64::from_le_bytes(header[24..32].try_into().unwrap());
+        let entry_count = u64::from_le_bytes(header[32..40].try_into().unwrap());
+
+        // Meta count lives in an 8-byte header immediately after the chunk body.
+        let meta_header_offset = HEADER_SIZE as u64 + entry_count * ENTRY_SIZE as u64;
+        let mut meta_count_buf = [0u8; META_HEADER_SIZE];
+        pread_exact(&file, &mut meta_count_buf, meta_header_offset)?;
+        let meta_count = u64::from_le_bytes(meta_count_buf);
 
         Ok(Manifest {
-            inner: Mutex::new(ManifestInner {
-                checkpoint_lsn,
-                timestamp,
-                path: path.to_path_buf(),
-                file,
-                entry_count,
-                fork_nblocks: HashMap::new(),
-                deleted_forks: vec![],
-                flush_failures: 0,
-                relfork_map: HashMap::new(),
-            }),
+            checkpoint: Checkpoint::new(timeline_id, lsn),
+            timestamp,
+            path,
+            file,
+            entry_count,
+            meta_count,
         })
     }
 
     /// Deserialize from the S3 wire format (`msgpack(...)`).
     /// Writes the decoded entries to a local TIKM file at `path`.
     ///
-    /// Wire format: 6-tuple `(lsn, timestamp, chunks, fork_nblocks, deleted_forks, flush_failures)`.
-    /// Old 5-tuple format (without `flush_failures`) is accepted for backward compatibility.
-    pub fn from_bytes(data: &[u8], path: &Path) -> io::Result<Self> {
-        // Try new 6-tuple format first; fall back to old 5-tuple.
-        let (checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks, flush_failures) =
-            if let Ok((lsn, ts, ch, nb, df, ff)) = rmp_serde::from_slice::<(
-                Lsn,
-                i64,
-                Vec<(ChunkTag, ChunkRef)>,
-                HashMap<RelFork, u32>,
-                Vec<RelFork>,
-                u32,
-            )>(data)
-            {
-                (lsn, ts, ch, nb, df, ff)
-            } else {
-                let (lsn, ts, ch, nb, df): (
-                    Lsn,
-                    i64,
-                    Vec<(ChunkTag, ChunkRef)>,
-                    HashMap<RelFork, u32>,
-                    Vec<RelFork>,
-                ) = rmp_serde::from_slice(data)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                (lsn, ts, ch, nb, df, 0)
-            };
+    /// Wire format: 4-tuple `(checkpoint, timestamp, chunks, meta_map)`.
+    pub fn from_bytes(data: &[u8], root_path: &Path) -> Result<Self> {
+        let (checkpoint, timestamp, chunks, meta_map): (
+            Checkpoint,
+            i64,
+            Vec<(ChunkTag, ChunkRef)>,
+            HashMap<RelFork, RelForkMeta>,
+        ) = rmp_serde::from_slice(data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let m = Self::new(
-            checkpoint_lsn,
-            timestamp,
-            chunks,
-            fork_nblocks,
-            deleted_forks,
-            path,
-        )?;
-        m.inner.lock().unwrap().flush_failures = flush_failures;
-        Ok(m)
+        Self::new(checkpoint, timestamp, chunks, meta_map, root_path)
     }
 
-    /// Serialize to the S3 wire format (`msgpack(...)`).
-    ///
-    /// Format: 6-tuple `(checkpoint_lsn, timestamp, chunks, fork_nblocks, deleted_forks, flush_failures)`.
-    pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let inner = self.inner.lock().unwrap();
-        let entries = read_all_entries(&inner)?;
-        rmp_serde::to_vec(&(
-            inner.checkpoint_lsn,
-            inner.timestamp,
-            &entries,
-            &inner.fork_nblocks,
-            &inner.deleted_forks,
-            inner.flush_failures,
-        ))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    /// Return the checkpoint LSN recorded in the manifest header.
-    pub fn checkpoint_lsn(&self) -> Lsn {
-        self.inner.lock().unwrap().checkpoint_lsn
-    }
-
-    /// Number of dirty chunks that failed to flush to express during this
-    /// checkpoint. Non-zero means the manifest is incomplete and WAL replay
-    /// is required to recover the missing blocks.
-    pub fn flush_failures(&self) -> u32 {
-        self.inner.lock().unwrap().flush_failures
-    }
-
-    /// Set the flush failure count. Called by the checkpoint after
-    /// `flush_all_dirty_chunks` reports failures.
-    pub fn set_flush_failures(&self, n: u32) {
-        self.inner.lock().unwrap().flush_failures = n;
-    }
-
-    /// Return the timestamp recorded in the manifest header.
-    pub fn timestamp(&self) -> i64 {
-        self.inner.lock().unwrap().timestamp
-    }
-
-    /// Return all `(ChunkTag, ChunkRef)` entries from the on-disk TIKM file.
-    pub fn entries(&self) -> io::Result<Vec<(ChunkTag, ChunkRef)>> {
-        let inner = self.inner.lock().unwrap();
-        read_all_entries(&inner)
-    }
-
-    /// Return the `fork_nblocks` map (populated from the S3 wire format only;
-    /// empty when opened from a local TIKM file via [`Manifest::open`]).
-    pub fn fork_nblocks(&self) -> HashMap<RelFork, u32> {
-        self.inner.lock().unwrap().fork_nblocks.clone()
-    }
-
-    /// Canonical local path for the base manifest TIKM file.
-    pub fn local_manifest_path(root_dir: &Path) -> PathBuf {
-        root_dir.join("base_manifest.bin")
-    }
-
-    /// Canonical local path for the recovery manifest TIKM file.
-    pub fn recovery_manifest_path(root_dir: &Path) -> PathBuf {
-        root_dir.join("recovery_manifest.bin")
+    /// Return the checkpoint recorded in the manifest header.
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.checkpoint
     }
 
     /// Binary search for `key` in the sorted on-disk TIKM file.
     /// Returns `Ok(Some(ChunkRef))` on hit, `Ok(None)` on miss.
     pub fn lookup(&self, key: &ChunkTag) -> Result<Option<ChunkRef>> {
-        let inner = self.inner.lock().unwrap();
-        let entry_count = inner.entry_count;
-        if entry_count == 0 {
+        if self.entry_count == 0 {
             return Ok(None);
         }
 
         let mut lo: u64 = 0;
-        let mut hi: u64 = entry_count;
+        let mut hi: u64 = self.entry_count;
         let mut buf = [0u8; 40];
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let offset = HEADER_SIZE as u64 + mid * ENTRY_SIZE as u64;
-            pread_exact(&inner.file, &mut buf, offset)?;
+            pread_exact(&self.file, &mut buf, offset)?;
 
             let tag = ChunkTag::decode(buf[0..CHUNK_TAG_SIZE].try_into().unwrap());
             match tag.cmp(key) {
@@ -434,89 +424,126 @@ impl Manifest {
         Ok(None)
     }
 
-    /// Apply a sequence of delta manifests onto `self`, updating the on-disk
-    /// TIKM file in place via an atomic rename.
-    ///
-    /// - Delta entries with a higher LSN than the base entry for the same
-    ///   `ChunkTag` win; on equal LSN the base (self) entry is kept.
-    /// - `checkpoint_lsn` and `timestamp` are updated to the last non-empty
-    ///   delta's values.
-    /// - An empty `deltas` slice is a no-op (no file I/O).
-    ///
-    /// # Panics (debug only)
-    /// Panics if `deltas` are not in ascending `checkpoint_lsn` order.
-    pub fn apply_deltas(&self, deltas: &[Manifest]) -> io::Result<()> {
-        if deltas.is_empty() {
-            return Ok(());
+    /// Binary search for `rf` in the sorted on-disk meta section. Returns
+    /// `Ok(Some(meta))` on hit, `Ok(None)` on miss. Symmetric with
+    /// [`Self::lookup`] for chunks — no in-memory `HashMap`.
+    pub(crate) fn lookup_relfork_meta(&self, rf: &RelFork) -> Result<Option<RelForkMeta>> {
+        if self.meta_count == 0 {
+            return Ok(None);
         }
+        let body_offset = self.meta_body_offset();
+        let mut lo: u64 = 0;
+        let mut hi: u64 = self.meta_count;
+        let mut buf = [0u8; META_ENTRY_SIZE];
 
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let offset = body_offset + mid * META_ENTRY_SIZE as u64;
+            pread_exact(&self.file, &mut buf, offset)?;
+            let parsed_rf = RelFork::decode(buf[0..REL_FORK_SIZE].try_into().unwrap());
+            match parsed_rf.cmp(rf) {
+                Ordering::Equal => {
+                    let nblocks = u32::from_le_bytes(
+                        buf[REL_FORK_SIZE..REL_FORK_SIZE + 4].try_into().unwrap(),
+                    );
+                    let deleted = buf[REL_FORK_SIZE + 4] != 0;
+                    return Ok(Some(RelForkMeta { nblocks, deleted }));
+                }
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Apply a sequence of [`SegmentCheckpoint`] summaries (in
+    /// **ascending checkpoint LSN order** — oldest first) onto `self`,
+    /// updating the on-disk TIKM file in place via an atomic rename.
+    ///
+    /// - For each chunk in `segment.chunks`, the resulting `ChunkRef` points
+    ///   to the same checkpoint prefix used at write time
+    ///   (`segment.prev_ckpt`), matching the S3 layout consumed by
+    ///   [`crate::io::locator::Locator::chunk_base`].
+    /// - On conflict (same `ChunkTag` appears in multiple segments), the
+    ///   higher-LSN `ChunkRef` wins.
+    /// - `meta_map` entries are last-write-wins by iteration order; segments
+    ///   are processed in the order given, so the newest segment's
+    ///   `RelForkMeta` per relfork wins.
+    /// - `checkpoint_lsn` and `timestamp` advance to the newest non-empty
+    ///   segment-checkpoint's values.
+    /// - An empty `segments` slice is a no-op.
+    /// Compute the merged manifest from `segments` applied on top of `self`.
+    /// Pure: does not touch the local TIKM file or `self`'s internal state.
+    /// Returns the merged state + S3 wire bytes for the caller to publish.
+    ///
+    /// The caller is expected to (in order):
+    /// 1. PUT [`AppliedManifest::bytes`] to S3.
+    /// 2. Call [`Self::commit_applied`] to atomically rewrite the local TIKM
+    ///    file and advance internal state.
+    ///
+    /// Splitting the work lets the caller interleave the S3 PUT without
+    /// holding the manifest lock, and ensures the local file is never
+    /// published ahead of S3.
+    pub fn apply_segments(&self, segments: &[SegmentCheckpoint]) -> Result<AppliedManifest> {
         debug_assert!(
-            deltas
-                .windows(2)
-                .all(|w| w[0].checkpoint_lsn() <= w[1].checkpoint_lsn()),
-            "deltas must be in ascending LSN order"
+            segments.windows(2).all(|w| w[0].ckpt <= w[1].ckpt),
+            "segments must be in ascending Checkpoint order"
         );
 
-        let mut inner = self.inner.lock().unwrap();
-
-        // Collect all delta entries; track the last non-empty delta's metadata.
-        let mut combined_delta: Vec<(ChunkTag, ChunkRef)> = Vec::new();
-        let mut last_lsn = inner.checkpoint_lsn;
-        let mut last_ts = inner.timestamp;
-        // Start with self's fork_nblocks; delta wins per fork key.
-        let mut merged_nblocks: HashMap<RelFork, u32> = inner.fork_nblocks.clone();
-        let mut deleted_set: HashSet<RelFork> = HashSet::new();
-
-        for delta in deltas {
-            let delta_inner = delta.inner.lock().unwrap();
-            let entries = read_all_entries(&delta_inner)?;
-            if !entries.is_empty() {
-                last_lsn = delta_inner.checkpoint_lsn;
-                last_ts = delta_inner.timestamp;
+        // 1. Collect (tag, ChunkRef) entries and merge relfork meta updates
+        //    from every segment. Track the highest segment ckpt to advance
+        //    manifest metadata.
+        let mut combined: Vec<(ChunkTag, ChunkRef)> = Vec::new();
+        let mut new_meta: HashMap<RelFork, RelForkMeta> = HashMap::new();
+        let mut last_ckpt = self.checkpoint;
+        let mut last_ts = self.timestamp;
+        for seg in segments {
+            if !seg.chunks.is_empty() || !seg.relforks.is_empty() {
+                last_ckpt = seg.ckpt;
             }
-            combined_delta.extend(entries);
-            // Delta's nblocks win over base's nblocks.
-            for (&k, &v) in &delta_inner.fork_nblocks {
-                merged_nblocks.insert(k, v);
+            let cref = ChunkRef {
+                db_id: 0,
+                timeline_id: seg.prev_ckpt.timeline_id.as_u32(),
+                lsn: seg.prev_ckpt.lsn,
+            };
+            for &tag in &seg.chunks {
+                combined.push((tag, cref));
             }
-            for &rf in &delta_inner.deleted_forks {
-                deleted_set.insert(rf);
+            // Last-write-wins for relfork meta (segments oldest-first).
+            for (rf, meta) in &seg.relforks {
+                new_meta.insert(*rf, meta.clone());
             }
-            // delta_inner lock released here
         }
+        last_ts = chrono::Utc::now().timestamp().max(last_ts);
 
-        // Sort by (tag asc, lsn desc); dedup keeping the highest-LSN entry
-        // per tag (dedup_by_key keeps the first element per key run, and the
-        // first after descending-lsn sort has the highest LSN).
-        combined_delta.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.lsn.cmp(&a.1.lsn)));
-        combined_delta.dedup_by_key(|(tag, _)| *tag);
+        // 2. Sort by (tag asc, lsn desc); dedup keeping the highest-LSN entry.
+        combined.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.lsn.cmp(&a.1.lsn)));
+        combined.dedup_by_key(|(tag, _)| *tag);
 
-        // Two-pointer merge: sequential scan of base + sorted combined_delta.
-        let base_entries = read_all_entries(&inner)?;
+        // 3. Two-pointer merge of existing base chunks + new combined.
+        let base_entries = read_all_entries(self)?;
         let mut output: Vec<(ChunkTag, ChunkRef)> =
-            Vec::with_capacity(base_entries.len() + combined_delta.len());
+            Vec::with_capacity(base_entries.len() + combined.len());
         let mut bi = 0usize;
-        let mut di = 0usize;
-
-        while bi < base_entries.len() && di < combined_delta.len() {
-            match base_entries[bi].0.cmp(&combined_delta[di].0) {
+        let mut ci = 0usize;
+        while bi < base_entries.len() && ci < combined.len() {
+            match base_entries[bi].0.cmp(&combined[ci].0) {
                 Ordering::Less => {
                     output.push(base_entries[bi]);
                     bi += 1;
                 }
                 Ordering::Greater => {
-                    output.push(combined_delta[di]);
-                    di += 1;
+                    output.push(combined[ci]);
+                    ci += 1;
                 }
                 Ordering::Equal => {
-                    // Keep higher LSN; tie goes to self (base entry).
-                    if combined_delta[di].1.lsn > base_entries[bi].1.lsn {
-                        output.push(combined_delta[di]);
+                    if combined[ci].1.lsn > base_entries[bi].1.lsn {
+                        output.push(combined[ci]);
                     } else {
                         output.push(base_entries[bi]);
                     }
                     bi += 1;
-                    di += 1;
+                    ci += 1;
                 }
             }
         }
@@ -524,158 +551,259 @@ impl Manifest {
             output.push(base_entries[bi]);
             bi += 1;
         }
-        while di < combined_delta.len() {
-            output.push(combined_delta[di]);
-            di += 1;
+        while ci < combined.len() {
+            output.push(combined[ci]);
+            ci += 1;
         }
 
-        // Purge tombstoned forks from the merged output and nblocks map.
-        if !deleted_set.is_empty() {
-            output.retain(|(tag, _)| !deleted_set.contains(&tag.relfork()));
-            merged_nblocks.retain(|rf, _| !deleted_set.contains(rf));
+        // 4. Merge existing on-disk meta with `new_meta` (new wins).
+        let base_meta = read_all_meta_entries(self)?;
+        let mut merged_meta: HashMap<RelFork, RelForkMeta> = base_meta.into_iter().collect();
+        for (rf, meta) in new_meta {
+            merged_meta.insert(rf, meta);
         }
 
-        // Write to a tmp path then atomically rename over the live path.
-        let tmp_path = PathBuf::from(format!("{}.tmp", inner.path.display()));
-        write_tikm(&tmp_path, last_lsn, last_ts, &output)?;
-        fs::rename(&tmp_path, &inner.path)?;
+        // 5. Drop chunks belonging to forks marked deleted in merged meta.
+        let deleted: HashSet<RelFork> = merged_meta
+            .iter()
+            .filter(|(_, m)| m.deleted)
+            .map(|(rf, _)| *rf)
+            .collect();
+        if !deleted.is_empty() {
+            output.retain(|(tag, _)| !deleted.contains(&tag.relfork()));
+        }
 
-        // Reopen with a fresh read handle pointing at the renamed file.
-        inner.file = File::open(&inner.path)?;
-        inner.entry_count = output.len() as u64;
-        inner.checkpoint_lsn = last_lsn;
-        inner.timestamp = last_ts;
-        inner.fork_nblocks = merged_nblocks;
-        inner.deleted_forks = vec![];
+        // 6. Sort meta by RelFork (required by on-disk binary search).
+        let mut meta_sorted: Vec<(RelFork, RelForkMeta)> = merged_meta.into_iter().collect();
+        meta_sorted.sort_unstable_by_key(|(rf, _)| *rf);
 
-        Ok(())
+        // 7. Compute the S3 wire bytes from the in-memory state.
+        let meta_map: HashMap<RelFork, RelForkMeta> = meta_sorted.iter().cloned().collect();
+        let bytes = rmp_serde::to_vec(&(last_ckpt, last_ts, &output, &meta_map))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Ok(AppliedManifest {
+            checkpoint: last_ckpt,
+            timestamp: last_ts,
+            chunks: output,
+            meta: meta_sorted,
+            bytes,
+        })
     }
 
-    /// Look up the block count for a relation fork stored in this manifest.
+    /// Atomically publish `applied` to the local TIKM file (tmp + rename)
+    /// and return a fresh `Manifest` reflecting the new checkpoint. Call
+    /// after [`Self::apply_segments`] and the caller's external publish
+    /// (e.g. S3 PUT) have both succeeded — this is the step that makes the
+    /// new state visible to other backends via [`Self::open_local`].
     ///
-    /// Returns `None` if no nblocks entry was recorded (e.g. legacy manifest
-    /// or a relation that wasn't touched since the last checkpoint).
-    pub fn lookup_nblocks(&self, rf: &RelFork) -> Option<u32> {
-        self.inner.lock().unwrap().fork_nblocks.get(rf).copied()
-    }
-
-    /// Return the list of relation forks deleted during this checkpoint interval.
-    /// Always empty in a base manifest (tombstones are consumed by `apply_deltas`).
-    pub fn deleted_forks(&self) -> Vec<RelFork> {
-        self.inner.lock().unwrap().deleted_forks.clone()
-    }
-
-    // -------- new interface --------
-    pub(crate) fn lookup_relfork_meta(&self, rf: &RelFork) -> Option<RelForkMeta> {
-        self.inner.lock().unwrap().relfork_map.get(rf).cloned()
+    /// `self` is unchanged. The caller (typically `Store`) swaps the
+    /// returned `Manifest` in via `Arc` replacement; existing `Arc<Manifest>`
+    /// holders keep reading the old state through their FD until they drop
+    /// their `Arc`.
+    pub fn commit_applied(&self, applied: AppliedManifest) -> Result<Self> {
+        let file = write_tikm(
+            &self.path,
+            applied.checkpoint,
+            applied.timestamp,
+            &applied.chunks,
+            &applied.meta,
+        )?;
+        Ok(Manifest {
+            checkpoint: applied.checkpoint,
+            timestamp: applied.timestamp,
+            path: self.path.clone(),
+            file,
+            entry_count: applied.chunks.len() as u64,
+            meta_count: applied.meta.len() as u64,
+        })
     }
 }
 
-// ── PITR base materialization ──
-
-type MaterializeResultInner<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// Outcome of a single `materialize_base` call.
-#[derive(Debug)]
-pub enum MaterializeResult {
-    /// No new deltas were found; the existing base is already up to date.
-    NoNewDeltas { base_lsn: Lsn },
-    /// A new base manifest was uploaded.
-    Materialized {
-        prev_base_lsn: Lsn,
-        new_lsn: Lsn,
-        delta_count: usize,
-    },
+/// Result of [`Manifest::apply_segments`] — the merged state plus the S3
+/// wire bytes, ready for the caller to publish externally before committing
+/// via [`Manifest::commit_applied`].
+pub(crate) struct AppliedManifest {
+    pub checkpoint: Checkpoint,
+    pub timestamp: i64,
+    pub chunks: Vec<(ChunkTag, ChunkRef)>,
+    pub meta: Vec<(RelFork, RelForkMeta)>,
+    /// msgpack-encoded `(checkpoint, timestamp, chunks, meta_map)` ready to
+    /// PUT to S3 at the base-manifest key for `checkpoint`.
+    pub bytes: Vec<u8>,
 }
 
-/// Merge all delta manifests newer than the latest base into a new base and
-/// upload it to the standard store.
-///
-/// Returns [`MaterializeResult::NoNewDeltas`] immediately if there are no new
-/// deltas (idempotent). Does NOT delete delta manifests — cleanup is
-/// enforce_retention_org's responsibility.
-pub fn materialize_base(
-    sim: &Store,
-    ns: &ProjectNamespace,
-    timeline: u32,
-) -> MaterializeResultInner<MaterializeResult> {
-    let base_prefix = ns.base_prefix_for_timeline(timeline);
-    let base_keys = sim.list_prefix_standard(&base_prefix)?;
+// ── Tests ─────────────────────────────────────────────────────────────────
 
-    let mut base_lsns: Vec<Lsn> = base_keys
-        .iter()
-        .filter_map(|key| {
-            let rest = key.strip_prefix(&base_prefix)?;
-            let lsn_hex = rest.split('/').next()?;
-            Lsn::from_hex(lsn_hex).ok()
-        })
-        .collect();
-    base_lsns.sort();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::timeline::Checkpoint;
+    use pgsys::common::ForkNumber;
+    use pgsys::timeline_id::TimelineId;
+    use tempfile::tempdir;
 
-    let base_local_path =
-        std::env::temp_dir().join(format!("tiko_pitr_base_{}.tikm", ns.project_id));
-
-    let (base, base_lsn) = if let Some(&lsn) = base_lsns.last() {
-        let manifest_key = ns.base_manifest_key(timeline, lsn);
-        let bytes = sim.get_standard(&manifest_key)?;
-        (Manifest::from_bytes(&bytes, &base_local_path)?, lsn)
-    } else {
-        (Manifest::empty(&base_local_path)?, Lsn::INVALID)
-    };
-
-    let delta_prefix = ns.delta_prefix_for_timeline(timeline);
-    let delta_keys = sim.list_prefix_standard(&delta_prefix)?;
-
-    let mut delta_lsns: Vec<Lsn> = delta_keys
-        .iter()
-        .filter_map(|key| {
-            let rest = key.strip_prefix(&delta_prefix)?;
-            let lsn_hex = rest.split('/').next()?;
-            Lsn::from_hex(lsn_hex).ok()
-        })
-        .filter(|&lsn| lsn > base_lsn)
-        .collect();
-    delta_lsns.sort();
-    delta_lsns.dedup();
-
-    if delta_lsns.is_empty() {
-        tracing::debug!("tiko: pitr: no new deltas since base {base_lsn}");
-        return Ok(MaterializeResult::NoNewDeltas { base_lsn });
+    impl Manifest {
+        /// Serialize to the S3 wire format (`msgpack(...)`).
+        ///
+        /// Format: 4-tuple `(checkpoint, timestamp, chunks, meta_map)`.
+        pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
+            let entries = read_all_entries(self)?;
+            let meta_entries = read_all_meta_entries(self)?;
+            let meta_map: HashMap<RelFork, RelForkMeta> = meta_entries.into_iter().collect();
+            rmp_serde::to_vec(&(self.checkpoint, self.timestamp, &entries, &meta_map))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }
     }
 
-    let mut deltas = Vec::with_capacity(delta_lsns.len());
-    for &delta_lsn in &delta_lsns {
-        let key = ns.delta_manifest_key(timeline, delta_lsn);
-        let delta_bytes = sim.get_standard(&key)?;
-        let delta_path = std::env::temp_dir().join(format!(
-            "tiko_pitr_delta_{}_{}.tikm",
-            ns.project_id,
-            delta_lsn.to_hex()
-        ));
-        deltas.push(Manifest::from_bytes(&delta_bytes, &delta_path)?);
+    fn tag(rel: u32, chunk_id: u32) -> ChunkTag {
+        ChunkTag {
+            spc_oid: 1,
+            db_oid: 1,
+            rel_number: rel,
+            fork_number: 0 as ForkNumber,
+            chunk_id,
+        }
     }
 
-    base.apply_deltas(&deltas)?;
-
-    let new_lsn = *delta_lsns.last().unwrap();
-    let delta_count = delta_lsns.len();
-    tracing::debug!(
-        "tiko: pitr: uploading new base manifest at lsn={} ({} delta(s) merged, prev_base={})",
-        new_lsn.to_hex(),
-        delta_count,
-        base_lsn,
-    );
-    sim.put_standard(&ns.base_manifest_key(timeline, new_lsn), &base.to_bytes()?)?;
-
-    if let Some(ctx) = ProjectCtx::try_get() {
-        let mut all_updates = vec![base];
-        all_updates.extend(deltas);
-        ctx.base_manifest.apply_deltas(&all_updates)?;
+    fn rf(rel: u32) -> RelFork {
+        RelFork {
+            spc_oid: 1,
+            db_oid: 1,
+            rel_number: rel,
+            fork_number: 0 as ForkNumber,
+        }
     }
 
-    Ok(MaterializeResult::Materialized {
-        prev_base_lsn: base_lsn,
-        new_lsn,
-        delta_count,
-    })
+    fn ckpt(lsn: u64) -> Checkpoint {
+        Checkpoint::new(TimelineId::new(1), Lsn::new(lsn))
+    }
+
+    fn segment(
+        ckpt_lsn: u64,
+        prev_lsn: u64,
+        tags: &[ChunkTag],
+        rels: &[(RelFork, RelForkMeta)],
+    ) -> SegmentCheckpoint {
+        let mut s = SegmentCheckpoint::new(
+            ckpt(ckpt_lsn),
+            ckpt(prev_lsn),
+            HashSet::new(),
+            HashMap::new(),
+        );
+        for t in tags {
+            s.chunks.insert(*t);
+        }
+        for (rf, m) in rels {
+            s.relforks.insert(*rf, m.clone());
+        }
+        s
+    }
+
+    #[test]
+    fn apply_segments_merges_chunks_and_relforks() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        let s1 = segment(
+            100,
+            0,
+            &[tag(1, 0), tag(1, 1)],
+            &[(rf(1), RelForkMeta::new(32, false))],
+        );
+        let s2 = segment(
+            200,
+            100,
+            &[tag(1, 1), tag(2, 0)],
+            &[
+                (rf(1), RelForkMeta::new(48, false)),
+                (rf(2), RelForkMeta::new(8, false)),
+            ],
+        );
+
+        let applied = base.apply_segments(&[s1, s2]).unwrap();
+        let base = base.commit_applied(applied).unwrap();
+
+        // Chunk (1,0) only in s1 → prev_ckpt=0 → ChunkRef.lsn = 0.
+        // Chunk (1,1) in both s1 and s2 → higher LSN wins → prev_ckpt=100.
+        // Chunk (2,0) only in s2 → prev_ckpt=100.
+        let r10 = base.lookup(&tag(1, 0)).unwrap().unwrap();
+        assert_eq!(r10.lsn.as_u64(), 0);
+        let r11 = base.lookup(&tag(1, 1)).unwrap().unwrap();
+        assert_eq!(r11.lsn.as_u64(), 100);
+        let r20 = base.lookup(&tag(2, 0)).unwrap().unwrap();
+        assert_eq!(r20.lsn.as_u64(), 100);
+
+        // Relfork meta: rf(1) overwritten by s2 → 48 blocks; rf(2) only in s2.
+        assert_eq!(
+            base.lookup_relfork_meta(&rf(1)).unwrap().unwrap().nblocks,
+            48
+        );
+        assert_eq!(
+            base.lookup_relfork_meta(&rf(2)).unwrap().unwrap().nblocks,
+            8
+        );
+
+        // checkpoint_lsn advances to the newest applied segment.
+        assert_eq!(base.checkpoint().lsn.as_u64(), 200);
+    }
+
+    #[test]
+    fn apply_segments_deleted_relfork_drops_chunks() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        let s1 = segment(
+            100,
+            0,
+            &[tag(1, 0), tag(2, 0)],
+            &[(rf(1), RelForkMeta::new(32, false))],
+        );
+        let s2 = segment(
+            200,
+            100,
+            &[],
+            &[(rf(1), RelForkMeta::new(0, true))], // relfork rf(1) dropped
+        );
+        let applied = base.apply_segments(&[s1, s2]).unwrap();
+        let base = base.commit_applied(applied).unwrap();
+
+        // Chunks for the deleted relfork were purged.
+        assert!(base.lookup(&tag(1, 0)).unwrap().is_none());
+        // Chunks for surviving relforks remain.
+        assert!(base.lookup(&tag(2, 0)).unwrap().is_some());
+
+        let m = base.lookup_relfork_meta(&rf(1)).unwrap().unwrap();
+        assert!(m.deleted);
+    }
+
+    #[test]
+    fn apply_segments_roundtrip_via_bytes() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        let s = segment(
+            100,
+            0,
+            &[tag(1, 0)],
+            &[(rf(1), RelForkMeta::new(32, false))],
+        );
+        let applied = base.apply_segments(&[s]).unwrap();
+        let base = base.commit_applied(applied).unwrap();
+
+        let bytes = base.to_bytes().unwrap();
+        let dir2 = tempdir().unwrap();
+        let restored = Manifest::from_bytes(&bytes, dir2.path()).unwrap();
+
+        assert_eq!(restored.checkpoint().lsn.as_u64(), 100);
+        assert!(restored.lookup(&tag(1, 0)).unwrap().is_some());
+        assert_eq!(
+            restored
+                .lookup_relfork_meta(&rf(1))
+                .unwrap()
+                .unwrap()
+                .nblocks,
+            32
+        );
+    }
 }

@@ -120,7 +120,7 @@ impl std::fmt::Display for RelFork {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
-pub(crate) struct RelForkMeta {
+pub struct RelForkMeta {
     pub nblocks: u32,
     pub deleted: bool,
 }

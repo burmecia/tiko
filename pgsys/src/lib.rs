@@ -14,6 +14,7 @@ pub mod lsn;
 pub mod lwlock;
 pub mod shmem;
 pub mod smgr;
+pub mod timeline_id;
 pub mod utils;
 pub mod wait_events;
 

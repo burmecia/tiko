@@ -1,5 +1,7 @@
 use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 
+use crate::io::io_control::IoWorkRequest;
+
 /// Crate-level error type for `core`.
 #[derive(Debug, thiserror::Error)]
 
@@ -10,6 +12,15 @@ pub enum Error {
 
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("rmp_serde encode: {0}")]
+    RmpSerdeEncode(#[from] rmp_serde::encode::Error),
+
+    #[error("rmp_serde decode: {0}")]
+    RmpSerdeDecode(#[from] rmp_serde::decode::Error),
+
+    #[error("tokio mpsc try send error: {0}")]
+    TrySendError(#[from] tokio::sync::mpsc::error::TrySendError<IoWorkRequest>),
 
     #[error("store not available")]
     StoreNotAvailable,
@@ -71,6 +82,9 @@ impl Error {
                 _ => e.raw_os_error().unwrap_or(libc::EIO),
             },
             Error::Json(_) => libc::EINVAL,
+            Error::RmpSerdeEncode(_) => libc::EINVAL,
+            Error::RmpSerdeDecode(_) => libc::EINVAL,
+            Error::TrySendError(_) => libc::EAGAIN,
             Error::StoreNotAvailable => libc::ENODEV,
             Error::EvictionSweepExhausted => libc::EAGAIN,
             Error::Other(_) => libc::EIO,

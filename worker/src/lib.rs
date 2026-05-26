@@ -6,7 +6,7 @@ pub mod tasks;
 pub use core::{cache, io_control, ops};
 
 // Re-export the shared store modules
-pub use core::{manifest, project, recovery, s3, s3_sim, store};
+pub use core::{manifest, s3, s3_sim, storage};
 
 mod io_handler;
 mod main_loop;
@@ -59,7 +59,7 @@ pub extern "C-unwind" fn _PG_init() {
     // Initialize the worker cdylib's own copy of Store. The smgr staticlib
     // has a separate copy (initialized by tiko_init) that Tokio threads here
     // cannot see — each linked copy of core has its own STORE OnceLock.
-    Store::init();
+    Store::init().expect("tiko: Store::init() should be successful");
 
     // install hooks for shared memory initialization
     shmem::init_shared_memory();
