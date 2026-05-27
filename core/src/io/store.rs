@@ -824,7 +824,7 @@ impl Store {
 
         let count = to_apply.len();
         pg_log_debug1(format!(
-            "tiko: compaction applied {count} segment checkpoint(s); base_ckpt → {new_base_ckpt}"
+            "tiko: compaction applied {count} segment checkpoint(s); {base_ckpt} → {new_base_ckpt}"
         ));
         Ok(CompactionResult::Applied {
             new_base_ckpt,

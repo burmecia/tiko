@@ -71,7 +71,12 @@ impl Checkpoint {
 
 impl fmt::Display for Checkpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.timeline_id, self.lsn)
+        write!(
+            f,
+            "{}-{}",
+            self.timeline_id.to_hex_variable_width(),
+            self.lsn
+        )
     }
 }
 

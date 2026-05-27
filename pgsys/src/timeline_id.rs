@@ -27,6 +27,12 @@ impl TimelineId {
         format!("{:08X}", self.0)
     }
 
+    /// Format as variable-width uppercase hex (`{:X}`).
+    #[inline]
+    pub fn to_hex_variable_width(self) -> String {
+        format!("{:X}", self.0)
+    }
+
     /// Parse a fixed-width or variable-width hex representation of a TimelineId.
     pub fn from_hex(hex: &str) -> Result<Self, core::num::ParseIntError> {
         u32::from_str_radix(hex, 16).map(Self)
