@@ -48,9 +48,13 @@ impl Locator {
         )
     }
 
-    /// S3/storage key for a timeline segment file: `{ns}/timeline/{segment_id}.segment`.
+    /// S3/storage key for a timeline segment file: `{ns}/timeline/{segment}`.
     pub(crate) fn timeline_segment(&self, segment_id: &SegmentId) -> String {
-        format!("{ns}/timeline/{segment_id}.segment", ns = self.ns)
+        format!(
+            "{ns}/timeline/{segment}",
+            ns = self.ns,
+            segment = segment_id.to_path_string()
+        )
     }
 
     /// Listing prefix for all timeline segment files: `{ns}/timeline/`.

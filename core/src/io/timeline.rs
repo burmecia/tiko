@@ -90,22 +90,21 @@ pub struct SegmentId {
     pub index: u64,
 }
 
-impl fmt::Display for SegmentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{:016X}", self.timeline_id.to_hex(), self.index)
-    }
-}
-
 impl SegmentId {
-    /// Parse a `SegmentId` from its on-disk file name (without the
-    /// containing directory). Accepts the `.segment` suffix that the
-    /// locator appends, and rejects anything that doesn't match the
-    /// `{tl_hex}-{index_hex}.segment` shape.
-    pub fn from_filename(name: &str) -> Option<Self> {
-        let stem = name.strip_suffix(".segment")?;
-        let (tl_str, idx_str) = stem.split_once('-')?;
-        let timeline_id = TimelineId::from_hex(tl_str).ok()?;
-        let index = u64::from_str_radix(idx_str, 16).ok()?;
+    pub fn to_path_string(&self) -> String {
+        format!("{}/{:016X}.segment", self.timeline_id, self.index)
+    }
+
+    /// Parse a `SegmentId` from its on-disk path string with or without the
+    /// containing directory, e.g. 12/34/timeline/00000001/0000000000008655.segment.
+    pub fn from_path_string(path_str: &str) -> Option<Self> {
+        let stem = path_str.strip_suffix(".segment")?;
+        let p: Vec<&str> = stem.rsplit('/').collect();
+        if p.len() < 2 {
+            return None;
+        }
+        let index = u64::from_str_radix(p[0], 16).ok()?;
+        let timeline_id = TimelineId::from_hex(p[1]).ok()?;
         Some(Self { timeline_id, index })
     }
 
@@ -126,6 +125,12 @@ impl SegmentId {
             Lsn::new(self.index.saturating_add(1) * TIMELINE_SEGMENT_LSN_RANGE - 1),
         );
         seg_high >= low && seg_low <= high
+    }
+}
+
+impl fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{:016X}", self.timeline_id.to_hex(), self.index)
     }
 }
 
@@ -644,13 +649,15 @@ mod tests {
             timeline_id: TimelineId::new(0x3A),
             index: 0x42,
         };
-        let name = format!("{s}.segment");
-        let parsed = SegmentId::from_filename(&name).unwrap();
+        let name = s.to_path_string();
+        let parsed = SegmentId::from_path_string(&name).unwrap();
         assert_eq!(parsed, s);
 
-        assert!(SegmentId::from_filename("not-a-segment.txt").is_none());
-        assert!(SegmentId::from_filename("0000003A-0000000000000042.txt").is_none());
-        assert!(SegmentId::from_filename("zz-no-segment.segment").is_none());
+        assert!(SegmentId::from_path_string("not-a-segment.txt").is_none());
+        assert!(SegmentId::from_path_string("0000003A/0000000000000042.txt").is_none());
+        assert!(
+            SegmentId::from_path_string("zz/no/not-segment/0000000000000042.segment").is_none()
+        );
     }
 
     #[test]

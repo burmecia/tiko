@@ -545,10 +545,7 @@ impl Store {
         };
         let mut ids: Vec<SegmentId> = keys
             .iter()
-            .filter_map(|k| {
-                let name = k.rsplit('/').next()?;
-                SegmentId::from_filename(name)
-            })
+            .filter_map(|path_str| SegmentId::from_path_string(path_str))
             .collect();
         ids.sort_unstable();
         Ok(ids)
