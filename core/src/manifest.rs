@@ -688,8 +688,10 @@ mod tests {
         let mut s = SegmentCheckpoint::new(
             ckpt(ckpt_lsn),
             ckpt(prev_lsn),
+            Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
+            &vec![1, 2, 3, 4],
         );
         for t in tags {
             s.chunks.insert(*t);

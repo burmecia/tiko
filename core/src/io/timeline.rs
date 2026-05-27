@@ -139,22 +139,28 @@ impl SegmentId {
 pub(crate) struct SegmentCheckpoint {
     pub ckpt: Checkpoint,
     pub prev_ckpt: Checkpoint,
+    pub redo_ckpt: Checkpoint,
     pub chunks: HashSet<ChunkTag>,
     pub relforks: HashMap<RelFork, RelForkMeta>,
+    pub pg_state_bytes: Vec<u8>,
 }
 
 impl SegmentCheckpoint {
     pub fn new(
         ckpt: Checkpoint,
         prev_ckpt: Checkpoint,
+        redo_ckpt: Checkpoint,
         chunks: HashSet<ChunkTag>,
         relforks: HashMap<RelFork, RelForkMeta>,
+        pg_state_bytes: &[u8],
     ) -> Self {
         Self {
             ckpt,
             prev_ckpt,
+            redo_ckpt,
             chunks,
             relforks,
+            pg_state_bytes: pg_state_bytes.to_vec(),
         }
     }
 
@@ -577,8 +583,10 @@ mod tests {
         let mut s = SegmentCheckpoint::new(
             Checkpoint::new(TimelineId::new(1), Lsn::new(100)),
             Checkpoint::new(TimelineId::new(1), Lsn::new(50)),
+            Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
+            &vec![1, 2, 3, 4],
         );
         s.chunks.insert(tag(1, 0));
         s.chunks.insert(tag(1, 1));
@@ -590,8 +598,10 @@ mod tests {
         let decoded: SegmentCheckpoint = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.ckpt, s.ckpt);
         assert_eq!(decoded.prev_ckpt, s.prev_ckpt);
+        assert_eq!(decoded.redo_ckpt, s.redo_ckpt);
         assert_eq!(decoded.chunks, s.chunks);
         assert_eq!(decoded.relforks, s.relforks);
+        assert_eq!(decoded.pg_state_bytes, s.pg_state_bytes);
     }
 
     #[test]
@@ -603,8 +613,10 @@ mod tests {
         let mut s = SegmentCheckpoint::new(
             Checkpoint::new(tl, Lsn::new(10)),
             Checkpoint::new(tl, Lsn::new(0)),
+            Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
+            &vec![5, 6, 7, 8],
         );
         s.chunks.insert(tag(1, 0));
         seg.push(s);

@@ -65,10 +65,21 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
 
     let pgdata_dir = data_dir_path();
 
+    // Capture pg_state archive bytes — so the
+    // archive reflects pg_control / pg_xact / etc. at the start of the
+    // checkpoint rather than after potentially long chunk S3 writes.
+    let pg_state_bytes = match build_pg_state_archive(&pgdata_dir) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            pg_log_error("tiko: tiko_perform_checkpoint: Failed to build pg_state archive");
+            return;
+        }
+    };
+
     // Segment-based commit protocol: flush dirty chunks, write-lock fence,
     // set redo_ckpt, drain backend drafts, write segment, advance active
     // window, persist DbMeta.
-    if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt) {
+    if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt, &pg_state_bytes) {
         pg_log_error(&format!(
             "tiko: tiko_perform_checkpoint: run_commit_protocol failed at {ckpt}, redo {redo_ckpt}: {e}"
         ));
@@ -88,19 +99,6 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
                 "tiko: tiko_perform_checkpoint: shutdown compaction failed: {e}"
             ));
         }
-    }
-
-    // Capture pg_state archive bytes — so the
-    // archive reflects pg_control / pg_xact / etc. at the start of the
-    // checkpoint rather than after potentially long chunk S3 writes.
-    if let Ok(pg_state_bytes) = build_pg_state_archive(&pgdata_dir) {
-        //upload_pg_state(store, ns, timeline, lsn, &pg_state_bytes)?;
-        pg_log_debug1(format!(
-            "tiko: pg_state archive {} bytes",
-            pg_state_bytes.len()
-        ));
-    } else {
-        pg_log_error("tiko: tiko_perform_checkpoint: Failed to build pg_state archive");
     }
 }
 
