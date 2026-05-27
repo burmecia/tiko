@@ -422,11 +422,11 @@ pub struct TimelineState {
     pub head_ckpt: Checkpoint,
     pub redo_ckpt: Checkpoint,
     /// Number of valid entries in `active_window` (0..=ACTIVE_WINDOW_SIZE).
-    pub active_count: u32,
+    active_count: u32,
     /// Index of the next write slot (mod ACTIVE_WINDOW_SIZE). The newest
     /// active checkpoint sits at `(active_head - 1) mod ACTIVE_WINDOW_SIZE`.
-    pub active_head: u32,
-    pub active_window: [ActiveCheckpoint; ACTIVE_WINDOW_SIZE],
+    active_head: u32,
+    active_window: [ActiveCheckpoint; ACTIVE_WINDOW_SIZE],
     /// Live-interval draft buffer. Backends record into it under
     /// `lock.read()`; the checkpointer drains it under `lock.write()` as
     /// part of the commit fence.

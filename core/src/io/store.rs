@@ -680,15 +680,6 @@ impl Store {
         Ok(None)
     }
 
-    /// Write `segment` to storage (overwriting any previous version at the
-    /// same key). Subsequent commits in the same segment LSN range will
-    /// re-read this file via `load_or_init_segment` and append to it.
-    fn write_segment(&self, segment: &TimelineSegment) -> Result<()> {
-        let key = self.lctr.timeline_segment(&segment.segment_id);
-        let bytes = segment.to_bytes()?;
-        self.storage.put(&key, &bytes)
-    }
-
     /// Build a [`SegmentCheckpoint`] from the drained drafts and append it
     /// to the appropriate timeline segment file (load existing or init new).
     ///
@@ -705,7 +696,14 @@ impl Store {
         let summary =
             SegmentCheckpoint::new(commit_ckpt, prev_ckpt, drained.chunks, drained.relforks);
         seg.push(summary.clone());
-        self.write_segment(&seg)?;
+
+        // Write `segment` to storage (overwriting any previous version at the
+        // same key). Subsequent commits in the same segment LSN range will
+        // re-read this file via `load_or_init_segment` and append to it.
+        let key = self.lctr.timeline_segment(&segment_id);
+        let bytes = seg.to_bytes()?;
+        self.storage.put(&key, &bytes)?;
+
         Ok(summary)
     }
 
