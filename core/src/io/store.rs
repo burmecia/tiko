@@ -588,22 +588,10 @@ impl Store {
     /// Try to load the segment at `segment_id` from storage. Returns
     /// `Ok(None)` if no segment file exists (e.g. that LSN range hasn't been
     /// committed to yet).
-    fn try_load_segment(&self, segment_id: &SegmentId) -> Result<Option<TimelineSegment>> {
+    fn load_segment(&self, segment_id: &SegmentId) -> Result<TimelineSegment> {
         let key = self.lctr.timeline_segment(segment_id);
-        match self.storage.get(&key) {
-            Ok(bytes) => Ok(Some(TimelineSegment::from_bytes(&bytes)?)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Load the existing on-storage segment for `segment_id`, or construct
-    /// an empty one if no such file exists yet. Used by the write path
-    /// (`commit_segment`).
-    fn load_or_init_segment(&self, segment_id: &SegmentId) -> Result<TimelineSegment> {
-        Ok(self
-            .try_load_segment(segment_id)?
-            .unwrap_or_else(|| TimelineSegment::new(*segment_id)))
+        let seg_bytes = self.storage.get(&key)?;
+        TimelineSegment::from_bytes(&seg_bytes)
     }
 
     /// Walk on-disk segments newest → oldest covering the half-open
@@ -630,10 +618,7 @@ impl Store {
         // drops checkpoints at `high_ckpt_excl` and above.
         let segments = self.list_segments_in_range(low_ckpt, high_ckpt_excl)?;
         for sid in segments.iter().rev() {
-            let seg = match self.try_load_segment(sid)? {
-                Some(s) => s,
-                None => continue,
-            };
+            let seg = self.load_segment(sid)?;
             for sc in seg.checkpoints.iter().rev() {
                 if sc.ckpt < low_ckpt || sc.ckpt >= high_ckpt_excl {
                     continue;
@@ -661,10 +646,7 @@ impl Store {
         }
         let segments = self.list_segments_in_range(low_ckpt, high_ckpt)?;
         for sid in segments.iter().rev() {
-            let seg = match self.try_load_segment(sid)? {
-                Some(s) => s,
-                None => continue,
-            };
+            let seg = self.load_segment(sid)?;
             for sc in seg.checkpoints.iter().rev() {
                 if sc.ckpt < low_ckpt || sc.ckpt > high_ckpt {
                     continue;
@@ -691,7 +673,11 @@ impl Store {
         pg_state_bytes: &[u8],
     ) -> Result<SegmentCheckpoint> {
         let segment_id = commit_ckpt.to_segment_id();
-        let mut seg = self.load_or_init_segment(&segment_id)?;
+        let mut seg = match self.load_segment(&segment_id) {
+            Ok(existing) => existing,
+            Err(e) if e.is_not_found() => TimelineSegment::new(segment_id),
+            Err(e) => return Err(e),
+        };
         let summary = SegmentCheckpoint::new(
             commit_ckpt,
             prev_ckpt,
@@ -704,7 +690,7 @@ impl Store {
 
         // Write `segment` to storage (overwriting any previous version at the
         // same key). Subsequent commits in the same segment LSN range will
-        // re-read this file via `load_or_init_segment` and append to it.
+        // re-read this file and append to it.
         let key = self.lctr.timeline_segment(&segment_id);
         let bytes = seg.to_bytes()?;
         self.storage.put(&key, &bytes)?;
@@ -754,10 +740,7 @@ impl Store {
         let segments = self.list_segments_in_range(base_ckpt, upper_ckpt)?;
         let mut to_apply: Vec<SegmentCheckpoint> = Vec::new();
         for sid in &segments {
-            let seg = match self.try_load_segment(sid)? {
-                Some(s) => s,
-                None => continue,
-            };
+            let seg = self.load_segment(sid)?;
             for sc in &seg.checkpoints {
                 if sc.ckpt > base_ckpt && sc.ckpt < upper_ckpt {
                     to_apply.push(sc.clone());
@@ -874,10 +857,7 @@ impl Store {
         // checkpoint first. Stop once we have enough.
         let mut newest_first: Vec<SegmentCheckpoint> = Vec::new();
         'outer: for segment_id in segment_ids.iter().rev() {
-            let seg = match self.try_load_segment(segment_id)? {
-                Some(s) => s,
-                None => continue,
-            };
+            let seg = self.load_segment(segment_id)?;
             for sc in seg.checkpoints.iter().rev() {
                 newest_first.push(sc.clone());
                 if newest_first.len() >= ACTIVE_WINDOW_SIZE {
