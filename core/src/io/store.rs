@@ -39,6 +39,7 @@ pub enum CompactionResult {
     /// Successfully applied `count` segment checkpoints and advanced
     /// `base_ckpt` to `new_base_ckpt`.
     Applied {
+        base_ckpt: Checkpoint,
         new_base_ckpt: Checkpoint,
         count: usize,
     },
@@ -815,6 +816,7 @@ impl Store {
             "tiko: compaction applied {count} segment checkpoint(s); {base_ckpt} → {new_base_ckpt}"
         ));
         Ok(CompactionResult::Applied {
+            base_ckpt,
             new_base_ckpt,
             count,
         })

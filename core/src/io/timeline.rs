@@ -27,7 +27,7 @@ use crate::relfork::{RelFork, RelForkMeta};
 const TIMELINE_SEGMENT_MAGIC: [u8; 4] = *b"TLSG";
 const TIMELINE_SEGMENT_VERSION: u32 = 1;
 /// Number of LSN units covered by one segment file. `segment_id.index = lsn / TIMELINE_SEGMENT_LSN_RANGE`.
-pub const TIMELINE_SEGMENT_LSN_RANGE: u64 = 512;
+pub const TIMELINE_SEGMENT_LSN_RANGE: u64 = 1 << 28; // 256 MB
 
 /// Number of recent checkpoints kept fully indexed in the shmem active window.
 pub const ACTIVE_WINDOW_SIZE: usize = 64;
@@ -141,13 +141,14 @@ impl fmt::Display for SegmentId {
 /// `prev_ckpt` is the path prefix where chunks visible at `ckpt` were written
 /// — i.e. the checkpoint that was the committed head at write time.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct SegmentCheckpoint {
+pub struct SegmentCheckpoint {
     pub ckpt: Checkpoint,
     pub prev_ckpt: Checkpoint,
     pub redo_ckpt: Checkpoint,
     pub chunks: HashSet<ChunkTag>,
     pub relforks: HashMap<RelFork, RelForkMeta>,
-    pub pg_state_bytes: Vec<u8>,
+    pub pg_state: Vec<u8>,
+    pub created_at: i64,
 }
 
 impl SegmentCheckpoint {
@@ -157,7 +158,7 @@ impl SegmentCheckpoint {
         redo_ckpt: Checkpoint,
         chunks: HashSet<ChunkTag>,
         relforks: HashMap<RelFork, RelForkMeta>,
-        pg_state_bytes: &[u8],
+        pg_state: &[u8],
     ) -> Self {
         Self {
             ckpt,
@@ -165,7 +166,8 @@ impl SegmentCheckpoint {
             redo_ckpt,
             chunks,
             relforks,
-            pg_state_bytes: pg_state_bytes.to_vec(),
+            pg_state: pg_state.to_vec(),
+            created_at: chrono::Utc::now().timestamp(),
         }
     }
 
@@ -183,7 +185,7 @@ impl SegmentCheckpoint {
 /// On-disk + on-S3 segment file: an ordered list of per-checkpoint summaries
 /// covering one segment-id LSN range.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TimelineSegment {
+pub struct TimelineSegment {
     magic: [u8; 4],
     version: u32,
     pub segment_id: SegmentId,
@@ -606,7 +608,7 @@ mod tests {
         assert_eq!(decoded.redo_ckpt, s.redo_ckpt);
         assert_eq!(decoded.chunks, s.chunks);
         assert_eq!(decoded.relforks, s.relforks);
-        assert_eq!(decoded.pg_state_bytes, s.pg_state_bytes);
+        assert_eq!(decoded.pg_state, s.pg_state);
     }
 
     #[test]

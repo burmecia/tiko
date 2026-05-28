@@ -39,11 +39,12 @@ pub async fn compactor_task(store: &'static Store) {
 
         match store.run_compaction() {
             Ok(CompactionResult::Applied {
+                base_ckpt,
                 new_base_ckpt,
                 count,
             }) => {
                 relay_info(format!(
-                    "tiko: compactor: merged {count} segment checkpoint(s); base_ckpt → {new_base_ckpt}",
+                    "tiko: compactor: merged {count} segment checkpoint(s); {base_ckpt} → {new_base_ckpt}",
                 ));
             }
             Ok(CompactionResult::NoNewSegments) => {
