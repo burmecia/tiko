@@ -76,6 +76,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn locator(&self) -> &Locator {
+        &self.lctr
+    }
+
     /// Update the DbMeta JSON object on storage with the latest checkpoint
     /// LSN. Internal helper called from [`Store::run_commit_protocol`].
     fn update_db_meta(&self, ckpt: &Checkpoint) -> Result<()> {
@@ -501,6 +505,14 @@ impl Store {
             io_control.stats.storage.inc_lists();
         });
         Ok(ret)
+    }
+
+    pub fn storage_delete(&self, key: &str) -> Result<()> {
+        self.storage.delete(key)?;
+        IoControl::try_get().map(|io_control| {
+            io_control.stats.storage.inc_deletes();
+        });
+        Ok(())
     }
 
     // ── Backend draft (eviction-flush recording) ──────────────────────────

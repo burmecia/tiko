@@ -1,2 +1,2 @@
-pub mod compactor;
-//pub mod wal_receiver;
+pub(crate) mod compactor;
+pub(crate) mod wal_receiver;

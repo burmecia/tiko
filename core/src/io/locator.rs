@@ -2,7 +2,7 @@ use super::timeline::{Checkpoint, SegmentId};
 use crate::{chunk::ChunkTag, db::DbNamespace, manifest::ChunkRef};
 use pgsys::timeline_id::TimelineId;
 
-pub(crate) struct Locator {
+pub struct Locator {
     ns: DbNamespace,
 }
 
@@ -11,9 +11,13 @@ impl Locator {
         Self { ns }
     }
 
+    // ── Database meta key ────────────────────────────
+
     pub(super) fn db_meta(&self) -> String {
         format!("{ns}/db_meta.json", ns = self.ns)
     }
+
+    // ── Chunk keys ────────────────────────────
 
     pub(super) fn chunk(&self, tag: &ChunkTag, ckpt: &Checkpoint) -> String {
         let rf = tag.relfork();
@@ -35,6 +39,8 @@ impl Locator {
         self.chunk(tag, &ckpt)
     }
 
+    // ── Base manifest keys ────────────────────────────
+
     pub(super) fn bases_dir(&self) -> String {
         format!("{ns}/bases/", ns = self.ns)
     }
@@ -48,6 +54,8 @@ impl Locator {
         )
     }
 
+    // ── Timeline segment keys ────────────────────────────
+
     /// S3/storage key for a timeline segment file: `{ns}/timeline/{segment}`.
     pub(crate) fn timeline_segment(&self, segment_id: &SegmentId) -> String {
         format!(
@@ -60,5 +68,47 @@ impl Locator {
     /// Listing prefix for all timeline segment files: `{ns}/timeline/`.
     pub(crate) fn timeline_segments_dir(&self) -> String {
         format!("{ns}/timeline/", ns = self.ns)
+    }
+
+    // ── WAL and metadata keys ────────────────────────────
+
+    pub fn wal_segment(&self, timeline_id: TimelineId, wal_segment: &str) -> String {
+        format!(
+            "{ns}/wal/{timeline_id}/{wal_segment}",
+            ns = self.ns,
+            timeline_id = timeline_id.to_hex(),
+            wal_segment = wal_segment
+        )
+    }
+
+    /// Prefix for all 256 KiB chunk objects belonging to one in-flight segment.
+    ///
+    /// `{ns}/wal/{timeline_id}/{wal_segment}.chunks/`
+    ///
+    /// The `.chunks` suffix distinguishes the chunk directory from the sealed
+    /// segment object (`{wal_segment}`) stored at the same parent prefix.
+    pub fn wal_chunk_prefix(&self, timeline_id: TimelineId, wal_segment: &str) -> String {
+        format!(
+            "{ns}/wal/{timeline_id}/{wal_segment}.chunks/",
+            ns = self.ns,
+            timeline_id = timeline_id.to_hex(),
+            wal_segment = wal_segment
+        )
+    }
+
+    /// Key for one 256 KiB streaming chunk within an in-flight WAL segment.
+    ///
+    /// `{ns}/wal/{timeline_id}/{wal_segment}.chunks/{byte_offset:016X}`
+    pub fn wal_chunk_key(
+        &self,
+        timeline_id: TimelineId,
+        wal_segment: &str,
+        byte_offset: usize,
+    ) -> String {
+        format!(
+            "{}/{:016X}",
+            self.wal_chunk_prefix(timeline_id, wal_segment),
+            byte_offset
+        )
     }
 }

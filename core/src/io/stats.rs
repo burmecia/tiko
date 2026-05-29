@@ -57,6 +57,7 @@ pub struct BucketStats {
     pub gets: AtomicU64,
     pub puts: AtomicU64,
     pub lists: AtomicU64,
+    pub deletes: AtomicU64,
     pub get_bytes: AtomicU64,
     pub put_bytes: AtomicU64,
 }
@@ -66,16 +67,18 @@ impl BucketStats {
         self.gets.store(0, Ordering::Relaxed);
         self.puts.store(0, Ordering::Relaxed);
         self.lists.store(0, Ordering::Relaxed);
+        self.deletes.store(0, Ordering::Relaxed);
         self.get_bytes.store(0, Ordering::Relaxed);
         self.put_bytes.store(0, Ordering::Relaxed);
     }
 
     fn summary(&self) -> String {
         format!(
-            "r={} w={} l={} rb={} wb={}",
+            "r={} w={} l={} d={} rb={} wb={}",
             self.gets.load(Ordering::Relaxed),
             self.puts.load(Ordering::Relaxed),
             self.lists.load(Ordering::Relaxed),
+            self.deletes.load(Ordering::Relaxed),
             self.get_bytes.load(Ordering::Relaxed),
             self.put_bytes.load(Ordering::Relaxed),
         )
@@ -93,6 +96,10 @@ impl BucketStats {
 
     pub(crate) fn inc_lists(&self) {
         self.lists.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_deletes(&self) {
+        self.deletes.fetch_add(1, Ordering::Relaxed);
     }
 }
 

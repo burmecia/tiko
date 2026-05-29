@@ -69,10 +69,18 @@ impl ObjectStorage for S3Sim {
 
     fn delete(&self, key: &str) -> Result<()> {
         let path = self.root.join(key);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        if path.is_dir() {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         }
     }
 

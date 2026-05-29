@@ -14,6 +14,25 @@ TIKO_PROJECT_ID="56"
 
 PG_BIN_DIR="./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin"
 
+echo "Building Tiko smgr..."
+if ! (cargo build -p smgr) >/dev/null; then
+  echo "Tiko smgr build failed" >&2
+  exit 1
+fi
+
+echo "Building PostgreSQL..."
+rm -f postgres/src/backend/postgres
+if ! (cd postgres && make -j4 && make install) >/dev/null; then
+  echo "Postgres build/install failed" >&2
+  exit 1
+fi
+
+echo "Building Tiko Worker..."
+if ! (cargo build -p worker) >/dev/null; then
+  echo "Tiko Worker build failed" >&2
+  exit 1
+fi
+
 rm -rf tt log.log
 $PG_BIN_DIR/initdb -D tt
 cp ./postgresql.conf.sample tt/postgresql.conf

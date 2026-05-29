@@ -889,10 +889,10 @@ log_statement=all
 
 # WAL is streamed in real-time by the tikoworker background task.
 # archive_mode / archive_command are not used with Tiko.
-# wal_level             = replica
-# max_wal_senders       = 2      # ≥ 1 for the streaming task; +1 spare
-# max_replication_slots = 2      # ≥ 1 for tiko_wal_stream; +1 spare
+wal_level             = replica
+max_wal_senders       = 2      # ≥ 1 for the streaming task; +1 spare
+max_replication_slots = 2      # ≥ 1 for tiko_wal_stream; +1 spare
 
 # Safety valve: bounds pg_wal disk usage if streaming falls behind.
 # When hit, the slot is invalidated and a WAL gap results — size accordingly.
-#max_slot_wal_keep_size = 1GB
+max_slot_wal_keep_size = 1GB

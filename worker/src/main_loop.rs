@@ -49,7 +49,7 @@ fn setup_signal_handlers() {
         pgsys::bgworker::BackgroundWorkerUnblockSignals();
     }
 
-    pg_log_info("tiko: signal handlers installed");
+    pg_log_debug1("tiko: signal handlers installed");
 }
 
 /// Wait event identifier for Tiko worker main loop
@@ -90,7 +90,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     thread_pool::spawn_compactor_task();
 
     // Spawn WAL streaming task.
-    //thread_pool::spawn_wal_receiver_task();
+    thread_pool::spawn_wal_receiver_task();
 
     // Get shared memory IO control structure
     let io_control = IoControl::get();
@@ -144,7 +144,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
 
     io_control.stats.log_summary();
     pg_log_info(&format!(
-        "tiko: shutting down (loops={}, requests={})",
+        "tiko: shutting down (io_loops={}, io_requests={})",
         loop_count, requests_processed
     ));
 

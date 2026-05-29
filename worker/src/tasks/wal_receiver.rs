@@ -16,13 +16,15 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use pgsys::timeline_id::TimelineId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-//use core::{project::ProjectNamespace, store::Store};
+use crate::log_relay::{relay_debug1, relay_warning};
+use core::io::store::Store;
 use pgsys::common::XLOG_SEG_SIZE;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -63,25 +65,22 @@ impl Default for WalReceiverConfig {
 /// Tokio task: stream WAL from the local primary to the sim store.
 ///
 /// Never returns.  Reconnects with exponential backoff on any error.
-pub async fn wal_receiver_task(
-    sim: &'static Store,
-    //ns: ProjectNamespace,
-    config: WalReceiverConfig,
-) {
-    tracing::info!(
+pub async fn wal_receiver_task(sim: &'static Store, config: WalReceiverConfig) {
+    relay_debug1(format!(
         "tiko: wal_receiver: task started with connstr: {}, slot: {}",
-        config.connstr,
-        config.slot_name
-    );
+        config.connstr, config.slot_name
+    ));
     let mut backoff = Duration::from_secs(1);
     loop {
-        match run_streaming(sim,  &config).await {
+        match run_streaming(sim, &config).await {
             Ok(()) => {
-                tracing::info!("tiko: wal_receiver: connection closed, reconnecting");
+                relay_debug1("tiko: wal_receiver: connection closed, reconnecting");
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
-                tracing::warn!("tiko: wal_receiver: {e}, reconnecting in {backoff:?}");
+                relay_warning(format!(
+                    "tiko: wal_receiver: {e}, reconnecting in {backoff:?}"
+                ));
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
@@ -116,11 +115,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ── Core streaming loop ───────────────────────────────────────────────────────
 
-async fn run_streaming(
-    sim: &'static Store,
-    ns: &ProjectNamespace,
-    config: &WalReceiverConfig,
-) -> Result<(), BoxError> {
+async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Result<(), BoxError> {
     let params = parse_connstr(&config.connstr);
 
     // ── Connect ───────────────────────────────────────────────────────────────
@@ -130,18 +125,19 @@ async fn run_streaming(
     let os_user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
     let user = params.get("user").copied().unwrap_or(os_user.as_str());
     let mut conn = ReplConn::connect(&socket_path, user).await?;
-    tracing::info!("tiko: wal_receiver: connected to postmaster");
+    relay_debug1("tiko: wal_receiver: connected to postmaster");
 
     // ── IDENTIFY_SYSTEM → timeline + current xlogpos ─────────────────────────
     // Columns: systemid | timeline | xlogpos | dbname
     let rows = conn.simple_query("IDENTIFY_SYSTEM").await?;
     let row = rows.first().ok_or("IDENTIFY_SYSTEM: empty response")?;
-    let timeline: u32 = row
+    let timeline_id: TimelineId = row
         .get(1)
         .and_then(|s| s.as_deref())
         .ok_or("IDENTIFY_SYSTEM: missing timeline")?
-        .parse()
-        .map_err(|e| format!("IDENTIFY_SYSTEM: bad timeline: {e}"))?;
+        .parse::<u32>()
+        .map_err(|e| format!("IDENTIFY_SYSTEM: bad timeline: {e}"))?
+        .into();
     // xlogpos is the fallback start LSN when the slot has no restart_lsn yet
     // (slot created without RESERVE_WAL, or never used).
     let xlogpos_str = row
@@ -177,10 +173,10 @@ async fn run_streaming(
             config.slot_name
         );
         conn.simple_query(&create_sql).await?;
-        tracing::info!(
+        relay_debug1(format!(
             "tiko: wal_receiver: created slot '{}', starting from {xlogpos_str}",
             config.slot_name
-        );
+        ));
         // consistent_point in the CREATE response is always 0/0 for physical
         // slots — meaningless.  RESERVE_WAL retains WAL from xlogpos onwards.
         xlogpos
@@ -188,19 +184,19 @@ async fn run_streaming(
         // Slot exists — column 1 is restart_lsn (may be NULL if slot has never streamed).
         match row.into_iter().nth(1).flatten() {
             Some(s) => {
-                tracing::debug!(
+                relay_debug1(format!(
                     "tiko: wal_receiver: slot '{}' already exists, resuming",
                     config.slot_name
-                );
+                ));
                 parse_lsn(&s).map_err(|e| format!("slot restart_lsn parse error: {e}"))?
             }
             None => {
                 // restart_lsn is NULL — slot was not created with RESERVE_WAL
                 // or has never streamed.  Start from current WAL position.
-                tracing::info!(
+                relay_debug1(format!(
                     "tiko: wal_receiver: slot '{}' has no restart_lsn, starting from current WAL position ({xlogpos_str})",
                     config.slot_name
-                );
+                ));
                 xlogpos
             }
         }
@@ -212,16 +208,16 @@ async fn run_streaming(
         config.slot_name,
         (start_lsn >> 32) as u32,
         start_lsn as u32,
-        timeline
+        timeline_id.as_u32()
     );
     conn.start_replication(&start_sql).await?;
-    tracing::info!(
+    relay_debug1(format!(
         "tiko: wal_receiver: streaming started (slot={}, tl={}, lsn={:X}/{:X})",
         config.slot_name,
-        timeline,
+        timeline_id.to_hex_variable_width(),
         (start_lsn >> 32) as u32,
         start_lsn as u32,
-    );
+    ));
 
     // ── Message loop ──────────────────────────────────────────────────────────
     let mut confirmed_lsn: u64 = start_lsn;
@@ -241,8 +237,7 @@ async fn run_streaming(
                         handle_xlogdata(
                             &msg,
                             sim,
-                            ns,
-                            timeline,
+                            timeline_id,
                             &mut cur_seg,
                             &mut confirmed_lsn,
                             &mut conn,
@@ -256,10 +251,10 @@ async fn run_streaming(
                         }
                     }
                     _ => {
-                        tracing::warn!(
+                        relay_warning(format!(
                             "tiko: wal_receiver: unknown CopyData type 0x{:02X}",
                             msg[0]
-                        );
+                        ));
                     }
                 }
             }
@@ -285,7 +280,7 @@ async fn handle_xlogdata(
     msg: &[u8],
     sim: &'static Store,
     //ns: &ProjectNamespace,
-    timeline: u32,
+    timeline_id: TimelineId,
     cur_seg: &mut Option<SegState>,
     confirmed_lsn: &mut u64,
     conn: &mut ReplConn,
@@ -307,7 +302,7 @@ async fn handle_xlogdata(
     if let Some(state) = cur_seg.as_ref() {
         if state.seg_no != seg_no_new {
             let old = cur_seg.take().unwrap();
-            seal_segment(old, sim, timeline, confirmed_lsn, conn).await?;
+            seal_segment(old, sim, timeline_id, confirmed_lsn, conn).await?;
         }
     }
 
@@ -318,8 +313,8 @@ async fn handle_xlogdata(
     while state.buf.len() - state.chunks_uploaded >= CHUNK_BYTES {
         let offset = state.chunks_uploaded;
         let slice = state.buf[offset..offset + CHUNK_BYTES].to_vec();
-        let name = seg_name(timeline, state.seg_no);
-        let key = ns.wal_chunk_key(timeline, &name, offset);
+        let name = wal_seg_name(timeline_id, state.seg_no);
+        let key = sim.locator().wal_chunk_key(timeline_id, &name, offset);
         state.chunk_tasks.spawn(async move {
             tokio::task::spawn_blocking(move || sim.storage_put(&key, &slice))
                 .await
@@ -345,12 +340,12 @@ async fn seal_segment(
     mut state: SegState,
     sim: &'static Store,
     //ns: &ProjectNamespace,
-    timeline: u32,
+    timeline_id: TimelineId,
     confirmed_lsn: &mut u64,
     conn: &mut ReplConn,
 ) -> Result<(), BoxError> {
     let seg_no = state.seg_no;
-    let name = seg_name(timeline, seg_no);
+    let name = wal_seg_name(timeline_id, seg_no);
 
     // 1. Wait for all inflight chunk PUTs.
     while let Some(result) = state.chunk_tasks.join_next().await {
@@ -361,7 +356,9 @@ async fn seal_segment(
     let chunks_uploaded = state.chunks_uploaded;
     if state.buf.len() > chunks_uploaded {
         let tail = state.buf[chunks_uploaded..].to_vec();
-        let tail_key = ns.wal_chunk_key(timeline, &name, chunks_uploaded);
+        let tail_key = sim
+            .locator()
+            .wal_chunk_key(timeline_id, &name, chunks_uploaded);
         tokio::task::spawn_blocking(move || sim.storage_put(&tail_key, &tail))
             .await
             .map_err(|e| format!("tail spawn_blocking panicked: {e}"))?
@@ -371,14 +368,14 @@ async fn seal_segment(
     // 3. Zero-pad to XLOG_SEG_SIZE and PUT the sealed segment.
     state.buf.resize(XLOG_SEG_SIZE, 0);
     let sealed = state.buf;
-    let seg_key = ns.wal_key(timeline, &name);
+    let seg_key = sim.locator().wal_segment(timeline_id, &name);
     let name_log = name.clone();
     tokio::task::spawn_blocking(move || sim.storage_put(&seg_key, &sealed))
         .await
         .map_err(|e| format!("seal spawn_blocking panicked: {e}"))?
         .map_err(|e| format!("sealed PUT failed for {name_log}: {e}"))?;
 
-    tracing::trace!("tiko: wal_receiver: sealed {name}");
+    relay_debug1(format!("tiko: wal_receiver: sealed {name}"));
 
     // 4. Advance confirmed_lsn — only here, always at a segment boundary.
     *confirmed_lsn = (seg_no + 1) * XLOG_SEG_SIZE as u64;
@@ -386,14 +383,9 @@ async fn seal_segment(
 
     // 5. Best-effort compaction: delete chunk objects (fire-and-forget).
     //    Stranded chunks are harmless — tiko_restore prefers the sealed object.
-    let chunk_prefix = ns.wal_chunk_prefix(timeline, &name);
+    let chunk_prefix = sim.locator().wal_chunk_prefix(timeline_id, &name);
     tokio::task::spawn_blocking(move || {
-        if let Ok(keys) = sim.storage_list_prefix(&chunk_prefix) {
-            for key in keys {
-                let _ = sim.delete_standard(&key);
-            }
-        }
-        let _ = sim.remove_dir_standard(&chunk_prefix);
+        let _ = sim.storage_delete(&chunk_prefix);
     });
 
     Ok(())
@@ -426,8 +418,8 @@ async fn send_standby_status(conn: &mut ReplConn, flush_lsn: u64) -> Result<(), 
 
 /// Format a WAL segment filename from timeline and segment number.
 /// Format: `{timeline:08X}{seg_no:016X}`  e.g. `000000010000000000000002`
-fn seg_name(timeline: u32, seg_no: u64) -> String {
-    format!("{:08X}{:016X}", timeline, seg_no)
+fn wal_seg_name(timeline_id: TimelineId, seg_no: u64) -> String {
+    format!("{}{:016X}", timeline_id.to_hex(), seg_no)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -474,7 +466,7 @@ impl ReplConn {
         for (k, v) in &[
             ("user", user),
             ("replication", "true"),
-            ("application_name", "tiko_wal_stream"),
+            ("application_name", DEFAULT_SLOT_NAME),
         ] {
             body.put(k.as_bytes());
             body.put_u8(0);

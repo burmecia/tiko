@@ -10,7 +10,7 @@ use pgsys::logging::*;
 use std::sync::{Once, OnceLock};
 
 use crate::tasks::compactor::compactor_task;
-//use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
+use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
 use core::{
     //project::{ProjectCtx, ProjectNamespace},
     io::store::Store,
@@ -20,12 +20,11 @@ use core::{
 ///
 /// Does nothing if:
 /// - The runtime has not been initialised.
-/// - `ProjectCtx` is not yet loaded (env vars absent).
-/// - `S3Sim` has not been initialised.
+/// - `Store` has not been initialised.
 ///
 /// Call this from `worker_main` after both `init_tokio_runtime` and
 /// `init_project_ctx` have completed.
-pub fn spawn_compactor_task() {
+pub(crate) fn spawn_compactor_task() {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_compactor_task called before runtime init; skipping");
         return;
@@ -41,25 +40,19 @@ pub fn spawn_compactor_task() {
 
 /// Spawn the WAL receiver task on the Tokio runtime.
 ///
-/// Does nothing if the runtime, `ProjectCtx`, or `S3Sim` are not yet initialised.
-pub fn spawn_wal_receiver_task() {
-    let Some(_runtime) = TOKIO_RUNTIME.get() else {
+/// Does nothing if the runtime, or `Store` are not yet initialised.
+pub(crate) fn spawn_wal_receiver_task() {
+    let Some(runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_wal_receiver_task called before runtime init; skipping");
         return;
     };
 
-    // let Some(ctx) = ProjectCtx::try_get() else {
-    //     pg_log_info("tiko: ProjectCtx not initialised; skipping WAL receiver task");
-    //     return;
-    // };
-
-    let Ok(_sim) = Store::try_get() else {
+    let Ok(store) = Store::try_get() else {
         pg_log_warning("tiko: Store not initialised; skipping WAL receiver task");
         return;
     };
 
-    // let ns = ctx.ns().clone();
-    //runtime.spawn(wal_receiver_task(sim, ns, WalReceiverConfig::default()));
+    runtime.spawn(wal_receiver_task(store, WalReceiverConfig::default()));
     pg_log_info("tiko: WAL receiver task spawned");
 }
 
@@ -73,7 +66,7 @@ static RUNTIME_INIT: Once = Once::new();
 /// - Worker thread pool (4 threads for async work)
 /// - Blocking thread pool (8 threads for blocking operations)
 /// - Proper naming and lifecycle management
-pub fn init_tokio_runtime() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn init_tokio_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let mut init_error: Option<Box<dyn std::error::Error>> = None;
 
     RUNTIME_INIT.call_once(|| {
@@ -105,7 +98,7 @@ pub fn init_tokio_runtime() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// # Panics
 /// If called before `init_tokio_runtime()`
-pub fn get_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn get_runtime() -> &'static tokio::runtime::Runtime {
     TOKIO_RUNTIME.get().expect("Tokio runtime not initialized")
 }
 
@@ -113,7 +106,7 @@ pub fn get_runtime() -> &'static tokio::runtime::Runtime {
 ///
 /// # Arguments
 /// * `task` - Async function to execute
-pub fn spawn_task<F>(task: F)
+pub(crate) fn spawn_task<F>(task: F)
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
@@ -125,13 +118,13 @@ where
 ///
 /// Note: With OnceLock, we cannot directly shutdown the runtime.
 /// The runtime will shutdown when the process exits.
-pub fn shutdown_tokio_runtime() {
+pub(crate) fn shutdown_tokio_runtime() {
     pg_log_info("tiko: Tokio runtime will shutdown with process termination");
 }
 
 /// Configuration for the thread pool
 #[derive(Debug, Clone)]
-pub struct ThreadPoolConfig {
+pub(crate) struct ThreadPoolConfig {
     pub worker_threads: usize,
     pub blocking_threads: usize,
 }
@@ -146,7 +139,7 @@ impl Default for ThreadPoolConfig {
 }
 
 /// Create a runtime with custom configuration
-pub fn init_tokio_runtime_with_config(
+pub(crate) fn init_tokio_runtime_with_config(
     config: ThreadPoolConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut init_error: Option<Box<dyn std::error::Error>> = None;
