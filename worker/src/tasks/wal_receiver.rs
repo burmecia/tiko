@@ -98,6 +98,10 @@ struct SegState {
     chunks_uploaded: usize,
     /// In-flight chunk PUT tasks joined before sealing.
     chunk_tasks: JoinSet<Result<(), String>>,
+    /// True when streaming began partway into this segment, so `buf[0..offset)`
+    /// is a zero-filled placeholder rather than real WAL. Such a segment must
+    /// never be written as a sealed (complete) object — see `seal_segment`.
+    partial: bool,
 }
 
 impl SegState {
@@ -107,6 +111,7 @@ impl SegState {
             buf: Vec::with_capacity(XLOG_SEG_SIZE),
             chunks_uploaded: 0,
             chunk_tasks: JoinSet::new(),
+            partial: false,
         }
     }
 }
@@ -324,8 +329,11 @@ async fn handle_xlogdata(
             // streaming resumes at offset 0.
             s.buf.resize(seg_offset, 0);
             // Skip chunk uploads for the zero-filled prefix — it is not real
-            // WAL and the sealed segment object covers the whole file anyway.
+            // WAL. Mark the segment partial so it is never sealed as a complete
+            // object: the prefix is zeros, and a sealed object would masquerade
+            // as a fully-valid 16 MiB segment that restore could replay into.
             s.chunks_uploaded = seg_offset;
+            s.partial = true;
         }
         *cur_seg = Some(s);
     }
@@ -354,11 +362,15 @@ async fn handle_xlogdata(
 
 /// Seal a completed WAL segment.
 ///
-/// 1. Join all in-flight chunk PUTs (any error propagates to reconnect loop).
-/// 2. Upload any tail bytes not yet covered by a chunk.
-/// 3. Zero-pad to `XLOG_SEG_SIZE` and PUT the sealed object.
-/// 4. Send `StandbyStatusUpdate` — the ONLY place `confirmed_lsn` advances.
-/// 5. Spawn best-effort deletion of superseded chunk objects.
+/// 1. Join all in-flight chunk PUTs and upload the tail (any error propagates
+///    to the reconnect loop).
+/// 2. For a fully-observed segment: zero-pad to `XLOG_SEG_SIZE`, PUT the sealed
+///    object, and compact (delete) the now-superseded chunk objects.
+///    For a partial segment (streaming began mid-segment): keep chunks only —
+///    its `[0, start_offset)` prefix is a zero placeholder, so a sealed object
+///    would falsely advertise a complete, replayable 16 MiB segment.
+/// 3. Advance `confirmed_lsn` — the ONLY place it moves — and send a
+///    `StandbyStatusUpdate`, always at a segment boundary.
 async fn seal_segment(
     mut state: SegState,
     sim: &'static Store,
@@ -370,46 +382,41 @@ async fn seal_segment(
     let seg_no = state.seg_no;
     let name = wal_seg_name(timeline_id, seg_no);
 
-    // 1. Wait for all inflight chunk PUTs.
-    while let Some(result) = state.chunk_tasks.join_next().await {
-        result.map_err(|e| format!("chunk task panicked for {name}: {e}"))??;
-    }
+    // 1. Drain inflight chunk PUTs and flush the trailing partial chunk.
+    join_chunks_and_flush_tail(&mut state, sim, timeline_id, &name).await?;
 
-    // 2. Upload any tail bytes not covered by a full chunk.
-    let chunks_uploaded = state.chunks_uploaded;
-    if state.buf.len() > chunks_uploaded {
-        let tail = state.buf[chunks_uploaded..].to_vec();
-        let tail_key = sim
-            .locator()
-            .wal_chunk_key(timeline_id, &name, chunks_uploaded);
-        tokio::task::spawn_blocking(move || sim.storage_put(&tail_key, &tail))
+    if state.partial {
+        // Mid-stream start: do NOT write a sealed object and do NOT compact —
+        // the chunks covering [start_offset, end) are the only real copy.
+        relay_debug1(format!(
+            "tiko: wal_receiver: segment {name} began mid-stream; kept as chunks-only (no sealed object)"
+        ));
+    } else {
+        // 2. Zero-pad to XLOG_SEG_SIZE and PUT the sealed segment.
+        state.buf.resize(XLOG_SEG_SIZE, 0);
+        let sealed = state.buf;
+        let seg_key = sim.locator().wal_segment(timeline_id, &name);
+        let name_log = name.clone();
+        tokio::task::spawn_blocking(move || sim.storage_put(&seg_key, &sealed))
             .await
-            .map_err(|e| format!("tail spawn_blocking panicked: {e}"))?
-            .map_err(|e| format!("tail PUT failed for {name}: {e}"))?;
+            .map_err(|e| format!("seal spawn_blocking panicked: {e}"))?
+            .map_err(|e| format!("sealed PUT failed for {name_log}: {e}"))?;
+
+        relay_debug1(format!("tiko: wal_receiver: sealed {name}"));
+
+        // Best-effort compaction: delete chunk objects (fire-and-forget).
+        // Stranded chunks are harmless — tiko_restore prefers the sealed object.
+        let chunk_prefix = sim.locator().wal_chunk_prefix(timeline_id, &name);
+        tokio::task::spawn_blocking(move || {
+            let _ = sim.storage_delete(&chunk_prefix);
+        });
     }
 
-    // 3. Zero-pad to XLOG_SEG_SIZE and PUT the sealed segment.
-    state.buf.resize(XLOG_SEG_SIZE, 0);
-    let sealed = state.buf;
-    let seg_key = sim.locator().wal_segment(timeline_id, &name);
-    let name_log = name.clone();
-    tokio::task::spawn_blocking(move || sim.storage_put(&seg_key, &sealed))
-        .await
-        .map_err(|e| format!("seal spawn_blocking panicked: {e}"))?
-        .map_err(|e| format!("sealed PUT failed for {name_log}: {e}"))?;
-
-    relay_debug1(format!("tiko: wal_receiver: sealed {name}"));
-
-    // 4. Advance confirmed_lsn — only here, always at a segment boundary.
+    // 3. Advance confirmed_lsn — only here, always at a segment boundary.
+    //    Must stay segment-aligned: reconnect resumes from this value, and a
+    //    mid-segment value would force the partial-start path on every resume.
     *confirmed_lsn = (seg_no + 1) * XLOG_SEG_SIZE as u64;
     send_standby_status(conn, *confirmed_lsn).await?;
-
-    // 5. Best-effort compaction: delete chunk objects (fire-and-forget).
-    //    Stranded chunks are harmless — tiko_restore prefers the sealed object.
-    let chunk_prefix = sim.locator().wal_chunk_prefix(timeline_id, &name);
-    tokio::task::spawn_blocking(move || {
-        let _ = sim.storage_delete(&chunk_prefix);
-    });
 
     Ok(())
 }
@@ -429,7 +436,25 @@ async fn flush_partial_tail(
         None => return Ok(()),
     };
     let name = wal_seg_name(timeline_id, state.seg_no);
+    join_chunks_and_flush_tail(&mut state, sim, timeline_id, &name).await?;
+    relay_debug1(format!(
+        "tiko: wal_receiver: flushed partial tail for {name}"
+    ));
+    Ok(())
+}
 
+/// Join all in-flight chunk PUTs, then upload any buffered tail bytes not yet
+/// covered by a full chunk. Shared by `seal_segment` and `flush_partial_tail`.
+///
+/// The tail is keyed at `chunks_uploaded` (its real byte offset within the
+/// segment), so chunk keys remain consistent whether or not a sealed object
+/// is later written.
+async fn join_chunks_and_flush_tail(
+    state: &mut SegState,
+    sim: &'static Store,
+    timeline_id: TimelineId,
+    name: &str,
+) -> Result<(), BoxError> {
     while let Some(result) = state.chunk_tasks.join_next().await {
         result.map_err(|e| format!("chunk task panicked for {name}: {e}"))??;
     }
@@ -439,14 +464,11 @@ async fn flush_partial_tail(
         let tail = state.buf[chunks_uploaded..].to_vec();
         let tail_key = sim
             .locator()
-            .wal_chunk_key(timeline_id, &name, chunks_uploaded);
+            .wal_chunk_key(timeline_id, name, chunks_uploaded);
         tokio::task::spawn_blocking(move || sim.storage_put(&tail_key, &tail))
             .await
-            .map_err(|e| format!("tail flush panicked: {e}"))?
-            .map_err(|e| format!("tail flush PUT failed for {name}: {e}"))?;
-        relay_debug1(format!(
-            "tiko: wal_receiver: flushed partial tail for {name}"
-        ));
+            .map_err(|e| format!("tail spawn_blocking panicked for {name}: {e}"))?
+            .map_err(|e| format!("tail PUT failed for {name}: {e}"))?;
     }
 
     Ok(())
