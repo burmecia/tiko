@@ -41,4 +41,6 @@ $PG_BIN_DIR/pg_ctl -D tt -l log.log start
 
 $PG_BIN_DIR/psql -d postgres -c "create temp table tt(a int);create index idx_tt on tt(a);insert into tt values(123);select * from tt;"
 
+sleep 2
+
 $PG_BIN_DIR/pg_ctl -D tt -l log.log stop

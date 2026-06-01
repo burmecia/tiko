@@ -16,7 +16,7 @@ use core::{
 };
 use std::time::Duration;
 
-use crate::log_relay::{relay_debug1, relay_info};
+use crate::log_relay::{relay_debug1, relay_debug2, relay_info};
 
 // ── Background task ───────────────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ pub async fn compactor_task(store: &'static Store) {
                 ));
             }
             Ok(CompactionResult::NoNewSegments) => {
-                relay_debug1("tiko: compactor: no new segments above base — skipping");
+                relay_debug2("tiko: compactor: no new segments above base — skipping");
             }
             Ok(CompactionResult::Raced) => {
                 relay_debug1("tiko: compactor: raced with another compactor; will retry next tick");

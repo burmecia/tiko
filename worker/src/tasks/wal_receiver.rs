@@ -258,7 +258,13 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
                     }
                 }
             }
-            Ok(Ok(None)) => return Ok(()), // CopyDone: clean EOF from walsender
+            Ok(Ok(None)) => {
+                // CopyDone: walsender finished streaming through the shutdown
+                // checkpoint. Flush the partial tail so S3 has WAL up to the
+                // actual shutdown point, not just the last sealed segment.
+                flush_partial_tail(&mut cur_seg, sim, timeline_id).await?;
+                return Ok(());
+            }
             Ok(Err(e)) => return Err(e),
             Err(_timeout) => {
                 // No message — send proactive keepalive.
@@ -306,7 +312,24 @@ async fn handle_xlogdata(
         }
     }
 
-    let state = cur_seg.get_or_insert_with(|| SegState::new(seg_no_new));
+    if cur_seg.is_none() {
+        let seg_offset = (start_lsn % XLOG_SEG_SIZE as u64) as usize;
+        let mut s = SegState::new(seg_no_new);
+        if seg_offset > 0 {
+            // Zero-fill up to the actual data offset so the sealed segment
+            // object has WAL bytes at the correct positions within the file.
+            // This happens only on the very first connection when the slot's
+            // restart_lsn is mid-segment (xlogpos at slot creation time).
+            // On reconnects, confirmed_lsn is always segment-aligned so
+            // streaming resumes at offset 0.
+            s.buf.resize(seg_offset, 0);
+            // Skip chunk uploads for the zero-filled prefix — it is not real
+            // WAL and the sealed segment object covers the whole file anyway.
+            s.chunks_uploaded = seg_offset;
+        }
+        *cur_seg = Some(s);
+    }
+    let state = cur_seg.as_mut().unwrap();
     state.buf.extend_from_slice(wal_data);
 
     // Fire chunk PUTs for newly complete 256 KiB windows — non-blocking.
@@ -387,6 +410,44 @@ async fn seal_segment(
     tokio::task::spawn_blocking(move || {
         let _ = sim.storage_delete(&chunk_prefix);
     });
+
+    Ok(())
+}
+
+// ── Partial tail flush on clean shutdown ──────────────────────────────────────
+
+/// On clean shutdown (CopyDone), upload any buffered bytes not yet covered by
+/// a chunk PUT. Unlike `seal_segment`, does not zero-pad or write a sealed
+/// segment object — the segment is incomplete and restore falls back to chunks.
+async fn flush_partial_tail(
+    cur_seg: &mut Option<SegState>,
+    sim: &'static Store,
+    timeline_id: TimelineId,
+) -> Result<(), BoxError> {
+    let mut state = match cur_seg.take() {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let name = wal_seg_name(timeline_id, state.seg_no);
+
+    while let Some(result) = state.chunk_tasks.join_next().await {
+        result.map_err(|e| format!("chunk task panicked for {name}: {e}"))??;
+    }
+
+    let chunks_uploaded = state.chunks_uploaded;
+    if state.buf.len() > chunks_uploaded {
+        let tail = state.buf[chunks_uploaded..].to_vec();
+        let tail_key = sim
+            .locator()
+            .wal_chunk_key(timeline_id, &name, chunks_uploaded);
+        tokio::task::spawn_blocking(move || sim.storage_put(&tail_key, &tail))
+            .await
+            .map_err(|e| format!("tail flush panicked: {e}"))?
+            .map_err(|e| format!("tail flush PUT failed for {name}: {e}"))?;
+        relay_debug1(format!(
+            "tiko: wal_receiver: flushed partial tail for {name}"
+        ));
+    }
 
     Ok(())
 }
