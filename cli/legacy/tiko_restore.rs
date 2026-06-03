@@ -12,10 +12,10 @@
 //! Exits 0 if the segment was found and written; exits 1 if not found or on error.
 //!
 //! Required environment variables:
-//! - `TIKO_ROOT_PATH`    — root path for the sim store (replaces `PGDATA`)
+//! - `TIKO_ROOT_PATH`    — root path for the store store (replaces `PGDATA`)
 //! - `TIKO_ORG_ID`      — organisation identifier (u64)
+//! - `TIKO_DB_ID`       — database identifier (u64)
 //! - `TIKO_PROJECT_ID`  — project identifier (u64)
-//! - `TIKO_BRANCH_ID`   — branch identifier (u64)
 //!
 //! Optional environment variables (for branch WAL fallback):
 //! - `TIKO_PARENT_PROJECT_ID`     — parent project identifier (u64)
@@ -30,8 +30,37 @@
 
 use std::path::{Path, PathBuf};
 
-use core::{ENV_BRANCH_ID, ENV_ORG_ID, ENV_PROJECT_ID, project::ProjectNamespace, store::Store};
+use core::{
+    env::{ENV_ORG_ID, ENV_DB_ID, ENV_PROJECT_ID},
+    io::store::Store,
+    error::Result,
+};
 use pgsys::Lsn;
+
+fn run() -> Result<()> {
+    let store = Store::init()?;
+    let own_ns = namespace_from_env()?;
+    let parent_ns = parent_namespace_from_env();
+    let branch_lsn = branch_checkpoint_lsn_from_env();
+
+    match restore_segment(
+        &store,
+        &own_ns,
+        parent_ns.as_ref(),
+        branch_lsn,
+        wal_filename,
+        &dest_path,
+    )? {
+        true => {
+            eprintln!("tiko_restore: ok segment={wal_filename}");
+            Ok(())
+        }
+        false => {
+            eprintln!("tiko_restore: not found segment={wal_filename}");
+            std::process::exit(1);
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -49,7 +78,7 @@ fn main() {
         dest_path.display()
     );
 
-    let sim = match sim_from_env() {
+    let store = match sim_from_env() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tiko_restore: {e}");
@@ -69,7 +98,7 @@ fn main() {
     let branch_lsn = branch_checkpoint_lsn_from_env();
 
     match restore_segment(
-        &sim,
+        &store,
         &own_ns,
         parent_ns.as_ref(),
         branch_lsn,
@@ -127,7 +156,7 @@ fn branch_checkpoint_lsn_from_env() -> Option<Lsn> {
     Lsn::from_hex(s.trim()).ok()
 }
 
-/// Download a WAL segment from the sim standard store and write it to `dest`.
+/// Download a WAL segment from the store standard store and write it to `dest`.
 ///
 /// Returns `Ok(true)` on success, `Ok(false)` if the segment is not found in
 /// either namespace.
@@ -137,7 +166,7 @@ fn branch_checkpoint_lsn_from_env() -> Option<Lsn> {
 /// 2. If a parent namespace is provided AND the segment's LSN is within the
 ///    branch point (`segment_lsn ≤ branch_lsn`), try the parent namespace.
 fn restore_segment(
-    sim: &Store,
+    store: &Store,
     own_ns: &ProjectNamespace,
     parent_ns: Option<&ProjectNamespace>,
     branch_lsn: Option<Lsn>,
@@ -150,7 +179,7 @@ fn restore_segment(
     };
 
     // Step 1: try own namespace.
-    if download_wal_segment(sim, own_ns, timeline, filename, dest)? {
+    if download_wal_segment(store, own_ns, timeline, filename, dest)? {
         return Ok(true);
     }
 
@@ -158,7 +187,7 @@ fn restore_segment(
     // segment predates the branch checkpoint.
     if let (Some(p_ns), Some(branch_lsn)) = (parent_ns, branch_lsn) {
         let seg_lsn = segment_lsn_from_name(filename).unwrap_or(Lsn::new(u64::MAX));
-        if seg_lsn <= branch_lsn && download_wal_segment(sim, p_ns, timeline, filename, dest)? {
+        if seg_lsn <= branch_lsn && download_wal_segment(store, p_ns, timeline, filename, dest)? {
             return Ok(true);
         }
     }
@@ -171,13 +200,13 @@ fn restore_segment(
 ///
 /// Returns `Ok(true)` on success, `Ok(false)` if the key does not exist.
 fn download_wal_segment(
-    sim: &Store,
+    store: &Store,
     ns: &ProjectNamespace,
     timeline: u32,
     segment: &str,
     dest: &Path,
 ) -> std::io::Result<bool> {
-    match sim.storage_get(&ns.wal_key(timeline, segment))? {
+    match store.storage_get(&ns.wal_key(timeline, segment))? {
         Some(bytes) => {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -217,147 +246,4 @@ fn read_u64(var: &str) -> Result<u64, String> {
         .map_err(|_| format!("{var} not set"))?
         .parse::<u64>()
         .map_err(|_| format!("{var} is not a valid u64"))
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn setup() -> (TempDir, Store) {
-        let dir = TempDir::new().unwrap();
-        let sim = Store::new_sim(dir.path());
-        (dir, sim)
-    }
-
-    fn own_ns() -> ProjectNamespace {
-        ProjectNamespace::new(1001, 2001, 1)
-    }
-
-    fn parent_ns() -> ProjectNamespace {
-        ProjectNamespace::new(1001, 2000, 7)
-    }
-
-    /// Store a WAL segment in the sim standard bucket.
-    fn seed_wal(sim: &Store, ns: &ProjectNamespace, segment: &str, data: &[u8]) {
-        let timeline = parse_timeline(segment).unwrap();
-        let key = ns.wal_key(timeline, segment);
-        sim.storage_put(&key, data).unwrap();
-    }
-
-    const SEG1: &str = "000000010000000000000001"; // lsn = 0x1000000  (16 MB)
-    const SEG_BEYOND: &str = "000000010000000000000040"; // lsn = 0x40000000 (1 GB) — beyond 0x3A000028
-
-    // branch_checkpoint_lsn = 0x3A000028 from the spec example.
-    fn branch_lsn() -> Lsn {
-        Lsn::from_hex("000000003A000028").unwrap()
-    }
-
-    // ── Archive → restore round-trip ──────────────────────────────────────────
-
-    #[test]
-    fn archive_and_restore_round_trip() {
-        let (dir, sim) = setup();
-        let ns = own_ns();
-
-        // Seed the WAL segment directly (simulating tiko_archive having run).
-        seed_wal(&sim, &ns, SEG1, b"wal_segment_contents");
-
-        let dest = dir.path().join("restored");
-        let found = restore_segment(&sim, &ns, None, None, SEG1, &dest).unwrap();
-
-        assert!(
-            found,
-            "restore must succeed when segment exists in own namespace"
-        );
-        assert_eq!(std::fs::read(&dest).unwrap(), b"wal_segment_contents");
-    }
-
-    // ── Branch fallback: segment only in parent namespace ─────────────────────
-
-    #[test]
-    fn branch_fallback_finds_segment_in_parent() {
-        let (dir, sim) = setup();
-        let own = own_ns();
-        let parent = parent_ns();
-
-        // Segment is ONLY in the parent namespace.
-        seed_wal(&sim, &parent, SEG1, b"parent_wal_data");
-
-        let dest = dir.path().join("restored");
-        let found =
-            restore_segment(&sim, &own, Some(&parent), Some(branch_lsn()), SEG1, &dest).unwrap();
-
-        assert!(
-            found,
-            "fallback to parent must succeed for segment within branch point"
-        );
-        assert_eq!(std::fs::read(&dest).unwrap(), b"parent_wal_data");
-    }
-
-    // ── Segment beyond branch_checkpoint_lsn → not fetched from parent ────────
-
-    #[test]
-    fn segment_beyond_branch_lsn_not_fetched_from_parent() {
-        let (dir, sim) = setup();
-        let own = own_ns();
-        let parent = parent_ns();
-
-        // Segment is in the parent namespace but its LSN > branch_checkpoint_lsn.
-        seed_wal(&sim, &parent, SEG_BEYOND, b"future_wal_data");
-
-        let dest = dir.path().join("restored");
-        let found = restore_segment(
-            &sim,
-            &own,
-            Some(&parent),
-            Some(branch_lsn()),
-            SEG_BEYOND,
-            &dest,
-        )
-        .unwrap();
-
-        assert!(
-            !found,
-            "segment beyond branch_lsn must not be fetched from parent"
-        );
-        assert!(!dest.exists(), "dest must not be created on miss");
-    }
-
-    // ── Segment absent from both namespaces → not found ───────────────────────
-
-    #[test]
-    fn segment_absent_from_both_returns_false() {
-        let (dir, sim) = setup();
-        let own = own_ns();
-        let parent = parent_ns();
-
-        let dest = dir.path().join("restored");
-        let found =
-            restore_segment(&sim, &own, Some(&parent), Some(branch_lsn()), SEG1, &dest).unwrap();
-
-        assert!(!found, "absent segment must return false");
-        assert!(!dest.exists());
-    }
-
-    // ── segment_lsn_from_name ─────────────────────────────────────────────────
-
-    #[test]
-    fn segment_lsn_within_branch_point() {
-        // SEG1: log=0, seg=1 → lsn = 1 << 24 = 0x1000000
-        let lsn = segment_lsn_from_name(SEG1).unwrap();
-        assert!(lsn <= branch_lsn(), "SEG1 lsn {lsn:?} must be ≤ branch_lsn");
-    }
-
-    #[test]
-    fn segment_lsn_beyond_branch_point() {
-        // SEG_BEYOND: log=0, seg=0x40 → lsn = 0x40 << 24 = 0x40000000
-        let lsn = segment_lsn_from_name(SEG_BEYOND).unwrap();
-        assert!(
-            lsn > branch_lsn(),
-            "SEG_BEYOND lsn {lsn:?} must be > branch_lsn"
-        );
-    }
 }

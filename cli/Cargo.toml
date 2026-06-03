@@ -16,9 +16,9 @@ rust-version = { workspace = true }
 # name = "tiko_archive"
 # path = "src/bin/tiko_archive.rs"
 # 
-# [[bin]]
-# name = "tiko_restore"
-# path = "src/bin/tiko_restore.rs"
+[[bin]]
+name = "tiko_restore"
+path = "src/bin/tiko_restore.rs"
 
 # [[bin]]
 # name = "manifest_viewer"

@@ -72,17 +72,17 @@ pub async fn wal_receiver_task(sim: &'static Store, config: WalReceiverConfig) {
     ));
     let mut backoff = Duration::from_secs(1);
     loop {
+        sleep(backoff).await;
         match run_streaming(sim, &config).await {
             Ok(()) => {
                 relay_debug1("tiko: wal_receiver: connection closed, reconnecting");
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
+                backoff = (backoff * 2).min(Duration::from_secs(60));
                 relay_warning(format!(
                     "tiko: wal_receiver: {e}, reconnecting in {backoff:?}"
                 ));
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
             }
         }
     }

@@ -12,7 +12,11 @@ TIKO_ORG_ID="12"
 TIKO_DB_ID="34"
 TIKO_PROJECT_ID="56"
 
-PG_BIN_DIR="./postgres/tmp_install/Users/bolu/supabase/tiko/target/pg-install/bin"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_DIR="${BASE_DIR}/target"
+POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
+PG_BIN_DIR="${POSTGRES_INSTALL}/bin"
+PG_LIB_DIR="${POSTGRES_INSTALL}/lib/postgresql"
 
 echo "Building Tiko smgr..."
 if ! (cargo build -p smgr) >/dev/null; then
@@ -31,6 +35,12 @@ echo "Building Tiko Worker..."
 if ! (cargo build -p worker) >/dev/null; then
   echo "Tiko Worker build failed" >&2
   exit 1
+fi
+
+# Copy the compiled worker library to destination
+if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
+    echo "Copying Tiko Worker extension files ..."
+    cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${PG_LIB_DIR}"
 fi
 
 rm -rf tt log.log
