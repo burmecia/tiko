@@ -90,6 +90,7 @@ fn run_list(store: &Store) -> Result<()> {
 }
 
 fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
+    // 1. Parse the target checkpoint from the CLI arguments.
     let tl = TimelineId::from_hex(&args.timeline)
         .map_err(|e| Error::other(format!("invalid --timeline '{}': {e}", args.timeline)))?;
     let lsn = Lsn::parse_either(&args.lsn).map_err(Error::other)?;
@@ -137,6 +138,10 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             // 11. Failure: ensure stopped, restore PGDATA, leave PG down.
             eprintln!("tiko_pitr: recovery failed: {e}");
             eprintln!("tiko_pitr: restoring PGDATA from backup {}", backup.display());
+            // Best-effort stop before restoring. The foreground `postgres` run
+            // has already exited by the time we reach this arm, so PG is
+            // normally down already; this just guards against a stray process.
+            // We ignore the result and proceed to restore regardless.
             let _ = stop_pg(pg_ctl, pgdata);
             if let Err(re) = pitr::restore_dir(&backup, pgdata, "tiko") {
                 eprintln!(
@@ -207,6 +212,10 @@ fn extract_pg_state(pg_state: &[u8], pgdata: &Path) -> Result<()> {
 }
 
 /// `pg_ctl -D <pgdata> -m fast -w stop`, tolerating an already-stopped instance.
+///
+/// Assumes this process is the sole orchestrator of the target PGDATA (no
+/// concurrent `pg_ctl`): a non-zero exit with an absent `postmaster.pid` is
+/// treated as "already stopped".
 fn stop_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
     let status = Command::new(pg_ctl)
         .arg("stop")
