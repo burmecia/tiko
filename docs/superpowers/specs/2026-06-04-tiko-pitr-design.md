@@ -88,13 +88,16 @@ tiko_pitr list
     Print a numbered table of all checkpoints found across timeline segments:
     index, timeline, LSN, created_at (RFC3339), #chunks. Read-only; no PGDATA.
 
-tiko_pitr recover --timeline <TL> --lsn <LSN> [--pgdata <DIR>] [--pg-ctl <PATH>]
+tiko_pitr recover --timeline <TL> --lsn <LSN>
+                  [--pgdata <DIR>] [--pg-ctl <PATH>] [--postgres <PATH>]
     Recover the instance to the given checkpoint, then restart normally.
 ```
 
 Storage configured via env, identical to `tiko_restore` (`Store::init()`):
 `TIKO_ROOT_PATH`/`PGDATA`, `TIKO_ORG_ID`, `TIKO_DB_ID`, `TIKO_PROJECT_ID`.
-`--pgdata` defaults to `$PGDATA`; `--pg-ctl` defaults to `pg_ctl` on `PATH`.
+`--lsn` accepts PG `X/Y` or hex (`Lsn::parse_either`). `--pgdata` defaults to
+`$PGDATA`; `--pg-ctl` defaults to `pg_ctl` on `PATH`; `--postgres` defaults to
+the `postgres` binary sibling of `--pg-ctl` (falling back to `postgres` on `PATH`).
 
 The binary uses `extern crate cli;` for `pg_stubs` (same as `tiko_restore`),
 since `core`'s undefined PG symbols must resolve in a standalone process.
@@ -121,13 +124,14 @@ private `list_all_segments` / `load_segment` and `storage_*` primitives:
   dropped. Distinct, clear `Error` (`Error::other(...)`) if no base covers the
   target. Segment-model replacement for the legacy `recovery.rs::load_base_manifest`.
 
-Plus a small filesystem helper (in `core` so it is unit-testable, or a `cli`
-helper module — settled during planning):
+Plus a small filesystem helper in `core/src/pitr.rs` (so it is unit-testable in
+`core`, where tests reliably run):
 
-- **`backup_dir_excluding` / `restore_dir`** — recursively copy a directory to a
-  sibling backup, skipping a named subdirectory (`tiko/`) and the backup dir
-  itself; and restore from it. Portable Rust walk (not `cp`/`rsync`, which can't
-  cleanly exclude or may be absent). Used for the step-4 PGDATA snapshot.
+- **`backup_dir_excluding(src, dst, exclude_name)` / `restore_dir(backup, dst, exclude_name)`** —
+  recursively copy a directory to a sibling backup, skipping a named
+  subdirectory (`tiko/`) and the backup dir itself; and restore from it.
+  Portable Rust walk (not `cp`/`rsync`, which can't cleanly exclude or may be
+  absent). Used for the step-5 PGDATA snapshot.
 
 ### New module `core/src/pitr.rs` (conf helpers) + delete `recovery.rs`
 
@@ -188,12 +192,16 @@ Thin orchestration over the `core` helpers and `pg_ctl`/`tar`. Uses
 7. **Write PITR conf:** `write_pitr_recovery_conf(pgdata/postgresql.tiko.conf,
    target_tl, target_lsn)`.
 8. **Touch `recovery.signal`.**
-9. **Run recovery:** `pg_ctl -D <pgdata> start` and wait for the postmaster to
-   exit. With `action = 'shutdown'`, PG replays WAL (pulling segments via
-   `tiko_restore`) up to `recovery_target_lsn`, then shuts itself down. Exact
-   wait/success-detection mechanism (postmaster exit status; spawn + wait or
-   poll `postmaster.pid`) to be settled during planning; contract is "block
-   until PG finishes recovery and exits, and report whether it succeeded."
+9. **Run recovery:** run the `postgres` server binary in the **foreground** —
+   `postgres -D <pgdata>` via `Command::status()` — and wait for it to exit.
+   With `recovery_target_action = 'shutdown'`, PG replays WAL (pulling segments
+   via `tiko_restore`) up to `recovery_target_lsn`, then shuts itself down and
+   the process exits **0**. If it cannot reach the target (e.g. WAL ends first,
+   bad target, crash) PG exits **non-zero**. So the foreground exit status is a
+   reliable success/failure signal — cleaner than scripting `pg_ctl start -w`,
+   which polls for "ready to accept connections" that never happens in the
+   shutdown case. The `postgres` binary path is derived as a sibling of the
+   `pg_ctl` path, overridable via `--postgres`.
 10. **On success:** `remove_recovery_conf(postgresql.tiko.conf)`, delete
    `recovery.signal`, delete the PGDATA backup, then **restart normally**:
    `pg_ctl -D <pgdata> -w start` (new timeline at promotion).
