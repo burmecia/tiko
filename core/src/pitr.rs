@@ -105,6 +105,14 @@ pub fn backup_dir_excluding(src: &Path, dst: &Path, exclude_name: &str) -> Resul
 /// Restore `dst` from `backup`: delete every top-level entry in `dst` except
 /// `exclude_name`, then copy the backup's contents back in. After this, `dst`
 /// matches the snapshot for everything except the preserved `exclude_name` dir.
+///
+/// # Failure handling
+///
+/// This is not atomic: it deletes then re-copies in place, so an error or
+/// crash partway through leaves `dst` torn (some originals gone, some backup
+/// entries not yet written). The caller MUST keep `backup` intact until this
+/// returns `Ok`, and re-run the restore on failure rather than deleting the
+/// backup. (`tiko_pitr` only removes the backup after a successful restore.)
 pub fn restore_dir(backup: &Path, dst: &Path, exclude_name: &str) -> Result<()> {
     for entry in fs::read_dir(dst)? {
         let entry = entry?;
