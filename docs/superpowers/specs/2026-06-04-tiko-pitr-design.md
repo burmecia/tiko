@@ -17,31 +17,47 @@ recovery (PITR) lifecycle against Tiko's remote storage:
 5. Adjust the PostgreSQL conf to drive recovery to the target checkpoint.
 6. Run recovery, then restart the instance normally once it completes.
 
-## Background / existing infrastructure
+## Source-of-truth model (segment-based)
+
+The current architecture is **segment-based**. `core/src/recovery.rs` is a
+legacy file that still references a delta-manifest model (`delta_manifest_key`,
+`apply_deltas`, `pg_state_key`, `base_prefix_for_timeline`) and must be treated
+as reference only — it is refactored as part of this work. The authoritative
+logic lives in `core/src/manifest.rs`, `core/src/io/timeline.rs`, and
+`core/src/io/store.rs`.
+
+Data layout (from `core/src/io/locator.rs`):
+
+- **Checkpoints** are `SegmentCheckpoint`s inside `TimelineSegment` files under
+  `timeline_segments_dir()` = `{ns}/timeline/`, keyed
+  `{ns}/timeline/{tl:08X}/{idx:016X}.segment`. Each `SegmentCheckpoint` carries
+  `ckpt`, `prev_ckpt`, `redo_ckpt`, `chunks`, `relforks`, `pg_state`,
+  `created_at` (`core/src/io/timeline.rs`). This is what `list` enumerates.
+- **Base manifests** are produced by the compactor (`Store::run_compaction`),
+  listed under `bases_dir()` = `{ns}/bases/`, keyed
+  `{ns}/bases/{tl}/{lsn_hex}.manifest`. Each `Manifest` carries its own
+  `checkpoint()` and an embedded self-contained `pg_state` (`pg_state.tar.zst`),
+  accessible via `Manifest::pg_state()` (public, `core/src/manifest.rs`).
+
+Relevant existing pieces:
 
 - **`cli/src/bin/tiko_restore.rs`** — the `restore_command` helper PostgreSQL
-  invokes to fetch WAL segments from remote during archive recovery. `tiko_pitr`
-  reuses this as the recovery WAL source (`restore_command = 'tiko_restore %f %p'`).
+  invokes to fetch WAL segments from remote. `tiko_pitr` reuses it as the
+  recovery WAL source (`restore_command = 'tiko_restore %f %p'`).
 - **`cli/src/bin/tiko_tlseg_viewer.rs`** — parses one `.segment` file and prints
   its `SegmentCheckpoint`s. `tiko_pitr list` generalizes this across all segments.
-- **`core/src/recovery.rs`** — has the building blocks: `load_base_manifest`
-  (newest base with `base_lsn <= target_lsn`, currently private),
-  `write_recovery_conf` / `remove_recovery_conf` (conf block delimited by shared
-  begin/end markers), `TIKO_CONF_FILE = "postgresql.tiko.conf"`.
-  NOTE: the existing `write_recovery_conf` is built for *branching*
-  (`recovery_target = 'immediate'`, no `restore_command`) — `tiko_pitr` needs a
-  different conf writer (see below).
-- **`core/src/manifest.rs`** — `Manifest` (TIKM format). Base manifests embed a
-  self-contained `pg_state` (`pg_state.tar.zst`) in the trailer, accessible via
-  `Manifest::pg_state()`. Recent commits made base manifests self-contained
-  (redo checkpoint + pg_state) precisely for PITR.
-- **`core/src/io/timeline.rs`** — `TimelineSegment` (`.segment` files under
-  `{ns}/timeline/{tl:08X}/{idx:016X}.segment`), each holding ordered
-  `SegmentCheckpoint`s (`ckpt`, `prev_ckpt`, `redo_ckpt`, `chunks`, `relforks`,
-  `pg_state`, `created_at`).
-- **`core/src/io/store.rs`** — `Store::init()` (singleton, configured from env),
-  `storage_get` (auto-decompresses), `storage_list_prefix`, and the private
-  `list_all_segments` listing pattern.
+- **`core/src/io/store.rs`** — `Store::init()` (singleton, configured from env,
+  works standalone as `tiko_restore` proves), `storage_get` (auto-decompresses),
+  `storage_list_prefix`, `locator()`, and the **private** `list_all_segments` /
+  `load_segment` listing pattern. The locator key helpers (`bases_dir`,
+  `timeline_segments_dir`, `timeline_segment`, `base_manifest`) are
+  `pub(crate)`/`pub(super)` — not reachable from the `cli` crate, which forces
+  the reusable logic to be exposed as public `Store` methods.
+- **`core/src/recovery.rs`** — legacy. Provides the conf begin/end marker
+  constants and `remove_recovery_conf` (worth keeping), but its
+  `write_recovery_conf` is branch-oriented (`recovery_target = 'immediate'`, no
+  `restore_command`) and its base-manifest/delta code is dead under the segment
+  model. Refactored here (see below).
 
 ## Design decisions (resolved during brainstorming)
 
@@ -53,8 +69,12 @@ recovery (PITR) lifecycle against Tiko's remote storage:
 3. **Scope:** extract `pg_state` only. Do NOT build `recovery_manifest.bin`.
 4. **List UX:** `list` subcommand prints a table and exits; `recover` takes an
    explicit target. (List-only, re-run with args — scriptable.)
-5. **Code split:** binary stays thin; reusable logic (base-manifest selection,
-   PITR conf writer) lives in `core` for sharing and unit testing.
+5. **Code split:** binary stays thin; reusable logic (checkpoint listing,
+   base-manifest selection, PITR conf writer) lives in `core` for sharing and
+   unit testing. This requires exposing new public `Store` methods, since the
+   underlying locator/segment helpers are crate-private.
+6. **recovery.rs refactor:** drop the dead delta-manifest code paths and align
+   the surviving conf helpers with the segment-based PITR flow (details below).
 
 ## CLI surface (clap subcommands)
 
@@ -78,12 +98,28 @@ since `core`'s undefined PG symbols must resolve in a standalone process.
 
 ### core additions (new/exposed, unit-tested)
 
-- **Base-manifest selection** — expose the logic in `recovery.rs::load_base_manifest`
-  (newest base with `base_lsn <= target_lsn` on the target timeline; error if
-  none covers the target) as a reusable function callable from the binary.
-- **PITR conf writer** — a new function alongside `write_recovery_conf` that
+New public methods on `Store` (in `core/src/io/store.rs`), built on the existing
+private `list_all_segments` / `load_segment` and `storage_*` primitives:
+
+- **`list_checkpoints()`** — scan `timeline_segments_dir()`, load each
+  `TimelineSegment` (`storage_get` auto-decompresses → `TimelineSegment::from_bytes`),
+  flatten all `SegmentCheckpoint`s into a `Vec` of lightweight rows
+  (`ckpt: Checkpoint`, `redo_ckpt`, `created_at: i64`, `n_chunks: usize`), sorted
+  ascending by `(created_at, ckpt)`. Read-only.
+- **`load_base_manifest_at_or_before(target: Checkpoint) -> Result<Manifest>`** —
+  list `bases_dir()`, parse each key's `{tl}/{lsn_hex}.manifest` into a
+  `Checkpoint`, pick the newest with `base_ckpt <= target`, `storage_get` it, and
+  return `Manifest::from_bytes(...)`. Distinct, clear error if no base covers the
+  target. This is the segment-model replacement for the legacy
+  `recovery.rs::load_base_manifest`.
+
+### recovery.rs refactor (conf helpers)
+
+- **Keep:** the begin/end marker constants and `remove_recovery_conf` (clean,
+  marker-delimited strip — reused verbatim for cleanup).
+- **Add:** `write_pitr_recovery_conf(conf_path, target_tl, target_lsn)` that
   appends a Tiko PITR block to `postgresql.tiko.conf`, delimited by the SAME
-  begin/end markers `remove_recovery_conf` already strips:
+  markers so `remove_recovery_conf` strips it identically:
   ```
   restore_command = 'tiko_restore %f %p'
   recovery_target_lsn = '<target_lsn>'
@@ -91,33 +127,38 @@ since `core`'s undefined PG symbols must resolve in a standalone process.
   recovery_target_inclusive = on
   recovery_target_action = 'shutdown'
   ```
-  Marker constants stay shared so `remove_recovery_conf` cleans it identically.
+- **Remove:** the dead delta-manifest code paths (`prepare_recovery`'s
+  delta/`pg_state_key` logic, `apply_deltas_up_to`, `load_base_manifest`) that
+  no longer fit the segment model. Scope the removal to what is genuinely dead;
+  do not touch unrelated recovery-mode runtime hooks still in use.
 
 ### binary (`cli/src/bin/tiko_pitr.rs`)
 
-Thin orchestration over the `core` helpers and `pg_ctl`/`tar`.
+Thin orchestration over the `core` helpers and `pg_ctl`/`tar`. Uses
+`extern crate cli;` for `pg_stubs` (same as `tiko_restore`).
 
 ## Data flow
 
 ### `list`
 
 1. `Store::init()`.
-2. List timeline-segment objects under the timeline prefix.
-3. For each segment key: `storage_get` (auto-decompresses) →
-   `TimelineSegment::from_bytes` → iterate `checkpoints`.
-4. Collect `(ckpt.timeline_id, ckpt.lsn, created_at, chunks.len())`, sort by
-   `(created_at, ckpt)`, print numbered table.
+2. `store.list_checkpoints()` (scans all timeline segments, flattens
+   `SegmentCheckpoint`s, sorts by `(created_at, ckpt)`).
+3. Print a numbered table: index, timeline, LSN, created_at (RFC3339 via
+   `chrono`), #chunks.
 
 ### `recover`
 
 1. `Store::init()`; resolve `pgdata` and `pg_ctl` path.
-2. Validate the target `(timeline, lsn)` appears in the listed checkpoints
+2. Validate the target `(timeline, lsn)` appears in `list_checkpoints()`
    (fail fast before touching PGDATA).
-3. **Pick base manifest:** newest base with `base_lsn <= target_lsn` on the
-   target timeline (shared `core` helper). Clear error if none covers the target.
+3. **Pick base manifest:** `store.load_base_manifest_at_or_before(target)` —
+   newest base with `base_ckpt <= target`. Clear error if none covers the target.
 4. **Extract pg_state:** `Manifest::pg_state()` → tempfile → `tar -xf` into
-   `pgdata`. Lays down the base checkpoint's `pg_control` + xlog state.
-5. **Write PITR conf** to `postgresql.tiko.conf` (new conf writer above).
+   `pgdata`. Lays down the base checkpoint's `pg_control` + xlog state; PG
+   replays WAL forward from there to the target.
+5. **Write PITR conf:** `write_pitr_recovery_conf(pgdata/postgresql.tiko.conf,
+   target_tl, target_lsn)`.
 6. **Touch `recovery.signal`.**
 7. **Run recovery:** `pg_ctl -D <pgdata> start` and wait for the postmaster to
    exit. With `action = 'shutdown'`, PG replays WAL (pulling segments via
@@ -143,12 +184,15 @@ Thin orchestration over the `core` helpers and `pg_ctl`/`tar`.
 ## Testing
 
 - Unit tests in `core`:
-  - Base-manifest selection: picks newest `<= target_lsn`; returns the
-    no-coverage error when none qualifies.
-  - PITR conf writer: emitted block round-trips cleanly through
-    `remove_recovery_conf` (write → remove leaves the file as before).
-- Binary orchestration (`pg_ctl`, `tar`, full recovery) is integration-level and
-  verified separately, per project workflow.
+  - `load_base_manifest_at_or_before`: picks newest base `<= target`; returns
+    the no-coverage error when none qualifies. (Use an `S3Sim`-backed `Store`
+    over a temp dir, as existing `core` storage tests do.)
+  - Base-manifest key → `Checkpoint` parsing round-trip.
+  - `write_pitr_recovery_conf`: emitted block contains the expected directives
+    and round-trips cleanly through `remove_recovery_conf` (write → remove
+    leaves the file as before).
+- `list_checkpoints` and binary orchestration (`pg_ctl`, `tar`, full recovery)
+  are integration-level and verified separately, per project workflow.
 
 ## Out of scope
 
