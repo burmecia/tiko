@@ -13,12 +13,13 @@
 //! # TIKM file format
 //!
 //! ```text
-//! Header (40 bytes):
+//! Header (48 bytes):
 //!   magic:          [u8; 4] = b"TIKM"
 //!   version:        u32 = 1            (little-endian)
-//!   timeline_id:    u32                (little-endian)   ┐
-//!   _pad:           [u8; 4] = 0                          │ checkpoint
+//!   timeline_id:    u32                (little-endian)   ┐ base
+//!   redo_timeline_id: u32              (little-endian)   │ checkpoint
 //!   lsn:            u64                (little-endian)   ┘
+//!   redo_lsn:       u64                (little-endian)   redo checkpoint
 //!   timestamp:      i64 (unix secs)    (little-endian)
 //!   entry_count:    u64                (little-endian)   chunk count
 //!
@@ -36,7 +37,18 @@
 //!   nblocks   u32       (little-endian)
 //!   deleted   u8        (0 = false, nonzero = true)
 //!   _pad      3 bytes   (zero)
+//!
+//! pg_state trailer (8 + pg_state_len bytes):
+//!   pg_state_len:   u64                (little-endian)
+//!   pg_state:       [u8; pg_state_len] (pg_state.tar.zst archive bytes)
 //! ```
+//!
+//! `redo_ckpt` and `pg_state` make a base manifest a self-contained base
+//! backup for PITR: `pg_state` carries the `pg_control` + transaction-log
+//! image at the base checkpoint, and `redo_ckpt` is the LSN from which WAL
+//! replay begins. They are written by the compactor from the highest
+//! [`SegmentCheckpoint`] folded into the base. The trailer sits after the
+//! meta body and is never touched by lookups.
 //!
 //! Both lookups (chunks and relfork meta) are O(log N) `pread` binary
 //! searches over the sorted on-disk sections — no in-memory copies.
@@ -68,7 +80,7 @@ const TIKM_VERSION: u32 = 1;
 /// Filename of the local TIKM cache file under the tiko root path.
 const BASE_MANIFEST_FILE_NAME: &str = "base_manifest.tikm";
 /// Header size in bytes.
-const HEADER_SIZE: usize = 40;
+const HEADER_SIZE: usize = 48;
 /// Chunk-entry size in bytes (ChunkTag[20] + ChunkRef[20]).
 const ENTRY_SIZE: usize = CHUNK_TAG_SIZE + CHUNK_REF_SIZE;
 /// Meta-entry size in bytes (RelFork[16] + nblocks[4] + deleted[1] + pad[3]).
@@ -134,6 +146,14 @@ const _: () = assert!(std::mem::size_of::<ChunkRef>() == 24);
 /// sorted ascending by `ChunkTag`.
 pub(crate) struct Manifest {
     checkpoint: Checkpoint,
+    /// Redo checkpoint of the highest [`SegmentCheckpoint`] folded into this
+    /// base — the LSN from which WAL replay starts when this manifest is used
+    /// as a PITR base backup. Default (`0/0`) on an empty/bootstrap manifest.
+    redo_ckpt: Checkpoint,
+    /// `pg_state.tar.zst` archive (pg_control + transaction logs) captured at
+    /// the base checkpoint. Empty on an empty/bootstrap manifest. Stored in the
+    /// TIKM trailer; never read on the lookup hot path.
+    pg_state: Vec<u8>,
     timestamp: i64,
     /// Path to the local TIKM binary file.
     path: PathBuf,
@@ -158,6 +178,20 @@ impl Manifest {
     fn meta_body_offset(&self) -> u64 {
         self.meta_header_offset() + META_HEADER_SIZE as u64
     }
+}
+
+/// Read the length-prefixed pg_state trailer at `offset` from `file`.
+/// Returns an empty vector when the stored length is zero.
+fn read_pg_state(file: &File, offset: u64) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 8];
+    pread_exact(file, &mut len_buf, offset)?;
+    let len = u64::from_le_bytes(len_buf) as usize;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; len];
+    pread_exact(file, &mut buf, offset + 8)?;
+    Ok(buf)
 }
 
 // ── Low-level file I/O ──
@@ -187,9 +221,11 @@ fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 fn write_tikm(
     path: &Path,
     checkpoint: Checkpoint,
+    redo_ckpt: Checkpoint,
     timestamp: i64,
     chunks: &[(ChunkTag, ChunkRef)],
     meta: &[(RelFork, RelForkMeta)],
+    pg_state: &[u8],
 ) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -202,16 +238,18 @@ fn write_tikm(
         .truncate(true)
         .open(&tmp_path)?;
 
-    // Header (40 bytes): magic[4] + version[4] + timeline_id[4] + _pad[4] +
-    //                    lsn[8] + timestamp[8] + entry_count[8]
+    // Header (48 bytes): magic[4] + version[4] + timeline_id[4] +
+    //                    redo_timeline_id[4] + lsn[8] + redo_lsn[8] +
+    //                    timestamp[8] + entry_count[8]
     let mut header = [0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(&TIKM_MAGIC);
     header[4..8].copy_from_slice(&TIKM_VERSION.to_le_bytes());
     header[8..12].copy_from_slice(&checkpoint.timeline_id.as_u32().to_le_bytes());
-    // header[12..16] = padding (already zero)
+    header[12..16].copy_from_slice(&redo_ckpt.timeline_id.as_u32().to_le_bytes());
     header[16..24].copy_from_slice(&checkpoint.lsn.as_u64().to_le_bytes());
-    header[24..32].copy_from_slice(&timestamp.to_le_bytes());
-    header[32..40].copy_from_slice(&(chunks.len() as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&redo_ckpt.lsn.as_u64().to_le_bytes());
+    header[32..40].copy_from_slice(&timestamp.to_le_bytes());
+    header[40..48].copy_from_slice(&(chunks.len() as u64).to_le_bytes());
     f.write_all(&header)?;
 
     // Chunk body (sorted ascending by ChunkTag).
@@ -231,6 +269,11 @@ fn write_tikm(
         entry[REL_FORK_SIZE + 4] = m.deleted as u8;
         f.write_all(&entry)?;
     }
+
+    // pg_state trailer: length-prefixed archive bytes. Sits after the meta
+    // body and is never touched by binary-search lookups.
+    f.write_all(&(pg_state.len() as u64).to_le_bytes())?;
+    f.write_all(pg_state)?;
 
     f.flush()?;
     drop(f);
@@ -306,23 +349,37 @@ impl Manifest {
     /// Create a zero-entry manifest at the default checkpoint (used as a
     /// bootstrap starting point before the first real base exists).
     pub fn empty(root_path: &Path) -> Result<Self> {
-        Self::new(Checkpoint::default(), 0, vec![], HashMap::new(), root_path)
+        Self::new(
+            Checkpoint::default(),
+            Checkpoint::default(),
+            0,
+            vec![],
+            HashMap::new(),
+            Vec::new(),
+            root_path,
+        )
     }
 
     pub fn new(
         checkpoint: Checkpoint,
+        redo_ckpt: Checkpoint,
         timestamp: i64,
         mut chunks: Vec<(ChunkTag, ChunkRef)>,
         meta_map: HashMap<RelFork, RelForkMeta>,
+        pg_state: Vec<u8>,
         root_path: &Path,
     ) -> Result<Self> {
         chunks.sort_unstable_by_key(|(tag, _)| *tag);
         let mut meta: Vec<(RelFork, RelForkMeta)> = meta_map.into_iter().collect();
         meta.sort_unstable_by_key(|(rf, _)| *rf);
         let path = root_path.join(BASE_MANIFEST_FILE_NAME);
-        let file = write_tikm(&path, checkpoint, timestamp, &chunks, &meta)?;
+        let file = write_tikm(
+            &path, checkpoint, redo_ckpt, timestamp, &chunks, &meta, &pg_state,
+        )?;
         Ok(Manifest {
             checkpoint,
+            redo_ckpt,
+            pg_state,
             timestamp,
             path: path.to_path_buf(),
             file,
@@ -353,9 +410,12 @@ impl Manifest {
         }
 
         let timeline_id = TimelineId::new(u32::from_le_bytes(header[8..12].try_into().unwrap()));
+        let redo_timeline_id =
+            TimelineId::new(u32::from_le_bytes(header[12..16].try_into().unwrap()));
         let lsn = Lsn::new(u64::from_le_bytes(header[16..24].try_into().unwrap()));
-        let timestamp = i64::from_le_bytes(header[24..32].try_into().unwrap());
-        let entry_count = u64::from_le_bytes(header[32..40].try_into().unwrap());
+        let redo_lsn = Lsn::new(u64::from_le_bytes(header[24..32].try_into().unwrap()));
+        let timestamp = i64::from_le_bytes(header[32..40].try_into().unwrap());
+        let entry_count = u64::from_le_bytes(header[40..48].try_into().unwrap());
 
         // Meta count lives in an 8-byte header immediately after the chunk body.
         let meta_header_offset = HEADER_SIZE as u64 + entry_count * ENTRY_SIZE as u64;
@@ -363,8 +423,15 @@ impl Manifest {
         pread_exact(&file, &mut meta_count_buf, meta_header_offset)?;
         let meta_count = u64::from_le_bytes(meta_count_buf);
 
+        // pg_state trailer follows the meta body.
+        let trailer_offset =
+            meta_header_offset + META_HEADER_SIZE as u64 + meta_count * META_ENTRY_SIZE as u64;
+        let pg_state = read_pg_state(&file, trailer_offset)?;
+
         Ok(Manifest {
             checkpoint: Checkpoint::new(timeline_id, lsn),
+            redo_ckpt: Checkpoint::new(redo_timeline_id, redo_lsn),
+            pg_state,
             timestamp,
             path,
             file,
@@ -376,22 +443,43 @@ impl Manifest {
     /// Deserialize from the S3 wire format (`msgpack(...)`).
     /// Writes the decoded entries to a local TIKM file at `path`.
     ///
-    /// Wire format: 4-tuple `(checkpoint, timestamp, chunks, meta_map)`.
+    /// Wire format: 6-tuple
+    /// `(checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state)`.
     pub fn from_bytes(data: &[u8], root_path: &Path) -> Result<Self> {
-        let (checkpoint, timestamp, chunks, meta_map): (
+        let (checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state): (
+            Checkpoint,
             Checkpoint,
             i64,
             Vec<(ChunkTag, ChunkRef)>,
             HashMap<RelFork, RelForkMeta>,
+            Vec<u8>,
         ) = rmp_serde::from_slice(data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Self::new(checkpoint, timestamp, chunks, meta_map, root_path)
+        Self::new(
+            checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state, root_path,
+        )
     }
 
     /// Return the checkpoint recorded in the manifest header.
     pub fn checkpoint(&self) -> Checkpoint {
         self.checkpoint
+    }
+
+    /// Return the redo checkpoint — the LSN from which WAL replay begins when
+    /// this base manifest is used as a PITR base backup.
+    // Consumed by the recovery path (currently disabled in lib.rs).
+    #[allow(dead_code)]
+    pub fn redo_ckpt(&self) -> Checkpoint {
+        self.redo_ckpt
+    }
+
+    /// Return the `pg_state.tar.zst` archive captured at the base checkpoint.
+    /// Empty on a bootstrap/empty manifest.
+    // Consumed by the recovery path (currently disabled in lib.rs).
+    #[allow(dead_code)]
+    pub fn pg_state(&self) -> &[u8] {
+        &self.pg_state
     }
 
     /// Binary search for `key` in the sorted on-disk TIKM file.
@@ -493,6 +581,15 @@ impl Manifest {
         // 1. Collect (tag, ChunkRef) entries and merge relfork meta updates
         //    from every segment. Track the highest segment ckpt to advance
         //    manifest metadata.
+        //
+        //    The highest segment is checkpoint P — the point compaction
+        //    advances the base to. Carry its `redo_ckpt` and `pg_state` so the
+        //    new base manifest is a self-contained PITR base backup. With no
+        //    segments, keep `self`'s existing values.
+        let (redo_ckpt, pg_state) = match segments.last() {
+            Some(p) => (p.redo_ckpt, p.pg_state.clone()),
+            None => (self.redo_ckpt, self.pg_state.clone()),
+        };
         let mut combined: Vec<(ChunkTag, ChunkRef)> = Vec::new();
         let mut new_meta: HashMap<RelFork, RelForkMeta> = HashMap::new();
         let mut last_ckpt = self.checkpoint;
@@ -579,14 +676,17 @@ impl Manifest {
 
         // 7. Compute the S3 wire bytes from the in-memory state.
         let meta_map: HashMap<RelFork, RelForkMeta> = meta_sorted.iter().cloned().collect();
-        let bytes = rmp_serde::to_vec(&(last_ckpt, last_ts, &output, &meta_map))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let bytes =
+            rmp_serde::to_vec(&(last_ckpt, redo_ckpt, last_ts, &output, &meta_map, &pg_state))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(AppliedManifest {
             checkpoint: last_ckpt,
+            redo_ckpt,
             timestamp: last_ts,
             chunks: output,
             meta: meta_sorted,
+            pg_state,
             bytes,
         })
     }
@@ -605,12 +705,16 @@ impl Manifest {
         let file = write_tikm(
             &self.path,
             applied.checkpoint,
+            applied.redo_ckpt,
             applied.timestamp,
             &applied.chunks,
             &applied.meta,
+            &applied.pg_state,
         )?;
         Ok(Manifest {
             checkpoint: applied.checkpoint,
+            redo_ckpt: applied.redo_ckpt,
+            pg_state: applied.pg_state,
             timestamp: applied.timestamp,
             path: self.path.clone(),
             file,
@@ -625,11 +729,14 @@ impl Manifest {
 /// via [`Manifest::commit_applied`].
 pub(crate) struct AppliedManifest {
     pub checkpoint: Checkpoint,
+    pub redo_ckpt: Checkpoint,
     pub timestamp: i64,
     pub chunks: Vec<(ChunkTag, ChunkRef)>,
     pub meta: Vec<(RelFork, RelForkMeta)>,
-    /// msgpack-encoded `(checkpoint, timestamp, chunks, meta_map)` ready to
-    /// PUT to S3 at the base-manifest key for `checkpoint`.
+    pub pg_state: Vec<u8>,
+    /// msgpack-encoded
+    /// `(checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state)` ready
+    /// to PUT to S3 at the base-manifest key for `checkpoint`.
     pub bytes: Vec<u8>,
 }
 
@@ -646,13 +753,21 @@ mod tests {
     impl Manifest {
         /// Serialize to the S3 wire format (`msgpack(...)`).
         ///
-        /// Format: 4-tuple `(checkpoint, timestamp, chunks, meta_map)`.
+        /// Format: 6-tuple
+        /// `(checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state)`.
         pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
             let entries = read_all_entries(self)?;
             let meta_entries = read_all_meta_entries(self)?;
             let meta_map: HashMap<RelFork, RelForkMeta> = meta_entries.into_iter().collect();
-            rmp_serde::to_vec(&(self.checkpoint, self.timestamp, &entries, &meta_map))
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            rmp_serde::to_vec(&(
+                self.checkpoint,
+                self.redo_ckpt,
+                self.timestamp,
+                &entries,
+                &meta_map,
+                &self.pg_state,
+            ))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
     }
 
@@ -807,5 +922,51 @@ mod tests {
                 .nblocks,
             32
         );
+    }
+
+    #[test]
+    fn apply_segments_carries_redo_ckpt_and_pg_state_from_highest() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        // Two segments with distinct redo_ckpt / pg_state. The highest
+        // (checkpoint P = s2) is the one the base must inherit.
+        let mut s1 = SegmentCheckpoint::new(
+            ckpt(100),
+            ckpt(0),
+            ckpt(90),
+            HashSet::new(),
+            HashMap::new(),
+            &[0xAA, 0xBB],
+        );
+        s1.chunks.insert(tag(1, 0));
+        let mut s2 = SegmentCheckpoint::new(
+            ckpt(200),
+            ckpt(100),
+            ckpt(190),
+            HashSet::new(),
+            HashMap::new(),
+            &[1, 2, 3, 4, 5],
+        );
+        s2.chunks.insert(tag(2, 0));
+
+        let applied = base.apply_segments(&[s1, s2]).unwrap();
+        let base = base.commit_applied(applied).unwrap();
+
+        // Inherited from the highest segment (s2 = checkpoint P).
+        assert_eq!(base.redo_ckpt().lsn.as_u64(), 190);
+        assert_eq!(base.pg_state(), &[1, 2, 3, 4, 5]);
+
+        // Survives the S3 wire roundtrip.
+        let bytes = base.to_bytes().unwrap();
+        let dir2 = tempdir().unwrap();
+        let restored = Manifest::from_bytes(&bytes, dir2.path()).unwrap();
+        assert_eq!(restored.redo_ckpt().lsn.as_u64(), 190);
+        assert_eq!(restored.pg_state(), &[1, 2, 3, 4, 5]);
+
+        // Survives open_local (reads header + trailer from the TIKM file).
+        let reopened = Manifest::open_local(dir2.path()).unwrap();
+        assert_eq!(reopened.redo_ckpt().lsn.as_u64(), 190);
+        assert_eq!(reopened.pg_state(), &[1, 2, 3, 4, 5]);
     }
 }
