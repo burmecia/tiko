@@ -9,13 +9,14 @@
 //! 2. Crash-safe PGDATA snapshot/restore that excludes the bulk `tiko/`
 //!    directory (`backup_dir_excluding` / `restore_dir`).
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
 use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Name of the Tiko-managed include file under PGDATA. PostgreSQL must already
 /// `include`/`include_if_exists` this from `postgresql.conf`.
@@ -30,6 +31,9 @@ const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
 /// Drives archive recovery up to `target_lsn` on `target_tl`, pulling WAL
 /// segments from remote via `tiko_restore`. `recovery_target_action='shutdown'`
 /// makes PostgreSQL shut itself down the instant it reaches the target.
+///
+/// Note: this function does **not** check for an existing block; callers should
+/// call [`remove_recovery_conf`] first if the file may already contain one.
 pub fn write_pitr_recovery_conf(
     conf_path: &Path,
     target_tl: TimelineId,
@@ -75,6 +79,69 @@ pub fn remove_recovery_conf(conf_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recursively copy `src` into a fresh `dst`, skipping any top-level entry named
+/// `exclude_name` (e.g. `"tiko"`, the bulk data dir backed by remote storage).
+///
+/// Errors if `dst` already exists, so a stale backup from an interrupted run is
+/// never silently overwritten.
+pub fn backup_dir_excluding(src: &Path, dst: &Path, exclude_name: &str) -> Result<()> {
+    if dst.exists() {
+        return Err(Error::already_exists(format!(
+            "backup dir already exists: {} (inspect/remove it before retrying)",
+            dst.display()
+        )));
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name() == OsStr::new(exclude_name) {
+            continue;
+        }
+        copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Restore `dst` from `backup`: delete every top-level entry in `dst` except
+/// `exclude_name`, then copy the backup's contents back in. After this, `dst`
+/// matches the snapshot for everything except the preserved `exclude_name` dir.
+pub fn restore_dir(backup: &Path, dst: &Path, exclude_name: &str) -> Result<()> {
+    for entry in fs::read_dir(dst)? {
+        let entry = entry?;
+        if entry.file_name() == OsStr::new(exclude_name) {
+            continue;
+        }
+        let p = entry.path();
+        if fs::symlink_metadata(&p)?.file_type().is_dir() {
+            fs::remove_dir_all(&p)?;
+        } else {
+            fs::remove_file(&p)?;
+        }
+    }
+    for entry in fs::read_dir(backup)? {
+        let entry = entry?;
+        copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Recursively copy `from` to `to`, creating directories as needed. Symlinks
+/// are dereferenced (copied as their target's contents) — adequate for a PGDATA
+/// minus `tiko/`, which holds no tablespace symlinks in this deployment.
+fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
+    let ft = fs::symlink_metadata(from)?.file_type();
+    if ft.is_dir() {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        fs::copy(from, to)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +162,34 @@ mod tests {
 
         remove_recovery_conf(&conf).unwrap();
         assert_eq!(fs::read_to_string(&conf).unwrap(), before);
+    }
+
+    #[test]
+    fn backup_excludes_tiko_and_restore_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let pgdata = root.path().join("pgdata");
+        fs::create_dir_all(pgdata.join("global")).unwrap();
+        fs::write(pgdata.join("PG_VERSION"), "16\n").unwrap();
+        fs::write(pgdata.join("global/pg_control"), b"orig").unwrap();
+        fs::create_dir_all(pgdata.join("tiko/s3sim")).unwrap();
+        fs::write(pgdata.join("tiko/s3sim/blob"), b"bigdata").unwrap();
+
+        let bak = root.path().join("pgdata.tiko_pitr_bak");
+        backup_dir_excluding(&pgdata, &bak, "tiko").unwrap();
+        assert!(bak.join("PG_VERSION").exists());
+        assert!(bak.join("global/pg_control").exists());
+        assert!(!bak.join("tiko").exists(), "tiko/ must be excluded from backup");
+
+        // A second backup must refuse to overwrite.
+        assert!(backup_dir_excluding(&pgdata, &bak, "tiko").is_err());
+
+        // Mutate PGDATA as a recovery run would.
+        fs::write(pgdata.join("global/pg_control"), b"MUTATED").unwrap();
+        fs::write(pgdata.join("recovery.signal"), b"").unwrap();
+
+        restore_dir(&bak, &pgdata, "tiko").unwrap();
+        assert_eq!(fs::read(pgdata.join("global/pg_control")).unwrap(), b"orig");
+        assert!(!pgdata.join("recovery.signal").exists(), "restore must drop new files");
+        assert!(pgdata.join("tiko/s3sim/blob").exists(), "tiko/ must be left untouched");
     }
 }
