@@ -113,6 +113,14 @@ private `list_all_segments` / `load_segment` and `storage_*` primitives:
   target. This is the segment-model replacement for the legacy
   `recovery.rs::load_base_manifest`.
 
+Plus a small filesystem helper (in `core` so it is unit-testable, or a `cli`
+helper module — settled during planning):
+
+- **`backup_dir_excluding` / `restore_dir`** — recursively copy a directory to a
+  sibling backup, skipping a named subdirectory (`tiko/`) and the backup dir
+  itself; and restore from it. Portable Rust walk (not `cp`/`rsync`, which can't
+  cleanly exclude or may be absent). Used for the step-4 PGDATA snapshot.
+
 ### recovery.rs refactor (conf helpers)
 
 - **Keep:** the begin/end marker constants and `remove_recovery_conf` (clean,
@@ -154,32 +162,49 @@ Thin orchestration over the `core` helpers and `pg_ctl`/`tar`. Uses
    (fail fast before touching PGDATA).
 3. **Pick base manifest:** `store.load_base_manifest_at_or_before(target)` —
    newest base with `base_ckpt <= target`. Clear error if none covers the target.
-4. **Extract pg_state:** `Manifest::pg_state()` → tempfile → `tar -xf` into
+4. **Back up PGDATA (excluding `tiko/`):** before any PGDATA mutation, recursively
+   copy `pgdata` to a sibling backup dir (e.g. `{pgdata}.tiko_pitr_bak`),
+   skipping the `tiko/` directory (the bulk data/cache backed by remote storage)
+   and the backup dir itself. This is the crash-safety snapshot — cheap because
+   the large data files live in `tiko/`, which is omitted. If a backup dir
+   already exists (a prior interrupted run), abort and tell the user to inspect
+   it rather than overwriting.
+5. **Extract pg_state:** `Manifest::pg_state()` → tempfile → `tar -xf` into
    `pgdata`. Lays down the base checkpoint's `pg_control` + xlog state; PG
    replays WAL forward from there to the target.
-5. **Write PITR conf:** `write_pitr_recovery_conf(pgdata/postgresql.tiko.conf,
+6. **Write PITR conf:** `write_pitr_recovery_conf(pgdata/postgresql.tiko.conf,
    target_tl, target_lsn)`.
-6. **Touch `recovery.signal`.**
-7. **Run recovery:** `pg_ctl -D <pgdata> start` and wait for the postmaster to
+7. **Touch `recovery.signal`.**
+8. **Run recovery:** `pg_ctl -D <pgdata> start` and wait for the postmaster to
    exit. With `action = 'shutdown'`, PG replays WAL (pulling segments via
    `tiko_restore`) up to `recovery_target_lsn`, then shuts itself down. Exact
-   wait mechanism (spawn + wait for postmaster exit, or poll `postmaster.pid`)
-   to be settled during planning; contract is "block until PG finishes recovery
-   and exits."
-8. **Clean up:** `remove_recovery_conf(postgresql.tiko.conf)` + delete
-   `recovery.signal`.
-9. **Restart normally:** `pg_ctl -D <pgdata> -w start` (new timeline at promotion).
+   wait/success-detection mechanism (postmaster exit status; spawn + wait or
+   poll `postmaster.pid`) to be settled during planning; contract is "block
+   until PG finishes recovery and exits, and report whether it succeeded."
+9. **On success:** `remove_recovery_conf(postgresql.tiko.conf)`, delete
+   `recovery.signal`, delete the PGDATA backup, then **restart normally**:
+   `pg_ctl -D <pgdata> -w start` (new timeline at promotion).
+10. **On failure:** see Error handling below — restore PGDATA from the backup.
 
 ## Error handling
 
 - Every step returns `Result`; failures print `tiko_pitr: <context>: <err>` to
   stderr and `exit(1)`.
 - Fail fast: validate the target exists in the checkpoint list before any PGDATA
-  mutation (step 2).
-- **Recovery failure (step 7):** still attempt conf/`recovery.signal` cleanup
-  (step 8) so a half-written conf doesn't wedge the next start, but do NOT
-  auto-start normally — leave PG down and report, since the data-dir state is
-  uncertain.
+  mutation (steps 2–3, before the backup in step 4).
+- **Recovery failure (step 8)** — i.e. recovery does not complete successfully
+  (non-zero/abnormal postmaster exit, or the target is not reached):
+  1. Ensure PG is stopped.
+  2. **Restore PGDATA from the backup** taken in step 4: delete the mutated
+     PGDATA contents (excluding `tiko/`) and move the backup's contents back,
+     returning `pg_control`, `pg_wal/`, and conf files to their pre-recovery
+     state. This subsumes conf/`recovery.signal` cleanup — the restored conf has
+     no recovery block and no `recovery.signal`.
+  3. Do NOT auto-start normally — leave PG down and report, so the operator can
+     inspect before retrying.
+  The backup is only deleted on success (step 9); on failure it is consumed by
+  the restore. If the restore itself fails, leave the backup in place and report
+  loudly with its path.
 
 ## Testing
 
@@ -191,6 +216,9 @@ Thin orchestration over the `core` helpers and `pg_ctl`/`tar`. Uses
   - `write_pitr_recovery_conf`: emitted block contains the expected directives
     and round-trips cleanly through `remove_recovery_conf` (write → remove
     leaves the file as before).
+  - `backup_dir_excluding` / `restore_dir`: over a temp dir tree, the excluded
+    subdir is skipped, and backup → mutate → restore returns the tree to its
+    original contents.
 - `list_checkpoints` and binary orchestration (`pg_ctl`, `tar`, full recovery)
   are integration-level and verified separately, per project workflow.
 
