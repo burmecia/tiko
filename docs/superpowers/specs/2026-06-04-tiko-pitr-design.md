@@ -53,11 +53,14 @@ Relevant existing pieces:
   `timeline_segments_dir`, `timeline_segment`, `base_manifest`) are
   `pub(crate)`/`pub(super)` — not reachable from the `cli` crate, which forces
   the reusable logic to be exposed as public `Store` methods.
-- **`core/src/recovery.rs`** — legacy. Provides the conf begin/end marker
-  constants and `remove_recovery_conf` (worth keeping), but its
-  `write_recovery_conf` is branch-oriented (`recovery_target = 'immediate'`, no
-  `restore_command`) and its base-manifest/delta code is dead under the segment
-  model. Refactored here (see below).
+- **`core/src/recovery.rs`** — fully orphaned dead code: `pub mod recovery;` is
+  commented out in `core/src/lib.rs:9`, it references types that no longer exist
+  (`ProjectNamespace`, `pg_state_key`, `apply_deltas`, `recovery_manifest_path`),
+  and the only references to it are in `cli/legacy/` (also disabled). It does not
+  compile and nothing in the build depends on it. The conf marker constants,
+  `remove_recovery_conf`, and the `recovery_target_action`/conf-block approach
+  are good and worth salvaging. Refactor = delete the dead file and lift the
+  salvageable conf logic into a new, compiled, tested module (see below).
 
 ## Design decisions (resolved during brainstorming)
 
@@ -73,8 +76,10 @@ Relevant existing pieces:
    base-manifest selection, PITR conf writer) lives in `core` for sharing and
    unit testing. This requires exposing new public `Store` methods, since the
    underlying locator/segment helpers are crate-private.
-6. **recovery.rs refactor:** drop the dead delta-manifest code paths and align
-   the surviving conf helpers with the segment-based PITR flow (details below).
+6. **recovery.rs refactor:** `recovery.rs` is orphaned dead code (uncompiled,
+   references nonexistent types). Delete it and lift the salvageable conf logic
+   (markers, `remove_recovery_conf`) into a new compiled module `core/src/pitr.rs`
+   alongside the new PITR conf writer (details below).
 
 ## CLI surface (clap subcommands)
 
@@ -106,12 +111,15 @@ private `list_all_segments` / `load_segment` and `storage_*` primitives:
   flatten all `SegmentCheckpoint`s into a `Vec` of lightweight rows
   (`ckpt: Checkpoint`, `redo_ckpt`, `created_at: i64`, `n_chunks: usize`), sorted
   ascending by `(created_at, ckpt)`. Read-only.
-- **`load_base_manifest_at_or_before(target: Checkpoint) -> Result<Manifest>`** —
+- **`load_base_pg_state_at_or_before(target: Checkpoint) -> Result<(Checkpoint, Vec<u8>)>`** —
   list `bases_dir()`, parse each key's `{tl}/{lsn_hex}.manifest` into a
-  `Checkpoint`, pick the newest with `base_ckpt <= target`, `storage_get` it, and
-  return `Manifest::from_bytes(...)`. Distinct, clear error if no base covers the
-  target. This is the segment-model replacement for the legacy
-  `recovery.rs::load_base_manifest`.
+  `Checkpoint`, pick the newest with `base_ckpt <= target`, `storage_get` it,
+  `Manifest::from_bytes` it into a throwaway `tempdir` (so the process's live
+  `local_root` TIKM cache is not clobbered), and return
+  `(manifest.checkpoint(), manifest.pg_state().to_vec())`. `pg_state` and
+  `checkpoint` are in-memory fields, so they remain valid after the tempdir is
+  dropped. Distinct, clear `Error` (`Error::other(...)`) if no base covers the
+  target. Segment-model replacement for the legacy `recovery.rs::load_base_manifest`.
 
 Plus a small filesystem helper (in `core` so it is unit-testable, or a `cli`
 helper module — settled during planning):
@@ -121,24 +129,25 @@ helper module — settled during planning):
   itself; and restore from it. Portable Rust walk (not `cp`/`rsync`, which can't
   cleanly exclude or may be absent). Used for the step-4 PGDATA snapshot.
 
-### recovery.rs refactor (conf helpers)
+### New module `core/src/pitr.rs` (conf helpers) + delete `recovery.rs`
 
-- **Keep:** the begin/end marker constants and `remove_recovery_conf` (clean,
-  marker-delimited strip — reused verbatim for cleanup).
-- **Add:** `write_pitr_recovery_conf(conf_path, target_tl, target_lsn)` that
-  appends a Tiko PITR block to `postgresql.tiko.conf`, delimited by the SAME
-  markers so `remove_recovery_conf` strips it identically:
-  ```
-  restore_command = 'tiko_restore %f %p'
-  recovery_target_lsn = '<target_lsn>'
-  recovery_target_timeline = '<target_tl>'
-  recovery_target_inclusive = on
-  recovery_target_action = 'shutdown'
-  ```
-- **Remove:** the dead delta-manifest code paths (`prepare_recovery`'s
-  delta/`pg_state_key` logic, `apply_deltas_up_to`, `load_base_manifest`) that
-  no longer fit the segment model. Scope the removal to what is genuinely dead;
-  do not touch unrelated recovery-mode runtime hooks still in use.
+- **Delete** `core/src/recovery.rs` (orphaned, uncompiled, references nonexistent
+  types; nothing in the build depends on it).
+- **Create `core/src/pitr.rs`** (wired via `pub mod pitr;` in `lib.rs`) holding:
+  - The begin/end marker constants and `remove_recovery_conf` (lifted from
+    recovery.rs — clean, marker-delimited strip).
+  - `write_pitr_recovery_conf(conf_path, target_tl: TimelineId, target_lsn: Lsn)`
+    that appends a Tiko PITR block delimited by the SAME markers so
+    `remove_recovery_conf` strips it identically:
+    ```
+    restore_command = 'tiko_restore %f %p'
+    recovery_target_lsn = '<lsn.to_pg_string()>'
+    recovery_target_timeline = '<tl.as_u32()>'
+    recovery_target_inclusive = on
+    recovery_target_action = 'shutdown'
+    ```
+- These helpers are pure string/file ops with no `Store` dependency, so they are
+  directly unit-testable.
 
 ### binary (`cli/src/bin/tiko_pitr.rs`)
 
@@ -160,8 +169,9 @@ Thin orchestration over the `core` helpers and `pg_ctl`/`tar`. Uses
 1. `Store::init()`; resolve `pgdata` and `pg_ctl` path.
 2. Validate the target `(timeline, lsn)` appears in `list_checkpoints()`
    (fail fast before touching PGDATA).
-3. **Pick base manifest:** `store.load_base_manifest_at_or_before(target)` —
-   newest base with `base_ckpt <= target`. Clear error if none covers the target.
+3. **Pick base pg_state:** `store.load_base_pg_state_at_or_before(target)` →
+   `(base_ckpt, pg_state_bytes)`, newest base with `base_ckpt <= target`. Clear
+   error if none covers the target.
 4. **Stop PostgreSQL:** `pg_ctl -D <pgdata> -m fast -w stop`, so the data dir is
    quiesced before it is copied or mutated. Tolerate an already-stopped
    instance (treat "not running" as success).
@@ -172,7 +182,7 @@ Thin orchestration over the `core` helpers and `pg_ctl`/`tar`. Uses
    data files live in `tiko/`, which is omitted. If a backup dir already exists
    (a prior interrupted run), abort and tell the user to inspect it rather than
    overwriting.
-6. **Extract pg_state:** `Manifest::pg_state()` → tempfile → `tar -xf` into
+6. **Extract pg_state:** write `pg_state_bytes` → tempfile → `tar -xf` into
    `pgdata`. Lays down the base checkpoint's `pg_control` + xlog state; PG
    replays WAL forward from there to the target.
 7. **Write PITR conf:** `write_pitr_recovery_conf(pgdata/postgresql.tiko.conf,
@@ -212,9 +222,10 @@ Thin orchestration over the `core` helpers and `pg_ctl`/`tar`. Uses
 ## Testing
 
 - Unit tests in `core`:
-  - `load_base_manifest_at_or_before`: picks newest base `<= target`; returns
-    the no-coverage error when none qualifies. (Use an `S3Sim`-backed `Store`
-    over a temp dir, as existing `core` storage tests do.)
+  - `load_base_pg_state_at_or_before`: picks newest base `<= target` and returns
+    its `(checkpoint, pg_state)`; returns the no-coverage error when none
+    qualifies. (Use an `S3Sim`-backed `Store` over a temp dir, as existing `core`
+    storage tests do.)
   - Base-manifest key → `Checkpoint` parsing round-trip.
   - `write_pitr_recovery_conf`: emitted block contains the expected directives
     and round-trips cleanly through `remove_recovery_conf` (write → remove
