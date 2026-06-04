@@ -468,16 +468,15 @@ impl Manifest {
 
     /// Return the redo checkpoint — the LSN from which WAL replay begins when
     /// this base manifest is used as a PITR base backup.
-    // Consumed by the recovery path (currently disabled in lib.rs).
+    // Reserved for future PITR use; not yet called outside tests.
     #[allow(dead_code)]
     pub fn redo_ckpt(&self) -> Checkpoint {
         self.redo_ckpt
     }
 
     /// Return the `pg_state.tar.zst` archive captured at the base checkpoint.
-    /// Empty on a bootstrap/empty manifest.
-    // Consumed by the recovery path (currently disabled in lib.rs).
-    #[allow(dead_code)]
+    /// Empty on a bootstrap/empty manifest. Consumed by
+    /// `Store::load_base_pg_state_at_or_before` for PITR.
     pub fn pg_state(&self) -> &[u8] {
         &self.pg_state
     }
