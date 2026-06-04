@@ -22,7 +22,6 @@
 //!            recovery accordingly.
 
 use std::fs;
-use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -32,23 +31,13 @@ use core::{error::Result, io::store::Store};
 use pgsys::common::XLOG_SEG_SIZE;
 use pgsys::timeline_id::TimelineId;
 
-// ── PostgreSQL symbol stubs ─────────────────────────────────────────────────
 // `tiko_restore` runs as a standalone process (invoked by `restore_command`),
-// not loaded into the postmaster, so the PG globals that `core` transitively
-// references must be defined here or the binary won't link.
-//
-// `TIKO_ROOT_PATH` is expected to be set in the environment (so `DataDir` is
-// never actually dereferenced); the empty C string is a safe fallback. Log
-// calls become no-ops — PostgreSQL already captures `restore_command` stderr.
-
-/// `char *DataDir` — read by `data_dir_path()` only when `TIKO_ROOT_PATH` is
-/// unset. Points at an empty C string so a stray read can't deref null.
-#[unsafe(no_mangle)]
-pub static mut DataDir: *const c_char = c"".as_ptr();
-
-/// Logging trampoline `core`/`pgsys` call into; no-op outside the postmaster.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_pg_log(_elevel: c_int, _message: *const c_char) {}
+// not loaded into the postmaster, so the PG symbols that `core` transitively
+// references are supplied by `cli::pg_stubs`. The `extern crate` below forces
+// the `cli` lib onto the link line so its `#[no_mangle]` stubs resolve `core`'s
+// undefined references. `TIKO_ROOT_PATH` is expected to be set in the
+// environment so `DataDir` is never actually dereferenced.
+extern crate cli;
 
 #[derive(Parser)]
 #[command(
