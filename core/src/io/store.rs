@@ -21,9 +21,38 @@ use pgsys::logging::pg_log_debug1;
 use pgsys::{
     common::{BLCKSZ, BlockNumber},
     logging::{pg_log_info, pg_log_warning},
+    lsn::Lsn,
+    timeline_id::TimelineId,
 };
 
 use super::timeline::{Checkpoint, SegmentCheckpoint, SegmentId, TimelineSegment};
+
+/// Parse a base-manifest storage key into its `Checkpoint`.
+///
+/// Keys have the shape `{bases_prefix}{tl_hex}/{lsn_hex}.manifest`, where
+/// `bases_prefix` is `Locator::bases_dir()` (`{ns}/bases/`). Returns `None` for
+/// any key that doesn't match (so callers can `filter_map` over a raw listing).
+fn parse_base_manifest_ckpt(key: &str, bases_prefix: &str) -> Option<Checkpoint> {
+    let rel = key.strip_prefix(bases_prefix)?;
+    let (tl_hex, rest) = rel.split_once('/')?;
+    let lsn_hex = rest.strip_suffix(".manifest")?;
+    let timeline_id = TimelineId::from_hex(tl_hex).ok()?;
+    let lsn = Lsn::from_hex(lsn_hex).ok()?;
+    Some(Checkpoint::new(timeline_id, lsn))
+}
+
+/// From a raw listing of base-manifest keys, select the newest base manifest
+/// whose checkpoint is at or before `target`. Returns `(checkpoint, key)`.
+fn select_newest_base_at_or_before(
+    keys: &[String],
+    bases_prefix: &str,
+    target: Checkpoint,
+) -> Option<(Checkpoint, String)> {
+    keys.iter()
+        .filter_map(|k| parse_base_manifest_ckpt(k, bases_prefix).map(|c| (c, k.clone())))
+        .filter(|(c, _)| *c <= target)
+        .max_by_key(|(c, _)| *c)
+}
 
 /// Outcome of one [`Store::run_compaction`] call. Returned to the compactor
 /// task in `worker` for logging and metrics.
@@ -991,5 +1020,48 @@ impl Store {
         ));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod base_select_tests {
+    use super::*;
+
+    fn ckpt(tl: u32, lsn: u64) -> Checkpoint {
+        Checkpoint::new(TimelineId::new(tl), Lsn::new(lsn))
+    }
+
+    #[test]
+    fn parses_valid_key_and_rejects_others() {
+        let prefix = "12/5/bases/";
+        let key = "12/5/bases/00000001/0000000003000028.manifest";
+        assert_eq!(parse_base_manifest_ckpt(key, prefix), Some(ckpt(1, 0x3000028)));
+
+        assert_eq!(parse_base_manifest_ckpt("12/5/bases/00000001", prefix), None);
+        assert_eq!(parse_base_manifest_ckpt("12/5/other/x.manifest", prefix), None);
+        assert_eq!(
+            parse_base_manifest_ckpt("12/5/bases/zz/0000000000000001.manifest", prefix),
+            None
+        );
+    }
+
+    #[test]
+    fn selects_newest_at_or_before_target() {
+        let prefix = "12/5/bases/";
+        let keys = vec![
+            "12/5/bases/00000001/0000000000001000.manifest".to_string(),
+            "12/5/bases/00000001/0000000003000028.manifest".to_string(),
+            "12/5/bases/00000001/0000000009000000.manifest".to_string(),
+        ];
+        // Target between the 2nd and 3rd base → pick the 2nd.
+        let got = select_newest_base_at_or_before(&keys, prefix, ckpt(1, 0x5000000));
+        assert_eq!(got.unwrap().0, ckpt(1, 0x3000028));
+
+        // Target exactly on a base → inclusive pick.
+        let got = select_newest_base_at_or_before(&keys, prefix, ckpt(1, 0x3000028));
+        assert_eq!(got.unwrap().0, ckpt(1, 0x3000028));
+
+        // Target before the earliest base → none.
+        assert!(select_newest_base_at_or_before(&keys, prefix, ckpt(1, 0x10)).is_none());
     }
 }
