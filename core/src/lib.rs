@@ -6,7 +6,7 @@ pub mod io;
 pub mod manifest;
 pub mod ops;
 pub mod org;
-//pub mod recovery;
+pub mod pitr;
 pub mod relfork;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag, RelFork};
