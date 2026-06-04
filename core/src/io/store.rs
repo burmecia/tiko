@@ -54,6 +54,16 @@ fn select_newest_base_at_or_before(
         .max_by_key(|(c, _)| *c)
 }
 
+/// One row returned by [`Store::list_checkpoints`] — a recovery-target
+/// candidate flattened from the timeline segment files.
+#[derive(Debug, Clone)]
+pub struct CheckpointRow {
+    pub ckpt: Checkpoint,
+    pub redo_ckpt: Checkpoint,
+    pub created_at: i64,
+    pub n_chunks: usize,
+}
+
 /// Outcome of one [`Store::run_compaction`] call. Returned to the compactor
 /// task in `worker` for logging and metrics.
 #[derive(Debug)]
@@ -943,6 +953,48 @@ impl Store {
 
         io_control.timeline.hydrated.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// List every checkpoint recorded across all timeline segment files,
+    /// flattened and sorted ascending by `(created_at, ckpt)`. Read-only;
+    /// used by `tiko_pitr list` to present recovery targets.
+    pub fn list_checkpoints(&self) -> Result<Vec<CheckpointRow>> {
+        let segment_ids = self.list_all_segments()?;
+        let mut rows: Vec<CheckpointRow> = Vec::new();
+        for sid in &segment_ids {
+            let seg = self.load_segment(sid)?;
+            for sc in &seg.checkpoints {
+                rows.push(CheckpointRow {
+                    ckpt: sc.ckpt,
+                    redo_ckpt: sc.redo_ckpt,
+                    created_at: sc.created_at,
+                    n_chunks: sc.chunks.len(),
+                });
+            }
+        }
+        rows.sort_by_key(|r| (r.created_at, r.ckpt));
+        Ok(rows)
+    }
+
+    /// Find the newest base manifest with `base_ckpt <= target` and return its
+    /// `(checkpoint, pg_state)`. The manifest is materialised into a throwaway
+    /// tempdir so the process's live `local_root` TIKM cache is not clobbered;
+    /// `checkpoint` and `pg_state` are in-memory fields and stay valid after the
+    /// tempdir is dropped.
+    pub fn load_base_pg_state_at_or_before(
+        &self,
+        target: Checkpoint,
+    ) -> Result<(Checkpoint, Vec<u8>)> {
+        let prefix = self.lctr.bases_dir();
+        let keys = self.storage_list_prefix(&prefix)?;
+        let (_base_ckpt, key) = select_newest_base_at_or_before(&keys, &prefix, target)
+            .ok_or_else(|| {
+                Error::other(format!("no base manifest at or before checkpoint {target}"))
+            })?;
+        let bytes = self.storage_get(&key)?;
+        let tmp = tempfile::tempdir()?;
+        let manifest = Manifest::from_bytes(&bytes, tmp.path())?;
+        Ok((manifest.checkpoint(), manifest.pg_state().to_vec()))
     }
 
     /// Run the segment-based commit protocol — entry point called by the
