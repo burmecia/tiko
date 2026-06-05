@@ -13,6 +13,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
 
@@ -77,6 +78,31 @@ pub fn remove_recovery_conf(conf_path: &Path) -> Result<()> {
     let cleaned = format!("{}{}", &existing[..start], &existing[end_off..]);
     fs::write(conf_path, cleaned)?;
     Ok(())
+}
+
+/// Parse a `--time` recovery-target string to a Unix timestamp (seconds).
+///
+/// Accepts RFC3339/ISO with an explicit offset (honored), or a bare
+/// `YYYY-MM-DD[ T]HH:MM[:SS]` / `YYYY-MM-DD` which is interpreted as UTC. Used
+/// only to compare a target against the recoverable window and to select the
+/// base manifest; PostgreSQL re-parses `recovery_target_time` authoritatively
+/// during replay.
+pub fn parse_pg_timestamp(s: &str) -> Result<i64> {
+    let s = s.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.timestamp());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(ndt.and_utc().timestamp());
+        }
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp());
+    }
+    Err(Error::other(format!(
+        "could not parse --time '{s}'; use 'YYYY-MM-DD HH:MM:SS' or an RFC3339 timestamp"
+    )))
 }
 
 /// Recursively copy `src` into a fresh `dst`, skipping any top-level entry named
@@ -170,6 +196,16 @@ mod tests {
 
         remove_recovery_conf(&conf).unwrap();
         assert_eq!(fs::read_to_string(&conf).unwrap(), before);
+    }
+
+    #[test]
+    fn parse_pg_timestamp_handles_common_formats() {
+        assert_eq!(parse_pg_timestamp("1970-01-01 00:00:00").unwrap(), 0);
+        assert_eq!(parse_pg_timestamp("1970-01-01T00:00:00").unwrap(), 0);
+        assert_eq!(parse_pg_timestamp("1970-01-02").unwrap(), 86_400);
+        // RFC3339 with offset: 01:00+01:00 == 00:00 UTC == epoch.
+        assert_eq!(parse_pg_timestamp("1970-01-01T01:00:00+01:00").unwrap(), 0);
+        assert!(parse_pg_timestamp("not a timestamp").is_err());
     }
 
     #[test]
