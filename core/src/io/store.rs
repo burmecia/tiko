@@ -54,6 +54,22 @@ fn select_newest_base_at_or_before(
         .max_by_key(|(c, _)| *c)
 }
 
+/// From `(timestamp, checkpoint, key)` candidates, select the newest base
+/// manifest on `timeline` whose `timestamp <= target_ts`. Returns
+/// `(checkpoint, key)`. Ordering uses `(timestamp, checkpoint)`; both are
+/// monotonic, so this is the latest base at or before the target time.
+fn select_base_by_time(
+    candidates: &[(i64, Checkpoint, String)],
+    target_ts: i64,
+    timeline: TimelineId,
+) -> Option<(Checkpoint, String)> {
+    candidates
+        .iter()
+        .filter(|(ts, c, _)| *ts <= target_ts && c.timeline_id == timeline)
+        .max_by_key(|(ts, c, _)| (*ts, *c))
+        .map(|(_, c, k)| (*c, k.clone()))
+}
+
 /// One row returned by [`Store::list_checkpoints`] — a recovery-target
 /// candidate flattened from the timeline segment files.
 #[derive(Debug, Clone)]
@@ -1115,5 +1131,33 @@ mod base_select_tests {
 
         // Target before the earliest base → none.
         assert!(select_newest_base_at_or_before(&keys, prefix, ckpt(1, 0x10)).is_none());
+    }
+
+    #[test]
+    fn selects_base_by_time_newest_before_target_on_timeline() {
+        // (timestamp, checkpoint, key) candidates on timeline 1.
+        let cands = vec![
+            (100i64, ckpt(1, 0x1000), "k100".to_string()),
+            (200i64, ckpt(1, 0x2000), "k200".to_string()),
+            (300i64, ckpt(1, 0x3000), "k300".to_string()),
+            // A base on a different timeline that must be ignored.
+            (250i64, ckpt(2, 0x2500), "k250tl2".to_string()),
+        ];
+        let tl = TimelineId::new(1);
+
+        // Target between 200 and 300 → pick the ts=200 base.
+        let got = select_base_by_time(&cands, 250, tl).unwrap();
+        assert_eq!(got, (ckpt(1, 0x2000), "k200".to_string()));
+
+        // Exact match on a base timestamp → inclusive pick.
+        let got = select_base_by_time(&cands, 200, tl).unwrap();
+        assert_eq!(got.0, ckpt(1, 0x2000));
+
+        // Target before the earliest base on this timeline → none.
+        assert!(select_base_by_time(&cands, 50, tl).is_none());
+
+        // The tl=2 base is never chosen for tl=1 even when its ts qualifies.
+        let got = select_base_by_time(&cands, 260, tl).unwrap();
+        assert_eq!(got.0, ckpt(1, 0x2000));
     }
 }
