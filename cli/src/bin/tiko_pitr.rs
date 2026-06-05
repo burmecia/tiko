@@ -1,11 +1,11 @@
 //! `tiko_pitr` — automate Tiko point-in-time recovery (PITR).
 //!
 //! Two subcommands:
-//!   * `list` — print available recovery checkpoints from remote.
-//!   * `recover --timeline <TL> --lsn <LSN>` — stop the instance, snapshot
-//!     PGDATA (excluding `tiko/`), recover to the target checkpoint, then
-//!     restart normally. On failure, PGDATA is restored from the snapshot and
-//!     the instance is left stopped.
+//!   * `list` — print the recoverable time window from remote.
+//!   * `recover (--time <TS> | --lsn <LSN>) [--timeline <HEX>]` — stop the
+//!     instance, snapshot PGDATA (excluding `tiko/`), recover to the target
+//!     point in the window, then restart normally. On failure, PGDATA is
+//!     restored from the snapshot and the instance is left stopped.
 //!
 //! Storage is configured from the environment exactly as `tiko_restore`
 //! expects (`Store::init()`): `TIKO_ROOT_PATH`/`PGDATA`, `TIKO_ORG_ID`,
@@ -37,20 +37,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List available recovery checkpoints on remote.
+    /// Print the recoverable time window on remote.
     List,
-    /// Recover the instance to a target checkpoint, then restart normally.
+    /// Recover the instance to a point in the window, then restart normally.
     Recover(RecoverArgs),
 }
 
 #[derive(Args)]
+#[command(group(
+    clap::ArgGroup::new("target").required(true).args(["time", "lsn"])
+))]
 struct RecoverArgs {
-    /// Target timeline id, in hex as shown by `list` (e.g. `00000001`).
+    /// Target time, e.g. `'2026-06-04 10:00:00'` or RFC3339 (mutually
+    /// exclusive with --lsn).
     #[arg(long)]
-    timeline: String,
-    /// Target LSN, PostgreSQL `X/Y` or hex form (e.g. `0/3000028`).
+    time: Option<String>,
+    /// Target LSN, PostgreSQL `X/Y` or hex (mutually exclusive with --time).
     #[arg(long)]
-    lsn: String,
+    lsn: Option<String>,
+    /// Target timeline id in hex (e.g. `00000001`). Defaults to the window's
+    /// latest timeline.
+    #[arg(long)]
+    timeline: Option<String>,
     /// PostgreSQL data directory. Defaults to `$PGDATA`.
     #[arg(long, env = "PGDATA")]
     pgdata: PathBuf,
@@ -64,49 +72,54 @@ struct RecoverArgs {
 }
 
 fn run_list(store: &Store) -> Result<()> {
-    let rows = store.list_checkpoints()?;
-    if rows.is_empty() {
-        println!("no checkpoints found");
-        return Ok(());
-    }
-    println!(
-        "{:>4}  {:>10}  {:>18}  {:>26}  {:>7}",
-        "#", "timeline", "lsn", "created_at", "chunks"
-    );
-    for (i, r) in rows.iter().enumerate() {
-        let ts = DateTime::<Utc>::from_timestamp(r.created_at, 0)
+    let w = store.recovery_window()?;
+    let fmt_ts = |ts: i64| {
+        DateTime::<Utc>::from_timestamp(ts, 0)
             .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| r.created_at.to_string());
-        println!(
-            "{:>4}  {:>10}  {:>18}  {:>26}  {:>7}",
-            i,
-            r.ckpt.timeline_id.to_hex(),
-            r.ckpt.lsn.to_pg_string(),
-            ts,
-            r.n_chunks
-        );
-    }
+            .unwrap_or_else(|| ts.to_string())
+    };
+    println!("recoverable window:");
+    println!("  earliest: {}   (checkpoint {})", fmt_ts(w.earliest_ts), w.earliest_ckpt);
+    println!("  latest:   {}   (checkpoint {})", fmt_ts(w.latest_ts), w.latest_ckpt);
+    println!("  timeline: {}", w.timeline.to_hex());
     Ok(())
 }
 
 fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
-    // 1. Parse the target checkpoint from the CLI arguments.
-    let tl = TimelineId::from_hex(&args.timeline)
-        .map_err(|e| Error::other(format!("invalid --timeline '{}': {e}", args.timeline)))?;
-    let lsn = Lsn::parse_either(&args.lsn).map_err(Error::other)?;
-    let target = Checkpoint::new(tl, lsn);
+    // 1. Determine the recoverable window and resolve the target timeline.
+    let window = store.recovery_window()?;
+    let timeline = match &args.timeline {
+        Some(s) => TimelineId::from_hex(s)
+            .map_err(|e| Error::other(format!("invalid --timeline '{s}': {e}")))?,
+        None => window.timeline,
+    };
 
-    // 2. Validate the target is a real, available checkpoint.
-    let rows = store.list_checkpoints()?;
-    if !rows.iter().any(|r| r.ckpt == target) {
-        return Err(Error::other(format!(
-            "target {target} is not an available checkpoint; run `tiko_pitr list`"
-        )));
-    }
-
-    // 3. Pick the base pg_state to recover from (newest base <= target).
-    let (base_ckpt, pg_state) = store.load_base_pg_state_at_or_before(target)?;
-    eprintln!("tiko_pitr: recovering to {target} from base checkpoint {base_ckpt}");
+    // 2. Resolve the target (time or lsn), validate it is within the window,
+    //    and select the base pg_state to recover from. clap guarantees exactly
+    //    one of --time / --lsn is set.
+    let (base_ckpt, pg_state, target, target_label) = if let Some(time_str) = &args.time {
+        let target_ts = pitr::parse_pg_timestamp(time_str)?;
+        if target_ts < window.earliest_ts || target_ts > window.latest_ts {
+            return Err(Error::other(format!(
+                "target time '{time_str}' is outside the recoverable window; run `tiko_pitr list`"
+            )));
+        }
+        let (bc, pg) = store.load_base_pg_state_before_time(target_ts, timeline)?;
+        (bc, pg, pitr::RecoveryTarget::Time(time_str.clone()), format!("time '{time_str}'"))
+    } else {
+        let l = Lsn::parse_either(args.lsn.as_ref().unwrap()).map_err(Error::other)?;
+        // LSN bounds use the window's latest-timeline range; base selection +
+        // PostgreSQL validate the precise reachability for an older --timeline.
+        if l < window.earliest_ckpt.lsn || l > window.latest_ckpt.lsn {
+            return Err(Error::other(format!(
+                "target LSN {} is outside the recoverable window; run `tiko_pitr list`",
+                l.to_pg_string()
+            )));
+        }
+        let (bc, pg) = store.load_base_pg_state_at_or_before(Checkpoint::new(timeline, l))?;
+        (bc, pg, pitr::RecoveryTarget::Lsn(l), format!("lsn {}", l.to_pg_string()))
+    };
+    eprintln!("tiko_pitr: recovering to {target_label} on timeline {} from base checkpoint {base_ckpt}", timeline.to_hex());
 
     let pgdata = args.pgdata.as_path();
     let pg_ctl = args.pg_ctl.as_path();
@@ -117,25 +130,23 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     let conf = pgdata.join(pitr::TIKO_CONF_FILE);
     let backup = backup_path(pgdata);
 
-    // 4. Stop PostgreSQL so the data dir is quiesced before copy/mutation.
+    // 3. Stop PostgreSQL so the data dir is quiesced before copy/mutation.
     stop_pg(pg_ctl, pgdata)?;
 
-    // 5. Snapshot PGDATA (excluding the bulk `tiko/` dir).
+    // 4. Snapshot PGDATA (excluding the bulk `tiko/` dir).
     pitr::backup_dir_excluding(pgdata, &backup, "tiko")?;
 
-    // 6-9. Mutate + run recovery. On any failure, restore from the snapshot.
-    match recover_inner(&conf, pgdata, &pg_state, tl, lsn, &postgres) {
+    // 5. Mutate + run recovery. On any failure, restore from the snapshot.
+    match recover_inner(&conf, pgdata, &pg_state, timeline, &target, &postgres) {
         Ok(()) => {
-            // 10. Success: clean up recovery artifacts, drop backup, restart.
             pitr::remove_recovery_conf(&conf)?;
             let _ = std::fs::remove_file(pgdata.join("recovery.signal"));
             std::fs::remove_dir_all(&backup)?;
             start_pg(pg_ctl, pgdata)?;
-            eprintln!("tiko_pitr: recovery to {target} complete; database restarted");
+            eprintln!("tiko_pitr: recovery to {target_label} complete; database restarted");
             Ok(())
         }
         Err(e) => {
-            // 11. Failure: ensure stopped, restore PGDATA, leave PG down.
             eprintln!("tiko_pitr: recovery failed: {e}");
             eprintln!("tiko_pitr: restoring PGDATA from backup {}", backup.display());
             // Best-effort stop before restoring. The foreground `postgres` run
@@ -157,19 +168,19 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     }
 }
 
-/// Steps 6-9: extract pg_state, write the PITR conf, touch recovery.signal, and
-/// run `postgres` in the foreground. Returns `Ok` only if recovery reached the
+/// Extract pg_state, write the PITR conf, touch recovery.signal, and run
+/// `postgres` in the foreground. Returns `Ok` only if recovery reached the
 /// target (postgres exited 0).
 fn recover_inner(
     conf: &Path,
     pgdata: &Path,
     pg_state: &[u8],
-    tl: TimelineId,
-    lsn: Lsn,
+    timeline: TimelineId,
+    target: &pitr::RecoveryTarget,
     postgres: &Path,
 ) -> Result<()> {
     extract_pg_state(pg_state, pgdata)?;
-    pitr::write_pitr_recovery_conf(conf, tl, lsn)?;
+    pitr::write_pitr_recovery_conf(conf, timeline, target)?;
     std::fs::write(pgdata.join("recovery.signal"), b"")?;
 
     // Foreground run: with recovery_target_action='shutdown', postgres replays

@@ -26,32 +26,42 @@ pub const TIKO_CONF_FILE: &str = "postgresql.tiko.conf";
 const RECOVERY_CONF_BEGIN: &str = "# Tiko recovery settings — begin\n";
 const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
 
+/// A PITR recovery target: stop replay at a specific LSN, or at a timestamp.
+#[derive(Debug, Clone)]
+pub enum RecoveryTarget {
+    Lsn(Lsn),
+    Time(String),
+}
+
 /// Append a Tiko PITR recovery block to `conf_path`, delimited by begin/end
 /// markers so [`remove_recovery_conf`] can strip it cleanly later.
 ///
-/// Drives archive recovery up to `target_lsn` on `target_tl`, pulling WAL
-/// segments from remote via `tiko_restore`. `recovery_target_action='shutdown'`
-/// makes PostgreSQL shut itself down the instant it reaches the target.
+/// Drives archive recovery up to `target` on `timeline`, pulling WAL segments
+/// from remote via `tiko_restore`. `recovery_target_action='shutdown'` makes
+/// PostgreSQL shut itself down the instant it reaches the target.
 ///
 /// Note: this function does **not** check for an existing block; callers should
 /// call [`remove_recovery_conf`] first if the file may already contain one.
 pub fn write_pitr_recovery_conf(
     conf_path: &Path,
-    target_tl: TimelineId,
-    target_lsn: Lsn,
+    timeline: TimelineId,
+    target: &RecoveryTarget,
 ) -> Result<()> {
+    let target_line = match target {
+        RecoveryTarget::Lsn(lsn) => format!("recovery_target_lsn = '{}'\n", lsn.to_pg_string()),
+        RecoveryTarget::Time(ts) => format!("recovery_target_time = '{ts}'\n"),
+    };
     let snippet = format!(
         "\n{begin}\
          restore_command = 'tiko_restore %f %p'\n\
-         recovery_target_lsn = '{lsn}'\n\
+         {target_line}\
          recovery_target_timeline = '{tl}'\n\
          recovery_target_inclusive = on\n\
          recovery_target_action = 'shutdown'\n\
          {end}",
         begin = RECOVERY_CONF_BEGIN,
         end = RECOVERY_CONF_END,
-        lsn = target_lsn.to_pg_string(),
-        tl = target_tl.as_u32(),
+        tl = timeline.as_u32(),
     );
     let existing = fs::read_to_string(conf_path).unwrap_or_default();
     fs::write(conf_path, format!("{existing}{snippet}"))?;
@@ -187,12 +197,39 @@ mod tests {
         fs::write(&conf, "shared_buffers = 128MB\n").unwrap();
         let before = fs::read_to_string(&conf).unwrap();
 
-        write_pitr_recovery_conf(&conf, TimelineId::new(2), Lsn::new(0x3000028)).unwrap();
+        write_pitr_recovery_conf(
+            &conf,
+            TimelineId::new(2),
+            &RecoveryTarget::Lsn(Lsn::new(0x3000028)),
+        )
+        .unwrap();
         let with = fs::read_to_string(&conf).unwrap();
         assert!(with.contains("restore_command = 'tiko_restore %f %p'"));
         assert!(with.contains("recovery_target_lsn = '0/3000028'"));
         assert!(with.contains("recovery_target_timeline = '2'"));
         assert!(with.contains("recovery_target_action = 'shutdown'"));
+
+        remove_recovery_conf(&conf).unwrap();
+        assert_eq!(fs::read_to_string(&conf).unwrap(), before);
+    }
+
+    #[test]
+    fn pitr_conf_time_target_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join(TIKO_CONF_FILE);
+        fs::write(&conf, "shared_buffers = 128MB\n").unwrap();
+        let before = fs::read_to_string(&conf).unwrap();
+
+        write_pitr_recovery_conf(
+            &conf,
+            TimelineId::new(1),
+            &RecoveryTarget::Time("2026-06-04 10:00:00".to_string()),
+        )
+        .unwrap();
+        let with = fs::read_to_string(&conf).unwrap();
+        assert!(with.contains("recovery_target_time = '2026-06-04 10:00:00'"));
+        assert!(!with.contains("recovery_target_lsn"));
+        assert!(with.contains("recovery_target_timeline = '1'"));
 
         remove_recovery_conf(&conf).unwrap();
         assert_eq!(fs::read_to_string(&conf).unwrap(), before);
