@@ -80,6 +80,21 @@ pub struct CheckpointRow {
     pub n_chunks: usize,
 }
 
+/// The recoverable time window reported by [`Store::recovery_window`].
+///
+/// `earliest` is the oldest retained base manifest (replay floor); `latest` is
+/// the newest segment checkpoint. A PITR target must fall within `[earliest,
+/// latest]`. Derived from base manifests + segments, both governed by
+/// retention rather than by compaction.
+#[derive(Debug, Clone)]
+pub struct RecoveryWindow {
+    pub earliest_ts: i64,
+    pub earliest_ckpt: Checkpoint,
+    pub latest_ts: i64,
+    pub latest_ckpt: Checkpoint,
+    pub timeline: TimelineId,
+}
+
 /// Outcome of one [`Store::run_compaction`] call. Returned to the compactor
 /// task in `worker` for logging and metrics.
 #[derive(Debug)]
@@ -1011,6 +1026,73 @@ impl Store {
         let tmp = tempfile::tempdir()?;
         let manifest = Manifest::from_bytes(&bytes, tmp.path())?;
         Ok((manifest.checkpoint(), manifest.pg_state().to_vec()))
+    }
+
+    /// Compute the recoverable PITR window: `earliest` from the oldest retained
+    /// base manifest, `latest`/`timeline` from the newest segment checkpoint.
+    pub fn recovery_window(&self) -> Result<RecoveryWindow> {
+        let prefix = self.lctr.bases_dir();
+        let keys = self.storage_list_prefix(&prefix)?;
+        let (_oldest_ckpt, oldest_key) = keys
+            .iter()
+            .filter_map(|k| parse_base_manifest_ckpt(k, &prefix).map(|c| (c, k.clone())))
+            .min_by_key(|(c, _)| *c)
+            .ok_or_else(|| Error::other("no base manifest found; nothing is recoverable yet"))?;
+
+        let bytes = self.storage_get(&oldest_key)?;
+        let tmp = tempfile::tempdir()?;
+        let base = Manifest::from_bytes(&bytes, tmp.path())?;
+        let earliest_ts = base.timestamp();
+        let earliest_ckpt = base.checkpoint();
+
+        let rows = self.list_checkpoints()?;
+        let newest = rows
+            .last()
+            .ok_or_else(|| Error::other("no checkpoints found; nothing is recoverable yet"))?;
+
+        Ok(RecoveryWindow {
+            earliest_ts,
+            earliest_ckpt,
+            latest_ts: newest.created_at,
+            latest_ckpt: newest.ckpt,
+            timeline: newest.ckpt.timeline_id,
+        })
+    }
+
+    /// Find the newest base manifest with `timestamp <= target_ts` on `timeline`
+    /// and return its `(checkpoint, pg_state)`.
+    ///
+    /// Reads each base manifest's header to learn its timestamp (few base
+    /// manifests; cold CLI path). Future optimization: range-GET the 48-byte
+    /// TIKM header to avoid transferring the embedded `pg_state`.
+    pub fn load_base_pg_state_before_time(
+        &self,
+        target_ts: i64,
+        timeline: TimelineId,
+    ) -> Result<(Checkpoint, Vec<u8>)> {
+        let prefix = self.lctr.bases_dir();
+        let keys = self.storage_list_prefix(&prefix)?;
+        let tmp = tempfile::tempdir()?;
+
+        let mut candidates: Vec<(i64, Checkpoint, String)> = Vec::new();
+        for key in &keys {
+            if parse_base_manifest_ckpt(key, &prefix).is_none() {
+                continue;
+            }
+            let bytes = self.storage_get(key)?;
+            let m = Manifest::from_bytes(&bytes, tmp.path())?;
+            candidates.push((m.timestamp(), m.checkpoint(), key.clone()));
+        }
+
+        let (ckpt, key) = select_base_by_time(&candidates, target_ts, timeline).ok_or_else(|| {
+            Error::other(format!(
+                "no base manifest at or before time {target_ts} on timeline {timeline}"
+            ))
+        })?;
+
+        let bytes = self.storage_get(&key)?;
+        let manifest = Manifest::from_bytes(&bytes, tmp.path())?;
+        Ok((ckpt, manifest.pg_state().to_vec()))
     }
 
     /// Run the segment-based commit protocol — entry point called by the

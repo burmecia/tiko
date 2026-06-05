@@ -468,8 +468,6 @@ impl Manifest {
 
     /// Return the TIKM header timestamp (unix seconds) — the time of this base
     /// manifest's checkpoint. Used to order base manifests by time for PITR.
-    // Reserved for future PITR use; not yet called outside tests.
-    #[allow(dead_code)]
     pub fn timestamp(&self) -> i64 {
         self.timestamp
     }
