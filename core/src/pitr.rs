@@ -203,6 +203,9 @@ mod tests {
         assert_eq!(parse_pg_timestamp("1970-01-01 00:00:00").unwrap(), 0);
         assert_eq!(parse_pg_timestamp("1970-01-01T00:00:00").unwrap(), 0);
         assert_eq!(parse_pg_timestamp("1970-01-02").unwrap(), 86_400);
+        // Minute-precision (no seconds), both separators → UTC.
+        assert_eq!(parse_pg_timestamp("1970-01-01 00:01").unwrap(), 60);
+        assert_eq!(parse_pg_timestamp("1970-01-01T00:01").unwrap(), 60);
         // RFC3339 with offset: 01:00+01:00 == 00:00 UTC == epoch.
         assert_eq!(parse_pg_timestamp("1970-01-01T01:00:00+01:00").unwrap(), 0);
         assert!(parse_pg_timestamp("not a timestamp").is_err());
