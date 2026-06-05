@@ -466,6 +466,14 @@ impl Manifest {
         self.checkpoint
     }
 
+    /// Return the TIKM header timestamp (unix seconds) — the time of this base
+    /// manifest's checkpoint. Used to order base manifests by time for PITR.
+    // Reserved for future PITR use; not yet called outside tests.
+    #[allow(dead_code)]
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
     /// Return the redo checkpoint — the LSN from which WAL replay begins when
     /// this base manifest is used as a PITR base backup.
     // Reserved for future PITR use; not yet called outside tests.
