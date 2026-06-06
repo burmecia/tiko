@@ -3,6 +3,14 @@
 **Date:** 2026-06-04
 **Status:** Approved (design)
 
+> **Update (2026-06-07):** the recovery block is written to
+> `postgresql.auto.conf` (constant `RECOVERY_CONF_FILE`), not
+> `postgresql.tiko.conf`. `postgresql.auto.conf` is always read by PostgreSQL
+> (highest precedence) and exists in every data dir, so no `include` in
+> `postgresql.conf` is required — the original `postgresql.tiko.conf` approach
+> silently failed on data dirs without that include. References to
+> `postgresql.tiko.conf` below are superseded.
+
 ## Goal
 
 A new standalone binary `tiko_pitr` that automates the full point-in-time
