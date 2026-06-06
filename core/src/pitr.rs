@@ -3,7 +3,7 @@
 //! Two concerns live here, both pure filesystem/string operations with no
 //! dependency on the running `Store`, so they are unit-testable directly:
 //!
-//! 1. Editing `postgresql.tiko.conf`: writing a marker-delimited PITR recovery
+//! 1. Editing `postgresql.auto.conf`: writing a marker-delimited PITR recovery
 //!    block (`write_pitr_recovery_conf`) and stripping it again
 //!    (`remove_recovery_conf`).
 //! 2. Crash-safe PGDATA snapshot/restore that excludes the bulk `tiko/`
@@ -19,9 +19,14 @@ use pgsys::timeline_id::TimelineId;
 
 use crate::error::{Error, Result};
 
-/// Name of the Tiko-managed include file under PGDATA. PostgreSQL must already
-/// `include`/`include_if_exists` this from `postgresql.conf`.
-pub const TIKO_CONF_FILE: &str = "postgresql.tiko.conf";
+/// File under PGDATA that the PITR recovery block is written to.
+///
+/// `postgresql.auto.conf` is always read by PostgreSQL (processed last, so it
+/// has the highest precedence) and exists in every data dir, so the recovery
+/// settings take effect without requiring any `include` in `postgresql.conf`.
+/// The block is delimited by markers and stripped by [`remove_recovery_conf`]
+/// after recovery, leaving the file's other (ALTER SYSTEM) contents intact.
+pub const RECOVERY_CONF_FILE: &str = "postgresql.auto.conf";
 
 const RECOVERY_CONF_BEGIN: &str = "# Tiko recovery settings — begin\n";
 const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
@@ -198,7 +203,7 @@ mod tests {
     #[test]
     fn pitr_conf_round_trips_through_remove() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join(TIKO_CONF_FILE);
+        let conf = dir.path().join(RECOVERY_CONF_FILE);
         fs::write(&conf, "shared_buffers = 128MB\n").unwrap();
         let before = fs::read_to_string(&conf).unwrap();
 
@@ -221,7 +226,7 @@ mod tests {
     #[test]
     fn pitr_conf_time_target_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join(TIKO_CONF_FILE);
+        let conf = dir.path().join(RECOVERY_CONF_FILE);
         fs::write(&conf, "shared_buffers = 128MB\n").unwrap();
         let before = fs::read_to_string(&conf).unwrap();
 

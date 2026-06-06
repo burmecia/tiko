@@ -148,7 +148,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         .postgres
         .clone()
         .unwrap_or_else(|| sibling_postgres(pg_ctl));
-    let conf = pgdata.join(pitr::TIKO_CONF_FILE);
+    let conf = pgdata.join(pitr::RECOVERY_CONF_FILE);
     let backup = backup_path(pgdata);
 
     // 3. Stop PostgreSQL so the data dir is quiesced before copy/mutation.
