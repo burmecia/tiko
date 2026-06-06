@@ -69,6 +69,11 @@ struct RecoverArgs {
     /// `--pg-ctl`, falling back to `postgres` on `PATH`.
     #[arg(long)]
     postgres: Option<PathBuf>,
+    /// Path to the `tiko_restore` binary used as PostgreSQL's `restore_command`.
+    /// Defaults to the sibling of this `tiko_pitr` executable, falling back to
+    /// `tiko_restore` on `PATH`.
+    #[arg(long)]
+    tiko_restore: Option<PathBuf>,
 }
 
 fn run_list(store: &Store) -> Result<()> {
@@ -148,6 +153,10 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         .postgres
         .clone()
         .unwrap_or_else(|| sibling_postgres(pg_ctl));
+    let tiko_restore = args
+        .tiko_restore
+        .clone()
+        .unwrap_or_else(default_tiko_restore);
     let conf = pgdata.join(pitr::RECOVERY_CONF_FILE);
     let backup = backup_path(pgdata);
 
@@ -158,7 +167,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     pitr::backup_dir_excluding(pgdata, &backup, "tiko")?;
 
     // 5. Mutate + run recovery. On any failure, restore from the snapshot.
-    match recover_inner(&conf, pgdata, &pg_state, timeline, &target, &postgres) {
+    match recover_inner(&conf, pgdata, &pg_state, timeline, &target, &postgres, &tiko_restore) {
         Ok(()) => {
             pitr::remove_recovery_conf(&conf)?;
             let _ = std::fs::remove_file(pgdata.join("recovery.signal"));
@@ -202,9 +211,10 @@ fn recover_inner(
     timeline: TimelineId,
     target: &pitr::RecoveryTarget,
     postgres: &Path,
+    tiko_restore: &Path,
 ) -> Result<()> {
     extract_pg_state(pg_state, pgdata)?;
-    pitr::write_pitr_recovery_conf(conf, timeline, target)?;
+    pitr::write_pitr_recovery_conf(conf, timeline, target, tiko_restore)?;
     std::fs::write(pgdata.join("recovery.signal"), b"")?;
 
     // Foreground run: with recovery_target_action='shutdown', postgres replays
@@ -299,6 +309,16 @@ fn sibling_postgres(pg_ctl: &Path) -> PathBuf {
         Some(dir) if !dir.as_os_str().is_empty() => dir.join("postgres"),
         _ => PathBuf::from("postgres"),
     }
+}
+
+/// Default `tiko_restore` path: the sibling of this `tiko_pitr` executable
+/// (they are built/installed together), falling back to `tiko_restore` on
+/// `PATH` if the current exe path can't be resolved.
+fn default_tiko_restore() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("tiko_restore")))
+        .unwrap_or_else(|| PathBuf::from("tiko_restore"))
 }
 
 /// Sibling backup dir path: `{pgdata}.tiko_pitr_bak`.

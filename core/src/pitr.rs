@@ -42,8 +42,12 @@ pub enum RecoveryTarget {
 /// markers so [`remove_recovery_conf`] can strip it cleanly later.
 ///
 /// Drives archive recovery up to `target` on `timeline`, pulling WAL segments
-/// from remote via `tiko_restore`. `recovery_target_action='shutdown'` makes
-/// PostgreSQL shut itself down the instant it reaches the target.
+/// from remote via `restore_bin` (the `tiko_restore` binary).
+/// `recovery_target_action='shutdown'` makes PostgreSQL shut itself down the
+/// instant it reaches the target.
+///
+/// `restore_bin` is emitted as an absolute path so PostgreSQL's shell finds it
+/// regardless of `PATH`; it is double-quoted to tolerate spaces in the path.
 ///
 /// Note: this function does **not** check for an existing block; callers should
 /// call [`remove_recovery_conf`] first if the file may already contain one.
@@ -51,6 +55,7 @@ pub fn write_pitr_recovery_conf(
     conf_path: &Path,
     timeline: TimelineId,
     target: &RecoveryTarget,
+    restore_bin: &Path,
 ) -> Result<()> {
     let target_line = match target {
         RecoveryTarget::Lsn(lsn) => format!("recovery_target_lsn = '{}'\n", lsn.to_pg_string()),
@@ -58,7 +63,7 @@ pub fn write_pitr_recovery_conf(
     };
     let snippet = format!(
         "\n{begin}\
-         restore_command = 'tiko_restore %f %p'\n\
+         restore_command = '\"{restore}\" %f %p'\n\
          {target_line}\
          recovery_target_timeline = '{tl}'\n\
          recovery_target_inclusive = on\n\
@@ -66,6 +71,7 @@ pub fn write_pitr_recovery_conf(
          {end}",
         begin = RECOVERY_CONF_BEGIN,
         end = RECOVERY_CONF_END,
+        restore = restore_bin.display(),
         tl = timeline.as_u32(),
     );
     let existing = fs::read_to_string(conf_path).unwrap_or_default();
@@ -211,10 +217,11 @@ mod tests {
             &conf,
             TimelineId::new(2),
             &RecoveryTarget::Lsn(Lsn::new(0x3000028)),
+            Path::new("/opt/tiko/bin/tiko_restore"),
         )
         .unwrap();
         let with = fs::read_to_string(&conf).unwrap();
-        assert!(with.contains("restore_command = 'tiko_restore %f %p'"));
+        assert!(with.contains("restore_command = '\"/opt/tiko/bin/tiko_restore\" %f %p'"));
         assert!(with.contains("recovery_target_lsn = '0/3000028'"));
         assert!(with.contains("recovery_target_timeline = '2'"));
         assert!(with.contains("recovery_target_action = 'shutdown'"));
@@ -234,6 +241,7 @@ mod tests {
             &conf,
             TimelineId::new(1),
             &RecoveryTarget::Time("2026-06-04 10:00:00".to_string()),
+            Path::new("/opt/tiko/bin/tiko_restore"),
         )
         .unwrap();
         let with = fs::read_to_string(&conf).unwrap();
