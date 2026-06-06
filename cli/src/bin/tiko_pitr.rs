@@ -79,8 +79,16 @@ fn run_list(store: &Store) -> Result<()> {
             .unwrap_or_else(|| ts.to_string())
     };
     println!("recoverable window:");
-    println!("  earliest: {}   (checkpoint {})", fmt_ts(w.earliest_ts), w.earliest_ckpt);
-    println!("  latest:   {}   (checkpoint {})", fmt_ts(w.latest_ts), w.latest_ckpt);
+    println!(
+        "  earliest: {}   (checkpoint {})",
+        fmt_ts(w.earliest_ts),
+        w.earliest_ckpt
+    );
+    println!(
+        "  latest:   {}   (checkpoint {})",
+        fmt_ts(w.latest_ts),
+        w.latest_ckpt
+    );
     println!("  timeline: {}", w.timeline.to_hex());
     Ok(())
 }
@@ -105,7 +113,12 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             )));
         }
         let (bc, pg) = store.load_base_pg_state_before_time(target_ts, timeline)?;
-        (bc, pg, pitr::RecoveryTarget::Time(time_str.clone()), format!("time '{time_str}'"))
+        (
+            bc,
+            pg,
+            pitr::RecoveryTarget::Time(time_str.clone()),
+            format!("time '{time_str}'"),
+        )
     } else {
         let l = Lsn::parse_either(args.lsn.as_ref().unwrap()).map_err(Error::other)?;
         // LSN bounds use the window's latest-timeline range; base selection +
@@ -117,9 +130,17 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             )));
         }
         let (bc, pg) = store.load_base_pg_state_at_or_before(Checkpoint::new(timeline, l))?;
-        (bc, pg, pitr::RecoveryTarget::Lsn(l), format!("lsn {}", l.to_pg_string()))
+        (
+            bc,
+            pg,
+            pitr::RecoveryTarget::Lsn(l),
+            format!("lsn {}", l.to_pg_string()),
+        )
     };
-    eprintln!("tiko_pitr: recovering to {target_label} on timeline {} from base checkpoint {base_ckpt}", timeline.to_hex());
+    eprintln!(
+        "tiko_pitr: recovering to {target_label} on timeline {} from base checkpoint {base_ckpt}",
+        timeline.to_hex()
+    );
 
     let pgdata = args.pgdata.as_path();
     let pg_ctl = args.pg_ctl.as_path();
@@ -148,7 +169,10 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         }
         Err(e) => {
             eprintln!("tiko_pitr: recovery failed: {e}");
-            eprintln!("tiko_pitr: restoring PGDATA from backup {}", backup.display());
+            eprintln!(
+                "tiko_pitr: restoring PGDATA from backup {}",
+                backup.display()
+            );
             // Best-effort stop before restoring. The foreground `postgres` run
             // has already exited by the time we reach this arm, so PG is
             // normally down already; this just guards against a stray process.
@@ -190,7 +214,12 @@ fn recover_inner(
         .arg("-D")
         .arg(pgdata)
         .status()
-        .map_err(|e| Error::other(format!("failed to spawn postgres ({}): {e}", postgres.display())))?;
+        .map_err(|e| {
+            Error::other(format!(
+                "failed to spawn postgres ({}): {e}",
+                postgres.display()
+            ))
+        })?;
     if !status.success() {
         return Err(Error::other(format!(
             "postgres recovery did not reach the target (exit: {status})"
@@ -257,7 +286,9 @@ fn start_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
         .status()
         .map_err(|e| Error::other(format!("failed to spawn pg_ctl: {e}")))?;
     if !status.success() {
-        return Err(Error::other(format!("pg_ctl start failed (exit: {status})")));
+        return Err(Error::other(format!(
+            "pg_ctl start failed (exit: {status})"
+        )));
     }
     Ok(())
 }

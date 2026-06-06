@@ -17,10 +17,9 @@ use crate::{
     relfork::RelForkMeta,
     tiko_root_path,
 };
-use pgsys::logging::pg_log_debug1;
 use pgsys::{
     common::{BLCKSZ, BlockNumber},
-    logging::{pg_log_info, pg_log_warning},
+    logging::{pg_log_debug1, pg_log_debug2, pg_log_info, pg_log_warning},
     lsn::Lsn,
     timeline_id::TimelineId,
 };
@@ -196,7 +195,7 @@ impl Store {
         // unreadable (fresh data dir, or after a `tiko_root` reset).
         let initial: Manifest = match Manifest::open_local(&local_root) {
             Ok(manifest) => {
-                pg_log_debug1(format!(
+                pg_log_debug2(format!(
                     "tiko: Store::init(): opened local base manifest at {}",
                     manifest.checkpoint()
                 ));
@@ -1084,11 +1083,12 @@ impl Store {
             candidates.push((m.timestamp(), m.checkpoint(), key.clone()));
         }
 
-        let (ckpt, key) = select_base_by_time(&candidates, target_ts, timeline).ok_or_else(|| {
-            Error::other(format!(
-                "no base manifest at or before time {target_ts} on timeline {timeline}"
-            ))
-        })?;
+        let (ckpt, key) =
+            select_base_by_time(&candidates, target_ts, timeline).ok_or_else(|| {
+                Error::other(format!(
+                    "no base manifest at or before time {target_ts} on timeline {timeline}"
+                ))
+            })?;
 
         let bytes = self.storage_get(&key)?;
         let manifest = Manifest::from_bytes(&bytes, tmp.path())?;
@@ -1185,10 +1185,19 @@ mod base_select_tests {
     fn parses_valid_key_and_rejects_others() {
         let prefix = "12/5/bases/";
         let key = "12/5/bases/00000001/0000000003000028.manifest";
-        assert_eq!(parse_base_manifest_ckpt(key, prefix), Some(ckpt(1, 0x3000028)));
+        assert_eq!(
+            parse_base_manifest_ckpt(key, prefix),
+            Some(ckpt(1, 0x3000028))
+        );
 
-        assert_eq!(parse_base_manifest_ckpt("12/5/bases/00000001", prefix), None);
-        assert_eq!(parse_base_manifest_ckpt("12/5/other/x.manifest", prefix), None);
+        assert_eq!(
+            parse_base_manifest_ckpt("12/5/bases/00000001", prefix),
+            None
+        );
+        assert_eq!(
+            parse_base_manifest_ckpt("12/5/other/x.manifest", prefix),
+            None
+        );
         assert_eq!(
             parse_base_manifest_ckpt("12/5/bases/zz/0000000000000001.manifest", prefix),
             None

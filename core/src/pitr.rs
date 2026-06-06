@@ -102,7 +102,12 @@ pub fn parse_pg_timestamp(s: &str) -> Result<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.timestamp());
     }
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"] {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ] {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
             return Ok(ndt.and_utc().timestamp());
         }
@@ -262,7 +267,10 @@ mod tests {
         backup_dir_excluding(&pgdata, &bak, "tiko").unwrap();
         assert!(bak.join("PG_VERSION").exists());
         assert!(bak.join("global/pg_control").exists());
-        assert!(!bak.join("tiko").exists(), "tiko/ must be excluded from backup");
+        assert!(
+            !bak.join("tiko").exists(),
+            "tiko/ must be excluded from backup"
+        );
 
         // A second backup must refuse to overwrite.
         assert!(backup_dir_excluding(&pgdata, &bak, "tiko").is_err());
@@ -273,7 +281,13 @@ mod tests {
 
         restore_dir(&bak, &pgdata, "tiko").unwrap();
         assert_eq!(fs::read(pgdata.join("global/pg_control")).unwrap(), b"orig");
-        assert!(!pgdata.join("recovery.signal").exists(), "restore must drop new files");
-        assert!(pgdata.join("tiko/s3sim/blob").exists(), "tiko/ must be left untouched");
+        assert!(
+            !pgdata.join("recovery.signal").exists(),
+            "restore must drop new files"
+        );
+        assert!(
+            pgdata.join("tiko/s3sim/blob").exists(),
+            "tiko/ must be left untouched"
+        );
     }
 }
