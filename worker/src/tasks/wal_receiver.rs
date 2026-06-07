@@ -458,6 +458,10 @@ async fn flush_partial_tail(
 /// Read the shared-memory checkpoint/commit generation. Returns 0 when
 /// `IoControl` is not attached yet (very early startup) — treated as "no
 /// checkpoint observed".
+///
+/// The `0` sentinel can't cause a spurious flush: `last_flushed_generation` is
+/// seeded from this same function, so an unattached `IoControl` yields
+/// `cur == last` and the gate stays false.
 fn current_generation() -> u64 {
     IoControl::try_get()
         .map(|c| c.timeline.generation.load(Ordering::Acquire))
