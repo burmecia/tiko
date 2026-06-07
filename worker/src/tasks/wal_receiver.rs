@@ -25,7 +25,9 @@ use tokio::time::sleep;
 
 use crate::log_relay::{relay_debug1, relay_warning};
 use core::io::store::Store;
+use core::io_control::IoControl;
 use pgsys::common::XLOG_SEG_SIZE;
+use std::sync::atomic::Ordering;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -227,6 +229,9 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
     // ── Message loop ──────────────────────────────────────────────────────────
     let mut confirmed_lsn: u64 = start_lsn;
     let mut cur_seg: Option<SegState> = None;
+    // Last checkpoint/commit generation we flushed the tail at. Initialized to
+    // the current value so we don't flush spuriously right after connecting.
+    let mut last_flushed_generation: u64 = current_generation();
 
     loop {
         // Wait up to KEEPALIVE_INTERVAL for the next CopyData message.
@@ -276,6 +281,13 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
                 send_standby_status(&mut conn, confirmed_lsn).await?;
             }
         }
+
+        // Checkpoint-triggered tail flush: if a checkpoint advanced the shared
+        // generation since our last flush, push whatever WAL tail we've buffered
+        // so archived WAL tracks the head. Cheap atomic read on a hit-or-miss
+        // basis; the actual PUT only fires when there is a tail.
+        maybe_flush_on_checkpoint(&cur_seg, sim, timeline_id, &mut last_flushed_generation)
+            .await?;
     }
 }
 
@@ -440,6 +452,65 @@ async fn flush_partial_tail(
     relay_debug1(format!(
         "tiko: wal_receiver: flushed partial tail for {name}"
     ));
+    Ok(())
+}
+
+/// Read the shared-memory checkpoint/commit generation. Returns 0 when
+/// `IoControl` is not attached yet (very early startup) — treated as "no
+/// checkpoint observed".
+fn current_generation() -> u64 {
+    IoControl::try_get()
+        .map(|c| c.timeline.generation.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
+/// Checkpoint-triggered tail flush: if the shared-memory `generation` advanced
+/// since `last_flushed_generation` and the current segment has buffered tail,
+/// PUT that tail now. Always advances `last_flushed_generation` to the observed
+/// value so an unchanged generation isn't re-evaluated.
+async fn maybe_flush_on_checkpoint(
+    cur_seg: &Option<SegState>,
+    sim: &'static Store,
+    timeline_id: TimelineId,
+    last_flushed_generation: &mut u64,
+) -> Result<(), BoxError> {
+    let cur = current_generation();
+    let has_tail = cur_seg
+        .as_ref()
+        .is_some_and(|s| s.buf.len() > s.chunks_uploaded);
+    if should_flush_tail(*last_flushed_generation, cur, has_tail) {
+        // has_tail implies cur_seg is Some.
+        flush_tail_now(cur_seg.as_ref().unwrap(), sim, timeline_id).await?;
+    }
+    *last_flushed_generation = cur;
+    Ok(())
+}
+
+/// PUT the current partial tail (`buf[chunks_uploaded..]`) at its byte offset,
+/// WITHOUT consuming the segment or advancing `chunks_uploaded`.
+///
+/// Used by the checkpoint-triggered flush so archived WAL keeps up with the
+/// head. Because `chunks_uploaded` is unchanged, the streaming path still owns
+/// that offset: when the buffer later fills a full 256 KiB window (or the
+/// segment is sealed), the normal PUT at the same key overwrites this partial
+/// object. `tiko_restore` takes the latest object per offset, so reads stay
+/// consistent. No-op if there is no buffered tail.
+async fn flush_tail_now(
+    state: &SegState,
+    sim: &'static Store,
+    timeline_id: TimelineId,
+) -> Result<(), BoxError> {
+    if state.buf.len() <= state.chunks_uploaded {
+        return Ok(());
+    }
+    let name = wal_seg_name(timeline_id, state.seg_no);
+    let offset = state.chunks_uploaded;
+    let tail = state.buf[offset..].to_vec();
+    let key = sim.locator().wal_chunk_key(timeline_id, &name, offset);
+    tokio::task::spawn_blocking(move || sim.storage_put(&key, &tail))
+        .await
+        .map_err(|e| format!("checkpoint tail flush spawn_blocking panicked for {name}: {e}"))?
+        .map_err(|e| format!("checkpoint tail PUT failed for {name}: {e}"))?;
     Ok(())
 }
 
