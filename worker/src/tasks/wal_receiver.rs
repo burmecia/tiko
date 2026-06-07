@@ -497,6 +497,14 @@ async fn send_standby_status(conn: &mut ReplConn, flush_lsn: u64) -> Result<(), 
     conn.send_copy_data(&buf).await
 }
 
+/// Decide whether the checkpoint-triggered path should flush the WAL tail now.
+///
+/// Flush only when the shared-memory `generation` advanced since our last flush
+/// (a checkpoint — or compaction — committed) AND there is buffered tail to push.
+fn should_flush_tail(last_gen: u64, cur_gen: u64, has_tail: bool) -> bool {
+    cur_gen != last_gen && has_tail
+}
+
 // ── Utility ───────────────────────────────────────────────────────────────────
 
 /// Format a WAL segment filename from timeline and segment number.
@@ -822,5 +830,20 @@ fn parse_error_response(data: &[u8]) -> String {
         message
     } else {
         format!("{message} ({sqlstate})")
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::should_flush_tail;
+
+    #[test]
+    fn should_flush_tail_gate() {
+        assert!(should_flush_tail(1, 2, true)); // generation advanced + tail present
+        assert!(!should_flush_tail(1, 2, false)); // advanced but nothing buffered
+        assert!(!should_flush_tail(2, 2, true)); // no checkpoint since last flush
+        assert!(!should_flush_tail(2, 2, false)); // unchanged + nothing buffered
     }
 }
