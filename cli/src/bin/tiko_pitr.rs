@@ -167,7 +167,15 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     pitr::backup_dir_excluding(pgdata, &backup, "tiko")?;
 
     // 5. Mutate + run recovery. On any failure, restore from the snapshot.
-    match recover_inner(&conf, pgdata, &pg_state, timeline, &target, &postgres, &tiko_restore) {
+    match recover_inner(
+        &conf,
+        pgdata,
+        &pg_state,
+        timeline,
+        &target,
+        &postgres,
+        &tiko_restore,
+    ) {
         Ok(()) => {
             pitr::remove_recovery_conf(&conf)?;
             let _ = std::fs::remove_file(pgdata.join("recovery.signal"));

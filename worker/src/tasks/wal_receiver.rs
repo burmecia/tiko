@@ -286,8 +286,7 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
         // generation since our last flush, push whatever WAL tail we've buffered
         // so archived WAL tracks the head. Cheap atomic read on a hit-or-miss
         // basis; the actual PUT only fires when there is a tail.
-        maybe_flush_on_checkpoint(&cur_seg, sim, timeline_id, &mut last_flushed_generation)
-            .await?;
+        maybe_flush_on_checkpoint(&cur_seg, sim, timeline_id, &mut last_flushed_generation).await?;
     }
 }
 
