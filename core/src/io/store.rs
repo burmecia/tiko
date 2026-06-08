@@ -159,12 +159,13 @@ pub struct CheckpointRow {
     pub n_chunks: usize,
 }
 
-/// The recoverable time window reported by [`Store::recovery_window`].
+/// The recoverable window reported by [`Store::recovery_window`], bounded by
+/// archived-WAL coverage.
 ///
-/// `earliest` is the oldest retained base manifest (replay floor); `latest` is
-/// the newest segment checkpoint. A PITR target must fall within `[earliest,
-/// latest]`. Derived from base manifests + segments, both governed by
-/// retention rather than by compaction.
+/// `earliest` is the oldest base manifest whose recovery WAL (`[redo,
+/// checkpoint]`) lies inside the contiguous archived-WAL run; `latest_lsn` is
+/// the end of that run (the highest recoverable LSN). A PITR target must fall
+/// within `[earliest_ckpt, latest_lsn]` (and `[earliest_ts, latest_ts]`).
 #[derive(Debug, Clone)]
 pub struct RecoveryWindow {
     pub earliest_ts: i64,
