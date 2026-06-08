@@ -117,10 +117,13 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             )));
         }
         let (bc, pg) = store.load_base_pg_state_before_time(target_ts, timeline)?;
+        // Carry the parsed UTC instant (not the raw string) so PostgreSQL's
+        // recovery_target_time is rendered as explicit UTC and can't be
+        // reinterpreted in the server timezone.
         (
             bc,
             pg,
-            pitr::RecoveryTarget::Time(time_str.clone()),
+            pitr::RecoveryTarget::Time(target_ts),
             format!("time '{time_str}'"),
         )
     } else {

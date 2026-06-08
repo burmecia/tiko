@@ -32,10 +32,27 @@ const RECOVERY_CONF_BEGIN: &str = "# Tiko recovery settings — begin\n";
 const RECOVERY_CONF_END: &str = "# Tiko recovery settings — end\n";
 
 /// A PITR recovery target: stop replay at a specific LSN, or at a timestamp.
+///
+/// `Time` carries a Unix-seconds instant (UTC), not a wall-clock string, so the
+/// target is timezone-unambiguous end to end (`parse_pg_timestamp` produces it,
+/// `format_recovery_target_time` renders it with an explicit offset for PG).
 #[derive(Debug, Clone)]
 pub enum RecoveryTarget {
     Lsn(Lsn),
-    Time(String),
+    Time(i64),
+}
+
+/// Render a Unix-seconds instant as a PostgreSQL `timestamptz` literal in UTC
+/// with an explicit `+00:00` offset.
+///
+/// `recovery_target_time` is a `timestamptz`: a literal **without** an offset is
+/// interpreted in the server's `timezone`, which would silently disagree with
+/// the UTC instant `tiko_pitr` selected (and that `tiko_pitr list` displays).
+/// Emitting the offset makes the target unambiguous regardless of server tz.
+pub fn format_recovery_target_time(unix_ts: i64) -> Result<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix_ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%:z").to_string())
+        .ok_or_else(|| Error::other(format!("invalid recovery target timestamp: {unix_ts}")))
 }
 
 /// Append a Tiko PITR recovery block to `conf_path`, delimited by begin/end
@@ -59,7 +76,9 @@ pub fn write_pitr_recovery_conf(
 ) -> Result<()> {
     let target_line = match target {
         RecoveryTarget::Lsn(lsn) => format!("recovery_target_lsn = '{}'\n", lsn.to_pg_string()),
-        RecoveryTarget::Time(ts) => format!("recovery_target_time = '{ts}'\n"),
+        RecoveryTarget::Time(ts) => {
+            format!("recovery_target_time = '{}'\n", format_recovery_target_time(*ts)?)
+        }
     };
     let snippet = format!(
         "\n{begin}\
@@ -237,20 +256,36 @@ mod tests {
         fs::write(&conf, "shared_buffers = 128MB\n").unwrap();
         let before = fs::read_to_string(&conf).unwrap();
 
+        // 0 = 1970-01-01 00:00:00 UTC; rendered with an explicit +00:00 offset.
         write_pitr_recovery_conf(
             &conf,
             TimelineId::new(1),
-            &RecoveryTarget::Time("2026-06-04 10:00:00".to_string()),
+            &RecoveryTarget::Time(0),
             Path::new("/opt/tiko/bin/tiko_restore"),
         )
         .unwrap();
         let with = fs::read_to_string(&conf).unwrap();
-        assert!(with.contains("recovery_target_time = '2026-06-04 10:00:00'"));
+        assert!(with.contains("recovery_target_time = '1970-01-01 00:00:00+00:00'"));
         assert!(!with.contains("recovery_target_lsn"));
         assert!(with.contains("recovery_target_timeline = '1'"));
 
         remove_recovery_conf(&conf).unwrap();
         assert_eq!(fs::read_to_string(&conf).unwrap(), before);
+    }
+
+    #[test]
+    fn format_recovery_target_time_is_explicit_utc() {
+        assert_eq!(
+            format_recovery_target_time(0).unwrap(),
+            "1970-01-01 00:00:00+00:00"
+        );
+        // parse (bare → UTC) and format (UTC + explicit offset) are inverse, so
+        // PostgreSQL reads back the exact instant tiko_pitr selected.
+        let ts = parse_pg_timestamp("2026-06-08 13:40:00").unwrap();
+        assert_eq!(
+            format_recovery_target_time(ts).unwrap(),
+            "2026-06-08 13:40:00+00:00"
+        );
     }
 
     #[test]
