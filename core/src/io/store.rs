@@ -119,6 +119,11 @@ fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
     let mut cur = top;
     let mut idx = 1;
     loop {
+        // Segment 0 is the lowest possible — nothing below it. (Also guards the
+        // `cur.seg_no - 1` below against debug-mode underflow.)
+        if cur.seg_no == 0 {
+            break;
+        }
         // Can only extend below if `cur` covers from its own segment start.
         if cur.lo != cur.seg_no * seg {
             break;
