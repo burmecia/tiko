@@ -1222,6 +1222,8 @@ impl Store {
 
         let tmp = tempfile::tempdir()?;
         let mut chosen: Option<(Checkpoint, i64)> = None;
+        // Ascending, stop at the first usable base. Worst case (all in-window
+        // bases unusable) GETs every candidate; acceptable on this cold CLI path.
         for (ckpt, key) in &candidates {
             let bytes = self.storage_get(key)?;
             let base = Manifest::from_bytes(&bytes, tmp.path())?;
@@ -1235,6 +1237,9 @@ impl Store {
         })?;
 
         // 4. Latest: run end, and the newest checkpoint time within the run.
+        //    If no checkpoint sits at/below w_hi the time window collapses to
+        //    `earliest_ts` (never over-promises); the LSN window can still be
+        //    wider than the time window in that edge.
         let latest_lsn = Lsn::new(w_hi);
         let latest_ts = rows
             .iter()

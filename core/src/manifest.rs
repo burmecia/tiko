@@ -472,10 +472,8 @@ impl Manifest {
         self.timestamp
     }
 
-    /// Return the redo checkpoint — the LSN from which WAL replay begins when
-    /// this base manifest is used as a PITR base backup.
-    /// Returns the redo checkpoint embedded in this base manifest — the LSN
-    /// from which WAL replay must begin to reach this base's checkpoint.
+    /// Return the redo checkpoint — the LSN from which WAL replay must begin
+    /// when this base manifest is used as a PITR base backup.
     pub fn redo_ckpt(&self) -> Checkpoint {
         self.redo_ckpt
     }
