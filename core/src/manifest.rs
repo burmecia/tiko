@@ -474,8 +474,8 @@ impl Manifest {
 
     /// Return the redo checkpoint — the LSN from which WAL replay begins when
     /// this base manifest is used as a PITR base backup.
-    // Reserved for future PITR use; not yet called outside tests.
-    #[allow(dead_code)]
+    /// Returns the redo checkpoint embedded in this base manifest — the LSN
+    /// from which WAL replay must begin to reach this base's checkpoint.
     pub fn redo_ckpt(&self) -> Checkpoint {
         self.redo_ckpt
     }

@@ -83,18 +83,17 @@ fn run_list(store: &Store) -> Result<()> {
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| ts.to_string())
     };
-    println!("recoverable window:");
+    println!("recoverable window (timeline {}):", w.timeline.to_hex());
     println!(
-        "  earliest: {}   (checkpoint {})",
+        "  earliest: {}   lsn {}",
         fmt_ts(w.earliest_ts),
-        w.earliest_ckpt
+        w.earliest_ckpt.lsn.to_pg_string()
     );
     println!(
-        "  latest:   {}   (checkpoint {})",
+        "  latest:   {}   lsn {}",
         fmt_ts(w.latest_ts),
-        w.latest_ckpt
+        w.latest_lsn.to_pg_string()
     );
-    println!("  timeline: {}", w.timeline.to_hex());
     Ok(())
 }
 
@@ -128,7 +127,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         let l = Lsn::parse_either(args.lsn.as_ref().unwrap()).map_err(Error::other)?;
         // LSN bounds use the window's latest-timeline range; base selection +
         // PostgreSQL validate the precise reachability for an older --timeline.
-        if l < window.earliest_ckpt.lsn || l > window.latest_ckpt.lsn {
+        if l < window.earliest_ckpt.lsn || l > window.latest_lsn {
             return Err(Error::other(format!(
                 "target LSN {} is outside the recoverable window; run `tiko_pitr list`",
                 l.to_pg_string()

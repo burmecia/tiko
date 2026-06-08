@@ -70,6 +70,11 @@ impl Locator {
         format!("{ns}/timeline/", ns = self.ns)
     }
 
+    /// Listing prefix for one timeline's WAL objects: `{ns}/wal/{tl:08X}/`.
+    pub(crate) fn wal_timeline_dir(&self, timeline_id: TimelineId) -> String {
+        format!("{ns}/wal/{tl}/", ns = self.ns, tl = timeline_id.to_hex())
+    }
+
     // ── WAL and metadata keys ────────────────────────────
 
     pub fn wal_segment(&self, timeline_id: TimelineId, wal_segment: &str) -> String {

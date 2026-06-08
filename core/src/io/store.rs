@@ -170,7 +170,8 @@ pub struct RecoveryWindow {
     pub earliest_ts: i64,
     pub earliest_ckpt: Checkpoint,
     pub latest_ts: i64,
-    pub latest_ckpt: Checkpoint,
+    /// End of the contiguous archived-WAL run (highest recoverable LSN).
+    pub latest_lsn: Lsn,
     pub timeline: TimelineId,
 }
 
@@ -1107,34 +1108,146 @@ impl Store {
         Ok((manifest.checkpoint(), manifest.pg_state().to_vec()))
     }
 
-    /// Compute the recoverable PITR window: `earliest` from the oldest retained
-    /// base manifest, `latest`/`timeline` from the newest segment checkpoint.
+    /// Compute the contiguous archived-WAL run `[w_lo, w_hi]` (absolute LSN) for
+    /// `timeline`, reaching the highest archived segment. Lists `{ns}/wal/{tl}/`,
+    /// classifies sealed segments vs partial chunks, and GETs the highest
+    /// segment's last chunk for its byte length when that segment is partial.
+    fn archived_wal_run(&self, timeline: TimelineId) -> Result<(u64, u64)> {
+        let seg = XLOG_SEG_SIZE as u64;
+        let prefix = self.lctr.wal_timeline_dir(timeline);
+        let keys = match self.storage_list_prefix(&prefix) {
+            Ok(k) => k,
+            Err(e) if e.is_not_found() => Vec::new(),
+            Err(e) => return Err(e),
+        };
+
+        struct Acc {
+            sealed: bool,
+            min_off: Option<usize>,
+            max_off: Option<usize>,
+        }
+        let mut segs: std::collections::BTreeMap<u64, Acc> = std::collections::BTreeMap::new();
+        for key in &keys {
+            let Some((seg_no, off)) = parse_wal_key(key, &prefix) else {
+                continue;
+            };
+            let acc = segs.entry(seg_no).or_insert(Acc {
+                sealed: false,
+                min_off: None,
+                max_off: None,
+            });
+            match off {
+                None => acc.sealed = true,
+                Some(o) => {
+                    acc.min_off = Some(acc.min_off.map_or(o, |m| m.min(o)));
+                    acc.max_off = Some(acc.max_off.map_or(o, |m| m.max(o)));
+                }
+            }
+        }
+        let Some(&highest) = segs.keys().next_back() else {
+            return Err(Error::other(
+                "no archived WAL for timeline; nothing is recoverable yet",
+            ));
+        };
+
+        let mut entries: Vec<SegEntry> = Vec::with_capacity(segs.len());
+        for (&seg_no, acc) in &segs {
+            if acc.sealed {
+                // Sealed is authoritative even if leftover chunks exist.
+                entries.push(SegEntry {
+                    seg_no,
+                    lo: seg_no * seg,
+                    hi: (seg_no + 1) * seg,
+                    full: true,
+                });
+            } else {
+                let min_off = acc.min_off.unwrap_or(0);
+                let lo = seg_no * seg + min_off as u64;
+                // Only the highest segment's exact end matters; lower partial
+                // segments never extend the run, so their `hi` is unused.
+                let hi = if seg_no == highest {
+                    let max_off = acc.max_off.unwrap_or(0);
+                    let name = format!("{}{:016X}", timeline.to_hex(), seg_no);
+                    let chunk_key = self.lctr.wal_chunk_key(timeline, &name, max_off);
+                    let len = self.storage_get(&chunk_key)?.len();
+                    seg_no * seg + max_off as u64 + len as u64
+                } else {
+                    lo
+                };
+                entries.push(SegEntry {
+                    seg_no,
+                    lo,
+                    hi,
+                    full: false,
+                });
+            }
+        }
+
+        wal_contiguous_run(&entries).ok_or_else(|| {
+            Error::other("no archived WAL for timeline; nothing is recoverable yet")
+        })
+    }
+
+    /// Compute the PITR-recoverable window bounded by archived-WAL coverage:
+    /// `earliest` = the oldest base manifest whose recovery WAL is inside the
+    /// contiguous archived run; `latest_lsn` = the end of that run. Errors with
+    /// a clear message when nothing is recoverable yet.
     pub fn recovery_window(&self) -> Result<RecoveryWindow> {
-        let prefix = self.lctr.bases_dir();
-        let keys = self.storage_list_prefix(&prefix)?;
-        let (_oldest_ckpt, oldest_key) = keys
-            .iter()
-            .filter_map(|k| parse_base_manifest_ckpt(k, &prefix).map(|c| (c, k.clone())))
-            .min_by_key(|(c, _)| *c)
-            .ok_or_else(|| Error::other("no base manifest found; nothing is recoverable yet"))?;
-
-        let bytes = self.storage_get(&oldest_key)?;
-        let tmp = tempfile::tempdir()?;
-        let base = Manifest::from_bytes(&bytes, tmp.path())?;
-        let earliest_ts = base.timestamp();
-        let earliest_ckpt = base.checkpoint();
-
+        // 1. Timeline = newest checkpoint's timeline.
         let rows = self.list_checkpoints()?;
         let newest = rows
             .last()
             .ok_or_else(|| Error::other("no checkpoints found; nothing is recoverable yet"))?;
+        let timeline = newest.ckpt.timeline_id;
+
+        // 2. Contiguous archived-WAL run for this timeline.
+        let (w_lo, w_hi) = self.archived_wal_run(timeline)?;
+
+        // 3. Oldest usable base: ascending by checkpoint, first whose redo WAL
+        //    is archived. Candidates are bases on this timeline with checkpoint
+        //    within the run.
+        let bases_prefix = self.lctr.bases_dir();
+        let base_keys = self.storage_list_prefix(&bases_prefix)?;
+        let mut candidates: Vec<(Checkpoint, String)> = base_keys
+            .iter()
+            .filter_map(|k| parse_base_manifest_ckpt(k, &bases_prefix).map(|c| (c, k.clone())))
+            .filter(|(c, _)| {
+                c.timeline_id == timeline
+                    && c.lsn.as_u64() >= w_lo
+                    && c.lsn.as_u64() <= w_hi
+            })
+            .collect();
+        candidates.sort_by_key(|(c, _)| *c);
+
+        let tmp = tempfile::tempdir()?;
+        let mut chosen: Option<(Checkpoint, i64)> = None;
+        for (ckpt, key) in &candidates {
+            let bytes = self.storage_get(key)?;
+            let base = Manifest::from_bytes(&bytes, tmp.path())?;
+            if is_base_usable(ckpt.lsn.as_u64(), base.redo_ckpt().lsn.as_u64(), w_lo, w_hi) {
+                chosen = Some((base.checkpoint(), base.timestamp()));
+                break;
+            }
+        }
+        let (earliest_ckpt, earliest_ts) = chosen.ok_or_else(|| {
+            Error::other("no base manifest's WAL is archived; nothing is recoverable yet")
+        })?;
+
+        // 4. Latest: run end, and the newest checkpoint time within the run.
+        let latest_lsn = Lsn::new(w_hi);
+        let latest_ts = rows
+            .iter()
+            .filter(|r| r.ckpt.lsn.as_u64() <= w_hi)
+            .map(|r| r.created_at)
+            .max()
+            .unwrap_or(earliest_ts);
 
         Ok(RecoveryWindow {
             earliest_ts,
             earliest_ckpt,
-            latest_ts: newest.created_at,
-            latest_ckpt: newest.ckpt,
-            timeline: newest.ckpt.timeline_id,
+            latest_ts,
+            latest_lsn,
+            timeline,
         })
     }
 
