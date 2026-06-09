@@ -27,7 +27,7 @@ use std::process::exit;
 
 use clap::Parser;
 
-use core::{error::Result, io::store::Store};
+use core::{error::Result, io::store::Store, pgcontrol};
 use pgsys::common::XLOG_SEG_SIZE;
 use pgsys::timeline_id::TimelineId;
 
@@ -112,6 +112,8 @@ fn restore(store: &Store, args: &Args) -> Result<Outcome> {
         buf[offset..end].copy_from_slice(&data);
     }
 
+    maybe_synthesize_long_header(&mut buf, timeline_id, name);
+
     write_atomic(&args.dest_path, &buf)?;
     Ok(Outcome::Restored)
 }
@@ -123,6 +125,48 @@ fn parse_wal_segment_name(name: &str) -> Option<TimelineId> {
         return None;
     }
     TimelineId::from_hex(&name[..8]).ok()
+}
+
+/// Little-endian bytes of `XLOG_PAGE_MAGIC` — what a real WAL page 0 begins with.
+const XLOG_PAGE_MAGIC_LE: [u8; 2] = 0xD118u16.to_le_bytes();
+
+/// On first access to a segment, PostgreSQL reads page 0's long header to
+/// validate the segment (`XLogReaderValidatePageHeader`) even when the target
+/// record is on a later page. A segment streamed mid-segment never archived its
+/// page 0, so the assembled buffer starts zero-filled and PG sees magic `0000`.
+/// If page 0 is missing (no real magic), synthesize a valid long header in
+/// place. Best-effort: on any missing input, warn (to the PG log) and leave the
+/// buffer unchanged — no worse than before.
+fn maybe_synthesize_long_header(buf: &mut [u8], tli: TimelineId, name: &str) {
+    if buf[0..2] == XLOG_PAGE_MAGIC_LE {
+        return; // offset 0 was archived — real long header already present
+    }
+    let Some(seg_no) = pgcontrol::parse_wal_seg_no(name) else {
+        return; // not a parseable segment name; nothing to synthesize
+    };
+    // restore_command runs with cwd = the data directory, so global/pg_control
+    // is the live control file holding this cluster's system_identifier.
+    let sysid = match fs::read("global/pg_control") {
+        Ok(ctl) => match pgcontrol::read_system_identifier(&ctl) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!(
+                    "tiko_restore: bad global/pg_control ({e}); \
+                     leaving segment {name} page 0 unsynthesized"
+                );
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "tiko_restore: cannot read global/pg_control ({e}); \
+                 leaving segment {name} page 0 unsynthesized"
+            );
+            return;
+        }
+    };
+    let hdr = pgcontrol::wal_long_header(tli, seg_no, sysid);
+    buf[0..hdr.len()].copy_from_slice(&hdr);
 }
 
 /// Parse the byte offset encoded in a chunk key's final path component
