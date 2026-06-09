@@ -76,7 +76,9 @@ pub fn wal_long_header(
 
 /// Inverse of [`xlog_file_name`]: parse a 24-hex WAL segment name into its
 /// segment number (`logid * SEGS_PER_LOGID + logseg`). `None` for any name that
-/// is not exactly 24 hex digits.
+/// is not exactly 24 hex digits. The timeline prefix is ignored — segment
+/// numbers are timeline-independent; callers needing the timeline parse it
+/// separately.
 pub fn parse_wal_seg_no(name: &str) -> Option<u64> {
     if name.len() != 24 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
