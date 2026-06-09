@@ -16,6 +16,8 @@ const SEGS_PER_LOGID: u64 = (1u64 << 32) / XLOG_SEG_SIZE as u64;
 
 // PG18 ControlFileData layout (PG_CONTROL_VERSION 1800), confirmed via offsetof
 // against the build's headers. `crc` is the last field; CRC covers [0, OFF_CRC).
+// pg_control is native-endian; the from_le_bytes/to_le_bytes below assume a
+// little-endian host (arm64/x86-64), which is the only supported platform.
 const PG_CONTROL_VERSION_PG18: u32 = 1800;
 const OFF_VERSION: usize = 8;
 const OFF_STATE: usize = 16;
