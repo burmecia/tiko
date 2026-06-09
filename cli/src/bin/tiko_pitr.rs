@@ -20,6 +20,7 @@ use clap::{Args, Parser, Subcommand};
 use core::error::{Error, Result};
 use core::io::store::Store;
 use core::io::timeline::Checkpoint;
+use core::pgcontrol;
 use core::pitr;
 use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
@@ -224,6 +225,9 @@ fn recover_inner(
     tiko_restore: &Path,
 ) -> Result<()> {
     extract_pg_state(pg_state, pgdata)?;
+    // Make the extracted snapshot look like a base backup so PG reaches
+    // consistency at the base checkpoint and can stop at an earlier target.
+    shape_base_backup(pgdata)?;
     pitr::write_pitr_recovery_conf(conf, timeline, target, tiko_restore)?;
     std::fs::write(pgdata.join("recovery.signal"), b"")?;
 
@@ -245,6 +249,27 @@ fn recover_inner(
             "postgres recovery did not reach the target (exit: {status})"
         )));
     }
+    Ok(())
+}
+
+/// Shape the extracted PGDATA so PostgreSQL recovers it as a base backup whose
+/// consistency point is the base checkpoint: write a `backup_label` and patch
+/// `global/pg_control` (state + minRecoveryPoint + CRC). The checkpoint/redo/
+/// timeline are read from the just-extracted `pg_control`.
+fn shape_base_backup(pgdata: &Path) -> Result<()> {
+    let ctl_path = pgdata.join("global").join("pg_control");
+    let mut ctl = std::fs::read(&ctl_path)
+        .map_err(|e| Error::other(format!("read {}: {e}", ctl_path.display())))?;
+
+    let (checkpoint, redo, tli) = pgcontrol::read_checkpoint_lsns(&ctl)?;
+
+    let label = pgcontrol::backup_label(redo, checkpoint, tli, Utc::now());
+    std::fs::write(pgdata.join("backup_label"), label)?;
+
+    // Consistency point = the base checkpoint (tiko's snapshot is atomic there).
+    pgcontrol::shape_for_backup_recovery(&mut ctl, checkpoint, tli)?;
+    std::fs::write(&ctl_path, &ctl)
+        .map_err(|e| Error::other(format!("write {}: {e}", ctl_path.display())))?;
     Ok(())
 }
 
