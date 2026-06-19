@@ -77,7 +77,10 @@ pub fn write_pitr_recovery_conf(
     let target_line = match target {
         RecoveryTarget::Lsn(lsn) => format!("recovery_target_lsn = '{}'\n", lsn.to_pg_string()),
         RecoveryTarget::Time(ts) => {
-            format!("recovery_target_time = '{}'\n", format_recovery_target_time(*ts)?)
+            format!(
+                "recovery_target_time = '{}'\n",
+                format_recovery_target_time(*ts)?
+            )
         }
     };
     let snippet = format!(

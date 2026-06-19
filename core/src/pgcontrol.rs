@@ -266,17 +266,32 @@ mod tests {
     #[test]
     fn wal_long_header_bytes() {
         let h = wal_long_header(TimelineId::new(1), 2, 0x0123_4567_89AB_CDEF);
-        assert_eq!(u16::from_le_bytes(h[0..2].try_into().unwrap()), XLOG_PAGE_MAGIC);
-        assert_eq!(u16::from_le_bytes(h[2..4].try_into().unwrap()), XLP_LONG_HEADER);
+        assert_eq!(
+            u16::from_le_bytes(h[0..2].try_into().unwrap()),
+            XLOG_PAGE_MAGIC
+        );
+        assert_eq!(
+            u16::from_le_bytes(h[2..4].try_into().unwrap()),
+            XLP_LONG_HEADER
+        );
         assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 1); // tli
         assert_eq!(
             u64::from_le_bytes(h[8..16].try_into().unwrap()),
             2 * XLOG_SEG_SIZE as u64 // xlp_pageaddr = segment start
         );
         assert_eq!(u32::from_le_bytes(h[16..20].try_into().unwrap()), 0); // rem_len
-        assert_eq!(u64::from_le_bytes(h[24..32].try_into().unwrap()), 0x0123_4567_89AB_CDEF); // sysid
-        assert_eq!(u32::from_le_bytes(h[32..36].try_into().unwrap()), XLOG_SEG_SIZE as u32);
-        assert_eq!(u32::from_le_bytes(h[36..40].try_into().unwrap()), XLOG_BLCKSZ);
+        assert_eq!(
+            u64::from_le_bytes(h[24..32].try_into().unwrap()),
+            0x0123_4567_89AB_CDEF
+        ); // sysid
+        assert_eq!(
+            u32::from_le_bytes(h[32..36].try_into().unwrap()),
+            XLOG_SEG_SIZE as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(h[36..40].try_into().unwrap()),
+            XLOG_BLCKSZ
+        );
     }
 
     #[test]
@@ -284,7 +299,10 @@ mod tests {
         assert_eq!(parse_wal_seg_no("000000010000000000000002"), Some(2));
         assert_eq!(parse_wal_seg_no("000000010000000100000000"), Some(256));
         // Round-trips with xlog_file_name.
-        assert_eq!(parse_wal_seg_no(&xlog_file_name(TimelineId::new(1), 700)), Some(700));
+        assert_eq!(
+            parse_wal_seg_no(&xlog_file_name(TimelineId::new(1), 700)),
+            Some(700)
+        );
         assert_eq!(parse_wal_seg_no("short"), None);
         assert_eq!(parse_wal_seg_no("00000001.history"), None);
     }

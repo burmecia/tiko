@@ -1184,9 +1184,8 @@ impl Store {
             }
         }
 
-        wal_contiguous_run(&entries).ok_or_else(|| {
-            Error::other("no archived WAL for timeline; nothing is recoverable yet")
-        })
+        wal_contiguous_run(&entries)
+            .ok_or_else(|| Error::other("no archived WAL for timeline; nothing is recoverable yet"))
     }
 
     /// Compute the PITR-recoverable window bounded by archived-WAL coverage:
@@ -1213,9 +1212,7 @@ impl Store {
             .iter()
             .filter_map(|k| parse_base_manifest_ckpt(k, &bases_prefix).map(|c| (c, k.clone())))
             .filter(|(c, _)| {
-                c.timeline_id == timeline
-                    && c.lsn.as_u64() >= w_lo
-                    && c.lsn.as_u64() <= w_hi
+                c.timeline_id == timeline && c.lsn.as_u64() >= w_lo && c.lsn.as_u64() <= w_hi
             })
             .collect();
         candidates.sort_by_key(|(c, _)| *c);
@@ -1460,7 +1457,12 @@ mod wal_coverage_tests {
     const SEG: u64 = XLOG_SEG_SIZE as u64;
 
     fn sealed(seg_no: u64) -> SegEntry {
-        SegEntry { seg_no, lo: seg_no * SEG, hi: (seg_no + 1) * SEG, full: true }
+        SegEntry {
+            seg_no,
+            lo: seg_no * SEG,
+            hi: (seg_no + 1) * SEG,
+            full: true,
+        }
     }
 
     #[test]
@@ -1489,14 +1491,24 @@ mod wal_coverage_tests {
 
     #[test]
     fn contiguous_run_partial_top_over_sealed() {
-        let top = SegEntry { seg_no: 2, lo: 2 * SEG, hi: 2 * SEG + 0x500, full: false };
+        let top = SegEntry {
+            seg_no: 2,
+            lo: 2 * SEG,
+            hi: 2 * SEG + 0x500,
+            full: false,
+        };
         let entries = vec![sealed(0), sealed(1), top];
         assert_eq!(wal_contiguous_run(&entries), Some((0, 2 * SEG + 0x500)));
     }
 
     #[test]
     fn contiguous_run_midsegment_start_no_extend() {
-        let top = SegEntry { seg_no: 2, lo: 2 * SEG + 0x1F898, hi: 2 * SEG + 0x5F898, full: false };
+        let top = SegEntry {
+            seg_no: 2,
+            lo: 2 * SEG + 0x1F898,
+            hi: 2 * SEG + 0x5F898,
+            full: false,
+        };
         assert_eq!(
             wal_contiguous_run(&[top]),
             Some((2 * SEG + 0x1F898, 2 * SEG + 0x5F898))
