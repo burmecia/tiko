@@ -43,19 +43,22 @@ use std::path::Path;
 use core::{error::Result, io::store::Store, io::timeline::Checkpoint};
 use pgsys::{Lsn, common::data_dir_path, logging::*, timeline_id::TimelineId};
 
+const CHECKPOINT_CAUSE_BASEBACKUP: i32 = 0x0200;
+
 /// Called from Postgres `CreateCheckPoint()`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_perform_checkpoint(
     timeline_id: u32,
     checkpoint_lsn: u64,
     redo_lsn: u64,
+    flags: i32,
     is_shutdown: bool,
 ) {
     let ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(checkpoint_lsn));
     let redo_ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(redo_lsn));
 
     pg_log_info(format!(
-        "tiko: tiko_perform_checkpoint: checkpoint {ckpt}, redo {redo_ckpt}, is_shutdown {is_shutdown}"
+        "tiko: tiko_perform_checkpoint: checkpoint {ckpt}, redo {redo_ckpt}, flags=0x{flags:X}, is_shutdown {is_shutdown}"
     ));
 
     let store = match Store::try_get() {
@@ -83,6 +86,14 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
         pg_log_error(&format!(
             "tiko: tiko_perform_checkpoint: run_commit_protocol failed at {ckpt}, redo {redo_ckpt}: {e}"
         ));
+    }
+
+    if (flags & CHECKPOINT_CAUSE_BASEBACKUP) != 0 {
+        if let Err(e) = store.run_compaction() {
+            pg_log_warning(format!(
+                "tiko: tiko_perform_checkpoint: basebackup compaction failed: {e}"
+            ));
+        }
     }
 
     // Shutdown checkpoint: fold accumulated segments into the base manifest
