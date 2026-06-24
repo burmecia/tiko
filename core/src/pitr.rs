@@ -59,9 +59,10 @@ pub fn format_recovery_target_time(unix_ts: i64) -> Result<String> {
 /// markers so [`remove_recovery_conf`] can strip it cleanly later.
 ///
 /// Drives archive recovery up to `target` on `timeline`, pulling WAL segments
-/// from remote via `restore_bin` (the `tiko_restore` binary).
-/// `recovery_target_action='shutdown'` makes PostgreSQL shut itself down the
-/// instant it reaches the target.
+/// from remote via `restore_bin` (the `tiko_restore` binary). When `promote`
+/// is true, `recovery_target_action='promote'` so PostgreSQL ends recovery by
+/// creating a new timeline and continuing as a writable primary; otherwise
+/// `'shutdown'` halts at the target.
 ///
 /// `restore_bin` is emitted as an absolute path so PostgreSQL's shell finds it
 /// regardless of `PATH`; it is double-quoted to tolerate spaces in the path.
@@ -73,6 +74,7 @@ pub fn write_pitr_recovery_conf(
     timeline: TimelineId,
     target: &RecoveryTarget,
     restore_bin: &Path,
+    promote: bool,
 ) -> Result<()> {
     let target_line = match target {
         RecoveryTarget::Lsn(lsn) => format!("recovery_target_lsn = '{}'\n", lsn.to_pg_string()),
@@ -83,13 +85,14 @@ pub fn write_pitr_recovery_conf(
             )
         }
     };
+    let action = if promote { "promote" } else { "shutdown" };
     let snippet = format!(
         "\n{begin}\
          restore_command = '\"{restore}\" %f %p'\n\
          {target_line}\
          recovery_target_timeline = '{tl}'\n\
          recovery_target_inclusive = on\n\
-         recovery_target_action = 'shutdown'\n\
+         recovery_target_action = '{action}'\n\
          {end}",
         begin = RECOVERY_CONF_BEGIN,
         end = RECOVERY_CONF_END,
@@ -176,18 +179,9 @@ pub fn backup_dir_excluding(src: &Path, dst: &Path, exclude_name: &str) -> Resul
     Ok(())
 }
 
-/// Restore `dst` from `backup`: delete every top-level entry in `dst` except
-/// `exclude_name`, then copy the backup's contents back in. After this, `dst`
-/// matches the snapshot for everything except the preserved `exclude_name` dir.
-///
-/// # Failure handling
-///
-/// This is not atomic: it deletes then re-copies in place, so an error or
-/// crash partway through leaves `dst` torn (some originals gone, some backup
-/// entries not yet written). The caller MUST keep `backup` intact until this
-/// returns `Ok`, and re-run the restore on failure rather than deleting the
-/// backup. (`tiko_pitr` only removes the backup after a successful restore.)
-pub fn restore_dir(backup: &Path, dst: &Path, exclude_name: &str) -> Result<()> {
+/// Delete every top-level entry in `dst` except `exclude_name`. Used by PITR
+/// restore to clear PGDATA while preserving the bulk `tiko/` directory.
+pub fn wipe_dir_excluding(dst: &Path, exclude_name: &str) -> Result<()> {
     for entry in fs::read_dir(dst)? {
         let entry = entry?;
         if entry.file_name() == OsStr::new(exclude_name) {
@@ -200,6 +194,22 @@ pub fn restore_dir(backup: &Path, dst: &Path, exclude_name: &str) -> Result<()> 
             fs::remove_file(&p)?;
         }
     }
+    Ok(())
+}
+
+/// Restore `dst` from `backup`: delete every top-level entry in `dst` except
+/// `exclude_name`, then copy the backup's contents back in. After this, `dst`
+/// matches the snapshot for everything except the preserved `exclude_name` dir.
+///
+/// # Failure handling
+///
+/// This is not atomic: it deletes then re-copies in place, so an error or
+/// crash partway through leaves `dst` torn (some originals gone, some backup
+/// entries not yet written). The caller MUST keep `backup` intact until this
+/// returns `Ok`, and re-run the restore on failure rather than deleting the
+/// backup. (`tiko_pitr` only removes the backup after a successful restore.)
+pub fn restore_dir(backup: &Path, dst: &Path, exclude_name: &str) -> Result<()> {
+    wipe_dir_excluding(dst, exclude_name)?;
     for entry in fs::read_dir(backup)? {
         let entry = entry?;
         copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
@@ -240,6 +250,7 @@ mod tests {
             TimelineId::new(2),
             &RecoveryTarget::Lsn(Lsn::new(0x3000028)),
             Path::new("/opt/tiko/bin/tiko_restore"),
+            false,
         )
         .unwrap();
         let with = fs::read_to_string(&conf).unwrap();
@@ -265,6 +276,7 @@ mod tests {
             TimelineId::new(1),
             &RecoveryTarget::Time(0),
             Path::new("/opt/tiko/bin/tiko_restore"),
+            false,
         )
         .unwrap();
         let with = fs::read_to_string(&conf).unwrap();

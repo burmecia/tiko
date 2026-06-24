@@ -1,47 +1,43 @@
 //! Checkpoint flush — the S3/PITR half of PostgreSQL's checkpoint.
 //!
-//! Called from `CheckPointGuts()` in `xlog.c` after `CheckPointBuffers()`.
-//! The checkpointer is a plain PG process — no Tokio runtime.  All I/O is
+//! Called from `CreateCheckPoint()` in `xlog.c` after `CheckPointBuffers()`.
+//! The checkpointer is a plain PG process — no Tokio runtime. All I/O is
 //! synchronous (`std::fs` + `S3Sim` which is also `std::fs`).
 //!
 //! # Algorithm
 //!
-//! 0. **Guard**: returns early if `IoControl`, `S3Sim`, or `ProjectCtx`
-//!    are not yet initialised — nothing to flush or upload.
+//! 0. **Guard**: returns early if `Store` is not yet initialised.
 //!
-//! 1. **Flush dirty chunks** (`flush_all_dirty_chunks`): every dirty cache
-//!    slot is PUT to the express-bucket `latest` object.
-//!    **Flush dirty nblocks** (`flush_all_dirty_nblocks`): every dirty entry
-//!    in the fork-meta table is PUT to the express nblocks key.
-//!    Returns `(nblocks_map, deleted_set)` from in-memory fork-meta.
+//! 1. **Segment commit** (`run_commit_protocol`): flush dirty chunks +
+//!    relfork meta to the express bucket, write-lock fence, set `redo_ckpt`,
+//!    drain the backend `DraftBuffer`, append a `SegmentCheckpoint` to the
+//!    timeline segment file, push the active window, advance `head_ckpt`,
+//!    and persist `DbMeta`. (pg_state is no longer captured here: PITR bases
+//!    now come from `pg_basebackup` tarballs uploaded by `tiko_pitr backup`,
+//!    and segments carry an empty `pg_state` trailer.)
 //!
-//! 2. **Scan express** for chunk `latest` keys (`{org}/{proj}/chunks/…/latest`)
-//!    to build the dirty chunk set for this checkpoint interval.
-//!    Also scan for `/.deleted` markers to catch mid-interval evictions.
+//! 2. **Basebackups** (`CHECKPOINT_CAUSE_BASEBACKUP`): materialise a base
+//!    manifest at the checkpoint LSN so `tiko_pitr` can pair the (small)
+//!    `pg_basebackup` tarball with the chunk-ref map at the same LSN. To
+//!    avoid racing the background compactor, the checkpointer pauses it,
+//!    drains any in-flight run, then runs `run_compaction` itself.
 //!
-//! 2.5. **Capture `pg_state`**: build the tar+zstd archive of `pg_control`,
-//!    `pg_xact`, etc. into memory **before** any S3 uploads.
-//!
-//! 3. **Write each dirty chunk** to the standard bucket at its versioned key.
-//!    Data is read from the express `latest` object and decompressed.
-//!    Chunks whose fork is in the deleted set are skipped.
-//!
-//! 4. **Build delta manifest** (dirty chunks → `ChunkRef`s with own
-//!    `branch_id`), upload it and the pre-built `pg_state` archive to the
-//!    standard bucket.
-//!
-//! 5. **Clean up `/.deleted` markers** from express after a successful upload.
+//! 3. **Shutdown**: fold accumulated segments into the base manifest inline.
+//!    The Tiko bgworker is killed in `PM_STOP_BACKENDS` before the shutdown
+//!    checkpoint runs, so there is no in-process compactor to race with.
 //!
 //! # Crash safety
 //!
-//! The checkpoint is naturally idempotent: rescanning express after a crash
-//! reproduces the same dirty-chunk set because express is consistent.
-//! Standard-bucket PUT and delta manifest PUT are both atomic.
+//! The checkpoint is naturally idempotent: re-running `run_commit_protocol`
+//! reproduces the same segment because the draft drain + express scan are
+//! consistent. The base manifest PUT is atomic.
 
-use std::path::Path;
-
-use core::{error::Result, io::store::Store, io::timeline::Checkpoint};
-use pgsys::{Lsn, common::data_dir_path, logging::*, timeline_id::TimelineId};
+use core::{
+    io::store::Store,
+    io::timeline::Checkpoint,
+    io_control::IoControl,
+};
+use pgsys::{Lsn, logging::*, timeline_id::TimelineId};
 
 const CHECKPOINT_CAUSE_BASEBACKUP: i32 = 0x0200;
 
@@ -56,9 +52,10 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
 ) {
     let ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(checkpoint_lsn));
     let redo_ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(redo_lsn));
+    let is_basebackup = (flags & CHECKPOINT_CAUSE_BASEBACKUP) != 0;
 
     pg_log_info(format!(
-        "tiko: tiko_perform_checkpoint: checkpoint {ckpt}, redo {redo_ckpt}, flags=0x{flags:X}, is_shutdown {is_shutdown}"
+        "tiko: tiko_perform_checkpoint: checkpoint {ckpt}, redo {redo_ckpt}, is_basebackup {is_basebackup}, is_shutdown {is_shutdown}"
     ));
 
     let store = match Store::try_get() {
@@ -66,34 +63,20 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
         Err(_) => return,
     };
 
-    let pgdata_dir = data_dir_path();
-
-    // Capture pg_state archive bytes — so the
-    // archive reflects pg_control / pg_xact / etc. at the start of the
-    // checkpoint rather than after potentially long chunk S3 writes.
-    let pg_state_bytes = match build_pg_state_archive(&pgdata_dir) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            pg_log_error("tiko: tiko_perform_checkpoint: Failed to build pg_state archive");
-            return;
-        }
-    };
-
-    // Segment-based commit protocol: flush dirty chunks, write-lock fence,
-    // set redo_ckpt, drain backend drafts, write segment, advance active
-    // window, persist DbMeta.
-    if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt, &pg_state_bytes) {
+    // Commit the interval's dirty state into a timeline segment. pg_state is
+    // no longer captured: PITR bases come from pg_basebackup tarballs.
+    if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt, &[]) {
         pg_log_error(&format!(
             "tiko: tiko_perform_checkpoint: run_commit_protocol failed at {ckpt}, redo {redo_ckpt}: {e}"
         ));
     }
 
-    if (flags & CHECKPOINT_CAUSE_BASEBACKUP) != 0 {
-        if let Err(e) = store.run_compaction() {
-            pg_log_warning(format!(
-                "tiko: tiko_perform_checkpoint: basebackup compaction failed: {e}"
-            ));
-        }
+    // Basebackup checkpoint: form a base manifest at the checkpoint LSN, with
+    // the background compactor paused + drained so we don't race it. The base
+    // manifest pairs with the pg_basebackup tarball uploaded by
+    // `tiko_pitr backup` to anchor PITR at this LSN.
+    if is_basebackup {
+        run_basebackup_compaction(store, ckpt);
     }
 
     // Shutdown checkpoint: fold accumulated segments into the base manifest
@@ -113,49 +96,40 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
     }
 }
 
-/// Build the in-memory tar+zstd archive.  Returns compressed bytes.
-fn build_pg_state_archive(pgdata: &Path) -> Result<Vec<u8>> {
-    let buf: Vec<u8> = Vec::new();
-    let enc = zstd::Encoder::new(buf, 3)?;
-    let mut builder = tar::Builder::new(enc);
-
-    // global/pg_control
-    let pg_control = pgdata.join("global").join("pg_control");
-    if pg_control.exists() {
-        builder.append_path_with_name(&pg_control, "global/pg_control")?;
+/// Run `run_compaction` to materialise a base manifest at the just-committed
+/// checkpoint LSN, coordinating with the background compactor via the shmem
+/// pause flag + in-progress counter so the two can't run in parallel.
+///
+/// Sequence: `pause_compaction` → `drain_compaction` (wait for any in-flight
+/// background run) → `run_compaction` → `resume_compaction`. If `IoControl`
+/// is unavailable (very early startup), coordination is skipped and
+/// `run_compaction` is called directly (it self-skips in that case).
+/// Run `run_compaction_through(commit_ckpt)` to materialise a base manifest AT
+/// the basebackup checkpoint LSN, coordinating with the background compactor
+/// via the shmem pause flag + in-progress counter so the two can't run in
+/// parallel.
+///
+/// Sequence: `pause_compaction` → `drain_compaction` (wait for any in-flight
+/// background run) → `run_compaction_through` → `resume_compaction`. If
+/// `IoControl` is unavailable (very early startup), coordination is skipped
+/// and the compaction is called directly (it self-skips in that case).
+fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
+    if let Some(io_control) = IoControl::try_get() {
+        io_control.timeline.pause_compaction();
+        // Ensure the flag is always cleared, even if the compaction errors.
+        let result = (|| {
+            io_control.timeline.drain_compaction();
+            store.run_compaction_through(commit_ckpt)
+        })();
+        io_control.timeline.resume_compaction();
+        if let Err(e) = result {
+            pg_log_warning(format!(
+                "tiko: tiko_perform_checkpoint: basebackup compaction failed: {e}"
+            ));
+        }
+    } else if let Err(e) = store.run_compaction_through(commit_ckpt) {
+        pg_log_warning(format!(
+            "tiko: tiko_perform_checkpoint: basebackup compaction failed: {e}"
+        ));
     }
-
-    // pg_xact/
-    let pg_xact = pgdata.join("pg_xact");
-    if pg_xact.is_dir() {
-        builder.append_dir_all("pg_xact", &pg_xact)?;
-    }
-
-    // pg_multixact/members/
-    let multixact_members = pgdata.join("pg_multixact").join("members");
-    if multixact_members.is_dir() {
-        builder.append_dir_all("pg_multixact/members", &multixact_members)?;
-    }
-
-    // pg_multixact/offsets/
-    let multixact_offsets = pgdata.join("pg_multixact").join("offsets");
-    if multixact_offsets.is_dir() {
-        builder.append_dir_all("pg_multixact/offsets", &multixact_offsets)?;
-    }
-
-    // pg_subtrans/
-    let pg_subtrans = pgdata.join("pg_subtrans");
-    if pg_subtrans.is_dir() {
-        builder.append_dir_all("pg_subtrans", &pg_subtrans)?;
-    }
-
-    // global/pg_filenode.map
-    let filenode_map = pgdata.join("global").join("pg_filenode.map");
-    if filenode_map.exists() {
-        builder.append_path_with_name(&filenode_map, "global/pg_filenode.map")?;
-    }
-
-    let enc = builder.into_inner()?;
-    let compressed = enc.finish()?;
-    Ok(compressed)
 }

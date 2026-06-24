@@ -172,6 +172,7 @@ dependencies = [
  "pgsys",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "zstd",
 ]

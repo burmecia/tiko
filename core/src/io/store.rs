@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     chunk::{CHUNK_SIZE, ChunkTag, RelFork},
     db::{DbMeta, DbNamespace},
@@ -18,7 +20,7 @@ use crate::{
     tiko_root_path,
 };
 use pgsys::{
-    common::{BLCKSZ, BlockNumber, XLOG_SEG_SIZE},
+    common::{BLCKSZ, BlockNumber, XLOG_SEG_SIZE, data_dir_path},
     logging::{pg_log_debug1, pg_log_debug2, pg_log_info, pg_log_warning},
     lsn::Lsn,
     timeline_id::TimelineId,
@@ -38,35 +40,6 @@ fn parse_base_manifest_ckpt(key: &str, bases_prefix: &str) -> Option<Checkpoint>
     let timeline_id = TimelineId::from_hex(tl_hex).ok()?;
     let lsn = Lsn::from_hex(lsn_hex).ok()?;
     Some(Checkpoint::new(timeline_id, lsn))
-}
-
-/// From a raw listing of base-manifest keys, select the newest base manifest
-/// whose checkpoint is at or before `target`. Returns `(checkpoint, key)`.
-fn select_newest_base_at_or_before(
-    keys: &[String],
-    bases_prefix: &str,
-    target: Checkpoint,
-) -> Option<(Checkpoint, String)> {
-    keys.iter()
-        .filter_map(|k| parse_base_manifest_ckpt(k, bases_prefix).map(|c| (c, k.clone())))
-        .filter(|(c, _)| *c <= target)
-        .max_by_key(|(c, _)| *c)
-}
-
-/// From `(timestamp, checkpoint, key)` candidates, select the newest base
-/// manifest on `timeline` whose `timestamp <= target_ts`. Returns
-/// `(checkpoint, key)`. Ordering uses `(timestamp, checkpoint)`; both are
-/// monotonic, so this is the latest base at or before the target time.
-fn select_base_by_time(
-    candidates: &[(i64, Checkpoint, String)],
-    target_ts: i64,
-    timeline: TimelineId,
-) -> Option<(Checkpoint, String)> {
-    candidates
-        .iter()
-        .filter(|(ts, c, _)| *ts <= target_ts && c.timeline_id == timeline)
-        .max_by_key(|(ts, c, _)| (*ts, *c))
-        .map(|(_, c, k)| (*c, k.clone()))
 }
 
 /// One WAL segment's coverage on a timeline, in absolute LSN. `full` = a sealed
@@ -106,10 +79,13 @@ fn parse_wal_key(key: &str, wal_prefix: &str) -> Option<(u64, Option<usize>)> {
 /// Compute the contiguous archived-WAL run that reaches the highest segment in
 /// `entries`. Returns `(w_lo, w_hi)` absolute LSN, or `None` if empty.
 ///
-/// The highest segment anchors the run end. The run extends down through
-/// consecutive `full` (sealed) segments while contiguous; it stops at the first
-/// missing/partial lower segment, or as soon as a segment does not start at its
-/// own segment boundary (a mid-segment front gap).
+/// The highest segment anchors the run end (`w_hi`). The run extends down
+/// through consecutive segments whose coverage is contiguous: `cur` must cover
+/// from its own segment start (no mid-segment front gap inside `cur`), and the
+/// next-lower segment's coverage end (`hi`) must reach `cur`'s segment start.
+/// Both sealed segments and chunks-only segments qualify — the streaming WAL
+/// receiver writes chunks contiguously, so a chunks-only segment whose `hi`
+/// reaches the next segment's boundary is fully covered up to that point.
 fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
     let seg = XLOG_SEG_SIZE as u64;
     let mut sorted: Vec<SegEntry> = entries.to_vec();
@@ -124,15 +100,17 @@ fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
         if cur.seg_no == 0 {
             break;
         }
-        // Can only extend below if `cur` covers from its own segment start.
+        // Can only extend below if `cur` covers from its own segment start
+        // (no mid-segment front gap inside `cur`).
         if cur.lo != cur.seg_no * seg {
             break;
         }
         let Some(next) = sorted.get(idx).copied() else {
             break;
         };
-        // Must be the immediately-lower segment, full, and contiguous.
-        if next.seg_no != cur.seg_no - 1 || !next.full || next.hi != cur.lo {
+        // next must be the immediately-lower segment whose coverage reaches
+        // cur's segment start. Sealed or chunks-only both qualify here.
+        if next.seg_no != cur.seg_no - 1 || next.hi != cur.lo {
             break;
         }
         w_lo = next.lo;
@@ -159,13 +137,35 @@ pub struct CheckpointRow {
     pub n_chunks: usize,
 }
 
+/// One row returned by [`Store::list_backups`] — a base backup taken via
+/// `pg_basebackup` and stored under the `backup/` prefix.
+#[derive(Debug, Clone)]
+pub struct BackupRow {
+    pub ckpt: Checkpoint,
+    pub redo_ckpt: Checkpoint,
+    pub created_at: i64,
+}
+
+/// JSON sidecar stored next to each base-backup tarball (`{...}.json`) so that
+/// time-based selection does not require downloading the tarball.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackupMeta {
+    checkpoint: Checkpoint,
+    redo_ckpt: Checkpoint,
+    timeline_id: u32,
+    created_at: i64,
+}
+
 /// The recoverable window reported by [`Store::recovery_window`], bounded by
 /// archived-WAL coverage.
 ///
-/// `earliest` is the oldest base manifest whose recovery WAL (`[redo,
-/// checkpoint]`) lies inside the contiguous archived-WAL run; `latest_lsn` is
-/// the end of that run (the highest recoverable LSN). A PITR target must fall
-/// within `[earliest_ckpt, latest_lsn]` (and `[earliest_ts, latest_ts]`).
+/// A single period `[earliest, latest_lsn]`: `earliest` is the oldest base
+/// *backup* (a `pg_basebackup` tarball under `backup/`) whose recovery WAL
+/// (`[redo, checkpoint]`) lies inside the contiguous archived-WAL run, and
+/// `latest_lsn` is the end of that run (the WAL archiving head, T2). A PITR
+/// target must fall within `[earliest_ckpt, latest_lsn]` (and
+/// `[earliest_ts, latest_ts]`). Recovery selects the latest backup at or before
+/// the target as the restore anchor.
 #[derive(Debug, Clone)]
 pub struct RecoveryWindow {
     pub earliest_ts: i64,
@@ -823,6 +823,30 @@ impl Store {
         Ok(None)
     }
 
+    /// Delete every timeline segment file on storage.
+    ///
+    /// Used by PITR recovery prep (`tiko_pitr recover`) after installing the
+    /// backup's base manifest: the recovered instance anchors all reads on
+    /// that manifest (+ WAL replay, then the new timeline's segments after
+    /// promote). The pre-recovery segments hold the OLD timeline's history
+    /// ABOVE the backup LSN — leaving them in place would let the read path's
+    /// segment scan resolve "future" chunk versions after promote. Removing
+    /// them makes recovery self-contained on the base manifest.
+    pub fn delete_all_segments(&self) -> Result<()> {
+        let ids = self.list_all_segments()?;
+        for sid in ids {
+            let key = self.lctr.timeline_segment(&sid);
+            match self.storage_delete(&key) {
+                Ok(_) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => pg_log_warning(format!(
+                    "tiko: failed to delete timeline segment {key}: {e}",
+                )),
+            }
+        }
+        Ok(())
+    }
+
     /// Build a [`SegmentCheckpoint`] from the drained drafts and append it
     /// to the appropriate timeline segment file (load existing or init new).
     ///
@@ -985,6 +1009,99 @@ impl Store {
         })
     }
 
+    /// Like [`run_compaction`], but folds every segment checkpoint up to and
+    /// **including** `target` into the base manifest, advancing `base_ckpt` to
+    /// the resulting checkpoint.
+    ///
+    /// Used by the `CHECKPOINT_CAUSE_BASEBACKUP` checkpoint to form a base
+    /// manifest AT the backup LSN (`target` = the basebackup commit
+    /// checkpoint). That lets PITR anchor recovery on a single, complete base
+    /// manifest instead of base + segments above it — so the recovering smgr
+    /// never has to consult "future" segments (which would leak post-target
+    /// state).
+    ///
+    /// The manifest is keyed/headered at `applied.checkpoint` (the highest
+    /// folded checkpoint that actually changed data, ≤ `target`), keeping the
+    /// storage key, TIKM header and shmem `base_ckpt` consistent. If the
+    /// backup's own segment had no dirty data, `applied.checkpoint` is the
+    /// previous checkpoint — which already represents the backup's state, so
+    /// `materialize_base_manifest_at(target)` still resolves correctly.
+    pub fn run_compaction_through(&self, target: Checkpoint) -> Result<CompactionResult> {
+        let io_control = match IoControl::try_get() {
+            Some(c) => c,
+            None => return Ok(CompactionResult::Skipped),
+        };
+
+        let base_ckpt = {
+            let _guard = io_control.timeline.lock.read();
+            io_control.timeline.base_ckpt
+        };
+        if target <= base_ckpt {
+            return Ok(CompactionResult::NoNewSegments);
+        }
+
+        // Fold every segment checkpoint in (base_ckpt, target] (inclusive of
+        // `target`, unlike `run_compaction` which is exclusive of redo_ckpt).
+        let segments = self.list_segments_in_range(base_ckpt, target)?;
+        let mut to_apply: Vec<SegmentCheckpoint> = Vec::new();
+        for sid in &segments {
+            let seg = self.load_segment(sid)?;
+            for sc in &seg.checkpoints {
+                if sc.ckpt > base_ckpt && sc.ckpt <= target {
+                    to_apply.push(sc.clone());
+                }
+            }
+        }
+        if to_apply.is_empty() {
+            return Ok(CompactionResult::NoNewSegments);
+        }
+        to_apply.sort_by_key(|s| s.ckpt);
+
+        let current = self.base_manifest()?;
+        let applied = current.apply_segments(&to_apply)?;
+        // Key/header/base_ckpt all at `applied.checkpoint` for consistency.
+        let new_base_ckpt = applied.checkpoint;
+        let key = self.lctr.base_manifest(&new_base_ckpt);
+        self.storage.put(&key, &applied.bytes)?;
+        let new_manifest = Arc::new(current.commit_applied(applied)?);
+
+        {
+            let _write_guard = io_control.timeline.lock.write();
+            if io_control.timeline.base_ckpt != base_ckpt {
+                pg_log_warning(
+                    "tiko: compaction-through raced; another compactor advanced base_ckpt"
+                        .to_string(),
+                );
+                return Ok(CompactionResult::Raced);
+            }
+            io_control.timeline.set_base_ckpt(new_base_ckpt);
+        }
+        *self.base_manifest.lock().unwrap() = new_manifest;
+
+        // Delete superseded segment files entirely below the new base.
+        let new_base_seg = new_base_ckpt.to_segment_id();
+        for sid in segments.iter().take_while(|s| **s < new_base_seg) {
+            let seg_key = self.lctr.timeline_segment(sid);
+            match self.storage.delete(&seg_key) {
+                Ok(_) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => pg_log_warning(format!(
+                    "tiko: failed to delete superseded segment {seg_key}: {e}",
+                )),
+            }
+        }
+
+        let count = to_apply.len();
+        pg_log_debug1(format!(
+            "tiko: compaction-through applied {count} segment checkpoint(s); {base_ckpt} → {new_base_ckpt} (target {target})"
+        ));
+        Ok(CompactionResult::Applied {
+            base_ckpt,
+            new_base_ckpt,
+            count,
+        })
+    }
+
     /// Populate the shmem [`TimelineState`] from existing on-storage
     /// segments. Idempotent — the first caller does the work, subsequent
     /// calls observe `hydrated` and return immediately.
@@ -1011,56 +1128,76 @@ impl Store {
             return Ok(());
         }
 
-        // List every segment file across every timeline. The helper sorts
-        // ascending by `(timeline_id, index)` (derived `SegmentId` Ord),
-        // which is also the natural ordering of checkpoints because both
-        // `timeline_id` and `lsn` are monotonic across PG's lifetime.
-        let segment_ids = self.list_all_segments()?;
+        // PITR recovery detection. The recovering postmaster is started by
+        // `tiko_pitr recover`, which writes `recovery.signal` into PGDATA and
+        // installs the backup's base manifest (at the backup LSN) as the live
+        // TIKM. In that mode the installed manifest is the COMPLETE anchor
+        // snapshot, so we must NOT populate the active window from on-storage
+        // segments — those segments hold checkpoints ABOVE the backup LSN
+        // (post-target "future" state) that would leak into reads after promote
+        // (a cache miss would resolve a future chunk version instead of the
+        // anchor version). Reads go through the base manifest; the active
+        // window starts empty and fills only with the new timeline's
+        // checkpoints after promote.
+        let in_recovery = data_dir_path().join("recovery.signal").exists();
 
-        // Collect most-recent ACTIVE_WINDOW_SIZE SegmentCheckpoints by
-        // walking segments newest-first, then within each segment newest
-        // checkpoint first. Stop once we have enough.
-        let mut newest_first: Vec<SegmentCheckpoint> = Vec::new();
-        'outer: for segment_id in segment_ids.iter().rev() {
-            let seg = self.load_segment(segment_id)?;
-            for sc in seg.checkpoints.iter().rev() {
-                newest_first.push(sc.clone());
-                if newest_first.len() >= ACTIVE_WINDOW_SIZE {
-                    break 'outer;
+        if !in_recovery {
+            // Normal startup: populate the active window with the newest
+            // checkpoints so the read path can short-circuit segment scans.
+            // `list_all_segments` sorts ascending by `(timeline_id, index)`,
+            // the natural ordering of checkpoints.
+            let segment_ids = self.list_all_segments()?;
+
+            // Collect most-recent ACTIVE_WINDOW_SIZE SegmentCheckpoints by
+            // walking segments newest-first, then within each segment newest
+            // checkpoint first. Stop once we have enough.
+            let mut newest_first: Vec<SegmentCheckpoint> = Vec::new();
+            'outer: for segment_id in segment_ids.iter().rev() {
+                let seg = self.load_segment(segment_id)?;
+                for sc in seg.checkpoints.iter().rev() {
+                    newest_first.push(sc.clone());
+                    if newest_first.len() >= ACTIVE_WINDOW_SIZE {
+                        break 'outer;
+                    }
                 }
+            }
+
+            // Replay oldest-first so the ring buffer ends up newest-at-front.
+            for sc in newest_first.iter().rev() {
+                io_control.timeline.push_active(
+                    sc.ckpt,
+                    sc.prev_ckpt,
+                    sc.chunks.iter().copied(),
+                    sc.relforks.iter().map(|(rf, meta)| (*rf, meta.clone())),
+                );
+            }
+
+            if let Some(newest) = newest_first.first() {
+                pg_log_info(format!(
+                    "tiko: hydrated timeline state: {} active checkpoint(s), head={}",
+                    newest_first.len(),
+                    newest.ckpt,
+                ));
+            } else {
+                pg_log_info("tiko: hydrated timeline state: no existing segments");
             }
         }
 
-        // Replay oldest-first so the ring buffer ends up newest-at-front.
-        for sc in newest_first.iter().rev() {
-            io_control.timeline.push_active(
-                sc.ckpt,
-                sc.prev_ckpt,
-                sc.chunks.iter().copied(),
-                sc.relforks.iter().map(|(rf, meta)| (*rf, meta.clone())),
-            );
-        }
-
         // Recover base_ckpt from the loaded base manifest (if any). The
-        // manifest carries its own `Checkpoint`. Fresh clusters (no
-        // segments, no base) leave base_ckpt at default. Read from the
-        // cached snapshot directly — this runs once at hydration and shmem
-        // base_ckpt isn't yet populated, so we can't go through
-        // `base_manifest()`.
+        // manifest carries its own `Checkpoint`. Fresh clusters (no segments,
+        // no base) leave base_ckpt at default. Read from the cached snapshot
+        // directly — this runs once at hydration and shmem base_ckpt isn't yet
+        // populated, so we can't go through `base_manifest()`. In PITR recovery
+        // this is the installed backup-L_b manifest, so base_ckpt = the anchor.
         let base_ckpt = self.base_manifest.lock().unwrap().checkpoint();
         if base_ckpt != Checkpoint::default() {
             io_control.timeline.set_base_ckpt(base_ckpt);
         }
 
-        if let Some(newest) = newest_first.first() {
+        if in_recovery {
             pg_log_info(format!(
-                "tiko: hydrated timeline state: {} active checkpoint(s), head={}, base={}",
-                newest_first.len(),
-                newest.ckpt,
-                io_control.timeline.base_ckpt,
+                "tiko: PITR recovery — active-window hydration skipped; reads anchor on base manifest at {base_ckpt}"
             ));
-        } else {
-            pg_log_info("tiko: hydrated timeline state: no existing segments");
         }
 
         io_control.timeline.hydrated.store(true, Ordering::Release);
@@ -1088,25 +1225,143 @@ impl Store {
         Ok(rows)
     }
 
-    /// Find the newest base manifest with `base_ckpt <= target` and return its
-    /// `(checkpoint, pg_state)`. The manifest is materialised into a throwaway
-    /// tempdir so the process's live `local_root` TIKM cache is not clobbered;
-    /// `checkpoint` and `pg_state` are in-memory fields and stay valid after the
-    /// tempdir is dropped.
-    pub fn load_base_pg_state_at_or_before(
+    // ── Base backups (pg_basebackup-based PITR anchors) ──────────────────
+
+    /// Upload a base-backup tarball and its metadata sidecar to the `backup/`
+    /// prefix. `tar_bytes` is the compressed (`tar.zst`) output of a
+    /// `pg_basebackup` run whose checkpoint is `ckpt`.
+    pub fn put_backup(
+        &self,
+        ckpt: Checkpoint,
+        redo_ckpt: Checkpoint,
+        created_at: i64,
+        tar_bytes: &[u8],
+    ) -> Result<()> {
+        let tar_key = self.lctr.backup_object(&ckpt);
+        self.storage_put(&tar_key, tar_bytes)?;
+
+        let meta = BackupMeta {
+            checkpoint: ckpt,
+            redo_ckpt,
+            timeline_id: ckpt.timeline_id.as_u32(),
+            created_at,
+        };
+        let meta_bytes = serde_json::to_vec(&meta)
+            .map_err(|e| Error::other(format!("failed to serialize backup meta: {e}")))?;
+        self.storage_put(&self.lctr.backup_meta(&ckpt), &meta_bytes)?;
+        Ok(())
+    }
+
+    /// List every base backup on storage, parsed into [`BackupRow`]s (read from
+    /// the `.json` sidecars) and sorted ascending by checkpoint.
+    pub fn list_backups(&self) -> Result<Vec<BackupRow>> {
+        let prefix = self.lctr.backup_dir();
+        let keys = match self.storage_list_prefix(&prefix) {
+            Ok(k) => k,
+            Err(e) if e.is_not_found() => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut rows: Vec<BackupRow> = Vec::new();
+        for key in &keys {
+            // Only the `.json` sidecars carry metadata; skip the tarballs.
+            let Some(rel) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !rel.ends_with(".json") {
+                continue;
+            }
+            let bytes = match self.storage_get(key) {
+                Ok(b) => b,
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e),
+            };
+            let meta: BackupMeta = serde_json::from_slice(&bytes).map_err(|e| {
+                Error::other(format!("failed to parse backup meta {key}: {e}"))
+            })?;
+            rows.push(BackupRow {
+                ckpt: meta.checkpoint,
+                redo_ckpt: meta.redo_ckpt,
+                created_at: meta.created_at,
+            });
+        }
+        rows.sort_by_key(|r| r.ckpt);
+        Ok(rows)
+    }
+
+    /// Select the newest base backup with `ckpt <= target` and return its
+    /// `(checkpoint, tar_bytes)`. Standard PITR anchor: the closest backup at
+    /// or before the target so the minimum WAL must be replayed.
+    pub fn load_backup_at_or_before(
         &self,
         target: Checkpoint,
     ) -> Result<(Checkpoint, Vec<u8>)> {
+        let ckpt = self
+            .list_backups()?
+            .into_iter()
+            .filter(|r| r.ckpt <= target)
+            .map(|r| r.ckpt)
+            .max_by_key(|c| *c)
+            .ok_or_else(|| {
+                Error::other(format!("no base backup at or before checkpoint {target}"))
+            })?;
+        let bytes = self.storage_get(&self.lctr.backup_object(&ckpt))?;
+        Ok((ckpt, bytes))
+    }
+
+    /// Select the newest base backup with `created_at <= target_ts` on
+    /// `timeline` and return its `(checkpoint, tar_bytes)`.
+    pub fn load_backup_before_time(
+        &self,
+        target_ts: i64,
+        timeline: TimelineId,
+    ) -> Result<(Checkpoint, Vec<u8>)> {
+        let ckpt = self
+            .list_backups()?
+            .into_iter()
+            .filter(|r| r.ckpt.timeline_id == timeline && r.created_at <= target_ts)
+            .max_by_key(|r| (r.created_at, r.ckpt))
+            .map(|r| r.ckpt)
+            .ok_or_else(|| {
+                Error::other(format!(
+                    "no base backup at or before time {target_ts} on timeline {timeline}"
+                ))
+            })?;
+        let bytes = self.storage_get(&self.lctr.backup_object(&ckpt))?;
+        Ok((ckpt, bytes))
+    }
+
+    /// Install the live `$TIKO_ROOT/base_manifest.tikm` for recovering to
+    /// `ckpt`: download the newest base manifest at or before `ckpt` and write
+    /// it as the live TIKM cache file.
+    ///
+    /// The basebackup checkpoint's own segment sits a little above the base
+    /// manifest produced by compaction (compaction folds strictly below the
+    /// checkpoint's redo), so the manifest at *exactly* `ckpt` may not exist.
+    /// The newest manifest `<= ckpt` is the correct anchor: the recovering smgr
+    /// seeds `base_ckpt` from it and supplements with the segments above it
+    /// (including the backup checkpoint's own segment) to resolve chunks at the
+    /// backup LSN. The atomic publish (per-PID tmp + rename inside
+    /// `Manifest::from_bytes` → `write_tikm`) means a crash never leaves a
+    /// partial file.
+    pub fn materialize_base_manifest_at(&self, ckpt: Checkpoint) -> Result<()> {
         let prefix = self.lctr.bases_dir();
         let keys = self.storage_list_prefix(&prefix)?;
-        let (_base_ckpt, key) = select_newest_base_at_or_before(&keys, &prefix, target)
+        let target_base = keys
+            .iter()
+            .filter_map(|k| parse_base_manifest_ckpt(k, &prefix))
+            .filter(|c| *c <= ckpt)
+            .max_by_key(|c| *c)
             .ok_or_else(|| {
-                Error::other(format!("no base manifest at or before checkpoint {target}"))
+                Error::other(format!("no base manifest at or before {ckpt} to anchor recovery"))
             })?;
+        let key = self.lctr.base_manifest(&target_base);
         let bytes = self.storage_get(&key)?;
-        let tmp = tempfile::tempdir()?;
-        let manifest = Manifest::from_bytes(&bytes, tmp.path())?;
-        Ok((manifest.checkpoint(), manifest.pg_state().to_vec()))
+        // `from_bytes` writes the TIKM at `local_root/base_manifest.tikm`.
+        let manifest = Manifest::from_bytes(&bytes, &self.local_root)?;
+        // Keep this process's cached snapshot in sync (harmless in the CLI,
+        // which exits after this call; required if ever called in-process).
+        *self.base_manifest.lock().unwrap() = Arc::new(manifest);
+        Ok(())
     }
 
     /// Compute the contiguous archived-WAL run `[w_lo, w_hi]` (absolute LSN) for
@@ -1145,11 +1400,11 @@ impl Store {
                 }
             }
         }
-        let Some(&highest) = segs.keys().next_back() else {
+        if segs.is_empty() {
             return Err(Error::other(
                 "no archived WAL for timeline; nothing is recoverable yet",
             ));
-        };
+        }
 
         let mut entries: Vec<SegEntry> = Vec::with_capacity(segs.len());
         for (&seg_no, acc) in &segs {
@@ -1164,17 +1419,18 @@ impl Store {
             } else {
                 let min_off = acc.min_off.unwrap_or(0);
                 let lo = seg_no * seg + min_off as u64;
-                // Only the highest segment's exact end matters; lower partial
-                // segments never extend the run, so their `hi` is unused.
-                let hi = if seg_no == highest {
-                    let max_off = acc.max_off.unwrap_or(0);
-                    let name = format!("{}{:016X}", timeline.to_hex(), seg_no);
-                    let chunk_key = self.lctr.wal_chunk_key(timeline, &name, max_off);
-                    let len = self.storage_get(&chunk_key)?.len();
-                    seg_no * seg + max_off as u64 + len as u64
-                } else {
-                    lo
+                // Compute the coverage end (hi) for EVERY chunks-only segment
+                // (not just the highest) so chunks-only segments can bridge the
+                // contiguous run. hi needs the length of the last chunk; a
+                // missing last chunk falls back to `max_off` (len 0).
+                let max_off = acc.max_off.unwrap_or(0);
+                let name = format!("{}{:016X}", timeline.to_hex(), seg_no);
+                let chunk_key = self.lctr.wal_chunk_key(timeline, &name, max_off);
+                let last_len = match self.storage_get(&chunk_key) {
+                    Ok(b) => b.len() as u64,
+                    Err(_) => 0,
                 };
+                let hi = seg_no * seg + max_off as u64 + last_len;
                 entries.push(SegEntry {
                     seg_no,
                     lo,
@@ -1189,9 +1445,10 @@ impl Store {
     }
 
     /// Compute the PITR-recoverable window bounded by archived-WAL coverage:
-    /// `earliest` = the oldest base manifest whose recovery WAL is inside the
-    /// contiguous archived run; `latest_lsn` = the end of that run. Errors with
-    /// a clear message when nothing is recoverable yet.
+    /// `earliest` = the oldest base *backup* whose recovery WAL (`[redo,
+    /// checkpoint]`) is inside the contiguous archived run; `latest_lsn` = the
+    /// end of that run. Errors with a clear message when nothing is recoverable
+    /// yet.
     pub fn recovery_window(&self) -> Result<RecoveryWindow> {
         // 1. Timeline = newest checkpoint's timeline.
         let rows = self.list_checkpoints()?;
@@ -1203,35 +1460,21 @@ impl Store {
         // 2. Contiguous archived-WAL run for this timeline.
         let (w_lo, w_hi) = self.archived_wal_run(timeline)?;
 
-        // 3. Oldest usable base: ascending by checkpoint, first whose redo WAL
-        //    is archived. Candidates are bases on this timeline with checkpoint
-        //    within the run.
-        let bases_prefix = self.lctr.bases_dir();
-        let base_keys = self.storage_list_prefix(&bases_prefix)?;
-        let mut candidates: Vec<(Checkpoint, String)> = base_keys
-            .iter()
-            .filter_map(|k| parse_base_manifest_ckpt(k, &bases_prefix).map(|c| (c, k.clone())))
-            .filter(|(c, _)| {
-                c.timeline_id == timeline && c.lsn.as_u64() >= w_lo && c.lsn.as_u64() <= w_hi
-            })
-            .collect();
-        candidates.sort_by_key(|(c, _)| *c);
+        // 3. Earliest usable base backup: ascending by checkpoint, first whose
+        //    recovery WAL is inside the archived run. PITR anchors on
+        //    pg_basebackup tarballs (`backup/`), not base manifests.
+        let mut backups = self.list_backups()?;
+        backups.retain(|b| b.ckpt.timeline_id == timeline);
+        backups.sort_by_key(|b| b.ckpt);
 
-        let tmp = tempfile::tempdir()?;
-        let mut chosen: Option<(Checkpoint, i64)> = None;
-        // Ascending, stop at the first usable base. Worst case (all in-window
-        // bases unusable) GETs every candidate; acceptable on this cold CLI path.
-        for (ckpt, key) in &candidates {
-            let bytes = self.storage_get(key)?;
-            let base = Manifest::from_bytes(&bytes, tmp.path())?;
-            if is_base_usable(ckpt.lsn.as_u64(), base.redo_ckpt().lsn.as_u64(), w_lo, w_hi) {
-                chosen = Some((base.checkpoint(), base.timestamp()));
-                break;
-            }
-        }
-        let (earliest_ckpt, earliest_ts) = chosen.ok_or_else(|| {
-            Error::other("no base manifest's WAL is archived; nothing is recoverable yet")
-        })?;
+        let chosen = backups
+            .into_iter()
+            .find(|b| is_base_usable(b.ckpt.lsn.as_u64(), b.redo_ckpt.lsn.as_u64(), w_lo, w_hi))
+            .ok_or_else(|| {
+                Error::other("no base backup's WAL is archived; nothing is recoverable yet")
+            })?;
+        let earliest_ckpt = chosen.ckpt;
+        let earliest_ts = chosen.created_at;
 
         // 4. Latest: run end, and the newest checkpoint time within the run.
         //    If no checkpoint sits at/below w_hi the time window collapses to
@@ -1252,43 +1495,6 @@ impl Store {
             latest_lsn,
             timeline,
         })
-    }
-
-    /// Find the newest base manifest with `timestamp <= target_ts` on `timeline`
-    /// and return its `(checkpoint, pg_state)`.
-    ///
-    /// Reads each base manifest's header to learn its timestamp (few base
-    /// manifests; cold CLI path). Future optimization: range-GET the 48-byte
-    /// TIKM header to avoid transferring the embedded `pg_state`.
-    pub fn load_base_pg_state_before_time(
-        &self,
-        target_ts: i64,
-        timeline: TimelineId,
-    ) -> Result<(Checkpoint, Vec<u8>)> {
-        let prefix = self.lctr.bases_dir();
-        let keys = self.storage_list_prefix(&prefix)?;
-        let tmp = tempfile::tempdir()?;
-
-        let mut candidates: Vec<(i64, Checkpoint, String)> = Vec::new();
-        for key in &keys {
-            if parse_base_manifest_ckpt(key, &prefix).is_none() {
-                continue;
-            }
-            let bytes = self.storage_get(key)?;
-            let m = Manifest::from_bytes(&bytes, tmp.path())?;
-            candidates.push((m.timestamp(), m.checkpoint(), key.clone()));
-        }
-
-        let (ckpt, key) =
-            select_base_by_time(&candidates, target_ts, timeline).ok_or_else(|| {
-                Error::other(format!(
-                    "no base manifest at or before time {target_ts} on timeline {timeline}"
-                ))
-            })?;
-
-        let bytes = self.storage_get(&key)?;
-        let manifest = Manifest::from_bytes(&bytes, tmp.path())?;
-        Ok((ckpt, manifest.pg_state().to_vec()))
     }
 
     /// Run the segment-based commit protocol — entry point called by the
@@ -1399,54 +1605,6 @@ mod base_select_tests {
             None
         );
     }
-
-    #[test]
-    fn selects_newest_at_or_before_target() {
-        let prefix = "12/5/bases/";
-        let keys = vec![
-            "12/5/bases/00000001/0000000000001000.manifest".to_string(),
-            "12/5/bases/00000001/0000000003000028.manifest".to_string(),
-            "12/5/bases/00000001/0000000009000000.manifest".to_string(),
-        ];
-        // Target between the 2nd and 3rd base → pick the 2nd.
-        let got = select_newest_base_at_or_before(&keys, prefix, ckpt(1, 0x5000000));
-        assert_eq!(got.unwrap().0, ckpt(1, 0x3000028));
-
-        // Target exactly on a base → inclusive pick.
-        let got = select_newest_base_at_or_before(&keys, prefix, ckpt(1, 0x3000028));
-        assert_eq!(got.unwrap().0, ckpt(1, 0x3000028));
-
-        // Target before the earliest base → none.
-        assert!(select_newest_base_at_or_before(&keys, prefix, ckpt(1, 0x10)).is_none());
-    }
-
-    #[test]
-    fn selects_base_by_time_newest_before_target_on_timeline() {
-        // (timestamp, checkpoint, key) candidates on timeline 1.
-        let cands = vec![
-            (100i64, ckpt(1, 0x1000), "k100".to_string()),
-            (200i64, ckpt(1, 0x2000), "k200".to_string()),
-            (300i64, ckpt(1, 0x3000), "k300".to_string()),
-            // A base on a different timeline that must be ignored.
-            (250i64, ckpt(2, 0x2500), "k250tl2".to_string()),
-        ];
-        let tl = TimelineId::new(1);
-
-        // Target between 200 and 300 → pick the ts=200 base.
-        let got = select_base_by_time(&cands, 250, tl).unwrap();
-        assert_eq!(got, (ckpt(1, 0x2000), "k200".to_string()));
-
-        // Exact match on a base timestamp → inclusive pick.
-        let got = select_base_by_time(&cands, 200, tl).unwrap();
-        assert_eq!(got.0, ckpt(1, 0x2000));
-
-        // Target before the earliest base on this timeline → none.
-        assert!(select_base_by_time(&cands, 50, tl).is_none());
-
-        // The tl=2 base is never chosen for tl=1 even when its ts qualifies.
-        let got = select_base_by_time(&cands, 260, tl).unwrap();
-        assert_eq!(got.0, ckpt(1, 0x2000));
-    }
 }
 
 #[cfg(test)]
@@ -1512,6 +1670,49 @@ mod wal_coverage_tests {
         assert_eq!(
             wal_contiguous_run(&[top]),
             Some((2 * SEG + 0x1F898, 2 * SEG + 0x5F898))
+        );
+    }
+
+    #[test]
+    fn contiguous_run_chunks_only_bridge() {
+        // All chunks-only (never sealed). seg4 is the top with a partial tail;
+        // seg3 covers fully up to the seg4 boundary; seg2 began mid-stream
+        // (its redo/archive starts partway in). The run should bridge down to
+        // seg2's mid-stream start.
+        let seg4 = SegEntry {
+            seg_no: 4,
+            lo: 4 * SEG,
+            hi: 4 * SEG + 0x500,
+            full: false,
+        };
+        let seg3 = SegEntry {
+            seg_no: 3,
+            lo: 3 * SEG,
+            hi: 4 * SEG, // reaches the seg4 boundary
+            full: false,
+        };
+        let seg2 = SegEntry {
+            seg_no: 2,
+            lo: 2 * SEG + 0x41EE8, // mid-stream start
+            hi: 3 * SEG,           // reaches the seg3 boundary
+            full: false,
+        };
+        assert_eq!(
+            wal_contiguous_run(&[seg2, seg3, seg4]),
+            Some((2 * SEG + 0x41EE8, 4 * SEG + 0x500))
+        );
+
+        // A chunks-only segment that does NOT reach the boundary must stop the
+        // walk (gap between seg3's end and seg4's start).
+        let seg3_short = SegEntry {
+            seg_no: 3,
+            lo: 3 * SEG,
+            hi: 4 * SEG - 1,
+            full: false,
+        };
+        assert_eq!(
+            wal_contiguous_run(&[seg3_short, seg4]),
+            Some((4 * SEG, 4 * SEG + 0x500))
         );
     }
 

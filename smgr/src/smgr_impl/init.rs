@@ -27,7 +27,7 @@ pub extern "C-unwind" fn tiko_init() {
         let pool = control.backend_pool(proc_num);
         pool.attach();
 
-        pg_log_debug1(&format!("tiko_init: backend {} pool attached", proc_num));
+        pg_log_debug2(&format!("tiko_init: backend {} pool attached", proc_num));
     }
 
     // Initialize Store — needed for both initdb and normal run. Also hydrates

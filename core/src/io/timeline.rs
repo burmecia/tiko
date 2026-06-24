@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -449,6 +449,16 @@ pub struct TimelineState {
     /// `lock.read()`; the checkpointer drains it under `lock.write()` as
     /// part of the commit fence.
     pub draft: DraftBuffer,
+    /// Set by the checkpointer during a `CHECKPOINT_CAUSE_BASEBACKUP`
+    /// checkpoint so the background compactor skips its tick. The
+    /// checkpointer then runs compaction itself (after draining any
+    /// in-flight compactor run, see `compaction_in_progress`) to form a
+    /// base manifest at the basebackup LSN without racing the compactor.
+    pub compaction_paused: AtomicBool,
+    /// Bumped by any caller around an in-flight `run_compaction` so a
+    /// pausing checkpointer can `drain_compaction()` (spin until zero)
+    /// before running its own compaction.
+    pub compaction_in_progress: AtomicU32,
 }
 
 impl TimelineState {
@@ -466,6 +476,8 @@ impl TimelineState {
             slot.reset();
         }
         self.draft.init();
+        self.compaction_paused.store(false, Ordering::Relaxed);
+        self.compaction_in_progress.store(0, Ordering::Relaxed);
     }
 
     /// Push a new active-window entry. Caller must hold `lock.write()` —
@@ -515,6 +527,58 @@ impl TimelineState {
             (*me).base_ckpt = base_ckpt;
         }
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    // ── Basebackup compaction coordination ───────────────────────────────
+    //
+    // The checkpointer's `CHECKPOINT_CAUSE_BASEBACKUP` path wants to run
+    // `run_compaction` itself to form a base manifest at the basebackup LSN.
+    // To avoid racing the background compactor (wasted S3 PUTs + the
+    // post-hoc `Raced` discard), it:
+    //   1. `pause_compaction()` — the compactor's next tick observes the
+    //      flag and skips.
+    //   2. `drain_compaction()` — spin until any already-running compaction
+    //      finishes (compactor bumps `compaction_in_progress` around its
+    //      `run_compaction` call).
+    //   3. runs its own `run_compaction`.
+    //   4. `resume_compaction()`.
+
+    /// Request the background compactor to skip its ticks. Process-local
+    /// shmem flag; safe to call from any process sharing `IoControl`.
+    pub fn pause_compaction(&self) {
+        self.compaction_paused.store(true, Ordering::Release);
+    }
+
+    /// Clear the pause flag. Cheap to call unconditionally.
+    pub fn resume_compaction(&self) {
+        self.compaction_paused.store(false, Ordering::Release);
+    }
+
+    /// Whether the background compactor should skip its current tick.
+    pub fn is_compaction_paused(&self) -> bool {
+        self.compaction_paused.load(Ordering::Acquire)
+    }
+
+    /// Record the start of a `run_compaction` call. Callers MUST pair this
+    /// with [`end_compaction`]. Used by both the background compactor and
+    /// the checkpointer's basebackup compaction so `drain_compaction` can
+    /// observe in-flight work.
+    pub fn begin_compaction(&self) {
+        self.compaction_in_progress.fetch_add(1, Ordering::Release);
+    }
+
+    /// Record the end of a `run_compaction` call.
+    pub fn end_compaction(&self) {
+        self.compaction_in_progress.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Spin until no `run_compaction` is in flight. Bounded by the compactor
+    /// interval; a crashed compactor leaves the counter at 0 (the `begin`/
+    /// `end` pair is tight around the synchronous `run_compaction`).
+    pub fn drain_compaction(&self) {
+        while self.compaction_in_progress.load(Ordering::Acquire) > 0 {
+            std::hint::spin_loop();
+        }
     }
 
     /// Iterate active-window entries newest-first. Caller must hold a read

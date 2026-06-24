@@ -54,6 +54,33 @@ impl Locator {
         )
     }
 
+    // ── Base backup keys ────────────────────────────
+
+    /// Listing prefix for all base backups: `{ns}/backup/`.
+    pub(super) fn backup_dir(&self) -> String {
+        format!("{ns}/backup/", ns = self.ns)
+    }
+
+    /// Storage key for a base-backup tarball: `{ns}/backup/{tl}/{lsn}.tar.zst`.
+    pub(super) fn backup_object(&self, ckpt: &Checkpoint) -> String {
+        format!(
+            "{ns}/backup/{tl}/{lsn}.tar.zst",
+            ns = self.ns,
+            tl = ckpt.timeline_id,
+            lsn = ckpt.lsn.to_hex(),
+        )
+    }
+
+    /// Storage key for a base-backup metadata sidecar: `{ns}/backup/{tl}/{lsn}.json`.
+    pub(super) fn backup_meta(&self, ckpt: &Checkpoint) -> String {
+        format!(
+            "{ns}/backup/{tl}/{lsn}.json",
+            ns = self.ns,
+            tl = ckpt.timeline_id,
+            lsn = ckpt.lsn.to_hex(),
+        )
+    }
+
     // ── Timeline segment keys ────────────────────────────
 
     /// S3/storage key for a timeline segment file: `{ns}/timeline/{segment}`.

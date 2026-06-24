@@ -316,54 +316,66 @@ async fn handle_xlogdata(
         return Ok(());
     }
 
-    let seg_no_new = start_lsn / XLOG_SEG_SIZE as u64;
+    // Process `wal_data`, splitting at segment boundaries. The walsender CAN
+    // deliver a single XLogData message that spans a segment boundary, so we
+    // must not assume all of `wal_data` belongs to the segment of `start_lsn`:
+    // attributing the post-boundary tail to the old segment writes chunks past
+    // its 16 MiB end and leaves an unarchived coverage gap at the start of the
+    // new segment (which breaks PITR when a backup checkpoint lands in it).
+    let seg_size = XLOG_SEG_SIZE as u64;
+    let mut cursor = start_lsn;
+    let mut off = 0usize;
+    while off < wal_data.len() {
+        let seg_no = cursor / seg_size;
+        let seg_offset = (cursor % seg_size) as usize;
+        // Bytes from `cursor` up to the end of its segment.
+        let bytes_to_boundary = (seg_size as usize) - seg_offset;
+        let piece_len = bytes_to_boundary.min(wal_data.len() - off);
+        let piece = &wal_data[off..off + piece_len];
 
-    // Detect segment switch.
-    // The walsender never sends a single XLogData message that crosses a
-    // segment boundary, so all of `wal_data` belongs to `seg_no_new`.
-    if let Some(state) = cur_seg.as_ref() {
-        if state.seg_no != seg_no_new {
-            let old = cur_seg.take().unwrap();
-            seal_segment(old, sim, timeline_id, confirmed_lsn, conn).await?;
+        // Segment switch: seal the old segment before starting a new one.
+        if let Some(state) = cur_seg.as_ref() {
+            if state.seg_no != seg_no {
+                let old = cur_seg.take().unwrap();
+                seal_segment(old, sim, timeline_id, confirmed_lsn, conn).await?;
+            }
         }
-    }
-
-    if cur_seg.is_none() {
-        let seg_offset = (start_lsn % XLOG_SEG_SIZE as u64) as usize;
-        let mut s = SegState::new(seg_no_new);
-        if seg_offset > 0 {
-            // Zero-fill up to the actual data offset so the sealed segment
-            // object has WAL bytes at the correct positions within the file.
-            // This happens only on the very first connection when the slot's
-            // restart_lsn is mid-segment (xlogpos at slot creation time).
-            // On reconnects, confirmed_lsn is always segment-aligned so
-            // streaming resumes at offset 0.
-            s.buf.resize(seg_offset, 0);
-            // Skip chunk uploads for the zero-filled prefix — it is not real
-            // WAL. Mark the segment partial so it is never sealed as a complete
-            // object: the prefix is zeros, and a sealed object would masquerade
-            // as a fully-valid 16 MiB segment that restore could replay into.
-            s.chunks_uploaded = seg_offset;
-            s.partial = true;
+        if cur_seg.is_none() {
+            let mut s = SegState::new(seg_no);
+            if seg_offset > 0 {
+                // Mid-segment start — only on the very first connection, when
+                // the slot's restart_lsn is mid-segment. On reconnects and on
+                // normal segment transitions `cursor` is segment-aligned, so
+                // `seg_offset` is 0 (a clean, sealable segment). Zero-fill the
+                // prefix and mark partial: a sealed object's zero prefix would
+                // masquerade as a fully-valid, replayable 16 MiB segment.
+                s.buf.resize(seg_offset, 0);
+                s.chunks_uploaded = seg_offset;
+                s.partial = true;
+            }
+            *cur_seg = Some(s);
         }
-        *cur_seg = Some(s);
-    }
-    let state = cur_seg.as_mut().unwrap();
-    state.buf.extend_from_slice(wal_data);
 
-    // Fire chunk PUTs for newly complete 256 KiB windows — non-blocking.
-    while state.buf.len() - state.chunks_uploaded >= CHUNK_BYTES {
-        let offset = state.chunks_uploaded;
-        let slice = state.buf[offset..offset + CHUNK_BYTES].to_vec();
-        let name = wal_seg_name(timeline_id, state.seg_no);
-        let key = sim.locator().wal_chunk_key(timeline_id, &name, offset);
-        state.chunk_tasks.spawn(async move {
-            tokio::task::spawn_blocking(move || sim.storage_put(&key, &slice))
-                .await
-                .map_err(|e| format!("chunk task panicked: {e}"))?
-                .map_err(|e| format!("chunk PUT failed: {e}"))
-        });
-        state.chunks_uploaded += CHUNK_BYTES;
+        let state = cur_seg.as_mut().unwrap();
+        state.buf.extend_from_slice(piece);
+
+        // Fire chunk PUTs for newly complete 256 KiB windows — non-blocking.
+        while state.buf.len() - state.chunks_uploaded >= CHUNK_BYTES {
+            let offset = state.chunks_uploaded;
+            let slice = state.buf[offset..offset + CHUNK_BYTES].to_vec();
+            let name = wal_seg_name(timeline_id, state.seg_no);
+            let key = sim.locator().wal_chunk_key(timeline_id, &name, offset);
+            state.chunk_tasks.spawn(async move {
+                tokio::task::spawn_blocking(move || sim.storage_put(&key, &slice))
+                    .await
+                    .map_err(|e| format!("chunk task panicked: {e}"))?
+                    .map_err(|e| format!("chunk PUT failed: {e}"))
+            });
+            state.chunks_uploaded += CHUNK_BYTES;
+        }
+
+        off += piece_len;
+        cursor += piece_len as u64;
     }
 
     Ok(())

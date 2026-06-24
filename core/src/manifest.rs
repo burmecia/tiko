@@ -467,20 +467,30 @@ impl Manifest {
     }
 
     /// Return the TIKM header timestamp (unix seconds) — the time of this base
-    /// manifest's checkpoint. Used to order base manifests by time for PITR.
+    /// manifest's checkpoint.
+    #[allow(dead_code)]
     pub fn timestamp(&self) -> i64 {
         self.timestamp
     }
 
     /// Return the redo checkpoint — the LSN from which WAL replay must begin
-    /// when this base manifest is used as a PITR base backup.
+    /// when this base manifest anchors a PITR recovery. (The recovering smgr
+    /// reads the manifest's chunk refs; WAL replay bounds come from the
+    /// `backup/` tarball's `backup_label`, so this accessor is currently
+    /// unused at runtime but retained as part of the manifest API.)
+    #[allow(dead_code)]
     pub fn redo_ckpt(&self) -> Checkpoint {
         self.redo_ckpt
     }
 
     /// Return the `pg_state.tar.zst` archive captured at the base checkpoint.
-    /// Empty on a bootstrap/empty manifest. Consumed by
-    /// `Store::load_base_pg_state_at_or_before` for PITR.
+    /// Empty on a bootstrap/empty manifest.
+    ///
+    /// Currently unused: PITR bases now come from `pg_basebackup` tarballs
+    /// (see `Store::put_backup`), so checkpoints no longer build the
+    /// `pg_state` archive (the trailer is always empty). The field + trailer
+    /// are retained to keep the TIKM wire format stable.
+    #[allow(dead_code)]
     pub fn pg_state(&self) -> &[u8] {
         &self.pg_state
     }

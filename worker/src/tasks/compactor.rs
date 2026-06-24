@@ -13,12 +13,34 @@
 use core::{
     env,
     io::store::{CompactionResult, Store},
+    io_control::IoControl,
 };
 use std::time::Duration;
 
 use crate::log_relay::{relay_debug1, relay_debug2, relay_info};
 
 // ── Background task ───────────────────────────────────────────────────────────
+
+/// RAII guard that bumps `compaction_in_progress` on creation and decrements
+/// on drop, so a panic inside `run_compaction` can never strand the counter
+/// (a stranded counter would deadlock a subsequent basebackup
+/// `TimelineState::drain_compaction`).
+struct CompactionGuard {
+    io_control: &'static IoControl,
+}
+
+impl CompactionGuard {
+    fn new(io_control: &'static IoControl) -> Self {
+        io_control.timeline.begin_compaction();
+        Self { io_control }
+    }
+}
+
+impl Drop for CompactionGuard {
+    fn drop(&mut self) {
+        self.io_control.timeline.end_compaction();
+    }
+}
 
 /// Tokio task: advance `base_ckpt` periodically.
 ///
@@ -37,7 +59,29 @@ pub async fn compactor_task(store: &'static Store) {
     loop {
         interval.tick().await;
 
-        match store.run_compaction() {
+        // A `CHECKPOINT_CAUSE_BASEBACKUP` checkpoint runs compaction itself to
+        // form a base manifest at the basebackup LSN; skip this tick so we
+        // don't race it. The checkpointer unpauses after its own compaction.
+        if let Some(io_control) = IoControl::try_get() {
+            if io_control.timeline.is_compaction_paused() {
+                relay_debug2(
+                    "tiko: compactor: paused for basebackup checkpoint — skipping tick",
+                );
+                continue;
+            }
+        }
+
+        // Wrap the synchronous `run_compaction` in the in-progress guard so a
+        // pausing checkpointer's `drain_compaction` observes our work.
+        let result = match IoControl::try_get() {
+            Some(io_control) => {
+                let _guard = CompactionGuard::new(io_control);
+                store.run_compaction()
+            }
+            None => store.run_compaction(),
+        };
+
+        match result {
             Ok(CompactionResult::Applied {
                 base_ckpt,
                 new_base_ckpt,

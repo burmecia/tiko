@@ -10,9 +10,9 @@ ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 
 # Set environment variables for Tiko configuration
 unset TIKO_ROOT_PATH
-TIKO_ORG_ID="12"
-TIKO_DB_ID="34"
-TIKO_PROJECT_ID="56"
+export TIKO_ORG_ID="12"
+export TIKO_DB_ID="34"
+export TIKO_PROJECT_ID="56"
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${BASE_DIR}/target"

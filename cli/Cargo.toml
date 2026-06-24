@@ -39,5 +39,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 zstd = { workspace = true }
+tar = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
