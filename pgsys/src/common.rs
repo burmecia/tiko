@@ -102,6 +102,12 @@ unsafe extern "C" {
     /// Set by the startup process; other processes see false (xlogutils.h).
     pub static InRecovery: bool;
 
+    /// True system-wide while the cluster is in archive/crash recovery (reads
+    /// shared `XLogCtl` state). Safe to call from any backend, including
+    /// bgworkers — unlike the process-local `InRecovery`, it reflects the
+    /// cluster's actual recovery status. Returns false after promotion.
+    pub fn RecoveryInProgress() -> bool;
+
 }
 
 #[inline(always)]
@@ -121,6 +127,14 @@ pub fn is_under_postmaster() -> bool {
 #[inline(always)]
 pub fn in_recovery() -> bool {
     unsafe { InRecovery }
+}
+
+/// True while the cluster is in archive/crash recovery (shared state). Use this
+/// — not the process-local `in_recovery()` — from bgworkers to detect
+/// system-wide recovery status.
+#[inline(always)]
+pub fn recovery_in_progress() -> bool {
+    unsafe { RecoveryInProgress() }
 }
 
 /// Return the current backend's ProcNumber.

@@ -15,6 +15,7 @@ use core::{
     io::store::{CompactionResult, Store},
     io_control::IoControl,
 };
+use pgsys::common::recovery_in_progress;
 use std::time::Duration;
 
 use crate::log_relay::{relay_debug1, relay_debug2, relay_info};
@@ -52,12 +53,25 @@ pub async fn compactor_task(store: &'static Store) {
     let mut interval = tokio::time::interval(interval_secs);
 
     relay_info(format!(
-        "tiko: compactor started (interval={}s)",
+        "tiko: compactor started (interval={}s, in_recovery={})",
         interval_secs.as_secs(),
+        recovery_in_progress(),
     ));
 
     loop {
         interval.tick().await;
+
+        // While the cluster is in archive/crash recovery the base manifest is
+        // the PITR anchor — the compactor must not touch state. (It would be a
+        // no-op anyway: head_ckpt stays at default until the end-of-recovery
+        // checkpoint and the pre-recovery segments are deleted, so
+        // `run_compaction` would return `NoNewSegments`. Skip explicitly for
+        // clarity and defense-in-depth.) Resumes automatically once recovery
+        // finishes (promote).
+        if recovery_in_progress() {
+            relay_debug1("tiko: compactor: cluster in recovery — skipping tick");
+            continue;
+        }
 
         // A `CHECKPOINT_CAUSE_BASEBACKUP` checkpoint runs compaction itself to
         // form a base manifest at the basebackup LSN; skip this tick so we

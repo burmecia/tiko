@@ -321,7 +321,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     };
     eprintln!(
         "tiko_pitr: recovering to {target_label} on timeline {} from base backup {base_ckpt}",
-        timeline.to_hex()
+        timeline
     );
 
     let pgdata = args.pgdata.as_path();
