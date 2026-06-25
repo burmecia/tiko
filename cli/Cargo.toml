@@ -21,6 +21,10 @@ name = "tiko_pitr"
 path = "src/bin/tiko_pitr.rs"
 
 [[bin]]
+name = "tiko_branch"
+path = "src/bin/tiko_branch.rs"
+
+[[bin]]
 name = "tiko_restore"
 path = "src/bin/tiko_restore.rs"
 

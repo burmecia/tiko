@@ -15,9 +15,10 @@ use crate::{
         timeline::{ACTIVE_WINDOW_SIZE, RelforkLookup},
     },
     io_control::IoControl,
+    local_path,
     manifest::Manifest,
     relfork::RelForkMeta,
-    tiko_root_path,
+    storage_root_path,
 };
 use pgsys::{
     common::{BLCKSZ, BlockNumber, XLOG_SEG_SIZE, data_dir_path},
@@ -261,10 +262,14 @@ impl Store {
             return Ok(store);
         }
 
-        let local_root = tiko_root_path();
+        // Storage root is SHARED across databases (the remote object store);
+        // local_root is PER-DATABASE (cache/state files that must not collide
+        // between parent and branch).
+        let storage_root = storage_root_path();
+        let local_root = local_path();
         let ns = DbNamespace::new_from_env();
         let lctr = Locator::new(ns.clone());
-        let storage = Storage::new(&local_root);
+        let storage = Storage::new(&storage_root);
 
         // Local fast path: reuse the on-disk TIKM file if a previous
         // invocation (this process or a sibling) already published it. The
@@ -274,7 +279,7 @@ impl Store {
         // subsequent `base_manifest()` calls catches up.
         //
         // Falls back to an S3 list + GET if the local file is missing or
-        // unreadable (fresh data dir, or after a `tiko_root` reset).
+        // unreadable (fresh data dir, or after a local-path reset).
         let initial: Manifest = match Manifest::open_local(&local_root) {
             Ok(manifest) => {
                 pg_log_debug2(format!(
@@ -308,7 +313,7 @@ impl Store {
             ns,
             lctr,
             base_manifest: Mutex::new(Arc::new(initial)),
-            storage: Storage::new(&local_root),
+            storage,
             local_root,
             draft_spill_path,
         };
@@ -958,7 +963,7 @@ impl Store {
         let new_base_ckpt = to_apply.last().unwrap().ckpt;
         let key = self.lctr.base_manifest(&new_base_ckpt);
 
-        let applied = current.apply_segments(&to_apply)?;
+        let applied = current.apply_segments(&to_apply, self.ns.db_id)?;
         self.storage.put(&key, &applied.bytes)?;
         let new_manifest = Arc::new(current.commit_applied(applied)?);
 
@@ -1058,7 +1063,7 @@ impl Store {
         to_apply.sort_by_key(|s| s.ckpt);
 
         let current = self.base_manifest()?;
-        let applied = current.apply_segments(&to_apply)?;
+        let applied = current.apply_segments(&to_apply, self.ns.db_id)?;
         // Key/header/base_ckpt all at `applied.checkpoint` for consistency.
         let new_base_ckpt = applied.checkpoint;
         let key = self.lctr.base_manifest(&new_base_ckpt);
@@ -1275,9 +1280,8 @@ impl Store {
                 Err(e) if e.is_not_found() => continue,
                 Err(e) => return Err(e),
             };
-            let meta: BackupMeta = serde_json::from_slice(&bytes).map_err(|e| {
-                Error::other(format!("failed to parse backup meta {key}: {e}"))
-            })?;
+            let meta: BackupMeta = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::other(format!("failed to parse backup meta {key}: {e}")))?;
             rows.push(BackupRow {
                 ckpt: meta.checkpoint,
                 redo_ckpt: meta.redo_ckpt,
@@ -1291,10 +1295,7 @@ impl Store {
     /// Select the newest base backup with `ckpt <= target` and return its
     /// `(checkpoint, tar_bytes)`. Standard PITR anchor: the closest backup at
     /// or before the target so the minimum WAL must be replayed.
-    pub fn load_backup_at_or_before(
-        &self,
-        target: Checkpoint,
-    ) -> Result<(Checkpoint, Vec<u8>)> {
+    pub fn load_backup_at_or_before(&self, target: Checkpoint) -> Result<(Checkpoint, Vec<u8>)> {
         let ckpt = self
             .list_backups()?
             .into_iter()
@@ -1352,7 +1353,9 @@ impl Store {
             .filter(|c| *c <= ckpt)
             .max_by_key(|c| *c)
             .ok_or_else(|| {
-                Error::other(format!("no base manifest at or before {ckpt} to anchor recovery"))
+                Error::other(format!(
+                    "no base manifest at or before {ckpt} to anchor recovery"
+                ))
             })?;
         let key = self.lctr.base_manifest(&target_base);
         let bytes = self.storage_get(&key)?;
@@ -1362,6 +1365,44 @@ impl Store {
         // which exits after this call; required if ever called in-process).
         *self.base_manifest.lock().unwrap() = Arc::new(manifest);
         Ok(())
+    }
+
+    /// Seed a branch namespace by copying this (parent) database's newest base
+    /// manifest at or before `ckpt` into the `branch_ns` namespace.
+    ///
+    /// The manifest bytes are copied as-is, so the branch's manifest carries
+    /// `ChunkRef.db_id = parent_db_id` — which is exactly the copy-on-write
+    /// invariant: the branch's smgr resolves those chunks against the parent's
+    /// namespace (shared via `TIKO_STORAGE_ROOT`), and only materializes its own
+    /// chunk versions (carrying `db_id = branch_db_id`) when it dirties them.
+    ///
+    /// `ckpt` is typically the `CHECKPOINT_CAUSE_BASEBACKUP` checkpoint; the
+    /// manifest may be keyed slightly below it (if the basebackup segment had
+    /// no dirty data, `run_compaction_through` keys at the previous checkpoint
+    /// — which represents the same state).
+    pub fn seed_branch_base_manifest(
+        &self,
+        branch_ns: DbNamespace,
+        ckpt: Checkpoint,
+    ) -> Result<()> {
+        let prefix = self.lctr.bases_dir();
+        let keys = self.storage_list_prefix(&prefix)?;
+        let target_base = keys
+            .iter()
+            .filter_map(|k| parse_base_manifest_ckpt(k, &prefix))
+            .filter(|c| *c <= ckpt)
+            .max_by_key(|c| *c)
+            .ok_or_else(|| {
+                Error::other(format!(
+                    "no base manifest at or before {ckpt} in the parent namespace to seed the branch"
+                ))
+            })?;
+
+        let parent_key = self.lctr.base_manifest(&target_base);
+        let bytes = self.storage_get(&parent_key)?;
+        let branch_lctr = Locator::new(branch_ns);
+        let branch_key = branch_lctr.base_manifest(&target_base);
+        self.storage_put(&branch_key, &bytes)
     }
 
     /// Compute the contiguous archived-WAL run `[w_lo, w_hi]` (absolute LSN) for

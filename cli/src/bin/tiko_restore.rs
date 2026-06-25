@@ -35,8 +35,8 @@ use pgsys::timeline_id::TimelineId;
 // not loaded into the postmaster, so the PG symbols that `core` transitively
 // references are supplied by `cli::pg_stubs`. The `extern crate` below forces
 // the `cli` lib onto the link line so its `#[no_mangle]` stubs resolve `core`'s
-// undefined references. `TIKO_ROOT_PATH` is expected to be set in the
-// environment so `DataDir` is never actually dereferenced.
+// undefined references. `TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH` are expected to
+// be set in the environment so `DataDir` is never actually dereferenced.
 extern crate cli;
 
 #[derive(Parser)]

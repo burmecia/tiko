@@ -10,12 +10,13 @@ set -e  # Exit on any error
 ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 
 # Set environment variables for Tiko configuration
-unset TIKO_ROOT_PATH
+unset TIKO_STORAGE_ROOT TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
 # Keep the Tiko storage root OUTSIDE PGDATA so it survives PGDATA wipe/restore.
-export TIKO_ROOT_PATH="${PWD}/tiko_root"
+# Per-db local cache (base_manifest.tikm etc.) defaults to $PGDATA/tiko.
+export TIKO_STORAGE_ROOT="${PWD}/tiko_root"
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${BASE_DIR}/target"
@@ -45,7 +46,7 @@ if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
 fi
 
 # Fresh cluster + fresh Tiko storage root.
-rm -rf tt "${TIKO_ROOT_PATH}" log.log recovery.out
+rm -rf tt "${TIKO_STORAGE_ROOT}" log.log recovery.out
 $PG_BIN_DIR/initdb -D tt --auth=trust --no-instructions
 cp ./postgresql.conf.sample tt/postgresql.conf
 

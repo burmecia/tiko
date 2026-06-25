@@ -6,14 +6,14 @@ use crate::io::timeline::Checkpoint;
 use pgsys::Lsn;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub(crate) struct DbNamespace {
+pub struct DbNamespace {
     pub org_id: u64,
     pub db_id: u64,
     pub project_id: u64,
 }
 
 impl DbNamespace {
-    pub(crate) fn new(org_id: u64, db_id: u64, project_id: u64) -> Self {
+    pub fn new(org_id: u64, db_id: u64, project_id: u64) -> Self {
         Self {
             org_id,
             db_id,

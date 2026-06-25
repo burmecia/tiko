@@ -14,12 +14,11 @@
 //!     manifest are restored and the instance is left stopped.
 //!
 //! Storage is configured from the environment exactly as `tiko_restore`
-//! expects (`Store::init()`): `TIKO_ROOT_PATH`/`PGDATA`, `TIKO_ORG_ID`,
-//! `TIKO_DB_ID`, `TIKO_PROJECT_ID`.
+//! expects (`Store::init()`): `TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH`/`PGDATA`,
+//! `TIKO_ORG_ID`, `TIKO_DB_ID`, `TIKO_PROJECT_ID`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
-use std::time::{Duration, Instant};
+use std::process::exit;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
@@ -98,6 +97,9 @@ struct RecoverArgs {
     /// Path to `pg_ctl`. Defaults to `pg_ctl` on `PATH`.
     #[arg(long, default_value = "pg_ctl")]
     pg_ctl: PathBuf,
+    /// Port the recovering PostgreSQL listens on (used to poll for promotion).
+    #[arg(long, env = "PGPORT", default_value_t = 5432)]
+    port: u16,
     /// Path to `psql`, used to poll for recovery completion (promotion).
     /// Defaults to the sibling of `--pg-ctl`, falling back to `psql` on PATH.
     #[arg(long)]
@@ -169,7 +171,17 @@ fn run_backup(store: &Store, args: &BackupArgs) -> Result<()> {
     // 1. Run pg_basebackup. `-X none`: WAL is archived separately by the Tiko
     //    worker. `-c fast`: forces the basebackup checkpoint that the Tiko
     //    checkpointer hooks to run compaction (forming the base manifest).
-    run_pg_basebackup(args, backup_dir)?;
+    cli::pgops::run_pg_basebackup(
+        &cli::pgops::BasebackupOpts {
+            pg_basebackup: &args.pg_basebackup,
+            host: &args.host,
+            port: args.port,
+            user: args.user.as_deref(),
+            checkpoint: &args.checkpoint,
+            wal_method: "none",
+        },
+        backup_dir,
+    )?;
 
     // 2. Parse backup_label: CHECKPOINT LOCATION == the base manifest key
     //    (both are ControlFile->checkPoint == ProcLastRecPtr at the checkpoint
@@ -177,13 +189,13 @@ fn run_backup(store: &Store, args: &BackupArgs) -> Result<()> {
     let label_path = backup_dir.join("backup_label");
     let label = std::fs::read_to_string(&label_path)
         .map_err(|e| Error::other(format!("read {}: {e}", label_path.display())))?;
-    let (checkpoint_lsn, redo_lsn, timeline) = parse_backup_label(&label)?;
+    let (checkpoint_lsn, redo_lsn, timeline) = cli::pgops::parse_backup_label(&label)?;
     let ckpt = Checkpoint::new(timeline, checkpoint_lsn);
     let redo_ckpt = Checkpoint::new(timeline, redo_lsn);
     eprintln!("tiko_pitr: base backup at checkpoint {ckpt}, redo {redo_ckpt}");
 
     // 3. Pack the backup directory (tar + zstd).
-    let tar_zst = tar_dir_to_zst(backup_dir)?;
+    let tar_zst = cli::pgops::tar_dir_to_zst(backup_dir)?;
 
     // 4. Upload the tarball + metadata sidecar.
     let created_at = chrono::Utc::now().timestamp();
@@ -193,82 +205,6 @@ fn run_backup(store: &Store, args: &BackupArgs) -> Result<()> {
         tar_zst.len()
     );
     Ok(())
-}
-
-/// Invoke `pg_basebackup` to produce a plain-format base backup in `dest`.
-fn run_pg_basebackup(args: &BackupArgs, dest: &Path) -> Result<()> {
-    let mut cmd = Command::new(&args.pg_basebackup);
-    cmd.arg("-D").arg(dest);
-    cmd.args(["-X", "none"]); // WAL archived separately by Tiko.
-    cmd.args(["-F", "p"]); // plain format (directory)
-    cmd.args(["-c", &args.checkpoint]); // triggers CHECKPOINT_CAUSE_BASEBACKUP
-    cmd.args(["--no-password", "--no-manifest"]);
-    if !args.host.is_empty() {
-        cmd.args(["-h", &args.host]);
-    }
-    cmd.args(["-p", &args.port.to_string()]);
-    if let Some(user) = &args.user {
-        cmd.args(["-U", user]);
-    }
-    let status = cmd
-        .status()
-        .map_err(|e| Error::other(format!("failed to spawn pg_basebackup: {e}")))?;
-    if !status.success() {
-        return Err(Error::other(format!(
-            "pg_basebackup failed (exit: {status})"
-        )));
-    }
-    Ok(())
-}
-
-/// Parse `backup_label` into `(checkpoint_lsn, redo_lsn, timeline)`.
-///
-/// Relevant lines (see `build_backup_content` in `xlogbackup.c`):
-///   `START WAL LOCATION: X/Y (file ...)`   ← redo point
-///   `CHECKPOINT LOCATION: X/Y`             ← checkpoint record LSN (base key)
-///   `START TIMELINE: N`                     ← timeline id (decimal)
-fn parse_backup_label(label: &str) -> Result<(Lsn, Lsn, TimelineId)> {
-    let checkpoint_lsn = parse_label_lsn(label, "CHECKPOINT LOCATION:")?;
-    let redo_lsn = parse_label_lsn(label, "START WAL LOCATION:")?;
-    let timeline = parse_label_tli(label, "START TIMELINE:")?;
-    Ok((checkpoint_lsn, redo_lsn, timeline))
-}
-
-fn parse_label_lsn(label: &str, prefix: &str) -> Result<Lsn> {
-    let token = first_token_after(label, prefix)
-        .ok_or_else(|| Error::other(format!("backup_label missing '{prefix}' line")))?;
-    Lsn::parse_either(token).map_err(Error::other)
-}
-
-fn parse_label_tli(label: &str, prefix: &str) -> Result<TimelineId> {
-    let token = first_token_after(label, prefix)
-        .ok_or_else(|| Error::other(format!("backup_label missing '{prefix}' line")))?;
-    let t = u32::from_str_radix(token, 10)
-        .map_err(|_| Error::other(format!("invalid timeline in backup_label: '{token}'")))?;
-    Ok(TimelineId::new(t))
-}
-
-/// Return the first whitespace-delimited token following `prefix` on any line.
-fn first_token_after<'a>(label: &'a str, prefix: &str) -> Option<&'a str> {
-    for line in label.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix(prefix) {
-            return rest.trim().split_whitespace().next();
-        }
-    }
-    None
-}
-
-/// Pack a directory into a compressed `tar.zst` blob in memory.
-fn tar_dir_to_zst(src: &Path) -> Result<Vec<u8>> {
-    let tar_buf: Vec<u8> = Vec::new();
-    let mut builder = tar::Builder::new(tar_buf);
-    builder.append_dir_all(".", src)?;
-    builder.finish()?;
-    let tar_buf = builder
-        .into_inner()
-        .map_err(|e| Error::other(format!("tar finalize: {e}")))?;
-    zstd::encode_all(tar_buf.as_slice(), 3)
-        .map_err(|e| Error::other(format!("zstd compress: {e}")))
 }
 
 fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
@@ -329,7 +265,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     let psql = args
         .psql
         .clone()
-        .unwrap_or_else(|| sibling_binary(pg_ctl, "psql"));
+        .unwrap_or_else(|| cli::pgops::sibling_binary(pg_ctl, "psql"));
     let tiko_restore = args
         .tiko_restore
         .clone()
@@ -340,12 +276,12 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     // The live base manifest lives under the tiko root (excluded from the
     // PGDATA snapshot). Snapshot it separately so a failed recovery can restore
     // the manifest that matches the rolled-back PGDATA.
-    let manifest_path = core::tiko_root_path().join(BASE_MANIFEST_FILE_NAME);
+    let manifest_path = core::local_path().join(BASE_MANIFEST_FILE_NAME);
     let rollback = tempfile::tempdir()?;
     let manifest_backup = rollback.path().join(BASE_MANIFEST_FILE_NAME);
 
     // 3. Stop PostgreSQL so the data dir is quiesced before mutation.
-    stop_pg(pg_ctl, pgdata)?;
+    cli::pgops::stop_pg(pg_ctl, pgdata)?;
 
     // 4. Snapshot PGDATA (excluding the bulk `tiko/` dir) + the live manifest.
     pitr::backup_dir_excluding(pgdata, &backup, "tiko")?;
@@ -364,6 +300,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         timeline,
         &target,
         pg_ctl,
+        args.port,
         &psql,
         &tiko_restore,
         args.recovery_timeout,
@@ -382,7 +319,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             eprintln!("tiko_pitr: recovery failed: {e}");
             eprintln!("tiko_pitr: restoring PGDATA + base manifest from rollback snapshot");
             // Best-effort stop before restoring; ignore the result.
-            let _ = stop_pg(pg_ctl, pgdata);
+            let _ = cli::pgops::stop_pg(pg_ctl, pgdata);
             if let Err(re) = pitr::restore_dir(&backup, pgdata, "tiko") {
                 eprintln!(
                     "tiko_pitr: PGDATA RESTORE FAILED ({re}); backup left in place at {}",
@@ -413,6 +350,7 @@ fn recover_inner(
     timeline: TimelineId,
     target: &pitr::RecoveryTarget,
     pg_ctl: &Path,
+    port: u16,
     psql: &Path,
     tiko_restore: &Path,
     recovery_timeout: u64,
@@ -421,7 +359,7 @@ fn recover_inner(
     // tarball already carries a real `backup_label` from pg_basebackup, so no
     // pg_control shaping is needed.
     pitr::wipe_dir_excluding(pgdata, "tiko")?;
-    extract_backup(tar_bytes, pgdata)?;
+    cli::pgops::extract_backup(tar_bytes, pgdata)?;
 
     // Install the base manifest valid at the backup checkpoint as the live
     // `$TIKO_ROOT/base_manifest.tikm`. This closes the cross-LSN cache-miss
@@ -442,110 +380,12 @@ fn recover_inner(
     // Start in the background and poll until promotion. With
     // recovery_target_action='promote', postgres does not exit on its own; it
     // ends recovery by promoting and continuing as a primary.
-    start_pg(pg_ctl, pgdata)?;
-    if let Err(e) = wait_for_promotion(psql, recovery_timeout) {
-        let _ = stop_pg(pg_ctl, pgdata);
+    cli::pgops::start_pg(pg_ctl, pgdata)?;
+    if let Err(e) = cli::pgops::wait_for_promotion(psql, port, recovery_timeout) {
+        let _ = cli::pgops::stop_pg(pg_ctl, pgdata);
         return Err(e);
     }
     Ok(())
-}
-
-/// Decompress (zstd) and extract a base-backup tarball into `pgdata`.
-fn extract_backup(tar_zst: &[u8], pgdata: &Path) -> Result<()> {
-    let tar_buf = zstd::decode_all(tar_zst)
-        .map_err(|e| Error::other(format!("zstd decompress base backup: {e}")))?;
-    let mut arch = tar::Archive::new(tar_buf.as_slice());
-    arch.unpack(pgdata)
-        .map_err(|e| Error::other(format!("tar unpack base backup: {e}")))
-}
-
-/// Poll `SELECT pg_is_in_recovery()` once per second until it returns `f`
-/// (promotion complete) or `timeout_secs` elapses.
-fn wait_for_promotion(psql: &Path, timeout_secs: u64) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match run_psql(psql, "SELECT pg_is_in_recovery()") {
-            Ok(out) if out.trim() == "f" => return Ok(()),
-            // "t" = still in recovery; a query error = not accepting connections
-            // yet (early startup) or a transient blip. Keep polling until the
-            // deadline; if the server died, `pg_ctl start` already returned Err.
-            _ => {}
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::other(format!(
-                "PostgreSQL did not promote within {timeout_secs}s"
-            )));
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-/// Run `psql -d postgres -Atqc <sql>` and return stdout.
-fn run_psql(psql: &Path, sql: &str) -> Result<String> {
-    let out = Command::new(psql)
-        .args(["-d", "postgres"])
-        .args(["-Atqc", sql])
-        .output()
-        .map_err(|e| Error::other(format!("failed to spawn psql: {e}")))?;
-    if !out.status.success() {
-        return Err(Error::other(format!(
-            "psql failed (exit: {}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// `pg_ctl -D <pgdata> -m fast -w stop`, tolerating an already-stopped instance.
-///
-/// Assumes this process is the sole orchestrator of the target PGDATA (no
-/// concurrent `pg_ctl`): a non-zero exit with an absent `postmaster.pid` is
-/// treated as "already stopped".
-fn stop_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
-    let status = Command::new(pg_ctl)
-        .arg("stop")
-        .arg("-D")
-        .arg(pgdata)
-        .args(["-m", "fast", "-w"])
-        .status()
-        .map_err(|e| Error::other(format!("failed to spawn pg_ctl: {e}")))?;
-    if status.success() {
-        return Ok(());
-    }
-    // A non-zero exit may just mean "not running". Confirm via postmaster.pid.
-    if !pgdata.join("postmaster.pid").exists() {
-        return Ok(());
-    }
-    Err(Error::other(
-        "pg_ctl stop failed and postmaster.pid is still present",
-    ))
-}
-
-/// `pg_ctl -D <pgdata> -w start` for normal startup.
-fn start_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
-    let status = Command::new(pg_ctl)
-        .arg("start")
-        .arg("-D")
-        .arg(pgdata)
-        .arg("-w")
-        .status()
-        .map_err(|e| Error::other(format!("failed to spawn pg_ctl: {e}")))?;
-    if !status.success() {
-        return Err(Error::other(format!(
-            "pg_ctl start failed (exit: {status})"
-        )));
-    }
-    Ok(())
-}
-
-/// Derive a sibling binary (e.g. `psql`, `postgres`) of `pg_ctl`: same parent
-/// directory. Falls back to `name` on `PATH` if `pg_ctl` has no parent.
-fn sibling_binary(pg_ctl: &Path, name: &str) -> PathBuf {
-    match pg_ctl.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
-        _ => PathBuf::from(name),
-    }
 }
 
 /// Default `tiko_restore` path: the sibling of this `tiko_pitr` executable

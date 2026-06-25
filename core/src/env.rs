@@ -1,7 +1,15 @@
 use std::env;
 
-/// Environment variable for the Tiko root path (overrides default of `$PGDATA/tiko`).
-pub const ENV_TIKO_ROOT_PATH: &str = "TIKO_ROOT_PATH";
+/// Shared (remote) storage root — the storage tree all databases in a
+/// deployment share. S3Sim local filesystem now; real S3-compatible storage
+/// later. Parent and branch databases set this identically so a branch can
+/// read the parent's chunks (copy-on-write) via `ChunkRef.db_id`.
+pub const ENV_TIKO_STORAGE_ROOT: &str = "TIKO_STORAGE_ROOT";
+
+/// Per-database local path for non-shareable cache/state files
+/// (`base_manifest.tikm`, `draft.spill`, `chunk_cache`). Each database
+/// (parent or branch) uses its own value so these don't collide.
+pub const ENV_TIKO_LOCAL_PATH: &str = "TIKO_LOCAL_PATH";
 
 // Environment variable names for db identity (org_id, db_id, project_id).
 pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";

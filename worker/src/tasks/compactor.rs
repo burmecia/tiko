@@ -78,9 +78,7 @@ pub async fn compactor_task(store: &'static Store) {
         // don't race it. The checkpointer unpauses after its own compaction.
         if let Some(io_control) = IoControl::try_get() {
             if io_control.timeline.is_compaction_paused() {
-                relay_debug2(
-                    "tiko: compactor: paused for basebackup checkpoint — skipping tick",
-                );
+                relay_debug2("tiko: compactor: paused for basebackup checkpoint — skipping tick");
                 continue;
             }
         }

@@ -585,7 +585,11 @@ impl Manifest {
     /// Splitting the work lets the caller interleave the S3 PUT without
     /// holding the manifest lock, and ensures the local file is never
     /// published ahead of S3.
-    pub fn apply_segments(&self, segments: &[SegmentCheckpoint]) -> Result<AppliedManifest> {
+    pub fn apply_segments(
+        &self,
+        segments: &[SegmentCheckpoint],
+        db_id: u64,
+    ) -> Result<AppliedManifest> {
         debug_assert!(
             segments.windows(2).all(|w| w[0].ckpt <= w[1].ckpt),
             "segments must be in ascending Checkpoint order"
@@ -595,10 +599,10 @@ impl Manifest {
         //    from every segment. Track the highest segment ckpt to advance
         //    manifest metadata.
         //
-        //    The highest segment is checkpoint P — the point compaction
-        //    advances the base to. Carry its `redo_ckpt` and `pg_state` so the
-        //    new base manifest is a self-contained PITR base backup. With no
-        //    segments, keep `self`'s existing values.
+        // The highest segment is checkpoint P — the point compaction
+        // advances the base to. Carry its `redo_ckpt` and `pg_state` so the
+        // new base manifest is a self-contained PITR base backup. With no
+        // segments, keep `self`'s existing values.
         let (redo_ckpt, pg_state) = match segments.last() {
             Some(p) => (p.redo_ckpt, p.pg_state.clone()),
             None => (self.redo_ckpt, self.pg_state.clone()),
@@ -612,7 +616,7 @@ impl Manifest {
                 last_ckpt = seg.ckpt;
             }
             let cref = ChunkRef {
-                db_id: 0,
+                db_id,
                 timeline_id: seg.prev_ckpt.timeline_id.as_u32(),
                 lsn: seg.prev_ckpt.lsn,
             };
@@ -851,7 +855,7 @@ mod tests {
             ],
         );
 
-        let applied = base.apply_segments(&[s1, s2]).unwrap();
+        let applied = base.apply_segments(&[s1, s2], 34).unwrap();
         let base = base.commit_applied(applied).unwrap();
 
         // Chunk (1,0) only in s1 → prev_ckpt=0 → ChunkRef.lsn = 0.
@@ -895,7 +899,7 @@ mod tests {
             &[],
             &[(rf(1), RelForkMeta::new(0, true))], // relfork rf(1) dropped
         );
-        let applied = base.apply_segments(&[s1, s2]).unwrap();
+        let applied = base.apply_segments(&[s1, s2], 34).unwrap();
         let base = base.commit_applied(applied).unwrap();
 
         // Chunks for the deleted relfork were purged.
@@ -918,7 +922,7 @@ mod tests {
             &[tag(1, 0)],
             &[(rf(1), RelForkMeta::new(32, false))],
         );
-        let applied = base.apply_segments(&[s]).unwrap();
+        let applied = base.apply_segments(&[s], 34).unwrap();
         let base = base.commit_applied(applied).unwrap();
 
         let bytes = base.to_bytes().unwrap();
@@ -963,7 +967,7 @@ mod tests {
         );
         s2.chunks.insert(tag(2, 0));
 
-        let applied = base.apply_segments(&[s1, s2]).unwrap();
+        let applied = base.apply_segments(&[s1, s2], 34).unwrap();
         let base = base.commit_applied(applied).unwrap();
 
         // Inherited from the highest segment (s2 = checkpoint P).

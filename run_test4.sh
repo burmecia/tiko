@@ -7,7 +7,7 @@ set -e  # Exit on any error
 ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 
 # Set environment variables for Tiko configuration
-unset TIKO_ROOT_PATH
+unset TIKO_STORAGE_ROOT TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"

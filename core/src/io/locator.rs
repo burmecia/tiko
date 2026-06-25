@@ -30,13 +30,31 @@ impl Locator {
         )
     }
 
+    /// Like [`chunk`](Self::chunk) but addressing an arbitrary `db_id` within
+    /// this locator's org. Used by [`chunk_base`](Self::chunk_base) for
+    /// copy-on-write reads of chunks owned by another database (e.g. a branch
+    /// reading its parent's chunks via `ChunkRef.db_id`).
+    fn chunk_in_db(&self, tag: &ChunkTag, ckpt: &Checkpoint, db_id: u64) -> String {
+        let rf = tag.relfork();
+        format!(
+            "{org}/{db}/chunks/{ckpt}/{rf}/{chunk_id}",
+            org = self.ns.org_id,
+            db = db_id,
+            ckpt = ckpt.to_path_string(),
+            rf = rf,
+            chunk_id = tag.chunk_id
+        )
+    }
+
     pub(super) fn chunk_base(&self, tag: &ChunkTag, chunk_ref: &ChunkRef) -> String {
-        // The base manifest references chunks at their physical express
-        // prefix — the checkpoint LSN at which the chunk version was
-        // sealed. ChunkRef.timeline_id + ChunkRef.lsn reconstructs that
-        // prefix; the layout matches `chunk()` so reads share the path.
+        // The base manifest references a chunk version at the checkpoint LSN
+        // at which it was sealed (ChunkRef.timeline_id + ChunkRef.lsn). COW:
+        // the chunk lives in the OWNING database's namespace — `chunk_ref.db_id`
+        // — so a branch's base manifest (seeded from the parent) resolves
+        // shared chunks from the parent's namespace. `db_id` is always the
+        // real ENV_DB_ID of the writing database (never a placeholder).
         let ckpt = Checkpoint::new(TimelineId::from(chunk_ref.timeline_id), chunk_ref.lsn);
-        self.chunk(tag, &ckpt)
+        self.chunk_in_db(tag, &ckpt, chunk_ref.db_id)
     }
 
     // ── Base manifest keys ────────────────────────────

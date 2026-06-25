@@ -18,9 +18,9 @@
 
 use std::os::raw::{c_char, c_int};
 
-/// `char *DataDir` — read by [`pgsys::common::data_dir_path`] only when
-/// `TIKO_ROOT_PATH` is unset. Points at an empty C string so a stray read
-/// can't dereference null.
+/// `char *DataDir` — read by [`pgsys::common::data_dir_path`] only when both
+/// `TIKO_STORAGE_ROOT` and `TIKO_LOCAL_PATH` are unset. Points at an empty C
+/// string so a stray read can't dereference null.
 #[unsafe(no_mangle)]
 pub static mut DataDir: *const c_char = c"".as_ptr();
 

@@ -217,7 +217,7 @@ impl ChunkCache {
     // --- Cache file access ---
 
     fn cache_file_path() -> PathBuf {
-        crate::tiko_root_path().join("chunk_cache")
+        crate::local_path().join("chunk_cache")
     }
 
     fn cache_file() -> &'static File {
