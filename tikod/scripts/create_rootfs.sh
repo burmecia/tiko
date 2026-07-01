@@ -102,6 +102,20 @@ pip3 install --target /usr/lib/python3/dist-packages botocore >/dev/null 2>&1
 # Create s3 files mount point
 mkdir /mnt/s3files
 
+# S3 Files: AWS client config. The guest has no IMDS, so the efs-utils mount
+# helper reads credentials from /root/.aws/credentials (written after the
+# chroot, from env/creds-file, so the secret isn't in this committed script).
+mkdir -p /root/.aws
+cat > /root/.aws/config << 'AWS_CFG'
+[default]
+region = ap-southeast-2
+AWS_CFG
+: > /root/.aws/credentials
+chmod 600 /root/.aws/credentials
+
+# Monitor TLS mount health at boot.
+systemctl enable amazon-efs-mount-watchdog 2>/dev/null || true
+
 # Set timezone
 echo "UTC" > /etc/timezone
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
@@ -139,8 +153,41 @@ sudo cp -r $PG_INSTALL_DIR/* "$PG_TGT_DIR/"
 sudo cp "$SCRIPT_DIR/start_pg.sh" "$PG_HOME_DIR"
 sudo cp "$SCRIPT_DIR/../../postgresql.tiko.conf" "$PG_HOME_DIR"
 
+echo ">>> Configuring S3 Files auto-mount..."
+
+# Credentials: prefer env vars, else a gitignored assets/s3files-creds.env
+# (format: S3FILES_AWS_ACCESS_KEY_ID=... / S3FILES_AWS_SECRET_ACCESS_KEY=...).
+S3FILES_CREDS_ENV="$ASSETS_DIR/s3files-creds.env"
+if [ -z "${S3FILES_AWS_ACCESS_KEY_ID:-}" ] && [ -f "$S3FILES_CREDS_ENV" ]; then
+    . "$S3FILES_CREDS_ENV"
+fi
+if [ -n "${S3FILES_AWS_ACCESS_KEY_ID:-}" ] && [ -n "${S3FILES_AWS_SECRET_ACCESS_KEY:-}" ]; then
+    sudo tee "$ROOTFS/root/.aws/credentials" > /dev/null <<CREDS
+[default]
+aws_access_key_id = ${S3FILES_AWS_ACCESS_KEY_ID}
+aws_secret_access_key = ${S3FILES_AWS_SECRET_ACCESS_KEY}
+CREDS
+    sudo chmod 600 "$ROOTFS/root/.aws/credentials"
+    echo "    credentials baked in (IAM user tiko-s3files-vm)."
+else
+    echo "    WARNING: S3FILES_AWS_* not set and no assets/s3files-creds.env." >&2
+    echo "    /root/.aws/credentials left empty; S3 Files will NOT auto-mount." >&2
+fi
+
+# fstab: auto-mount at boot. _netdev waits for networking; nofail => no hang.
+S3FILES_FS_ID="${S3FILES_FS_ID:-fs-02b6905b6653757b6}"
+S3FILES_MT_IP="${S3FILES_MOUNT_TARGET_IP:-172.31.38.90}"   # ap-southeast-2a / apse2-az3
+sudo tee -a "$ROOTFS/etc/fstab" > /dev/null <<FSTAB_S3
+${S3FILES_FS_ID}:/ /mnt/s3files s3files _netdev,nofail,mounttargetip=${S3FILES_MT_IP},tls,iam 0 0
+FSTAB_S3
+
+# Ship the manual mount helper into the guest for ad-hoc use.
+sudo cp "$SCRIPT_DIR/mount_s3files_vm.sh" "$ROOTFS/usr/local/sbin/mount-s3files"
+sudo chmod +x "$ROOTFS/usr/local/sbin/mount-s3files"
+
 echo ">>> Verifying image..."
 sudo umount "$ROOTFS"
-e2fsck -f "$IMAGE"
+# -y: auto-answer yes so non-interactive builds don't abort on minor dirt.
+e2fsck -fy "$IMAGE"
 
 echo ">>> Done"
