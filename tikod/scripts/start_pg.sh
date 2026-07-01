@@ -3,36 +3,20 @@
 set -euo pipefail
 
 PGHOME=/var/lib/postgresql
+DB="tt"
 
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
 export TIKO_STORAGE_ROOT="$PGHOME/tiko_root"
-export TIKO_LOCAL_PATH="$PGHOME/toko_local"
+export TIKO_LOCAL_PATH="$PGHOME/tiko_local"
 
 cd $PGHOME
-rm -rf tt log.log
+rm -rf $DB log.log
 
-initdb -D tt
+initdb -D $DB
+cp postgresql.tiko.conf $DB
+echo "include_if_exists='postgresql.tiko.conf'" >> $DB/postgresql.conf
+echo "host all all 172.16.0.0/24 trust" >> $DB/pg_hba.conf
 
-echo >> tt/postgresql.conf << 'EOF'
-# Add settings for extensions here
-log_min_messages=debug1
-
-shared_preload_libraries=libtikoworker
-shared_buffers=256kB
-log_statement=all
-
-# WAL is streamed in real-time by the tikoworker background task.
-# archive_mode / archive_command are not used with Tiko.
-wal_level             = replica
-max_wal_senders       = 4      # ≥ 1 for the streaming task; +1 spare
-max_replication_slots = 4      # ≥ 1 for tiko_wal_stream; +1 spare
-
-# Safety valve: bounds pg_wal disk usage if streaming falls behind.
-# When hit, the slot is invalidated and a WAL gap results — size accordingly.
-max_slot_wal_keep_size = 1GB
-
-EOF
-
-pg_ctl -D tt -l log.log start
+pg_ctl -D $DB -l log.log start

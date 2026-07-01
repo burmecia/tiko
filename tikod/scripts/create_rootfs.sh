@@ -8,6 +8,7 @@ IMAGE="$ASSETS_DIR/ubuntu-24.04-rootfs.ext4"
 ROOTFS=/tmp/rootfs
 PG_INSTALL_DIR="$SCRIPT_DIR/../../target/pg-install"
 PG_TGT_DIR="$ROOTFS/usr/local"
+PG_HOME_DIR="$ROOTFS/var/lib/postgresql"
 
 echo ">>> Install debootstrap..."
 sudo apt update -qq
@@ -56,6 +57,19 @@ systemctl enable serial-getty@ttyS0.service
 sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
 systemctl enable ssh
 
+# Configure static networking for the Firecracker tap interface (see start_vm.sh)
+mkdir -p /etc/systemd/network
+cat > /etc/systemd/network/20-eth0.network << 'NETWORK'
+[Match]
+Name=eth0
+
+[Network]
+Address=172.16.0.2/24
+Gateway=172.16.0.1
+DNS=8.8.8.8
+NETWORK
+systemctl enable systemd-networkd
+
 # Set up fstab
 cat > /etc/fstab << 'FSTAB'
 /dev/vda  /     ext4  defaults,noatime  0 1
@@ -101,8 +115,8 @@ sudo umount "$ROOTFS/proc"
 
 echo ">>> Installing Postgres..."
 sudo cp -r $PG_INSTALL_DIR/* "$PG_TGT_DIR/"
-sudo cp "$SCRIPT_DIR/start_pg.sh" "$ROOTFS/var/lib/postgresql"
-sudo cp "$SCRIPT_DIR/../../postgresql.conf.sample" "$ROOTFS/var/lib/postgresql"
+sudo cp "$SCRIPT_DIR/start_pg.sh" "$PG_HOME_DIR"
+sudo cp "$SCRIPT_DIR/../../postgresql.tiko.conf" "$PG_HOME_DIR"
 
 echo ">>> Verifying image..."
 sudo umount "$ROOTFS"

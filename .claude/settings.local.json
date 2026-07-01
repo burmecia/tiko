@@ -12,7 +12,8 @@
       "Bash(git -C firecracker log --oneline -3)",
       "Bash(git -C firecracker rev-parse HEAD)",
       "Bash(git -C firecracker status --short)",
-      "Bash(git -C firecracker branch -a)"
+      "Bash(git -C firecracker branch -a)",
+      "Bash(nm /home/ubuntu/tiko/tikod/assets/vmlinux-6.1)"
     ]
   }
 }
