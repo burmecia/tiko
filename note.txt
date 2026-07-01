@@ -196,6 +196,29 @@ Partition locks	Spin RWLock (correct)	Keep as-is
 
 The background flusher and RAII pin are the two highest-value changes beyond the hash table fix. The background flusher eliminates the latency coupling; the RAII pin eliminates an entire class of bugs structurally rather than just detecting them at runtime.
 
+### Advancing the `postgres` submodule
+
+The `postgres` submodule is a fork at https://github.com/burmecia/postgres.git
+(branch `tiko-pg18`) carrying Tiko's changes on top of upstream REL_18_1.
+GitHub resolves the submodule pointer against this fork, so new commits must
+be pushed there before the parent pointer is bumped.
+
+To advance the submodule:
+
+1. Inside `postgres/`, make commits on the detached HEAD (or `tiko-pg18`):
+   `git -C postgres checkout tiko-pg18   # if you want a local branch`
+2. Push the new commits to the fork branch:
+   `git -C postgres push fork tiko-pg18`
+   (`fork` remote = git@github.com:burmecia/postgres.git; `origin` still
+   tracks upstream postgres/postgres for merging official updates.)
+3. Back in the parent repo, stage the new pointer and push:
+   `git add postgres && git commit -m "update postgres submodule" && git push origin main`
+
+Note: the submodule is a shallow clone (boundary = REL_18_1 tag), which is fine
+for pushing since the fork already has the full upstream base. To pull in a
+new upstream PG release, `git -C postgres fetch origin` then merge/rebase
+onto `tiko-pg18`.
+
 ### AWS SSH setup
 
 ```
