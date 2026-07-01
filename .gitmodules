@@ -1,6 +1,6 @@
 [submodule "postgres"]
 	path = postgres
-	url = https://github.com/postgres/postgres.git
+	url = https://github.com/burmecia/postgres.git
     shallow = true
 [submodule "firecracker"]
 	path = firecracker
