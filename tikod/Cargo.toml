@@ -1,0 +1,29 @@
+[package]
+name = "tikod"
+description = "Tiko compute control plane: microVM lifecycle, proxy, and orchestration"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[[bin]]
+name = "tikod"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+async-trait = "0.1"
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+arcbox-vz = { version = "0.4", features = ["macos-14"] }

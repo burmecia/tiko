@@ -1,5 +1,7 @@
 /target
 /tt
 /tiko_root
+/tikod/assets/*
 *.log
-tt_branch
+mem_file
+snapshot_file

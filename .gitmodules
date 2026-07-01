@@ -2,3 +2,6 @@
 	path = postgres
 	url = https://github.com/postgres/postgres.git
     shallow = true
+[submodule "firecracker"]
+	path = firecracker
+	url = https://github.com/firecracker-microvm/firecracker

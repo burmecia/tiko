@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test -p tikod)",
+      "Bash(cargo test -p s3worker -p tikod)",
+      "Bash(cargo test)",
+      "Bash(cargo build -p s3smgr)",
+      "Bash(cargo test -p s3worker)",
+      "Bash(cargo build -p tikod)",
+      "Bash(git config *)",
+      "Bash(git -C firecracker remote -v)",
+      "Bash(git -C firecracker log --oneline -3)",
+      "Bash(git -C firecracker rev-parse HEAD)",
+      "Bash(git -C firecracker status --short)",
+      "Bash(git -C firecracker branch -a)"
+    ]
+  }
+}

@@ -46,10 +46,16 @@ if ! (cargo build -p worker) >/dev/null; then
   exit 1
 fi
 
-# Copy the compiled library to the test directory for use in tests
-if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
+# Copy the compiled library to the test directory for use in tests.
+# Shared library suffix is platform-dependent (.dylib on macOS, .so on Linux).
+if [ "$(uname)" = "Darwin" ]; then
+    WORKER_LIB="libtikoworker.dylib"
+else
+    WORKER_LIB="libtikoworker.so"
+fi
+if [ -f "${TARGET_DIR}/debug/${WORKER_LIB}" ]; then
     echo "Copying Tiko Worker extension files ..."
-    cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${TEST_DIR}/worker"
+    cp "${TARGET_DIR}/debug/${WORKER_LIB}" "${TEST_DIR}/worker"
 fi
 
 echo "Running tests..."

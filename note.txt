@@ -195,3 +195,19 @@ Pin safety	assert!(prev > 0)	RAII PinnedSlot
 Partition locks	Spin RWLock (correct)	Keep as-is
 
 The background flusher and RAII pin are the two highest-value changes beyond the hash table fix. The background flusher eliminates the latency coupling; the RAII pin eliminates an entire class of bugs structurally rather than just detecting them at runtime.
+
+### AWS SSH setup
+
+```
+# AWS SSO configuration if no not set up yet
+# choose supabase-dev/LocalDev
+aws configure sso
+
+# SSH into the instance
+aws ec2-instance-connect ssh --profile LocalDev-436098097459 --instance-id i-0bb14f1e9e7f13682 --region ap-southeast-2 --connection-type eice --instance-ip 172.31.8.43 --os-user ubuntu
+
+# copy a file to the instance
+scp -o ProxyCommand='aws ec2-instance-connect open-tunnel --profile LocalDev-436098097459 --region ap-southeast-2 --instance-id %h' \
+    ~/tmp/tt.c ubuntu@i-0bb14f1e9e7f13682:/home/ubuntu/tmp
+
+```

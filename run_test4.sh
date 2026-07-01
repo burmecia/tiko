@@ -42,6 +42,10 @@ if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
     echo "Copying Tiko Worker extension files ..."
     cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${PG_LIB_DIR}"
 fi
+if [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
+    echo "Copying Tiko Worker extension files ..."
+    cp "${TARGET_DIR}/debug/libtikoworker.so" "${PG_LIB_DIR}"
+fi
 
 rm -rf tt log.log
 $PG_BIN_DIR/initdb -D tt
