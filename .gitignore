@@ -2,6 +2,7 @@
 /tt
 /tiko_root
 /tikod/assets/*
+!/tikod/assets/.gitkeep
 *.log
 mem_file
 snapshot_file
