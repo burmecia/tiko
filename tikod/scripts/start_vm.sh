@@ -27,4 +27,4 @@ sudo iptables -C FORWARD -i "$DEFAULT_IFACE" -o "$TAP_DEV" -m state --state RELA
     || sudo iptables -A FORWARD -i "$DEFAULT_IFACE" -o "$TAP_DEV" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 sudo rm -f $API_SOCKET
-sudo $FC_DIR/firecracker --api-sock $API_SOCKET --config-file $ASSETS_DIR/vm_config.json
+sudo $FC_DIR/firecracker --api-sock $API_SOCKET --config-file $SCRIPT_DIR/vm_config.json

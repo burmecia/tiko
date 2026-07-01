@@ -13,7 +13,18 @@
       "Bash(git -C firecracker rev-parse HEAD)",
       "Bash(git -C firecracker status --short)",
       "Bash(git -C firecracker branch -a)",
-      "Bash(nm /home/ubuntu/tiko/tikod/assets/vmlinux-6.1)"
+      "Bash(nm /home/ubuntu/tiko/tikod/assets/vmlinux-6.1)",
+      "Bash(losetup -a)",
+      "Bash(sudo e2fsck -f /home/ubuntu/tiko/tikod/assets/ubuntu-24.04-rootfs.ext4)",
+      "Bash(sudo e2fsck -fy /home/ubuntu/tiko/tikod/assets/ubuntu-24.04-rootfs.ext4)",
+      "Bash(sudo lsof /home/ubuntu/tiko/tikod/assets/ubuntu-24.04-rootfs.ext4)",
+      "Bash(sudo dmesg)",
+      "Bash(dd if=/dev/zero of=/home/ubuntu/tiko/tikod/assets/ubuntu-24.04-rootfs.ext4 bs=1M count=2048 status=none)",
+      "Bash(sync)",
+      "Bash(mkfs.ext4 -q /home/ubuntu/tiko/tikod/assets/ubuntu-24.04-rootfs.ext4)",
+      "Bash(apt-cache depends *)",
+      "Bash(debootstrap --print-debs --variant=minbase noble /tmp/nonexistent http://archive.ubuntu.com/ubuntu)",
+      "Bash(aws sts *)"
     ]
   }
 }

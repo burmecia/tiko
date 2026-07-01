@@ -15,16 +15,18 @@ sudo apt update -qq
 sudo apt install debootstrap -y >/dev/null 2>&1
 
 echo ">>> Create and mount the image..."
-dd if=/dev/zero of="$IMAGE" bs=1M count=1024
+dd if=/dev/zero of="$IMAGE" bs=1M count=2048
 mkfs.ext4 "$IMAGE"
 mkdir -p "$ROOTFS"
+sudo umount "$ROOTFS" >/dev/null 2>&1 || true
 sudo mount "$IMAGE" "$ROOTFS"
 
 echo ">>> Bootstrap Ubuntu 24.04 (Noble)..."
 sudo debootstrap \
     --arch=amd64 \
     --variant=minbase \
-    --include=systemd,systemd-sysv,udev,sudo,iproute2,iputils-ping,curl,vim,openssh-server \
+    --components=main,universe \
+    --include=systemd,systemd-sysv,udev,sudo,iproute2,iputils-ping,curl,vim,openssh-server,ca-certificates,wget,python3,python3-pip,python3-venv \
     noble \
     "$ROOTFS" \
     http://archive.ubuntu.com/ubuntu >/dev/null 2>&1
@@ -66,9 +68,15 @@ Name=eth0
 [Network]
 Address=172.16.0.2/24
 Gateway=172.16.0.1
-DNS=8.8.8.8
+DNS=1.1.1.1
 NETWORK
 systemctl enable systemd-networkd
+
+# minbase doesn't include systemd-resolved, so DNS= above isn't consumed by
+# anything - point resolv.conf at the same DNS server directly.
+cat > /etc/resolv.conf << 'RESOLV'
+nameserver 1.1.1.1
+RESOLV
 
 # Set up fstab
 cat > /etc/fstab << 'FSTAB'
@@ -84,6 +92,16 @@ deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe mult
 deb http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
 SOURCES
 
+# Install amazon-efs-utils (adds its own apt repo, then installs the package)
+export DEBIAN_FRONTEND=noninteractive
+curl -fsSL https://amazon-efs-utils.aws.com/efs-utils-installer.sh | sh -s -- --install
+
+# Install botocore
+pip3 install --target /usr/lib/python3/dist-packages botocore >/dev/null 2>&1
+
+# Create s3 files mount point
+mkdir /mnt/s3files
+
 # Set timezone
 echo "UTC" > /etc/timezone
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
@@ -93,6 +111,9 @@ find / -maxdepth 1 -name "*.usr-is-merged" -type d -delete
 
 # Create postgres user
 useradd --system --create-home --home-dir /var/lib/postgresql --shell /bin/bash postgres
+usermod -aG sudo postgres
+echo "postgres ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/postgres
+chmod 0440 /etc/sudoers.d/postgres
 
 # Set up Tiko env vars
 cat >> /var/lib/postgresql/.bash_profile << 'BASH_PROFILE'
