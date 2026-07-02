@@ -3,12 +3,13 @@
 set -euo pipefail
 
 PGHOME=/var/lib/postgresql
+S3FILES=/mnt/s3files
 DB="tt"
 
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
-export TIKO_STORAGE_ROOT="$PGHOME/tiko_root"
+export TIKO_STORAGE_ROOT="$S3FILES/tiko_root"
 export TIKO_LOCAL_PATH="$PGHOME/tiko_local"
 
 cd $PGHOME

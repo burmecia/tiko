@@ -15,7 +15,11 @@ sudo apt update -qq
 sudo apt install debootstrap -y >/dev/null 2>&1
 
 echo ">>> Create and mount the image..."
-dd if=/dev/zero of="$IMAGE" bs=1M count=2048
+# Sparse image: only blocks the guest actually writes consume host disk. Default
+# 5 GB (room for WAL + local cache); override with ROOTFS_SIZE_MB at build time.
+ROOTFS_SIZE_MB="${ROOTFS_SIZE_MB:-5120}"
+rm -f "$IMAGE"
+truncate -s "${ROOTFS_SIZE_MB}M" "$IMAGE"
 mkfs.ext4 "$IMAGE"
 mkdir -p "$ROOTFS"
 sudo umount "$ROOTFS" >/dev/null 2>&1 || true
@@ -100,7 +104,7 @@ curl -fsSL https://amazon-efs-utils.aws.com/efs-utils-installer.sh | sh -s -- --
 pip3 install --target /usr/lib/python3/dist-packages botocore >/dev/null 2>&1
 
 # Create s3 files mount point
-mkdir /mnt/s3files
+mkdir -p /mnt/s3files
 
 # S3 Files: AWS client config. The guest has no IMDS, so the efs-utils mount
 # helper reads credentials from /root/.aws/credentials (written after the
@@ -128,6 +132,27 @@ useradd --system --create-home --home-dir /var/lib/postgresql --shell /bin/bash 
 usermod -aG sudo postgres
 echo "postgres ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/postgres
 chmod 0440 /etc/sudoers.d/postgres
+
+# /mnt/s3files is mounted at boot (fstab); the mounted root inode is owned by
+# root, so chowning the bare mountpoint dir is hidden by the mount. Chown the
+# mounted root after it comes up. Root has ClientRootAccess, so it can chown
+# the root inode, and the new owner persists in S3 Files metadata across
+# remounts (idempotent). Skip gracefully if the mount is absent (nofail).
+cat > /etc/systemd/system/s3files-postgres-owner.service << 'UNIT'
+[Unit]
+Description=Make S3 Files mount (/mnt/s3files) writable by postgres
+After=mnt-s3files.mount
+
+[Service]
+Type=oneshot
+ConditionPathIsMountPoint=/mnt/s3files
+ExecStart=/bin/chown postgres:postgres /mnt/s3files
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable s3files-postgres-owner.service
 
 # Set up Tiko env vars
 cat >> /var/lib/postgresql/.bash_profile << 'BASH_PROFILE'

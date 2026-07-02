@@ -97,6 +97,12 @@ aws s3files list-mount-targets \
 4. Adds the fstab entry so the mount comes up at boot (see below).
 5. Copies `mount_s3files_vm.sh` into the guest as `/usr/local/sbin/mount-s3files`.
 6. Enables `amazon-efs-mount-watchdog` for TLS-mount health monitoring.
+7. Installs `s3files-postgres-owner.service`, a oneshot that runs after the
+   mount comes up and chowns `/mnt/s3files` to `postgres:postgres` so the
+   `postgres` user can write to it. The mounted root inode is normally owned by
+   root; chowning it works because the guest IAM identity has `ClientRootAccess`,
+   and the new ownership persists in S3 Files metadata across remounts (idempotent).
+   It is skipped via `ConditionPathIsMountPoint` if the mount is absent (`nofail`).
 
 fstab line added (env-overridable at build time via `S3FILES_FS_ID` /
 `S3FILES_MOUNT_TARGET_IP`):
