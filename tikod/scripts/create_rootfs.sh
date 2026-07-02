@@ -154,16 +154,23 @@ WantedBy=multi-user.target
 UNIT
 systemctl enable s3files-postgres-owner.service
 
-# Set up Tiko env vars
-cat >> /var/lib/postgresql/.bash_profile << 'BASH_PROFILE'
-export TIKO_ORG_ID="12"
-export TIKO_DB_ID="34"
-export TIKO_PROJECT_ID="56"
-export TIKO_STORAGE_ROOT=/var/lib/postgresql/tiko_root
-export TIKO_LOCAL_PATH=/var/lib/postgresql/tiko_local
+# Tiko identity + storage paths. tiko.env is the single source of truth,
+# sourced by .bash_profile (login shells) and start_pg.sh. start_vm.sh rewrites
+# it per-VM (host side) so each VM is a distinct project. These are the VM-0
+# defaults for the base image.
+cat > /var/lib/postgresql/tiko.env << 'TIKO_ENV'
+TIKO_ORG_ID=12
+TIKO_DB_ID=34
+TIKO_PROJECT_ID=56
+TIKO_STORAGE_ROOT=/mnt/s3files/tiko_root
+TIKO_LOCAL_PATH=/var/lib/postgresql/tiko_local
+TIKO_ENV
+
+cat > /var/lib/postgresql/.bash_profile << 'BASH_PROFILE'
+[ -f ~/tiko.env ] && set -a && . ~/tiko.env && set +a
 BASH_PROFILE
 
-chown postgres:postgres /var/lib/postgresql/.bash_profile
+chown postgres:postgres /var/lib/postgresql/tiko.env /var/lib/postgresql/.bash_profile
 
 EOF
 

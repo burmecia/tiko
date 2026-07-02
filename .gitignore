@@ -6,3 +6,5 @@
 *.log
 mem_file
 snapshot_file
+# Generated per-VM firecracker configs (start_vm.sh writes vm_config-<id>.json)
+tikod/scripts/vm_config-*.json
