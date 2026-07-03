@@ -155,9 +155,9 @@ UNIT
 systemctl enable s3files-postgres-owner.service
 
 # Tiko identity + storage paths. tiko.env is the single source of truth,
-# sourced by .bash_profile (login shells) and start_pg.sh. start_vm.sh rewrites
-# it per-VM (host side) so each VM is a distinct project. These are the VM-0
-# defaults for the base image.
+# sourced by .bash_profile (login shells) and the PG scripts (via tiko_env.sh).
+# start_vm.sh rewrites it per-VM (host side) so each VM is a distinct project.
+# These are the VM-0 defaults for the base image.
 cat > /var/lib/postgresql/tiko.env << 'TIKO_ENV'
 TIKO_ORG_ID=12
 TIKO_DB_ID=34
@@ -182,7 +182,8 @@ sudo umount "$ROOTFS/proc"
 
 echo ">>> Installing Postgres..."
 sudo cp -r $PG_INSTALL_DIR/* "$PG_TGT_DIR/"
-sudo cp "$SCRIPT_DIR/start_pg.sh" "$PG_HOME_DIR"
+sudo cp "$SCRIPT_DIR/start_pg.sh" "$SCRIPT_DIR/init_pg.sh" "$SCRIPT_DIR/tiko_env.sh" "$PG_HOME_DIR"
+sudo chmod +x "$PG_HOME_DIR/start_pg.sh" "$PG_HOME_DIR/init_pg.sh" "$PG_HOME_DIR/tiko_env.sh"
 sudo cp "$SCRIPT_DIR/../../postgresql.tiko.conf" "$PG_HOME_DIR"
 
 echo ">>> Configuring S3 Files auto-mount..."

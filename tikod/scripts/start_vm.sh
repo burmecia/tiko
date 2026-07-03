@@ -94,7 +94,8 @@ NETWORK
 # Per-VM hostname.
 echo "tiko-vm-${VM_ID}" | sudo tee "$ROOTFS_MNT/etc/hostname" >/dev/null
 
-# Per-VM Tiko identity (single source of truth, sourced by start_pg.sh + .bash_profile).
+# Per-VM Tiko identity (single source of truth, sourced by init_pg.sh /
+# start_pg.sh via tiko_env.sh, and by .bash_profile).
 sudo tee "$ROOTFS_MNT/var/lib/postgresql/tiko.env" >/dev/null <<TIKO_ENV
 TIKO_ORG_ID=${TIKO_ORG_ID}
 TIKO_DB_ID=${TIKO_DB_ID}

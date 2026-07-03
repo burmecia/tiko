@@ -1,40 +1,20 @@
 #!/bin/bash
 #
-# Initialize and start PostgreSQL inside the guest. Re-runnable: it wipes and
-# re-inits the data dir each boot.
+# Start PostgreSQL inside the guest. Assumes the data dir was initialized by
+# init_pg.sh. Safe to re-run: a no-op if the server is already running.
 #
-# Tiko identity (org/db/project) comes from /var/lib/postgresql/tiko.env, which
-# is written per-VM by start_vm.sh on the host. If absent (base-image / single-VM
-# case), defaults below are used. Inherited env vars win over the file, so
-# `TIKO_DB_ID=7 ./start_pg.sh` overrides.
+# Usage: /var/lib/postgresql/start_pg.sh
 
 set -euo pipefail
 
-PGHOME=/var/lib/postgresql
-S3FILES=/mnt/s3files
-DB="tt"
+. /var/lib/postgresql/tiko_env.sh
 
-# Per-VM identity from tiko.env (single source of truth, also sourced by
-# .bash_profile for login shells).
-if [ -f "$PGHOME/tiko.env" ]; then
-    set -a
-    . "$PGHOME/tiko.env"
-    set +a
+cd "$PGHOME"
+if [ ! -d "$DB" ]; then
+    echo "data dir $PGHOME/$DB not found — run init_pg.sh first" >&2
+    exit 1
 fi
-
-export TIKO_ORG_ID="${TIKO_ORG_ID:-12}"
-export TIKO_DB_ID="${TIKO_DB_ID:-34}"
-export TIKO_PROJECT_ID="${TIKO_PROJECT_ID:-56}"
-export TIKO_STORAGE_ROOT="${TIKO_STORAGE_ROOT:-$S3FILES/tiko_root}"
-export TIKO_LOCAL_PATH="${TIKO_LOCAL_PATH:-$PGHOME/tiko_local}"
-
-cd $PGHOME
-rm -rf $DB log.log
-
-initdb -D $DB
-cp postgresql.tiko.conf $DB
-echo "include_if_exists='postgresql.tiko.conf'" >> $DB/postgresql.conf
-# Trust connections from any per-VM subnet (172.16.0.0/16 covers 172.16.N.0/24).
-echo "host all all 172.16.0.0/16 trust" >> $DB/pg_hba.conf
-
-pg_ctl -D $DB -l log.log start
+if pg_ctl -D "$DB" status >/dev/null 2>&1; then
+    exit 0
+fi
+pg_ctl -D "$DB" -l log.log start

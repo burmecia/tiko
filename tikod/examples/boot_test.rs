@@ -203,7 +203,8 @@ async fn test_tcp_connect(ip: std::net::IpAddr, port: u16) -> Result<(), String>
     }
 }
 
-/// SSH into the VM (root:root) and run start_pg.sh as the postgres user.
+/// SSH into the VM (root:root) and initialize + start PostgreSQL as the
+/// postgres user.
 async fn ssh_start_pg(ip: std::net::IpAddr) -> Result<(), String> {
     let ssh_target = format!("root@{ip}");
     let ssh_opts: Vec<&str> = vec![
@@ -213,12 +214,12 @@ async fn ssh_start_pg(ip: std::net::IpAddr) -> Result<(), String> {
         "-o", "ConnectTimeout=5",
     ];
 
-    // Step 1: Run start_pg.sh as the postgres user.
-    tracing::debug!("Running start_pg.sh via SSH...");
+    // Step 1: Initialize the data dir, then start PostgreSQL.
+    tracing::debug!("Running init_pg.sh + start_pg.sh via SSH...");
     let output = tokio::process::Command::new("sshpass")
         .args(&ssh_opts)
         .arg(&ssh_target)
-        .arg("su - postgres -c /var/lib/postgresql/start_pg.sh 2>&1")
+        .arg("su - postgres -c '/var/lib/postgresql/init_pg.sh && /var/lib/postgresql/start_pg.sh' 2>&1")
         .output()
         .await
         .map_err(|e| format!("ssh spawn: {e}"))?;
@@ -227,12 +228,12 @@ async fn ssh_start_pg(ip: std::net::IpAddr) -> Result<(), String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(format!(
-            "start_pg.sh exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
+            "init/start_pg.sh exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
             output.status.code()
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    tracing::debug!("start_pg.sh: {stdout}");
+    tracing::debug!("init/start_pg.sh: {stdout}");
 
     // Step 2: Configure PG for remote access (listen_addresses + pg_hba trust).
     tracing::debug!("Configuring remote access...");
