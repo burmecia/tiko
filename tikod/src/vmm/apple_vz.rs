@@ -621,7 +621,8 @@ fn vz_worker_thread(
                                 std::fs::write(&snap_path, b"VZ_SNAPSHOT_STUB").ok();
                                 Ok(Snapshot {
                                     vm_id: vm_id.clone(),
-                                    state_path: snap_path,
+                                    state_path: snap_path.clone(),
+                                    mem_path: snap_path.with_extension("mem"),
                                     config: entry.config.clone(),
                                 })
                             }

@@ -97,8 +97,13 @@ pub struct DriveConfig {
 pub struct Snapshot {
     /// ID of the VM this snapshot belongs to.
     pub vm_id: VmId,
-    /// Path to the memory/state file on the host.
+    /// Path to the microVM-state file on the host (Firecracker `snapshot_path`).
     pub state_path: PathBuf,
+    /// Path to the guest-memory file on the host (Firecracker `mem_file_path`).
+    ///
+    /// Carried explicitly so `restore` does not depend on a path-naming
+    /// convention (the snapshot can be moved/renamed without breaking it).
+    pub mem_path: PathBuf,
     /// VM config at the time of snapshot (needed for restore).
     pub config: VmConfig,
 }

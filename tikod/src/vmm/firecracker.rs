@@ -19,7 +19,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
@@ -176,35 +175,102 @@ impl FcApiClient {
 // Networking helpers
 // ============================================================================
 
-/// IP address counter for allocating per-VM subnets.
-static IP_COUNTER: AtomicU64 = AtomicU64::new(2);
+/// Maximum number of concurrently distinct VM networks. The vm_index (derived
+/// from the vm_id's trailing integer) doubles as the tap-name suffix and the
+/// 3rd octet of the `172.16.{N}.0/24` subnet, so it must fit in a byte and
+/// stay within the script-compatible range [0, 250].
+const MAX_VM_INDEX: u32 = 250;
 
-/// Allocate the next guest IP (10.0.N.2) and host gateway (10.0.N.1).
-fn alloc_ip() -> (IpAddr, IpAddr, String) {
-    let n = IP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let guest = format!("10.0.{n}.2");
-    let gateway = format!("10.0.{n}.1");
-    let subnet = format!("10.0.{n}.0/24");
-    (
-        guest.parse().expect("valid IP"),
-        gateway.parse().expect("valid IP"),
-        subnet,
-    )
+/// Derive a deterministic vm_index from the trailing decimal digits of `vm_id`.
+///
+/// This mirrors the scripts' `VM_ID` model: tap name, subnet, and guest MAC
+/// are all keyed off a single small integer. Because the same vm_id always
+/// maps to the same index, `create_vm` and `restore_vm` attach the VM to the
+/// same subnet the guest was originally configured for — which is required
+/// because the guest's static network config (baked into the rootfs) is
+/// snapshot/restored verbatim.
+///
+/// `vm_id` must therefore end in a unique integer in `[0, MAX_VM_INDEX]`.
+fn vm_index_from_id(vm_id: &str) -> VmmResult<u8> {
+    let digits: String = vm_id
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        return Err(VmmError::InvalidConfig(format!(
+            "vm_id '{vm_id}' must end in a unique integer in [0,{MAX_VM_INDEX}] \
+             (used to derive tap name / subnet / guest MAC)"
+        )));
+    }
+    let n: u32 = digits
+        .parse()
+        .map_err(|_| VmmError::InvalidConfig(format!("invalid vm_id index: {digits}")))?;
+    if n > MAX_VM_INDEX {
+        return Err(VmmError::InvalidConfig(format!(
+            "vm_id index must be <= {MAX_VM_INDEX} (got {n})"
+        )));
+    }
+    Ok(n as u8)
 }
 
-/// Create a TAP device and configure NAT.
+/// Per-VM host networking parameters, derived deterministically from vm_index.
+struct VmNet {
+    tap_name: String,
+    guest_ip: IpAddr,
+    gateway_ip: IpAddr,
+    /// NAT subnet in CIDR notation, e.g. `172.16.5.0/24`.
+    subnet: String,
+    /// Guest MAC, e.g. `AA:FC:00:00:00:07`.
+    guest_mac: String,
+}
+
+/// Derive tap / guest IP / gateway / subnet / MAC from a vm_index.
+///
+/// Layout (matches `tikod/scripts/start_vm.sh`):
+///   tap{N}  172.16.{N}.2 (guest)  172.16.{N}.1 (host gw)  AA:FC:00:00:00:{N+2:02x}
+fn derive_net(vm_index: u8) -> VmNet {
+    let n = vm_index as u32;
+    VmNet {
+        tap_name: format!("tiko-tap-{n}"),
+        guest_ip: format!("172.16.{n}.2").parse().expect("valid guest IP"),
+        gateway_ip: format!("172.16.{n}.1").parse().expect("valid gateway IP"),
+        subnet: format!("172.16.{n}.0/24"),
+        guest_mac: format!("AA:FC:00:00:00:{:02x}", n + 2),
+    }
+}
+
+/// Create a TAP device and configure NAT. Idempotent: if the tap or NAT rule
+/// already exists (e.g. left over from a crashed run), it is reused rather
+/// than causing a failure. Mirrors `start_vm.sh`'s `ip link show` /
+/// `iptables -C` guards.
 fn create_tap(tap_name: &str, gateway_ip: &str, subnet: &str) -> VmmResult<()> {
-    run_cmd("ip", &["tuntap", "add", tap_name, "mode", "tap"])?;
-    run_cmd(
-        "ip",
-        &["addr", "add", &format!("{gateway_ip}/24"), "dev", tap_name],
-    )?;
+    let tap_exists = run_shell(&format!("ip link show {tap_name} >/dev/null 2>&1")).is_ok();
+    if !tap_exists {
+        run_cmd("ip", &["tuntap", "add", tap_name, "mode", "tap"])?;
+    }
+    // (Re)add the address; ignore "RTNETLINK answers: File exists".
+    let _ = run_shell(&format!(
+        "ip addr add {gateway_ip}/24 dev {tap_name} 2>/dev/null || true"
+    ));
     run_cmd("ip", &["link", "set", tap_name, "up"])?;
-    // NAT for outgoing traffic.
-    run_cmd(
-        "iptables",
-        &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
-    )?;
+    // NAT for outgoing traffic (add only if the rule isn't already present).
+    let nat_present = run_shell(&format!(
+        "iptables -t nat -C POSTROUTING -s {subnet} -j MASQUERADE 2>/dev/null"
+    ))
+    .is_ok();
+    if !nat_present {
+        run_cmd(
+            "iptables",
+            &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
+        )?;
+    }
+    // Ensure the host forwards packets between the tap and the default route.
+    // Idempotent.
+    let _ = run_shell("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1");
     Ok(())
 }
 
@@ -235,6 +301,171 @@ fn run_cmd(program: &str, args: &[&str]) -> VmmResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Run a shell snippet (passed to `sudo sh -c`) and return its combined
+/// output as a String, failing on non-zero exit.
+fn run_shell(snippet: &str) -> VmmResult<String> {
+    let output = std::process::Command::new("sudo")
+        .arg("-n")
+        .arg("sh")
+        .arg("-c")
+        .arg(snippet)
+        .output()
+        .map_err(|e| VmmError::Backend(format!("spawn sh: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(VmmError::Backend(format!("sh failed: {stderr}")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Ensure the current user can open `/dev/kvm`.
+///
+/// Firecracker is launched unprivileged (as the current user, unlike the
+/// scripts which use `sudo`), so it inherits this process's KVM access. If
+/// the user is not in the `kvm` group and there is no ACL, `create_vm` would
+/// fail with "Permission denied" on the KVM object. We self-grant access
+/// using the passwordless `sudo` the VMM already requires for tap/iptables:
+/// prefer `setfacl` (least privilege); fall back to `chmod 666` if `setfacl`
+/// is unavailable, with a warning that a udev rule is the persistent fix.
+fn ensure_kvm_access() {
+    const KVM: &str = "/dev/kvm";
+    let can_open = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(KVM)
+        .is_ok();
+    if can_open {
+        return;
+    }
+
+    let user = std::env::var("USER").unwrap_or_default();
+    let setfacl_ok = if !user.is_empty() {
+        run_shell(&format!("setfacl -m u:{user}:rw {KVM} 2>/dev/null")).is_ok()
+            && std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(KVM)
+                .is_ok()
+    } else {
+        false
+    };
+    if setfacl_ok {
+        info!(user = %user, "granted KVM access via setfacl on {KVM}");
+        return;
+    }
+
+    match run_shell(&format!("chmod 666 {KVM}")) {
+        Ok(_) => warn!(
+            "{KVM} was not accessible as the current user; fell back to `chmod 666` \
+             (setfacl unavailable). Add a udev rule or the kvm group membership for \
+             persistence across reboots."
+        ),
+        Err(e) => warn!(
+            "could not grant KVM access on {KVM}: {e}. \
+             create_vm will likely fail with a KVM permission error — ensure the \
+             service user is in the `kvm` group."
+        ),
+    }
+}
+
+/// Make a per-VM rootfs copy at `dest` from the base image `src`.
+///
+/// ext4 is single-writer: two VMs booted against the same read-write image
+/// would corrupt it. We therefore sparse-copy the base image once per VM
+/// (matching `start_vm.sh`) and reuse the copy on restart for speed.
+///
+/// The copy is made as the **current user** (no sudo) so that Firecracker —
+/// which `spawn_firecracker` also launches as the current user — can open the
+/// backing file. (The scripts run FC as root via sudo and so can use a
+/// root-owned copy; this VMM keeps FC unprivileged and aligns ownership with
+/// that.)
+fn copy_rootfs_per_vm(src: &Path, dest: &Path) -> VmmResult<()> {
+    if dest.exists() {
+        debug!(dest = %dest.display(), "per-VM rootfs copy already exists, reusing");
+        return Ok(());
+    }
+    if !src.exists() {
+        return Err(VmmError::InvalidConfig(format!(
+            "base rootfs not found: {}",
+            src.display()
+        )));
+    }
+    info!(src = %src.display(), dest = %dest.display(), "copying base rootfs (sparse)");
+    // Plain `cp --sparse=always` (no sudo): creates a current-user-owned copy.
+    let output = std::process::Command::new("cp")
+        .arg("--sparse=always")
+        .arg(src)
+        .arg(dest)
+        .output()
+        .map_err(|e| VmmError::Backend(format!("spawn cp: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(VmmError::Backend(format!("sparse cp failed: {stderr}")));
+    }
+    Ok(())
+}
+
+/// Inject the per-VM static network config into the rootfs copy.
+///
+/// The base image ships `20-eth0.network` hard-wired for `172.16.0.2` (see
+/// `create_rootfs.sh`). systemd-networkd uses that file and ignores the
+/// kernel `ip=` cmdline, so for any vm_index != 0 we must overwrite it with
+/// the VM's own `172.16.{N}.2/24` config — otherwise the guest comes up on
+/// the wrong subnet and is unreachable. Mirrors `start_vm.sh` (network +
+/// hostname injection via a temporary mount).
+fn inject_guest_net(rootfs: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
+    let mnt = run_shell("mktemp -d")?;
+    let mnt = mnt.trim_end_matches('\n');
+    // Ensure the mountpoint is cleaned up no matter how we exit.
+    let cleanup = |mnt: &str| {
+        let _ = run_shell(&format!("umount {mnt} 2>/dev/null; rmdir {mnt} 2>/dev/null"));
+    };
+
+    let guest_cidr = match net.guest_ip {
+        IpAddr::V4(v4) => format!("{v4}/24"),
+        _ => {
+            cleanup(mnt);
+            return Err(VmmError::Backend("guest IP must be IPv4".into()));
+        }
+    };
+    let gateway = net.gateway_ip.to_string();
+
+    let net_unit = format!(
+        "[Match]\nName=eth0\n\n[Network]\nAddress={guest_cidr}\nGateway={gateway}\nDNS=1.1.1.1\n"
+    );
+    let hostname = format!("tiko-vm-{vm_index}");
+
+    // Mount (sudo), write the network unit + hostname, unmount.
+    let mount_ok = run_shell(&format!("mount {} {mnt}", shell_quote(rootfs))).is_ok();
+    if !mount_ok {
+        cleanup(mnt);
+        return Err(VmmError::Backend(format!(
+            "failed to mount rootfs copy {} for net injection",
+            rootfs.display()
+        )));
+    }
+
+    let write_err = (|| {
+        run_shell(&format!(
+            "tee {mnt}/etc/systemd/network/20-eth0.network >/dev/null <<'NETUNIT'\n{net_unit}NETUNIT"
+        ))?;
+        run_shell(&format!(
+            "echo {hostname} > {mnt}/etc/hostname"
+        ))?;
+        Ok::<(), VmmError>(())
+    })();
+    cleanup(mnt);
+    write_err?;
+    debug!(rootfs = %rootfs.display(), guest = %net.guest_ip, "injected per-VM network config");
+    Ok(())
+}
+
+/// Single-quote a path for safe inclusion in a shell command. We only ever
+/// pass absolute paths we constructed ourselves, so this is belt-and-suspenders.
+fn shell_quote(p: &Path) -> String {
+    format!("'{}'", p.display())
 }
 
 // ============================================================================
@@ -282,7 +513,6 @@ pub struct FirecrackerVmm {
     runtime_dir: PathBuf,
     firecracker_bin: PathBuf,
     vms: StdMutex<HashMap<VmId, FcVmEntry>>,
-    vm_counter: AtomicU64,
 }
 
 impl FirecrackerVmm {
@@ -290,6 +520,8 @@ impl FirecrackerVmm {
         let runtime_dir = snapshot_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir).ok();
         std::fs::create_dir_all(&snapshot_dir).ok();
+
+        ensure_kvm_access();
 
         let fc_bin = std::env::var("FIRECRACKER_BIN").unwrap_or_else(|_| {
             "/home/ubuntu/tiko/firecracker/build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker"
@@ -301,7 +533,6 @@ impl FirecrackerVmm {
             runtime_dir,
             firecracker_bin: PathBuf::from(fc_bin),
             vms: StdMutex::new(HashMap::new()),
-            vm_counter: AtomicU64::new(0),
         }
     }
 
@@ -351,29 +582,25 @@ impl FirecrackerVmm {
     }
 
     /// Configure a newly spawned Firecracker VM via REST API.
+    ///
+    /// The JSON shape matches `tikod/scripts/vm_config-0.json` (the
+    /// verified-working reference). The guest IP is NOT passed on the kernel
+    /// cmdline — systemd-networkd reads the static config baked into the
+    /// rootfs copy (see `inject_guest_net`), so `boot_args` is used verbatim.
     async fn configure_vm(
         client: &FcApiClient,
         config: &VmConfig,
         tap_name: &str,
+        guest_mac: &str,
         serial_log: &Path,
     ) -> VmmResult<()> {
         // Boot source.
-        let mut boot_args = config.kernel_cmdline.clone();
-        // Add static IP config if not already in cmdline.
-        if !boot_args.contains("10.0.") {
-            boot_args = format!(
-                "{boot_args} ip=10.0.{}.2::10.0.{}.1:255.255.255.0:tiko:eth0:off",
-                ip_third_octet(config),
-                ip_third_octet(config),
-            );
-        }
-
         client
             .put(
                 "/boot-source",
                 &json!({
                     "kernel_image_path": config.kernel_path.to_string_lossy(),
-                    "boot_args": boot_args,
+                    "boot_args": config.kernel_cmdline,
                 }),
             )
             .await?;
@@ -385,6 +612,9 @@ impl FirecrackerVmm {
                 &json!({
                     "vcpu_count": config.vcpus,
                     "mem_size_mib": config.memory_mb,
+                    "smt": false,
+                    "track_dirty_pages": false,
+                    "huge_pages": "None",
                 }),
             )
             .await?;
@@ -398,6 +628,8 @@ impl FirecrackerVmm {
                     "path_on_host": config.rootfs_path.to_string_lossy(),
                     "is_root_device": true,
                     "is_read_only": false,
+                    "cache_type": "Unsafe",
+                    "io_engine": "Sync",
                 }),
             )
             .await?;
@@ -417,12 +649,13 @@ impl FirecrackerVmm {
                 .await?;
         }
 
-        // Network interface (TAP device).
+        // Network interface (TAP device) with a deterministic guest MAC.
         client
             .put(
                 "/network-interfaces/eth0",
                 &json!({
                     "iface_id": "eth0",
+                    "guest_mac": guest_mac,
                     "host_dev_name": tap_name,
                 }),
             )
@@ -449,12 +682,6 @@ impl FirecrackerVmm {
     }
 }
 
-/// Extract the third octet from the guest IP (for boot args).
-fn ip_third_octet(_config: &VmConfig) -> u64 {
-    // Default; actual value comes from alloc_ip and is set on the entry.
-    IP_COUNTER.load(Ordering::SeqCst) - 1
-}
-
 #[async_trait]
 impl Vmm for FirecrackerVmm {
     async fn create_vm(&self, config: VmConfig) -> VmmResult<VmId> {
@@ -474,44 +701,46 @@ impl Vmm for FirecrackerVmm {
             )));
         }
 
-        // Allocate networking.
-        let (guest_ip, gateway_ip, subnet) = alloc_ip();
-        let vm_num = self.vm_counter.fetch_add(1, Ordering::SeqCst);
-        let tap_name = format!("tiko-tap-{vm_num}");
+        // Deterministic per-VM networking keyed off the vm_id's trailing index.
+        let vm_index = vm_index_from_id(&vm_id)?;
+        let net = derive_net(vm_index);
         let serial_log = self.runtime_dir.join(format!("{vm_id}.console.log"));
 
-        info!(vm_id = %vm_id, tap = %tap_name, guest_ip = %guest_ip, "creating Firecracker VM");
+        info!(
+            vm_id = %vm_id, index = vm_index, tap = %net.tap_name,
+            guest_ip = %net.guest_ip, mac = %net.guest_mac,
+            "creating Firecracker VM"
+        );
 
-        // Create TAP device + NAT.
-        debug!(vm_id = %vm_id, tap = %tap_name, "creating TAP device");
-        create_tap(&tap_name, &gateway_ip.to_string(), &subnet)?;
+        // Per-VM rootfs copy (ext4 is single-writer). The VM attaches this
+        // copy, never the shared base image.
+        let rootfs_copy = self.snapshot_dir.join(format!("rootfs-{vm_index}.ext4"));
+        copy_rootfs_per_vm(&config.rootfs_path, &rootfs_copy)?;
+        inject_guest_net(&rootfs_copy, &net, vm_index)?;
+
+        // Create TAP device + NAT. On failure we leave the per-VM rootfs copy
+        // in place for a fast retry (it is reused by the next create_vm).
+        create_tap(&net.tap_name, &net.gateway_ip.to_string(), &net.subnet)?;
 
         // Spawn Firecracker process.
         let (child, api_sock) = match self.spawn_firecracker(&vm_id) {
             Ok(result) => result,
             Err(e) => {
-                destroy_tap(&tap_name, &subnet);
+                destroy_tap(&net.tap_name, &net.subnet);
                 return Err(e);
             }
         };
 
-        // Configure via REST API.
-        debug!(vm_id = %vm_id, "configuring via REST API");
+        // Configure via REST API. Build a config whose rootfs_path points at
+        // the per-VM copy so Firecracker attaches the copy, not the base.
+        let mut vm_config = config.clone();
+        vm_config.rootfs_path = rootfs_copy;
         let client = FcApiClient::new(&api_sock);
-        // Update the IP counter reference for the boot args.
-        IP_COUNTER.store(vm_num + 2, Ordering::SeqCst);
-
-        // Build boot args with the correct IP.
-        let mut full_config = config.clone();
-        let n = vm_num + 2;
-        full_config.kernel_cmdline = format!(
-            "{} ip=10.0.{n}.2::10.0.{n}.1:255.255.255.0:tiko:eth0:off",
-            full_config.kernel_cmdline
-        );
-
-        if let Err(e) = Self::configure_vm(&client, &full_config, &tap_name, &serial_log).await {
+        if let Err(e) =
+            Self::configure_vm(&client, &vm_config, &net.tap_name, &net.guest_mac, &serial_log).await
+        {
             warn!(vm_id = %vm_id, error = %e, "configure_vm failed");
-            destroy_tap(&tap_name, &subnet);
+            destroy_tap(&net.tap_name, &net.subnet);
             let _ = std::fs::remove_file(&api_sock);
             return Err(e);
         }
@@ -523,11 +752,11 @@ impl Vmm for FirecrackerVmm {
             FcVmEntry {
                 child: Some(child),
                 api_sock,
-                tap_name,
-                subnet,
+                tap_name: net.tap_name,
+                subnet: net.subnet,
                 serial_log,
                 config,
-                guest_ip,
+                guest_ip: net.guest_ip,
                 state: VmState::Stopped,
             },
         );
@@ -628,6 +857,7 @@ impl Vmm for FirecrackerVmm {
         Ok(Snapshot {
             vm_id: vm_id.clone(),
             state_path: snap_path,
+            mem_path,
             config,
         })
     }
@@ -638,38 +868,70 @@ impl Vmm for FirecrackerVmm {
         if !snapshot.state_path.exists() {
             return Err(VmmError::SnapshotNotFound(vm_id));
         }
+        if !snapshot.mem_path.exists() {
+            return Err(VmmError::SnapshotNotFound(vm_id));
+        }
 
-        // For restore, we need the mem file path derived from the snapshot path.
-        let mem_path = snapshot.state_path.with_extension("mem");
+        // Precondition: the original VM must be stopped first. Resuming while
+        // the original still holds the RW rootfs-{N}.ext4 would corrupt it
+        // (the snapshot references that same file). Mirrors resume_vm.sh.
+        {
+            let vms = self.vms.lock().unwrap();
+            if vms.contains_key(&vm_id) {
+                return Err(VmmError::InvalidState {
+                    vm_id: vm_id.clone(),
+                    current: vms[&vm_id].state,
+                    expected: VmState::Stopped,
+                });
+            }
+        }
 
-        // Allocate new networking with same name.
-        let (guest_ip, gateway_ip, subnet) = alloc_ip();
-        let tap_name = format!("tiko-tap-0");
+        // Same deterministic networking the VM was created with: the guest's
+        // static config (baked into the rootfs copy, carried in memory across
+        // the snapshot) expects exactly this subnet.
+        let vm_index = vm_index_from_id(&vm_id)?;
+        let net = derive_net(vm_index);
 
-        debug!(vm_id = %vm_id, tap = %tap_name, gateway = %gateway_ip, "creating TAP for restore");
-        create_tap(&tap_name, &gateway_ip.to_string(), &subnet)?;
+        debug!(
+            vm_id = %vm_id, tap = %net.tap_name, gateway = %net.gateway_ip,
+            "creating TAP for restore"
+        );
+        create_tap(&net.tap_name, &net.gateway_ip.to_string(), &net.subnet)?;
 
-        // Spawn a fresh Firecracker process.
+        // Spawn a fresh Firecracker process (no config-file: the snapshot
+        // already encodes the full device config).
         let (child, api_sock) = match self.spawn_firecracker(&vm_id) {
             Ok(result) => result,
             Err(e) => {
-                destroy_tap(&tap_name, &subnet);
+                destroy_tap(&net.tap_name, &net.subnet);
                 return Err(e);
             }
         };
 
         debug!(vm_id = %vm_id, snapshot = %snapshot.state_path.display(), "loading snapshot");
         let client = FcApiClient::new(&api_sock);
-        client
+        // `mem_backend` is the current Firecracker API shape (the older
+        // `mem_file_path` top-level field is rejected by recent builds).
+        // `resume_vm: false` — restore returns Paused per the Vmm trait
+        // contract; the caller resumes explicitly.
+        if let Err(e) = client
             .put(
                 "/snapshot/load",
                 &json!({
                     "snapshot_path": snapshot.state_path.to_string_lossy(),
-                    "mem_file_path": mem_path.to_string_lossy(),
+                    "mem_backend": {
+                        "backend_type": "File",
+                        "backend_path": snapshot.mem_path.to_string_lossy(),
+                    },
                     "resume_vm": false,
                 }),
             )
-            .await?;
+            .await
+        {
+            warn!(vm_id = %vm_id, error = %e, "snapshot load failed");
+            destroy_tap(&net.tap_name, &net.subnet);
+            return Err(e);
+        }
         debug!(vm_id = %vm_id, "snapshot loaded");
 
         let serial_log = self.runtime_dir.join(format!("{vm_id}.console.log"));
@@ -679,11 +941,11 @@ impl Vmm for FirecrackerVmm {
             FcVmEntry {
                 child: Some(child),
                 api_sock,
-                tap_name,
-                subnet,
+                tap_name: net.tap_name,
+                subnet: net.subnet,
                 serial_log,
                 config: snapshot.config.clone(),
-                guest_ip,
+                guest_ip: net.guest_ip,
                 state: VmState::Paused,
             },
         );
