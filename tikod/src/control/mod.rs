@@ -44,6 +44,10 @@ pub struct VmRecord {
     pub connection_count: u32,
     /// Snapshot ID if the VM is paused/snapshotted.
     pub snapshot_id: Option<String>,
+    /// Last time the guest agent pushed a metrics report.
+    pub last_report_at: Option<Instant>,
+    /// Last metrics report body (raw JSON from the agent).
+    pub last_metrics: Option<serde_json::Value>,
 }
 
 /// Configuration for the idle (auto-pause) policy.
@@ -95,6 +99,8 @@ impl Control {
                 last_active_at: Instant::now(),
                 connection_count: 0,
                 snapshot_id: None,
+                last_report_at: None,
+                last_metrics: None,
             },
         );
     }
@@ -158,6 +164,19 @@ impl Control {
     pub fn set_snapshot(&self, vm_id: &VmId, snapshot_id: String) {
         if let Some(mut rec) = self.vms.get_mut(vm_id) {
             rec.snapshot_id = Some(snapshot_id);
+        }
+    }
+
+    /// Store a metrics report from the guest agent. Returns `true` if the VM
+    /// was found in the registry, `false` if it's unknown (caller should 404).
+    pub fn record_report(&self, vm_id: &VmId, metrics: serde_json::Value) -> bool {
+        if let Some(mut rec) = self.vms.get_mut(vm_id) {
+            rec.last_report_at = Some(Instant::now());
+            rec.last_metrics = Some(metrics);
+            debug!(vm_id = %vm_id, "recorded metrics report");
+            true
+        } else {
+            false
         }
     }
 }

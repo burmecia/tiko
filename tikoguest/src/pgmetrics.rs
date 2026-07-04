@@ -131,7 +131,7 @@ impl PgMetrics {
                 FROM pg_stat_database WHERE datname = $1) AS cache_hit_ratio, \
               pg_current_wal_lsn()::text AS wal_lsn";
 
-        match client.query_one(&sql, &[&self.config.db_name]).await {
+        match client.query_one(sql, &[&self.config.db_name]).await {
             Ok(row) => {
                 let cache_hit_ratio: Option<f64> = row
                     .try_get("cache_hit_ratio")

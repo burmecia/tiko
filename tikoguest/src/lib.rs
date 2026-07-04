@@ -7,6 +7,7 @@
 
 pub mod env;
 pub mod http;
+pub mod observer;
 pub mod pgmetrics;
 pub mod pgops;
 pub mod server;

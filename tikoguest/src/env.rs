@@ -80,6 +80,18 @@ pub fn default_tiko_env_path(data_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("tiko.env"))
 }
 
+/// Look up a var with inherited-env > tiko-env-map > None precedence. For keys
+/// not in the defaults list (e.g. `TIKO_VM_ID`, `TIKOD_ADDR`) — the map is the
+/// result of [`load_tiko_env`], which already includes file-forwarded `TIKO_*`
+/// keys. Returns `None` if the var is absent or empty in both sources.
+pub fn lookup_optional(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| map.get(key).cloned())
+        .filter(|v| !v.is_empty())
+}
+
 /// Parse a `KEY=VALUE` env file (the format `start_vm.sh` writes for
 /// `tiko.env`). Blank lines and `#` comments are skipped. Errors are logged and
 /// yield an empty map rather than failing startup.

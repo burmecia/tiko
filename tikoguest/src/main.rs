@@ -1,14 +1,20 @@
 //! `tikoguest` — guest-side agent for tikod.
 //!
-//! Runs inside each Tiko VM as the `postgres` user. Exposes `pg_ctl` lifecycle
-//! operations (start/stop/restart/reload) and `postgresql.tiko.conf` reads/writes
-//! over a small HTTP/1.1 API on the guest network. tikod calls this agent over
-//! the VM's guest IP to control the database.
+//! Runs inside each Tiko VM as the `postgres` user. Serves:
+//! - **Inbound HTTP API** (tikod → agent): `pg_ctl` lifecycle, config R/W.
+//! - **Observer loop** (agent → tikod): periodic PG metrics push to
+//!   `POST /vms/{id}/reports`.
 //!
 //! ```text
 //! tikod ──HTTP──→ guest:9000 ──→ tikoguest ──→ pg_ctl / postgresql.tiko.conf
 //!                                       └──→ Postgres (PGDATA=/var/lib/postgresql/tt)
+//!
+//! tikoguest ──HTTP──→ tikod /vms/{id}/reports   (observer: metrics push)
 //! ```
+//!
+//! The observer loop starts only when `TIKO_VM_ID` and `TIKOD_ADDR` are
+//! available (from `tiko.env` or the process env). Without them the agent
+//! still serves its HTTP API — useful for testing and fresh VMs.
 //!
 //! Every path is overridable, so the agent is fully testable outside a VM:
 //! point `--pg-ctl` at a fake script and `--data-dir` at a temp dir.
@@ -16,10 +22,15 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use tikoguest::env;
+use tikoguest::http::HttpClient;
+use tikoguest::observer;
+use tikoguest::pgmetrics::{PgMetrics, PgMetricsConfig};
 use tikoguest::pgops::PgCtl;
 use tikoguest::server::PgServer;
 
@@ -58,6 +69,15 @@ struct Args {
     /// `<data_dir_parent>/tiko.env`. The resolved vars are passed to postgres.
     #[arg(long, env = "TIKO_ENV_FILE")]
     tiko_env: Option<PathBuf>,
+
+    /// Observer loop interval (seconds). 0 disables the observer.
+    #[arg(long, default_value_t = 30, env = "TIKOGUEST_OBSERVE_INTERVAL")]
+    observe_interval: u64,
+
+    /// libpq connection string for metrics collection. Defaults to the unix
+    /// socket as the `postgres` user, database `tt`.
+    #[arg(long, env = "TIKOGUEST_PG_CONN")]
+    pg_conn: Option<String>,
 }
 
 #[tokio::main]
@@ -89,6 +109,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting tikoguest agent"
     );
 
+    // ── Background tasks ───────────────────────────────────────────────────
+    //
+    // The observer loop pushes PG metrics to tikod. It only starts when the
+    // agent knows its own VM ID and tikod's address — both come from tiko.env
+    // (written by start_vm.sh) or the process env. Without them the agent
+    // still serves its HTTP API (useful for testing and fresh VMs).
+
+    if args.observe_interval > 0 {
+        let tiko_env = ctl.tiko_env();
+        let vm_id = env::lookup_optional(tiko_env, "TIKO_VM_ID");
+        let tikod_addr = env::lookup_optional(tiko_env, "TIKOD_ADDR");
+
+        match (vm_id, tikod_addr) {
+            (Some(vm_id), Some(addr)) => {
+                let Ok(tikod_addr) = addr.parse::<SocketAddr>() else {
+                    tracing::warn!(addr = %addr, "TIKOD_ADDR is not a valid SocketAddr — observer disabled");
+                    return start_server(listen_addr, ctl).await;
+                };
+
+                let pg_config = match &args.pg_conn {
+                    Some(conn) => PgMetricsConfig {
+                        connection_string: conn.clone(),
+                        db_name: "tt".into(),
+                    },
+                    None => PgMetricsConfig::default(),
+                };
+                let pg_metrics = PgMetrics::new(pg_config);
+                let tikod_client = HttpClient::new(tikod_addr);
+
+                tracing::info!(
+                    vm_id = %vm_id,
+                    tikod = %tikod_addr,
+                    interval_secs = args.observe_interval,
+                    "starting observer loop"
+                );
+                tokio::spawn(observer::observer_loop(
+                    pg_metrics,
+                    vm_id,
+                    tikod_client,
+                    Duration::from_secs(args.observe_interval),
+                ));
+            }
+            _ => {
+                tracing::info!(
+                    "observer loop disabled — TIKO_VM_ID or TIKOD_ADDR not set \
+                     (agent still serves HTTP API)"
+                );
+            }
+        }
+    }
+
+    start_server(listen_addr, ctl).await
+}
+
+async fn start_server(listen_addr: SocketAddr, ctl: PgCtl) -> Result<(), Box<dyn std::error::Error>> {
     let server = Arc::new(PgServer::new(ctl));
     server.run(listen_addr).await?;
     Ok(())

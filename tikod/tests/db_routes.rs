@@ -458,3 +458,51 @@ async fn get_vms_merges_live_and_registry() {
     assert!(paused["state"].is_null(), "scaled-to-zero state should be null");
     assert!(paused["guest_ip"].is_null(), "scaled-to-zero guest_ip should be null");
 }
+
+/// `POST /vms/{id}/reports` stores agent-pushed metrics in the control registry.
+/// `GET /vms` then surfaces `last_report_secs_ago` + the raw metrics.
+#[tokio::test]
+async fn post_reports_stores_metrics() {
+    let vmm: Arc<dyn Vmm> = Arc::new(MockVmm {
+        guest_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        known: ["vm-1".to_string()].into_iter().collect(),
+    });
+    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-report-test")));
+    let control = Arc::new(Control::new(IdlePolicy::default()));
+    control.register("vm-1".into(), "acme".into(), "main".into(), 5432);
+
+    let server = Arc::new(ApiServer::new(node, control));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+
+    // POST a metrics report for a registered VM → 204.
+    let body = serde_json::json!({
+        "available": true,
+        "connections": 3,
+        "active_backends": 1,
+        "long_running_tx": 0,
+        "db_size_bytes": 1048576,
+        "cache_hit_ratio": 0.99,
+        "wal_lsn": "0/3000000"
+    });
+    let (status, resp) = api_request(api_addr, "POST", "/vms/vm-1/reports", Some(&body.to_string())).await;
+    assert_eq!(status, 204, "{resp}");
+
+    // GET /vms shows the report info.
+    let (status, list_body) = api_request(api_addr, "GET", "/vms", None).await;
+    assert_eq!(status, 200, "{list_body}");
+    assert!(list_body.contains(r#""connections":3"#), "{list_body}");
+    assert!(list_body.contains(r#""wal_lsn":"0/3000000""#), "{list_body}");
+    assert!(list_body.contains(r#""last_report_secs_ago""#), "{list_body}");
+
+    // POST to an unregistered VM → 404.
+    let (status, _) = api_request(api_addr, "POST", "/vms/vm-ghost/reports", Some(&body.to_string())).await;
+    assert_eq!(status, 404);
+
+    // POST with invalid JSON → 400.
+    let (status, _) = api_request(api_addr, "POST", "/vms/vm-1/reports", Some("not json")).await;
+    assert_eq!(status, 400);
+}

@@ -35,8 +35,8 @@
 //!
 //! All `/vms/{vm_id}/db/*` routes resolve the VM's guest IP via the Vmm layer,
 //! then proxy to that guest's `tikoguest` agent (`guest_ip:agent_port`, default
-//! 9000 — see [`DEFAULT_AGENT_PORT`](crate::guestcontrol::DEFAULT_AGENT_PORT)). The
-//! agent's status code and structured error body are forwarded verbatim.
+//! 9000 — see [`DEFAULT_AGENT_PORT`](crate::guestcontrol::DEFAULT_AGENT_PORT)).
+//! The agent's status code and structured error body are forwarded verbatim.
 //!
 //! | Method | Path                            | Agent endpoint | Returns / Body                                            |
 //! |--------|---------------------------------|----------------|-----------------------------------------------------------|
@@ -49,6 +49,12 @@
 //! | `POST` | `/vms/{vm_id}/db/reload`        | `/pg/reload`   | 204                                                       |
 //! | `GET`  | `/vms/{vm_id}/db/config`        | `/pg/config`   | `{"settings":{name:value,...}}`                           |
 //! | `PUT`  | `/vms/{vm_id}/db/config`        | `/pg/config`   | 204  body: `{"settings":{name:value}}` (then reloads)     |
+//!
+//! # Agent-inbound routes (pushed by the guest `tikoguest` agent)
+//!
+//! | Method | Path                            | From            | Returns / Body                              |
+//! |--------|---------------------------------|-----------------|---------------------------------------------|
+//! | `POST` | `/vms/{vm_id}/reports`          | observer loop   | 204  body: metrics JSON (404 if unregistered) |
 //!
 //! # Error responses
 //!
@@ -212,7 +218,7 @@ impl ApiServer {
         method: &str,
         vm_id: &VmId,
         rest: &[&str],
-        _req: &Request,
+        req: &Request,
     ) -> Response {
         let vmm = self.node.vmm();
         match (method, rest) {
@@ -257,9 +263,35 @@ impl ApiServer {
                 }
                 Err(e) => err_resp(&e),
             },
+
+            // Agent-inbound: metrics report from the guest's observer loop.
+            ("POST", ["reports"]) => self.record_report(vm_id, req).await,
+
             _ => {
                 let path = format!("/vms/{vm_id}/{}", rest.join("/"));
                 not_found(method, &path)
+            }
+        }
+    }
+
+    /// `POST /vms/{vm_id}/reports` — receives a metrics report from the guest
+    /// agent's observer loop. Stores it in the control registry; returns 404
+    /// if the VM isn't registered.
+    async fn record_report(&self, vm_id: &VmId, req: &Request) -> Response {
+        let metrics: serde_json::Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return bad_request("invalid report body; expected JSON metrics"),
+        };
+        if self.control.record_report(vm_id, metrics) {
+            no_content()
+        } else {
+            Response {
+                status: 404,
+                body: serde_json::json!({
+                    "error": {"kind": "not_found", "message": format!("VM {vm_id} not registered")}
+                })
+                .to_string()
+                .into_bytes(),
             }
         }
     }
@@ -292,6 +324,8 @@ impl ApiServer {
                     "branch_id": rec.map(|r| r.branch_id.clone()),
                     "connection_count": rec.map(|r| r.connection_count),
                     "snapshot_id": rec.and_then(|r| r.snapshot_id.clone()),
+                    "last_report_secs_ago": rec.and_then(|r| r.last_report_at.map(|t| t.elapsed().as_secs())),
+                    "last_metrics": rec.and_then(|r| r.last_metrics.clone()),
                 }),
             );
         }
@@ -309,6 +343,8 @@ impl ApiServer {
                     "branch_id": rec.branch_id,
                     "connection_count": rec.connection_count,
                     "snapshot_id": rec.snapshot_id,
+                    "last_report_secs_ago": rec.last_report_at.map(|t| t.elapsed().as_secs()),
+                    "last_metrics": rec.last_metrics.clone(),
                 }),
             );
         }
@@ -627,6 +663,15 @@ fn no_content() -> Response {
     Response {
         status: 204,
         body: Vec::new(),
+    }
+}
+
+fn bad_request(message: &str) -> Response {
+    Response {
+        status: 400,
+        body: serde_json::json!({"error": {"kind": "bad_request", "message": message}})
+            .to_string()
+            .into_bytes(),
     }
 }
 
