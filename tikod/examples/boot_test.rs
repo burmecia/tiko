@@ -1,8 +1,9 @@
-//! Firecracker VMM lifecycle integration test.
+//! Firecracker VMM lifecycle integration test — driven over the HTTP control API.
 //!
-//! Exercises every method of the `Vmm` trait against `FirecrackerVmm`,
-//! including a parallel concurrency stage that proves multiple VMs can be
-//! managed simultaneously without IP / tap / socket / rootfs collisions.
+//! Starts an in-process `ApiServer` (backed by `FirecrackerVmm`) on an ephemeral
+//! port, then exercises every method of the `Vmm` trait via [`ApiClient`] over
+//! real HTTP — the same surface an external orchestrator would use. This is an
+//! end-to-end test of the API layer, not a direct VMM call test.
 //!
 //! ```text
 //! Stage A–E  single-VM full lifecycle   create→start→pause→resume→snapshot→destroy→restore→resume→destroy
@@ -32,10 +33,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
+use tikod::api::{ApiClient, ApiServer};
+use tikod::control::{Control, IdlePolicy};
+use tikod::node::Node;
 use tikod::vmm::firecracker::FirecrackerVmm;
-use tikod::vmm::{Snapshot, VmConfig, VmmError, VmState, Vmm};
+use tikod::vmm::{Snapshot, VmConfig, VmmError, VmState};
 
 /// Kernel cmdline for the two-drive overlay model. No `root=` is needed: the
 /// initramfs (`assets/tiko-initramfs.cpio.gz`) assembles an overlayfs root from
@@ -81,24 +85,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_dir)?;
     tracing::info!(data_dir = %data_dir.display(), "boot test data dir");
 
-    let vmm: Arc<FirecrackerVmm> = Arc::new(FirecrackerVmm::new(data_dir));
+    // ── Stand up the HTTP control API in-process ───────────────────────────
+    //
+    // The test talks to tikod the same way an external orchestrator would:
+    // raw HTTP/JSON over TCP. Binding to :0 yields an ephemeral port so the
+    // test never collides with a concurrently running tikod.
+    let vmm: Arc<FirecrackerVmm> = Arc::new(FirecrackerVmm::new(data_dir.clone()));
+    let node = Arc::new(Node::new(vmm, data_dir.join("snapshots")));
+    let control = Arc::new(Control::new(IdlePolicy::default()));
+
+    let api_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let api_addr = api_listener.local_addr()?;
+    tracing::info!(api_addr = %api_addr, "starting in-process API server");
+
+    let api_server = Arc::new(ApiServer::new(node, control));
+    let server_handle = {
+        let api_server = api_server.clone();
+        tokio::spawn(async move {
+            let _ = api_server.serve(api_listener).await;
+        })
+    };
+
+    let client = ApiClient::new(api_addr);
 
     // ── Stage A–E: single-VM full lifecycle ────────────────────────────────
     stage("A-E: single-VM full lifecycle");
-    full_lifecycle(&vmm, "fc-single-10", &kernel, &rootfs, &initrd).await?;
+    full_lifecycle(&client, "fc-single-10", &kernel, &rootfs, &initrd).await?;
 
     // ── Stage F: error paths ───────────────────────────────────────────────
     stage("F: error paths");
-    stage_errors(&vmm, &kernel, &rootfs, &initrd).await?;
+    stage_errors(&client, &kernel, &rootfs, &initrd).await?;
 
     // ── Stage G: concurrency (3 VMs in parallel) ───────────────────────────
     stage("G: concurrency (3 VMs in parallel)");
-    stage_concurrency(&vmm, &kernel, &rootfs, &initrd).await?;
+    stage_concurrency(&client, &kernel, &rootfs, &initrd).await?;
 
     // ── Stage H: idempotency ───────────────────────────────────────────────
     stage("H: idempotency");
-    stage_idempotency(&vmm, &kernel, &rootfs, &initrd).await?;
+    stage_idempotency(&client, &kernel, &rootfs, &initrd).await?;
 
+    server_handle.abort();
     tracing::info!("=== ALL STAGES PASSED ===");
     Ok(())
 }
@@ -114,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// (reachable) → pause → snapshot → destroy → restore → resume →
 /// (reachable) → destroy
 async fn full_lifecycle(
-    vmm: &FirecrackerVmm,
+    client: &ApiClient,
     vm_id: &str,
     kernel: &Path,
     rootfs: &Path,
@@ -124,19 +150,20 @@ async fn full_lifecycle(
     let config = make_config(vm_id, kernel, rootfs, initrd);
 
     // A. create + start.
-    let id = vmm
+    let id = client
         .create_vm(config)
         .await
         .map_err(|e| format!("create_vm({vm_id}): {e}"))?;
-    assert_state(vmm, &id, VmState::Stopped).await?;
+    assert_state(client, &id, VmState::Stopped).await?;
 
-    vmm.start_vm(&id)
+    client
+        .start_vm(&id)
         .await
         .map_err(|e| format!("start_vm({vm_id}): {e}"))?;
-    assert_state(vmm, &id, VmState::Running).await?;
+    assert_state(client, &id, VmState::Running).await?;
 
     // Reachability via vm_guest_ip + TCP 22 (sshd).
-    let ip = vmm
+    let ip = client
         .vm_guest_ip(&id)
         .await
         .map_err(|e| format!("vm_guest_ip({vm_id}): {e}"))?
@@ -145,24 +172,27 @@ async fn full_lifecycle(
     await_port_open(ip, 22, Duration::from_secs(90)).await?;
 
     // B. pause → unreachable → resume → reachable.
-    vmm.pause_vm(&id)
+    client
+        .pause_vm(&id)
         .await
         .map_err(|e| format!("pause_vm({vm_id}): {e}"))?;
-    assert_state(vmm, &id, VmState::Paused).await?;
+    assert_state(client, &id, VmState::Paused).await?;
     await_port_closed(ip, 22, Duration::from_secs(20)).await?;
 
-    vmm.resume_vm(&id)
+    client
+        .resume_vm(&id)
         .await
         .map_err(|e| format!("resume_vm({vm_id}): {e}"))?;
-    assert_state(vmm, &id, VmState::Running).await?;
+    assert_state(client, &id, VmState::Running).await?;
     await_port_open(ip, 22, Duration::from_secs(30)).await?;
 
     // C. snapshot (must be Paused first).
-    vmm.pause_vm(&id)
+    client
+        .pause_vm(&id)
         .await
         .map_err(|e| format!("pause_vm before snapshot ({vm_id}): {e}"))?;
-    assert_state(vmm, &id, VmState::Paused).await?;
-    let snap = vmm
+    assert_state(client, &id, VmState::Paused).await?;
+    let snap = client
         .snapshot_vm(&id)
         .await
         .map_err(|e| format!("snapshot_vm({vm_id}): {e}"))?;
@@ -185,28 +215,31 @@ async fn full_lifecycle(
     );
 
     // D. destroy.
-    vmm.destroy_vm(&id)
+    client
+        .destroy_vm(&id)
         .await
         .map_err(|e| format!("destroy_vm({vm_id}): {e}"))?;
-    assert_gone(vmm, &id).await?;
+    assert_gone(client, &id).await?;
 
     // E. restore → resume → reachable. Same deterministic IP (vm_id unchanged).
-    let restored = vmm
+    let restored = client
         .restore_vm(&snap)
         .await
         .map_err(|e| format!("restore_vm({vm_id}): {e}"))?;
-    assert_state(vmm, &restored, VmState::Paused).await?;
-    vmm.resume_vm(&restored)
+    assert_state(client, &restored, VmState::Paused).await?;
+    client
+        .resume_vm(&restored)
         .await
         .map_err(|e| format!("resume_vm(restored {vm_id}): {e}"))?;
-    assert_state(vmm, &restored, VmState::Running).await?;
+    assert_state(client, &restored, VmState::Running).await?;
     await_port_open(ip, 22, Duration::from_secs(30)).await?;
 
     // Cleanup.
-    vmm.destroy_vm(&restored)
+    client
+        .destroy_vm(&restored)
         .await
         .map_err(|e| format!("destroy_vm(restored {vm_id}): {e}"))?;
-    assert_gone(vmm, &restored).await?;
+    assert_gone(client, &restored).await?;
 
     tracing::info!("--- lifecycle OK: {vm_id} ---");
     Ok(())
@@ -218,7 +251,7 @@ async fn full_lifecycle(
 
 /// Verify the documented error variants are returned for misuse.
 async fn stage_errors(
-    vmm: &FirecrackerVmm,
+    client: &ApiClient,
     kernel: &Path,
     rootfs: &Path,
     initrd: &Path,
@@ -227,38 +260,40 @@ async fn stage_errors(
     let ghost = "ghost-99".to_string();
     expect_err(
         "vm_state(unknown)",
-        vmm.vm_state(&ghost).await,
+        client.vm_state(&ghost).await,
         |e| matches!(e, VmmError::VmNotFound(_)),
         "VmNotFound",
     );
     expect_err(
         "pause_vm(unknown)",
-        vmm.pause_vm(&ghost).await,
+        client.pause_vm(&ghost).await,
         |e| matches!(e, VmmError::VmNotFound(_)),
         "VmNotFound",
     );
     expect_err(
         "destroy_vm(unknown)",
-        vmm.destroy_vm(&ghost).await,
+        client.destroy_vm(&ghost).await,
         |e| matches!(e, VmmError::VmNotFound(_)),
         "VmNotFound",
     );
 
     // 2. snapshot_vm on a Running VM (not Paused) → InvalidState.
-    let id = vmm
+    let id = client
         .create_vm(make_config("err-snap-11", kernel, rootfs, initrd))
         .await
         .map_err(|e| format!("create_vm(err-snap-11): {e}"))?;
-    vmm.start_vm(&id)
+    client
+        .start_vm(&id)
         .await
         .map_err(|e| format!("start_vm(err-snap-11): {e}"))?;
     expect_err(
         "snapshot_vm(Running)",
-        vmm.snapshot_vm(&id).await,
+        client.snapshot_vm(&id).await,
         |e| matches!(e, VmmError::InvalidState { .. }),
         "InvalidState",
     );
-    vmm.destroy_vm(&id)
+    client
+        .destroy_vm(&id)
         .await
         .map_err(|e| format!("destroy_vm(err-snap-11): {e}"))?;
 
@@ -271,34 +306,37 @@ async fn stage_errors(
     };
     expect_err(
         "restore_vm(missing file)",
-        vmm.restore_vm(&bogus).await,
+        client.restore_vm(&bogus).await,
         |e| matches!(e, VmmError::SnapshotNotFound(_)),
         "SnapshotNotFound",
     );
 
     // 4. restore_vm while the original VM is still live → InvalidState
     //    (the snapshot and the live VM would share one RW overlay).
-    let id = vmm
+    let id = client
         .create_vm(make_config("err-restore-12", kernel, rootfs, initrd))
         .await
         .map_err(|e| format!("create_vm(err-restore-12): {e}"))?;
-    vmm.start_vm(&id)
+    client
+        .start_vm(&id)
         .await
         .map_err(|e| format!("start_vm(err-restore-12): {e}"))?;
-    vmm.pause_vm(&id)
+    client
+        .pause_vm(&id)
         .await
         .map_err(|e| format!("pause_vm(err-restore-12): {e}"))?;
-    let snap = vmm
+    let snap = client
         .snapshot_vm(&id)
         .await
         .map_err(|e| format!("snapshot_vm(err-restore-12): {e}"))?;
     expect_err(
         "restore_vm(while original live)",
-        vmm.restore_vm(&snap).await,
+        client.restore_vm(&snap).await,
         |e| matches!(e, VmmError::InvalidState { .. }),
         "InvalidState",
     );
-    vmm.destroy_vm(&id)
+    client
+        .destroy_vm(&id)
         .await
         .map_err(|e| format!("destroy_vm(err-restore-12): {e}"))?;
 
@@ -312,10 +350,11 @@ async fn stage_errors(
 
 /// Run `full_lifecycle` for 3 VMs concurrently via `tokio::spawn` (true
 /// parallelism on the multi-thread runtime). The headline check that the
-/// VMM handles multiple simultaneous VM lifecycles with no resource
-/// collisions (distinct taps, subnets, sockets, and per-VM rootfs copies).
+/// API server + VMM handle multiple simultaneous VM lifecycles with no
+/// resource collisions (distinct taps, subnets, sockets, and per-VM rootfs
+/// copies).
 async fn stage_concurrency(
-    vmm: &Arc<FirecrackerVmm>,
+    client: &ApiClient,
     kernel: &Path,
     rootfs: &Path,
     initrd: &Path,
@@ -325,12 +364,12 @@ async fn stage_concurrency(
 
     let mut handles = Vec::with_capacity(N);
     for vm_id in vm_ids {
-        let vmm = vmm.clone();
+        let client = client.clone();
         let kernel = kernel.to_path_buf();
         let rootfs = rootfs.to_path_buf();
         let initrd = initrd.to_path_buf();
         handles.push(tokio::spawn(async move {
-            full_lifecycle(&vmm, vm_id, &kernel, &rootfs, &initrd).await
+            full_lifecycle(&client, vm_id, &kernel, &rootfs, &initrd).await
         }));
     }
 
@@ -359,44 +398,48 @@ async fn stage_concurrency(
 /// (do not hard-fail) the behavior of double start / double pause — either an
 /// Ok no-op or a well-formed error is acceptable; a panic/hang is not.
 async fn stage_idempotency(
-    vmm: &FirecrackerVmm,
+    client: &ApiClient,
     kernel: &Path,
     rootfs: &Path,
     initrd: &Path,
 ) -> Result<(), String> {
-    let id = vmm
+    let id = client
         .create_vm(make_config("fc-idem-13", kernel, rootfs, initrd))
         .await
         .map_err(|e| format!("create_vm(fc-idem-13): {e}"))?;
 
-    vmm.start_vm(&id)
+    client
+        .start_vm(&id)
         .await
         .map_err(|e| format!("start_vm(fc-idem-13): {e}"))?;
-    assert_state(vmm, &id, VmState::Running).await?;
+    assert_state(client, &id, VmState::Running).await?;
 
-    match vmm.start_vm(&id).await {
+    match client.start_vm(&id).await {
         Ok(()) => tracing::info!("start_vm(Running) → Ok (treated as idempotent)"),
         Err(e) => tracing::info!("start_vm(Running) → Err (acceptable): {e}"),
     }
-    assert_state(vmm, &id, VmState::Running).await?;
+    assert_state(client, &id, VmState::Running).await?;
 
-    vmm.pause_vm(&id)
+    client
+        .pause_vm(&id)
         .await
         .map_err(|e| format!("pause_vm(fc-idem-13): {e}"))?;
-    assert_state(vmm, &id, VmState::Paused).await?;
-    match vmm.pause_vm(&id).await {
+    assert_state(client, &id, VmState::Paused).await?;
+    match client.pause_vm(&id).await {
         Ok(()) => tracing::info!("pause_vm(Paused) → Ok (treated as idempotent)"),
         Err(e) => tracing::info!("pause_vm(Paused) → Err (acceptable): {e}"),
     }
-    assert_state(vmm, &id, VmState::Paused).await?;
+    assert_state(client, &id, VmState::Paused).await?;
 
-    vmm.resume_vm(&id)
+    client
+        .resume_vm(&id)
         .await
         .map_err(|e| format!("resume_vm(fc-idem-13): {e}"))?;
-    vmm.destroy_vm(&id)
+    client
+        .destroy_vm(&id)
         .await
         .map_err(|e| format!("destroy_vm(fc-idem-13): {e}"))?;
-    assert_gone(vmm, &id).await?;
+    assert_gone(client, &id).await?;
 
     tracing::info!("--- idempotency observations collected ---");
     Ok(())
@@ -434,13 +477,13 @@ fn make_config(vm_id: &str, kernel: &Path, rootfs: &Path, initrd: &Path) -> VmCo
 /// synchronously after each successful Firecracker API call, so this usually
 /// succeeds on the first probe.
 async fn assert_state(
-    vmm: &FirecrackerVmm,
+    client: &ApiClient,
     vm_id: &str,
     expected: VmState,
 ) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match vmm.vm_state(&vm_id.to_string()).await {
+        match client.vm_state(&vm_id.to_string()).await {
             Ok(s) if s == expected => return Ok(()),
             Ok(s) if Instant::now() >= deadline => {
                 return Err(format!(
@@ -454,8 +497,8 @@ async fn assert_state(
 }
 
 /// Assert that `vm_id` is no longer known to the VMM (post-destroy).
-async fn assert_gone(vmm: &FirecrackerVmm, vm_id: &str) -> Result<(), String> {
-    match vmm.vm_state(&vm_id.to_string()).await {
+async fn assert_gone(client: &ApiClient, vm_id: &str) -> Result<(), String> {
+    match client.vm_state(&vm_id.to_string()).await {
         Err(VmmError::VmNotFound(_)) => Ok(()),
         Ok(s) => Err(format!(
             "assert_gone({vm_id}): expected VmNotFound, still {s}"

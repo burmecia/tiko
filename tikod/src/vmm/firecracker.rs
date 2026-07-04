@@ -665,7 +665,8 @@ struct FcVmEntry {
     tap_name: String,
     /// NAT subnet (e.g., "10.0.2.0/24").
     subnet: String,
-    /// Serial console log file path.
+    /// Serial console log file path (retained for debugging; not yet read back).
+    #[allow(dead_code)]
     serial_log: PathBuf,
     /// VM configuration.
     config: VmConfig,

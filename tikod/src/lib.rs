@@ -15,6 +15,7 @@
 //!                                    └── snapshot cache (local disk)
 //! ```
 
+pub mod api;
 pub mod config;
 pub mod control;
 pub mod node;

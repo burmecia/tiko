@@ -6,6 +6,7 @@
 //! Options:
 //!   --data-dir <PATH>      Directory for snapshots and runtime artifacts
 //!   --listen <ADDR>        Address for the PG proxy to listen on (default: 127.0.0.1:5432)
+//!   --api-listen <ADDR>    Address for the HTTP control API (default: 127.0.0.1:9000)
 //!   --idle-timeout <SECS>  Auto-pause after N seconds of inactivity (default: 300)
 //!   --backend <NAME>       Force a VMM backend: auto|vz|firecracker (default: auto)
 //! ```
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use tikod::api::ApiServer;
 use tikod::config::TikodConfig;
 use tikod::control::{Control, IdlePolicy};
 use tikod::node::Node;
@@ -35,6 +37,10 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:5432")]
     listen: String,
 
+    /// Address for the HTTP control API (VM lifecycle).
+    #[arg(long, default_value = "127.0.0.1:9000")]
+    api_listen: String,
+
     /// Auto-pause after N seconds of inactivity.
     #[arg(long, default_value_t = 300)]
     idle_timeout: u64,
@@ -51,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build configuration.
     let listen_addr: SocketAddr = args.listen.parse()?;
+    let api_listen_addr: SocketAddr = args.api_listen.parse()?;
     let data_dir = PathBuf::from(&args.data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
@@ -68,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         data_dir = %config.data_dir.display(),
         listen = %config.proxy.listen_addr,
+        api_listen = %api_listen_addr,
         idle_timeout = config.idle_policy.idle_timeout_secs,
         platform = std::env::consts::OS,
         "starting tikod"
@@ -82,6 +90,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create control plane.
     let control = Arc::new(Control::new(config.idle_policy.clone()));
+
+    // Start the HTTP control API in a background task.
+    let api_server = Arc::new(ApiServer::new(node.clone(), control.clone()));
+    tokio::spawn(async move {
+        if let Err(e) = api_server.run(api_listen_addr).await {
+            tracing::error!(error = %e, "API server exited");
+        }
+    });
 
     // Create and run proxy.
     let proxy = Proxy::new(node.clone(), control.clone(), config.proxy.clone());
