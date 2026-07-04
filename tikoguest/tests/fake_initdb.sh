@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fake initdb used by pgctl/tests/http_api.rs. Writes a minimal cluster layout
+# Fake initdb used by tikoguest/tests/http_api.rs. Writes a minimal cluster layout
 # (PG_VERSION + empty postgresql.conf + empty pg_hba.conf) into the -D <dir>
 # argument so the agent's post-init wiring (append to those files) succeeds.
 # @STATE_DIR@ is substituted with an absolute path per test fixture.

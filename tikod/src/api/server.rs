@@ -1,15 +1,15 @@
 //! HTTP control API — tikod is the single control point for a swarm of VMs.
 //!
 //! Both VM lifecycle ([`Vmm`](crate::vmm::Vmm) / [`Node`](crate::node::Node))
-//! and in-guest Postgres control ([`DbControl`](crate::dbcontrol::DbControl) →
-//! the per-VM `pgctl` agent) are exposed here. Clients never talk to a VM or its
+//! and in-guest Postgres control ([`GuestClient`](crate::guestcontrol::GuestClient) →
+//! the per-VM `tikoguest` agent) are exposed here. Clients never talk to a VM or its
 //! Postgres directly — every operation goes through this API, and tikod fans it
 //! out to the right guest over the guest IP. Like the Firecracker backend
 //! client, this server uses raw HTTP/1.1 over TCP — no external HTTP library.
 //!
 //! ```text
 //! Client ──HTTP──→ tikod API ──┬─ Vmm/Node ──→ backend (Firecracker/VZ)
-//!                              └─ DbControl ──→ guest_ip:9000 ──→ pgctl ──→ pg_ctl
+//!                              └─ GuestClient ──→ guest_ip:9000 ──→ tikoguest ──→ pg_ctl
 //! ```
 //!
 //! # VM lifecycle routes
@@ -31,11 +31,11 @@
 //! | `PUT`  | `/vms/{vm_id}/snapshot`     | snapshot_vm       | `Snapshot`                               |
 //! | `PUT`  | `/vms/{vm_id}/scale-to-zero`| pause+snap+destroy| `Snapshot`                               |
 //!
-//! # Postgres control routes (forwarded to the guest `pgctl` agent)
+//! # Postgres control routes (forwarded to the guest `tikoguest` agent)
 //!
 //! All `/vms/{vm_id}/db/*` routes resolve the VM's guest IP via the Vmm layer,
-//! then proxy to that guest's `pgctl` agent (`guest_ip:agent_port`, default 9000
-//! — see [`DEFAULT_AGENT_PORT`](crate::dbcontrol::DEFAULT_AGENT_PORT)). The
+//! then proxy to that guest's `tikoguest` agent (`guest_ip:agent_port`, default
+//! 9000 — see [`DEFAULT_AGENT_PORT`](crate::guestcontrol::DEFAULT_AGENT_PORT)). The
 //! agent's status code and structured error body are forwarded verbatim.
 //!
 //! | Method | Path                            | Agent endpoint | Returns / Body                                            |
@@ -67,7 +67,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::control::Control;
-use crate::dbcontrol::{DbControl, DbControlError, DEFAULT_AGENT_PORT};
+use crate::guestcontrol::{GuestClient, GuestClientError, DEFAULT_AGENT_PORT};
 use crate::node::Node;
 use crate::vmm::{Snapshot, VmConfig, VmId, VmmError};
 
@@ -79,7 +79,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub struct ApiServer {
     node: Arc<Node>,
     control: Arc<Control>,
-    /// Port the in-guest `pgctl` agent listens on; used for `/vms/{id}/db/*`.
+    /// Port the in-guest `tikoguest` agent listens on; used for `/vms/{id}/db/*`.
     agent_port: u16,
 }
 
@@ -191,7 +191,7 @@ impl ApiServer {
                 Err(r) => r,
             },
 
-            // DB control routes: /vms/{vm_id}/db/{...} → in-guest pgctl agent.
+            // DB control routes: /vms/{vm_id}/db/{...} → in-guest tikoguest agent.
             (_, ["vms", vm_id, "db", rest @ ..]) => {
                 self.route_db(method, &VmId::from(*vm_id), rest, req)
                     .await
@@ -324,7 +324,7 @@ impl ApiServer {
         ok_json(serde_json::json!({"vms": vms}))
     }
 
-    /// Dispatch `/vms/{vm_id}/db/{...}` routes to the in-guest `pgctl` agent.
+    /// Dispatch `/vms/{vm_id}/db/{...}` routes to the in-guest `tikoguest` agent.
     /// Resolves the guest IP first; VM-not-found / no-IP surface as errors
     /// before any agent call is attempted.
     async fn route_db(&self, method: &str, vm_id: &VmId, rest: &[&str], req: &Request) -> Response {
@@ -345,7 +345,7 @@ impl ApiServer {
             }
             Err(e) => return err_resp(&e),
         };
-        let db = DbControl::for_guest(guest_ip, self.agent_port);
+        let db = GuestClient::for_guest(guest_ip, self.agent_port);
 
         let path = format!("/vms/{vm_id}/db/{}", rest.join("/"));
         match (method, rest) {
@@ -378,29 +378,29 @@ impl ApiServer {
     }
 }
 
-/// Forward a `DbResult<T: Serialize>` to a Response: Ok → 200 JSON, Err → mapped.
-fn forward<T: serde::Serialize>(res: Result<T, DbControlError>) -> Response {
+/// Forward a `GuestResult<T: Serialize>` to a Response: Ok → 200 JSON, Err → mapped.
+fn forward<T: serde::Serialize>(res: Result<T, GuestClientError>) -> Response {
     match res {
         Ok(v) => ok_value(&v),
-        Err(e) => db_err_resp(e),
+        Err(e) => guest_err_resp(e),
     }
 }
 
-/// Forward a `DbResult<()>`: Ok → 204, Err → mapped.
-fn forward_void(res: Result<(), DbControlError>) -> Response {
+/// Forward a `GuestResult<()>`: Ok → 204, Err → mapped.
+fn forward_void(res: Result<(), GuestClientError>) -> Response {
     match res {
         Ok(()) => no_content(),
-        Err(e) => db_err_resp(e),
+        Err(e) => guest_err_resp(e),
     }
 }
 
-/// Map a [`DbControlError`] to a Response. VM errors reuse the Vmm mapping;
+/// Map a [`GuestClientError`] to a Response. VM errors reuse the Vmm mapping;
 /// transport failures are 502 (bad gateway); agent errors forward the agent's
 /// own status code and `kind`.
-fn db_err_resp(e: DbControlError) -> Response {
+fn guest_err_resp(e: GuestClientError) -> Response {
     match e {
-        DbControlError::Vm(vmerr) => err_resp(&vmerr),
-        DbControlError::Transport(m) => Response {
+        GuestClientError::Vm(vmerr) => err_resp(&vmerr),
+        GuestClientError::Transport(m) => Response {
             status: 502,
             body: serde_json::json!({
                 "error": {"kind": "agent_unreachable", "message": m}
@@ -408,7 +408,7 @@ fn db_err_resp(e: DbControlError) -> Response {
             .to_string()
             .into_bytes(),
         },
-        DbControlError::Agent {
+        GuestClientError::Agent {
             status,
             kind,
             message,
@@ -446,10 +446,10 @@ fn parse_init_force(req: &Request) -> Result<bool, Response> {
 }
 
 /// Parse `{"mode":"fast|smart|immediate"}` from a `/pg/stop` request. Missing
-/// body defaults to [`crate::dbcontrol::StopMode::Fast`]; a present-but-invalid
+/// body defaults to [`crate::guestcontrol::StopMode::Fast`]; a present-but-invalid
 /// value is a 400.
-fn parse_stop_mode(req: &Request) -> Result<crate::dbcontrol::StopMode, Response> {
-    use crate::dbcontrol::StopMode;
+fn parse_stop_mode(req: &Request) -> Result<crate::guestcontrol::StopMode, Response> {
+    use crate::guestcontrol::StopMode;
     if req.body.is_empty() {
         return Ok(StopMode::default());
     }

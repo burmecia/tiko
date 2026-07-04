@@ -18,7 +18,7 @@
 pub mod api;
 pub mod config;
 pub mod control;
-pub mod dbcontrol;
+pub mod guestcontrol;
 pub mod node;
 pub mod proxy;
 pub mod vmm;

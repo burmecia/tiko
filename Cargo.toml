@@ -2,7 +2,7 @@
 members = [
   "cli",
   "core",
-  "pgctl",
+  "tikoguest",
   "pgsys",
   "smgr",
   "tikod",

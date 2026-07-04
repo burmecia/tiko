@@ -427,7 +427,7 @@ fn arg_path(p: &Path) -> String {
 /// Resolve the per-VM Tiko identity env map, mirroring `tiko_env.sh`:
 ///
 /// Precedence for each var: **inherited process env > `tiko.env` file value >
-/// default**. Inherited-wins lets the systemd unit (or `TIKO_DB_ID=7 pgctl`)
+/// default**. Inherited-wins lets the systemd unit (or `TIKO_DB_ID=7 tikoguest`)
 /// override the file; otherwise the per-VM file (written by `start_vm.sh`) is
 /// the source of truth; otherwise the `tiko_env.sh` defaults apply.
 ///
@@ -564,7 +564,7 @@ fn parse_pg_config(text: &str) -> PgCtlResult<BTreeMap<String, String>> {
 /// contain anything other than digits/`.`/`-`.
 fn render_pg_config(settings: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
-    out.push_str("# Managed by pgctl (tikod). Hand-edits will be overwritten.\n");
+    out.push_str("# Managed by tikoguest (tikod). Hand-edits will be overwritten.\n");
     for (name, value) in settings {
         let needs_quote = !value.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-');
         if needs_quote {

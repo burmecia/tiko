@@ -1,4 +1,4 @@
-//! `pgctl` — guest-side Postgres control agent for tikod.
+//! `tikoguest` — guest-side agent for tikod.
 //!
 //! Runs inside each Tiko VM as the `postgres` user. Exposes `pg_ctl` lifecycle
 //! operations (start/stop/restart/reload) and `postgresql.tiko.conf` reads/writes
@@ -6,7 +6,7 @@
 //! the VM's guest IP to control the database.
 //!
 //! ```text
-//! tikod ──HTTP──→ guest:9000 ──→ pgctl ──→ pg_ctl / postgresql.tiko.conf
+//! tikod ──HTTP──→ guest:9000 ──→ tikoguest ──→ pg_ctl / postgresql.tiko.conf
 //!                                       └──→ Postgres (PGDATA=/var/lib/postgresql/tt)
 //! ```
 //!
@@ -20,16 +20,16 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use pgctl::pgops::PgCtl;
-use pgctl::server::PgServer;
+use tikoguest::pgops::PgCtl;
+use tikoguest::server::PgServer;
 
-/// Guest-side Postgres control agent.
+/// Guest-side agent for tikod.
 #[derive(Parser, Debug)]
-#[command(name = "pgctl", version, about)]
+#[command(name = "tikoguest", version, about)]
 struct Args {
     /// Address to listen on. `0.0.0.0` so tikod (on the host) can reach it via
     /// the guest IP.
-    #[arg(long, default_value = "0.0.0.0:9000", env = "PGCTL_LISTEN")]
+    #[arg(long, default_value = "0.0.0.0:9000", env = "TIKOGUEST_LISTEN")]
     listen: String,
 
     /// PGDATA directory (default matches the Tiko guest layout).
@@ -45,12 +45,12 @@ struct Args {
     initdb: PathBuf,
 
     /// Log file passed to `pg_ctl -l` for start/restart.
-    #[arg(long, default_value = "/var/lib/postgresql/log.log", env = "PGCTL_LOG")]
+    #[arg(long, default_value = "/var/lib/postgresql/log.log", env = "TIKOGUEST_LOG")]
     log_path: PathBuf,
 
     /// Override config file (`include_if_exists` target in `postgresql.conf`).
     /// Defaults to `postgresql.tiko.conf` inside the data dir.
-    #[arg(long, env = "PGCTL_CONFIG_FILE")]
+    #[arg(long, env = "TIKOGUEST_CONFIG_FILE")]
     config_file: Option<PathBuf>,
 
     /// Per-VM Tiko identity file (org/db/project + storage roots), written by
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_file = %ctl.config_file.display(),
         tiko_db_id = ?ctl.tiko_env().get("TIKO_DB_ID"),
         tiko_org_id = ?ctl.tiko_env().get("TIKO_ORG_ID"),
-        "starting pgctl agent"
+        "starting tikoguest agent"
     );
 
     let server = Arc::new(PgServer::new(ctl));

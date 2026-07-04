@@ -1,6 +1,6 @@
 [package]
-name = "pgctl"
-description = "Guest-side Postgres control agent for tikod (pg_ctl + config over HTTP)"
+name = "tikoguest"
+description = "Guest-side agent for tikod: Postgres control, observability, scale-to-zero"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -9,7 +9,7 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 
 [[bin]]
-name = "pgctl"
+name = "tikoguest"
 path = "src/main.rs"
 
 [dependencies]

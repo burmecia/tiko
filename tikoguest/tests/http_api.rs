@@ -1,4 +1,4 @@
-//! pgctl HTTP API round-trip tests.
+//! tikoguest HTTP API round-trip tests.
 //!
 //! Drives the full HTTP → server → `pg_ctl` path with a *fake* `pg_ctl` shell
 //! script, so it runs anywhere (no Postgres / KVM / VM required). The fake
@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgctl::pgops::PgCtl;
-use pgctl::server::PgServer;
+use tikoguest::pgops::PgCtl;
+use tikoguest::server::PgServer;
 
 /// A temp data dir + fake pg_ctl wiring. The fake script's state (a marker
 /// file) lives under `state_dir` so the test can assert server-side effects.
@@ -31,7 +31,7 @@ impl Fixture {
     /// Bring up the agent on an ephemeral port with a fake pg_ctl.
     async fn start() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "pgctl-test-{}-{}",
+            "tikoguest-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -167,7 +167,7 @@ impl Fixture {
         };
         let text = tokio::time::timeout(Duration::from_secs(5), fut)
             .await
-            .expect("pgctl request timed out");
+            .expect("tikoguest request timed out");
 
         let (status, body) = split_response(&text);
         (status, body.to_string())
@@ -465,7 +465,7 @@ async fn tiko_env_defaults_when_file_absent() {
     // No tiko.env → the agent must still provide the tiko_env.sh defaults so
     // postgres doesn't panic on a missing identity var.
     let root = std::env::temp_dir().join(format!(
-        "pgctl-nodefault-{}-{}",
+        "tikoguest-nodefault-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

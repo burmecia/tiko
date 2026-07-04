@@ -193,17 +193,17 @@ sudo cp "$SCRIPT_DIR/start_pg.sh" "$SCRIPT_DIR/init_pg.sh" "$SCRIPT_DIR/tiko_env
 sudo chmod +x "$PG_HOME_DIR/start_pg.sh" "$PG_HOME_DIR/init_pg.sh" "$PG_HOME_DIR/tiko_env.sh"
 sudo cp "$SCRIPT_DIR/../../postgresql.tiko.conf" "$PG_HOME_DIR"
 
-echo ">>> Installing pgctl guest agent..."
+echo ">>> Installing tikoguest guest agent..."
 # Build the control agent (release) and bake it into the image. tikod reaches
-# it over the guest IP at :9000 (see tikod/src/dbcontrol.rs).
-( cd "$SCRIPT_DIR/../.." && cargo build --release -p pgctl )
-sudo install -m755 "$SCRIPT_DIR/../../target/release/pgctl" "$ROOTFS/usr/local/bin/pgctl"
-sudo install -m644 "$SCRIPT_DIR/pgctl.service" "$ROOTFS/etc/systemd/system/pgctl.service"
+# it over the guest IP at :9000 (see tikod/src/guestcontrol.rs).
+( cd "$SCRIPT_DIR/../.." && cargo build --release -p tikoguest )
+sudo install -m755 "$SCRIPT_DIR/../../target/release/tikoguest" "$ROOTFS/usr/local/bin/tikoguest"
+sudo install -m644 "$SCRIPT_DIR/tikoguest.service" "$ROOTFS/etc/systemd/system/tikoguest.service"
 # Enable at boot by creating the wants symlink (equivalent to `systemctl enable`
 # from inside the chroot, done host-side since the chroot phase already ran).
 sudo mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
-sudo ln -sf /etc/systemd/system/pgctl.service \
-    "$ROOTFS/etc/systemd/system/multi-user.target.wants/pgctl.service"
+sudo ln -sf /etc/systemd/system/tikoguest.service \
+    "$ROOTFS/etc/systemd/system/multi-user.target.wants/tikoguest.service"
 
 echo ">>> Configuring S3 Files auto-mount..."
 

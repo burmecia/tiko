@@ -1,4 +1,4 @@
-//! HTTP control API surface for the guest Postgres agent.
+//! HTTP control API surface for the guest agent.
 //!
 //! Raw HTTP/1.1 over TCP — same minimal-dependency style as tikod's API server.
 //! Runs inside the guest, bound to `0.0.0.0:<port>` so tikod can reach it over
@@ -49,7 +49,7 @@ impl PgServer {
 
     pub async fn run(self: Arc<Self>, listen_addr: SocketAddr) -> std::io::Result<()> {
         let listener = TcpListener::bind(listen_addr).await?;
-        info!(addr = %listen_addr, data_dir = %self.ctl.data_dir.display(), "pgctl listening");
+        info!(addr = %listen_addr, data_dir = %self.ctl.data_dir.display(), "tikoguest listening");
         self.serve(listener).await
     }
 
@@ -60,11 +60,11 @@ impl PgServer {
                     let this = self.clone();
                     tokio::spawn(async move {
                         if let Err(e) = this.handle_connection(stream, addr).await {
-                            error!(client = %addr, error = %e, "pgctl connection failed");
+                            error!(client = %addr, error = %e, "tikoguest connection failed");
                         }
                     });
                 }
-                Err(e) => error!(error = %e, "pgctl accept failed"),
+                Err(e) => error!(error = %e, "tikoguest accept failed"),
             }
         }
     }
@@ -81,7 +81,7 @@ impl PgServer {
                 return Ok(());
             }
         };
-        debug!(client = %addr, method = %req.method, path = %req.path, "pgctl request");
+        debug!(client = %addr, method = %req.method, path = %req.path, "tikoguest request");
         let resp = self.route(&req).await;
         write_response(&mut stream, resp.status, &resp.body).await
     }

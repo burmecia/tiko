@@ -1,6 +1,6 @@
 //! tikod DB control route round-trip tests.
 //!
-//! Exercises the full path `HTTP API → ApiServer → DbControl → in-guest agent`
+//! Exercises the full path `HTTP API → ApiServer → GuestClient → in-guest agent`
 //! with a **mock Vmm** (so we control the guest IP) and a **fake agent** (so we
 //! control Postgres control responses). No real VM or Postgres required.
 
@@ -76,7 +76,7 @@ impl Vmm for MockVmm {
     }
 }
 
-// ── Fake agent: a canned HTTP responder for pgctl routes ───────────────────
+// ── Fake agent: a canned HTTP responder for tikoguest routes ────────────────
 
 /// A minimal HTTP/1.1 server that returns canned responses keyed by
 /// `(method, path)`. Records the last config PUT body.
@@ -223,7 +223,7 @@ async fn api_request(api_addr: SocketAddr, method: &str, path: &str, body: Optio
 /// assertions).
 async fn harness() -> (SocketAddr, FakeAgent) {
     let agent = FakeAgent::start().await;
-    // Mock VMs report the loopback IP so DbControl connects to the fake agent.
+    // Mock VMs report the loopback IP so GuestClient connects to the fake agent.
     let guest_ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let mut known = std::collections::HashSet::new();
     known.insert("vm-1".to_string());

@@ -588,19 +588,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgctl"
-version = "0.1.0"
-dependencies = [
- "clap",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "pgsys"
 version = "0.1.0"
 dependencies = [
@@ -933,6 +920,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "tikoguest"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

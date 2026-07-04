@@ -7,7 +7,7 @@
 //!   --data-dir <PATH>      Directory for snapshots and runtime artifacts
 //!   --listen <ADDR>        Address for the PG proxy to listen on (default: 127.0.0.1:5432)
 //!   --api-listen <ADDR>    Address for the HTTP control API (default: 127.0.0.1:9000)
-//!   --agent-port <PORT>    Guest pgctl agent port for /vms/{id}/db/* (default: 9000)
+//!   --agent-port <PORT>    Guest tikoguest agent port for /vms/{id}/db/* (default: 9000)
 //!   --idle-timeout <SECS>  Auto-pause after N seconds of inactivity (default: 300)
 //!   --backend <NAME>       Force a VMM backend: auto|vz|firecracker (default: auto)
 //! ```
@@ -42,7 +42,7 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:9000")]
     api_listen: String,
 
-    /// Port the in-guest `pgctl` agent listens on (used for /vms/{id}/db/*).
+    /// Port the in-guest `tikoguest` agent listens on (used for /vms/{id}/db/*).
     #[arg(long, default_value_t = 9000)]
     agent_port: u16,
 

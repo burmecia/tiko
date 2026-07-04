@@ -1,5 +1,5 @@
 [Unit]
-Description=Tiko Postgres control agent (pgctl)
+Description=Tiko guest agent (tikoguest)
 Documentation=https://github.com/burmecia/tiko
 # The agent only needs the network to be up so tikod can reach it; it does not
 # itself depend on the S3 Files mount (that is Postgres's concern).
@@ -11,7 +11,7 @@ Type=simple
 # Runs as postgres so `pg_ctl` and config-file writes have the right owner.
 User=postgres
 Group=postgres
-ExecStart=/usr/local/bin/pgctl --listen 0.0.0.0:9000
+ExecStart=/usr/local/bin/tikoguest --listen 0.0.0.0:9000
 Restart=on-failure
 RestartSec=2
 

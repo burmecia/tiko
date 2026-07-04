@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fake pg_ctl used by pgctl/tests/http_api.rs. Simulates the real binary using a
+# Fake pg_ctl used by tikoguest/tests/http_api.rs. Simulates the real binary using a
 # marker file (<STATE_DIR>/running) so start/stop/status behave like a real
 # postmaster. Every argv line is appended to calls.log for assertions.
 # @STATE_DIR@ is substituted with an absolute path per test fixture.
