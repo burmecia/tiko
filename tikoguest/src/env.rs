@@ -58,9 +58,12 @@ pub fn load_tiko_env(tiko_env_path: &Path, data_dir: &Path) -> HashMap<String, S
             .unwrap_or(default);
         out.insert(key.to_string(), val);
     }
-    // Also forward any *other* TIKO_* keys present in the file (forward-compat).
+    // Also forward any *other* keys present in the file (forward-compat).
+    // The file is tiko.env — all keys in it are Tiko-related, so we don't
+    // filter by prefix. This catches e.g. TIKOD_ADDR (starts with "TIKOD_",
+    // not "TIKO_").
     for (k, v) in file_values {
-        if k.starts_with("TIKO_") && !out.contains_key(&k) {
+        if !out.contains_key(&k) {
             out.insert(k, v);
         }
     }
