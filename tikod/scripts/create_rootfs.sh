@@ -15,8 +15,11 @@ sudo apt update -qq
 sudo apt install debootstrap -y >/dev/null 2>&1
 
 echo ">>> Create and mount the image..."
-# Sparse image: only blocks the guest actually writes consume host disk. Default
-# 5 GB (room for WAL + local cache); override with ROOTFS_SIZE_MB at build time.
+# This is the SHARED READ-ONLY base image: immutable OS + pre-baked files,
+# attached as /dev/vda to every VM and used as the overlayfs lower layer (see
+# scripts/initramfs_init.sh). Per-VM mutable state lives on a separate small
+# RW overlay image, so this 5 GB base is stored exactly once regardless of VM
+# count. Default 5 GB; override with ROOTFS_SIZE_MB at build time.
 ROOTFS_SIZE_MB="${ROOTFS_SIZE_MB:-5120}"
 rm -f "$IMAGE"
 truncate -s "${ROOTFS_SIZE_MB}M" "$IMAGE"
@@ -82,11 +85,15 @@ cat > /etc/resolv.conf << 'RESOLV'
 nameserver 1.1.1.1
 RESOLV
 
-# Set up fstab
+# Set up fstab. The root is an overlayfs assembled by the initramfs
+# (lowerdir=/dev/vda = this RO base, upperdir=/dev/vdb = per-VM RW overlay),
+# so do NOT list /dev/vda as the root here — that would make systemd try to
+# remount it over the overlay. Only the kernel VFSes + /tmp need an entry; the
+# S3 Files network mount is appended below (and /run is auto-tmpfs by systemd).
 cat > /etc/fstab << 'FSTAB'
-/dev/vda  /     ext4  defaults,noatime  0 1
-proc      /proc proc  defaults          0 0
-sysfs     /sys  sysfs defaults          0 0
+proc      /proc proc  defaults                0 0
+sysfs     /sys  sysfs defaults                0 0
+tmpfs     /tmp  tmpfs defaults,nosuid,nodev   0 0
 FSTAB
 
 # Configure apt sources

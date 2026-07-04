@@ -2,12 +2,12 @@
 #
 # Stop a single running Firecracker VM without deleting it.
 #
-# Only kills the firecracker process for the given VM_ID. The rootfs copy
-# (assets/rootfs-<id>.ext4), the host tap device (tap<id>), and the per-VM
+# Only kills the firecracker process for the given VM_ID. The overlay image
+# (assets/overlay-<id>.ext4), the host tap device (tap<id>), and the per-VM
 # iptables rules are all left in place, so a subsequent
 #   ./start_vm.sh <VM_ID>           # (without --fresh)
-# relaunches firecracker against the existing tap + rootfs — a fast restart
-# with no rootfs copy, no tap creation, and no iptables reconfiguration.
+# relaunches firecracker against the existing tap + overlay — a fast restart
+# with no overlay rebuild, no tap creation, and no iptables reconfiguration.
 #
 # For a full teardown (remove tap + iptables too), use shutdown_vm.sh instead.
 #
@@ -24,7 +24,7 @@ if ! [[ "$VM_ID" =~ ^[0-9]+$ ]]; then
 fi
 
 API_SOCKET="/tmp/fc-${VM_ID}.socket"
-ROOTFS_COPY="$(cd "$(dirname "$0")" && pwd)/../assets/rootfs-${VM_ID}.ext4"
+OVERLAY_IMAGE="$(cd "$(dirname "$0")" && pwd)/../assets/overlay-${VM_ID}.ext4"
 
 if [ ! -S "$API_SOCKET" ] && ! pgrep -f -- "--api-sock $API_SOCKET" >/dev/null; then
     echo "no firecracker running for VM ${VM_ID} (socket $API_SOCKET absent, no matching process)" >&2
@@ -48,6 +48,6 @@ fi
 sudo rm -f "$API_SOCKET"
 
 echo ">>> VM ${VM_ID}: stopped. Kept for restart:"
-echo "    rootfs : $ROOTFS_COPY"
-echo "    tap    : tap${VM_ID} (still up)"
-echo "    restart: ./start_vm.sh ${VM_ID}   # without --fresh"
+echo "    overlay: $OVERLAY_IMAGE"
+echo "    tap     : tap${VM_ID} (still up)"
+echo "    restart : ./start_vm.sh ${VM_ID}   # without --fresh"

@@ -320,6 +320,27 @@ fn run_shell(snippet: &str) -> VmmResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Run a command as the CURRENT user (no sudo), failing on non-zero exit.
+///
+/// Used for creating/formatting per-VM backing files that Firecracker — also
+/// launched unprivileged (see `spawn_firecracker`) — must later open
+/// read-write. Creating them with `sudo` would leave them root-owned and
+/// unreadable-writable by Firecracker.
+fn run_user(program: &str, args: &[&str]) -> VmmResult<()> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| VmmError::Backend(format!("spawn {program}: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(VmmError::Backend(format!(
+            "{program} {} failed: {stderr}",
+            args.join(" ")
+        )));
+    }
+    Ok(())
+}
+
 /// Ensure the current user can open `/dev/kvm`.
 ///
 /// Firecracker is launched unprivileged (as the current user, unlike the
@@ -469,6 +490,168 @@ fn shell_quote(p: &Path) -> String {
 }
 
 // ============================================================================
+// Two-drive overlay model helpers
+// ============================================================================
+//
+// When [`overlay_mode`] is active (i.e. an initrd is configured — that initrd
+// IS the overlay-setup /init), a VM gets two block devices:
+//
+//   /dev/vda  RO  shared immutable base image (`rootfs_path`)  — overlayfs lower
+//   /dev/vdb  RW  per-VM writable image (`overlay-{N}.ext4`)   — overlayfs upper
+//
+// The base is attached read-only and is the SAME file for every VM, so it is
+// stored exactly once regardless of VM count. The overlay is small, sparse and
+// per-VM; it holds the overlayfs upper/work layers plus the per-VM network +
+// hostname files (seeded under `upper/` so they shadow the base via overlayfs).
+// This makes a root-fs upgrade as cheap as swapping the base image.
+
+/// Whether this VM uses the two-drive overlay model. Enabled precisely when an
+/// initrd is configured: the initrd's `/init` performs the overlay assembly.
+fn overlay_mode(config: &VmConfig) -> bool {
+    config.initrd_path.is_some()
+}
+
+/// Per-VM writable overlay image path, derived deterministically from the
+/// vm_index (mirrors the scripts' `overlay-<id>.ext4` naming).
+fn overlay_image_path(snapshot_dir: &Path, vm_index: u8) -> PathBuf {
+    snapshot_dir.join(format!("overlay-{vm_index}.ext4"))
+}
+
+/// Default overlay image size in MiB (sparse — only written blocks consume host
+/// disk). Overridable via the `OVERLAY_SIZE_MB` environment variable.
+fn overlay_size_mb() -> u64 {
+    std::env::var("OVERLAY_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048)
+}
+
+/// Create and seed the per-VM writable overlay image.
+///
+/// Lays out the overlayfs `upper/` and `work/` directories and writes the
+/// per-VM files that must differ from the shared base (the static network unit
+/// and hostname) into `upper/`. Because overlayfs merges upper with the lower
+/// (base), a file present in `upper/` shadows the same path in the base — so
+/// each VM gets its own network/hostname without ever touching the base image.
+///
+/// `base` is the shared RO base image; it is mounted read-only during seeding
+/// only to copy the intended ownership/mode of the mirrored paths (see
+/// [`seed_overlay`]).
+fn create_overlay_image(path: &Path, base: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
+    if path.exists() {
+        debug!(path = %path.display(), "overlay image already exists, reusing");
+        return Ok(());
+    }
+
+    let size_mb = overlay_size_mb();
+    info!(path = %path.display(), size_mb, "creating per-VM overlay image (sparse)");
+
+    // Create + format as the CURRENT user so the file stays user-owned and
+    // Firecracker (launched unprivileged) can open it read-write. Mounting for
+    // seeding (`seed_overlay`) still needs sudo, but that does not change the
+    // backing file's ownership.
+    let size_arg = format!("{size_mb}M");
+    let path_str = path.display().to_string();
+    run_user("truncate", &["-s", &size_arg, &path_str])?;
+    run_user("mkfs.ext4", &["-q", &path_str])?;
+    seed_overlay(path, base, net, vm_index)
+}
+
+/// Mount the overlay image (and the base image read-only) and write the per-VM
+/// network unit + hostname into `upper/`. Unmounts both on exit regardless of
+/// success/failure.
+///
+/// **Ownership replication:** overlayfs takes a *merged* directory's ownership
+/// and mode from the UPPER entry, not the lower. Any directory we pre-create
+/// under `upper/` (as root) would therefore shadow the base's ownership — e.g.
+/// `/var/lib/postgresql` is `postgres:postgres` in the base but would become
+/// `root:root`. To keep the overlay's metadata identical to the base, every
+/// directory and file we place in `upper/` has its ownership + mode copied from
+/// the matching base path via `chown`/`chmod --reference`.
+fn seed_overlay(overlay: &Path, base: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
+    let ov = run_shell("mktemp -d")?;
+    let ov = ov.trim_end_matches('\n');
+    let bro = run_shell("mktemp -d")?;
+    let bro = bro.trim_end_matches('\n');
+    let cleanup = || {
+        let _ = run_shell(&format!(
+            "umount {ov} 2>/dev/null; umount {bro} 2>/dev/null; rmdir {ov} {bro} 2>/dev/null"
+        ));
+    };
+
+    if run_shell(&format!("mount {} {ov}", shell_quote(overlay))).is_err() {
+        cleanup();
+        return Err(VmmError::Backend(format!(
+            "failed to mount overlay image {} for seeding",
+            overlay.display()
+        )));
+    }
+    // Mount the base read-only to read the intended ownership/mode of the
+    // mirrored paths.
+    if run_shell(&format!("mount -o ro,loop {} {bro}", shell_quote(base))).is_err() {
+        cleanup();
+        return Err(VmmError::Backend(format!(
+            "failed to mount base image {} RO for overlay seeding",
+            base.display()
+        )));
+    }
+
+    let (guest_cidr, gateway) = match net.guest_ip {
+        IpAddr::V4(v4) => (format!("{v4}/24"), net.gateway_ip.to_string()),
+        _ => {
+            cleanup();
+            return Err(VmmError::Backend("guest IP must be IPv4".into()));
+        }
+    };
+    let net_unit = format!(
+        "[Match]\nName=eth0\n\n[Network]\nAddress={guest_cidr}\nGateway={gateway}\nDNS=1.1.1.1\n"
+    );
+    let hostname = format!("tiko-vm-{vm_index}");
+
+    // Directories pre-created in upper/. Each must mirror the base's ownership
+    // + mode so overlayfs merged-directory metadata stays correct.
+    let dirs = [
+        "etc",
+        "etc/systemd",
+        "etc/systemd/network",
+        "var",
+        "var/lib",
+        "var/lib/postgresql",
+    ];
+
+    let seed_err = (|| {
+        for rel in dirs {
+            run_shell(&format!("mkdir -p {ov}/upper/{rel}"))?;
+            // Best-effort mirror of ownership + mode from the base path.
+            let _ = run_shell(&format!(
+                "chown --reference={bro}/{rel} {ov}/upper/{rel} 2>/dev/null; \
+                 chmod --reference={bro}/{rel} {ov}/upper/{rel} 2>/dev/null; true"
+            ));
+        }
+        run_shell(&format!("mkdir -p {ov}/work"))?;
+
+        run_shell(&format!(
+            "tee {ov}/upper/etc/systemd/network/20-eth0.network >/dev/null <<'NETUNIT'\n{net_unit}NETUNIT"
+        ))?;
+        let _ = run_shell(&format!(
+            "chown --reference={bro}/etc/systemd/network/20-eth0.network \
+             {ov}/upper/etc/systemd/network/20-eth0.network 2>/dev/null; true"
+        ));
+
+        run_shell(&format!("echo {hostname} > {ov}/upper/etc/hostname"))?;
+        let _ = run_shell(&format!(
+            "chown --reference={bro}/etc/hostname {ov}/upper/etc/hostname 2>/dev/null; true"
+        ));
+        Ok::<(), VmmError>(())
+    })();
+    cleanup();
+    seed_err?;
+
+    debug!(path = %overlay.display(), guest = %net.guest_ip, "overlay seeded with per-VM network + hostname");
+    Ok(())
+}
+
+// ============================================================================
 // Per-VM state
 // ============================================================================
 
@@ -587,23 +770,29 @@ impl FirecrackerVmm {
     /// verified-working reference). The guest IP is NOT passed on the kernel
     /// cmdline — systemd-networkd reads the static config baked into the
     /// rootfs copy (see `inject_guest_net`), so `boot_args` is used verbatim.
+    ///
+    /// `overlay_path`: when `Some`, switches to the two-drive overlay model —
+    /// the rootfs drive is attached READ-ONLY (shared base image), the given
+    /// image is attached as a second RW drive (the per-VM overlayfs upper),
+    /// and the configured initrd is added to the boot source. When `None`,
+    /// the legacy single-RW-rootfs model is used.
     async fn configure_vm(
         client: &FcApiClient,
         config: &VmConfig,
         tap_name: &str,
         guest_mac: &str,
         serial_log: &Path,
+        overlay_path: Option<&Path>,
     ) -> VmmResult<()> {
-        // Boot source.
-        client
-            .put(
-                "/boot-source",
-                &json!({
-                    "kernel_image_path": config.kernel_path.to_string_lossy(),
-                    "boot_args": config.kernel_cmdline,
-                }),
-            )
-            .await?;
+        // Boot source. Include the initrd (overlay-setup /init) when present.
+        let mut boot_source = json!({
+            "kernel_image_path": config.kernel_path.to_string_lossy(),
+            "boot_args": config.kernel_cmdline,
+        });
+        if let Some(initrd) = &config.initrd_path {
+            boot_source["initrd_path"] = json!(initrd.to_string_lossy());
+        }
+        client.put("/boot-source", &boot_source).await?;
 
         // Machine configuration.
         client
@@ -619,7 +808,8 @@ impl FirecrackerVmm {
             )
             .await?;
 
-        // Root filesystem drive.
+        // Root filesystem drive. Read-only (shared immutable base) in overlay
+        // mode; read-write (per-VM copy) in legacy mode.
         client
             .put(
                 "/drives/rootfs",
@@ -627,12 +817,31 @@ impl FirecrackerVmm {
                     "drive_id": "rootfs",
                     "path_on_host": config.rootfs_path.to_string_lossy(),
                     "is_root_device": true,
-                    "is_read_only": false,
+                    "is_read_only": overlay_path.is_some(),
                     "cache_type": "Unsafe",
                     "io_engine": "Sync",
                 }),
             )
             .await?;
+
+        // Per-VM writable overlay drive (overlayfs upper/work backing store).
+        // Must come after the rootfs so the base is /dev/vda and the overlay
+        // is /dev/vdb — exactly what the initramfs /init expects.
+        if let Some(overlay) = overlay_path {
+            client
+                .put(
+                    "/drives/overlay",
+                    &json!({
+                        "drive_id": "overlay",
+                        "path_on_host": overlay.to_string_lossy(),
+                        "is_root_device": false,
+                        "is_read_only": false,
+                        "cache_type": "Unsafe",
+                        "io_engine": "Sync",
+                    }),
+                )
+                .await?;
+        }
 
         // Extra drives.
         for drive in &config.drives {
@@ -700,26 +909,48 @@ impl Vmm for FirecrackerVmm {
                 config.rootfs_path.display()
             )));
         }
+        if let Some(initrd) = &config.initrd_path {
+            if !initrd.exists() {
+                return Err(VmmError::InvalidConfig(format!(
+                    "initrd not found: {}",
+                    initrd.display()
+                )));
+            }
+        }
 
         // Deterministic per-VM networking keyed off the vm_id's trailing index.
         let vm_index = vm_index_from_id(&vm_id)?;
         let net = derive_net(vm_index);
         let serial_log = self.runtime_dir.join(format!("{vm_id}.console.log"));
+        let overlay = overlay_mode(&config);
 
         info!(
             vm_id = %vm_id, index = vm_index, tap = %net.tap_name,
             guest_ip = %net.guest_ip, mac = %net.guest_mac,
-            "creating Firecracker VM"
+            overlay, "creating Firecracker VM"
         );
 
-        // Per-VM rootfs copy (ext4 is single-writer). The VM attaches this
-        // copy, never the shared base image.
-        let rootfs_copy = self.snapshot_dir.join(format!("rootfs-{vm_index}.ext4"));
-        copy_rootfs_per_vm(&config.rootfs_path, &rootfs_copy)?;
-        inject_guest_net(&rootfs_copy, &net, vm_index)?;
+        // Prepare per-VM storage.
+        //
+        // Overlay mode: attach the shared base image read-only and create a
+        // small per-VM overlay image (the overlayfs upper layer). The base is
+        // shared unchanged across all VMs — no copy.
+        //
+        // Legacy mode: ext4 is single-writer, so sparse-copy the base per VM.
+        let (rootfs_for_attach, overlay_path): (PathBuf, Option<PathBuf>) = if overlay {
+            let ov = overlay_image_path(&self.snapshot_dir, vm_index);
+            create_overlay_image(&ov, &config.rootfs_path, &net, vm_index)?;
+            // rootfs_path stays the shared base (attached read-only).
+            (config.rootfs_path.clone(), Some(ov))
+        } else {
+            let rootfs_copy = self.snapshot_dir.join(format!("rootfs-{vm_index}.ext4"));
+            copy_rootfs_per_vm(&config.rootfs_path, &rootfs_copy)?;
+            inject_guest_net(&rootfs_copy, &net, vm_index)?;
+            (rootfs_copy, None)
+        };
 
-        // Create TAP device + NAT. On failure we leave the per-VM rootfs copy
-        // in place for a fast retry (it is reused by the next create_vm).
+        // Create TAP device + NAT. On failure we leave the per-VM storage in
+        // place for a fast retry (it is reused by the next create_vm).
         create_tap(&net.tap_name, &net.gateway_ip.to_string(), &net.subnet)?;
 
         // Spawn Firecracker process.
@@ -731,13 +962,21 @@ impl Vmm for FirecrackerVmm {
             }
         };
 
-        // Configure via REST API. Build a config whose rootfs_path points at
-        // the per-VM copy so Firecracker attaches the copy, not the base.
+        // Configure via REST API. The rootfs drive points at `rootfs_for_attach`
+        // (the per-VM copy in legacy mode, the shared base in overlay mode) and
+        // the overlay drive is added when present.
         let mut vm_config = config.clone();
-        vm_config.rootfs_path = rootfs_copy;
+        vm_config.rootfs_path = rootfs_for_attach;
         let client = FcApiClient::new(&api_sock);
-        if let Err(e) =
-            Self::configure_vm(&client, &vm_config, &net.tap_name, &net.guest_mac, &serial_log).await
+        if let Err(e) = Self::configure_vm(
+            &client,
+            &vm_config,
+            &net.tap_name,
+            &net.guest_mac,
+            &serial_log,
+            overlay_path.as_deref(),
+        )
+        .await
         {
             warn!(vm_id = %vm_id, error = %e, "configure_vm failed");
             destroy_tap(&net.tap_name, &net.subnet);
@@ -873,8 +1112,8 @@ impl Vmm for FirecrackerVmm {
         }
 
         // Precondition: the original VM must be stopped first. Resuming while
-        // the original still holds the RW rootfs-{N}.ext4 would corrupt it
-        // (the snapshot references that same file). Mirrors resume_vm.sh.
+        // the original still holds the RW overlay-{N}.ext4 would corrupt it
+        // (the snapshot references that same per-VM file). Mirrors resume_vm.sh.
         {
             let vms = self.vms.lock().unwrap();
             if vms.contains_key(&vm_id) {
@@ -887,8 +1126,8 @@ impl Vmm for FirecrackerVmm {
         }
 
         // Same deterministic networking the VM was created with: the guest's
-        // static config (baked into the rootfs copy, carried in memory across
-        // the snapshot) expects exactly this subnet.
+        // static config (seeded into the per-VM overlay, carried in memory
+        // across the snapshot) expects exactly this subnet.
         let vm_index = vm_index_from_id(&vm_id)?;
         let net = derive_net(vm_index);
 

@@ -37,9 +37,11 @@ use tokio::net::TcpStream;
 use tikod::vmm::firecracker::FirecrackerVmm;
 use tikod::vmm::{Snapshot, VmConfig, VmmError, VmState, Vmm};
 
-/// Kernel cmdline identical to `scripts/vm_config-0.json` (verified working).
+/// Kernel cmdline for the two-drive overlay model. No `root=` is needed: the
+/// initramfs (`assets/tiko-initramfs.cpio.gz`) assembles an overlayfs root from
+/// /dev/vda (RO base) + /dev/vdb (RW overlay) before handing off to systemd.
 const BOOT_ARGS: &str =
-    "root=/dev/vda rw console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0";
+    "console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0";
 
 /// TCP connect timeout used for single liveness probes.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -57,11 +59,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
     let kernel = assets_dir.join("vmlinux-6.1");
     let rootfs = assets_dir.join("ubuntu-24.04-rootfs.ext4");
-    for (name, path) in [("kernel", &kernel), ("rootfs", &rootfs)] {
+    let initrd = assets_dir.join("tiko-initramfs.cpio.gz");
+    for (name, path) in [
+        ("kernel", &kernel),
+        ("rootfs", &rootfs),
+        ("initrd", &initrd),
+    ] {
         if !path.exists() {
             eprintln!("{name} not found at {}", path.display());
             eprintln!(
-                "Run: tikod/scripts/download_kernel.sh && tikod/scripts/create_rootfs.sh"
+                "Run: tikod/scripts/download_kernel.sh && tikod/scripts/create_rootfs.sh \
+                 && tikod/scripts/build_initramfs.sh"
             );
             std::process::exit(1);
         }
@@ -77,19 +85,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Stage A–E: single-VM full lifecycle ────────────────────────────────
     stage("A-E: single-VM full lifecycle");
-    full_lifecycle(&vmm, "fc-single-10", &kernel, &rootfs).await?;
+    full_lifecycle(&vmm, "fc-single-10", &kernel, &rootfs, &initrd).await?;
 
     // ── Stage F: error paths ───────────────────────────────────────────────
     stage("F: error paths");
-    stage_errors(&vmm, &kernel, &rootfs).await?;
+    stage_errors(&vmm, &kernel, &rootfs, &initrd).await?;
 
     // ── Stage G: concurrency (3 VMs in parallel) ───────────────────────────
     stage("G: concurrency (3 VMs in parallel)");
-    stage_concurrency(&vmm, &kernel, &rootfs).await?;
+    stage_concurrency(&vmm, &kernel, &rootfs, &initrd).await?;
 
     // ── Stage H: idempotency ───────────────────────────────────────────────
     stage("H: idempotency");
-    stage_idempotency(&vmm, &kernel, &rootfs).await?;
+    stage_idempotency(&vmm, &kernel, &rootfs, &initrd).await?;
 
     tracing::info!("=== ALL STAGES PASSED ===");
     Ok(())
@@ -110,9 +118,10 @@ async fn full_lifecycle(
     vm_id: &str,
     kernel: &Path,
     rootfs: &Path,
+    initrd: &Path,
 ) -> Result<(), String> {
     tracing::info!("--- lifecycle start: {vm_id} ---");
-    let config = make_config(vm_id, kernel, rootfs);
+    let config = make_config(vm_id, kernel, rootfs, initrd);
 
     // A. create + start.
     let id = vmm
@@ -212,6 +221,7 @@ async fn stage_errors(
     vmm: &FirecrackerVmm,
     kernel: &Path,
     rootfs: &Path,
+    initrd: &Path,
 ) -> Result<(), String> {
     // 1. Operations on an unknown vm_id → VmNotFound.
     let ghost = "ghost-99".to_string();
@@ -236,7 +246,7 @@ async fn stage_errors(
 
     // 2. snapshot_vm on a Running VM (not Paused) → InvalidState.
     let id = vmm
-        .create_vm(make_config("err-snap-11", kernel, rootfs))
+        .create_vm(make_config("err-snap-11", kernel, rootfs, initrd))
         .await
         .map_err(|e| format!("create_vm(err-snap-11): {e}"))?;
     vmm.start_vm(&id)
@@ -257,7 +267,7 @@ async fn stage_errors(
         vm_id: "ghost-99".into(),
         state_path: Path::new("/tmp/tikod-boot-test/nope.snap").into(),
         mem_path: Path::new("/tmp/tikod-boot-test/nope.mem").into(),
-        config: make_config("ghost-99", kernel, rootfs),
+        config: make_config("ghost-99", kernel, rootfs, initrd),
     };
     expect_err(
         "restore_vm(missing file)",
@@ -267,9 +277,9 @@ async fn stage_errors(
     );
 
     // 4. restore_vm while the original VM is still live → InvalidState
-    //    (the snapshot and the live VM would share one RW rootfs copy).
+    //    (the snapshot and the live VM would share one RW overlay).
     let id = vmm
-        .create_vm(make_config("err-restore-12", kernel, rootfs))
+        .create_vm(make_config("err-restore-12", kernel, rootfs, initrd))
         .await
         .map_err(|e| format!("create_vm(err-restore-12): {e}"))?;
     vmm.start_vm(&id)
@@ -308,6 +318,7 @@ async fn stage_concurrency(
     vmm: &Arc<FirecrackerVmm>,
     kernel: &Path,
     rootfs: &Path,
+    initrd: &Path,
 ) -> Result<(), String> {
     const N: usize = 3;
     let vm_ids = ["fc-concur-20", "fc-concur-21", "fc-concur-22"];
@@ -317,8 +328,9 @@ async fn stage_concurrency(
         let vmm = vmm.clone();
         let kernel = kernel.to_path_buf();
         let rootfs = rootfs.to_path_buf();
+        let initrd = initrd.to_path_buf();
         handles.push(tokio::spawn(async move {
-            full_lifecycle(&vmm, vm_id, &kernel, &rootfs).await
+            full_lifecycle(&vmm, vm_id, &kernel, &rootfs, &initrd).await
         }));
     }
 
@@ -350,9 +362,10 @@ async fn stage_idempotency(
     vmm: &FirecrackerVmm,
     kernel: &Path,
     rootfs: &Path,
+    initrd: &Path,
 ) -> Result<(), String> {
     let id = vmm
-        .create_vm(make_config("fc-idem-13", kernel, rootfs))
+        .create_vm(make_config("fc-idem-13", kernel, rootfs, initrd))
         .await
         .map_err(|e| format!("create_vm(fc-idem-13): {e}"))?;
 
@@ -400,7 +413,10 @@ fn stage(name: &str) {
 }
 
 /// Build a `VmConfig` for `vm_id` with the script-aligned kernel cmdline.
-fn make_config(vm_id: &str, kernel: &Path, rootfs: &Path) -> VmConfig {
+/// Setting `initrd_path` selects the two-drive overlay model in the Firecracker
+/// backend: the rootfs is attached read-only (shared base) and a per-VM overlay
+/// image (overlay-<index>.ext4) is attached read-write.
+fn make_config(vm_id: &str, kernel: &Path, rootfs: &Path, initrd: &Path) -> VmConfig {
     VmConfig {
         vm_id: vm_id.to_string(),
         kernel_path: kernel.to_path_buf(),
@@ -409,7 +425,7 @@ fn make_config(vm_id: &str, kernel: &Path, rootfs: &Path) -> VmConfig {
         memory_mb: 512,
         vcpus: 2,
         drives: vec![],
-        initrd_path: None,
+        initrd_path: Some(initrd.to_path_buf()),
     }
 }
 

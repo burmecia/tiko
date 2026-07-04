@@ -6,7 +6,7 @@
 # The VM keeps running (non-disruptive). The guest memory file can be up to
 # mem_size_mib (512 MB) and is written under tikod/assets/snapshots/vm-<id>/.
 #
-# The disk backing file (rootfs-<id>.ext4) is NOT part of the snapshot —
+# The disk backing file (overlay-<id>.ext4) is NOT part of the snapshot —
 # Firecracker only flushes it to the host FS cache (cache_type=Unsafe means the
 # guest cannot issue flushes). For a clean save/restore test, snapshot then stop
 # the VM immediately so disk state stays close to memory state.

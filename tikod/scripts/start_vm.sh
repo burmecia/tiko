@@ -1,26 +1,42 @@
 #!/bin/bash
 #
-# Start a single Firecracker VM. Multiple VMs run in parallel by giving each a
-# unique VM_ID (positional arg or env). Every per-instance resource is derived
-# from VM_ID so two VMs never collide:
+# Start a single Firecracker VM using the two-drive overlay model:
 #
-#   VM_ID  rootfs copy                 api socket          tap    subnet        guest mac
-#   -----  --------------------------  -----------------  -----  ------------   ----------------
-#   0      assets/rootfs-0.ext4        /tmp/fc-0.socket   tap0   172.16.0.0/24   AA:FC:00:00:00:02
-#   1      assets/rootfs-1.ext4        /tmp/fc-1.socket   tap1   172.16.1.0/24   AA:FC:00:00:00:03
+#   /dev/vda  RO  assets/ubuntu-24.04-rootfs.ext4   SHARED immutable base
+#   /dev/vdb  RW  assets/overlay-<id>.ext4          per-VM mutable overlay
+#
+# The base image is attached read-only and shared by ALL VMs (a root-fs upgrade
+# is just swapping this one file). The overlay image is small, sparse, and
+# per-VM; it holds the overlayfs upper/work layers plus the per-VM network +
+# Tiko-identity files (seeded under upper/ so they shadow the base). An
+# initramfs (assets/tiko-initramfs.cpio.gz) glues the two into a writable root
+# via overlayfs, then boots systemd.
+#
+# Multiple VMs run in parallel by giving each a unique VM_ID (positional arg or
+# env). Every per-instance resource is derived from VM_ID so two VMs never
+# collide:
+#
+#   VM_ID  overlay image            api socket          tap     subnet        guest mac
+#   -----  -----------------------  -----------------   ------  ------------   ----------------
+#   0      assets/overlay-0.ext4    /tmp/fc-0.socket    tap0    172.16.0.0/24   AA:FC:00:00:00:02
+#   1      assets/overlay-1.ext4    /tmp/fc-1.socket    tap1    172.16.1.0/24   AA:FC:00:00:00:03
 #
 # Usage:
 #   ./start_vm.sh [VM_ID] [--fresh]
 #
-#   VM_ID       non-negative integer (default 0, max 250). Env: VM_ID.
-#   --fresh     discard any existing per-VM rootfs copy and rebuild from the
-#               base image. Without it, an existing copy is reused (fast restart)
-#               and only the network/identity files are re-injected.
+#   VM_ID     non-negative integer (default 0, max 250). Env: VM_ID.
+#   --fresh   discard any existing per-VM overlay image and rebuild it from
+#             scratch (a clean guest /var, /etc, etc.). Without it, an existing
+#             overlay is reused (fast restart) and only the network/identity
+#             files are re-seeded.
 #
 # Per-VM Tiko identity (org/db/project) can be overridden via env vars. DB_ID
 # distinguishes each Tiko database; default db == VM_ID so each VM is its own
 # database under org 12:
 #   TIKO_ORG_ID / TIKO_DB_ID / TIKO_PROJECT_ID
+#
+# Build the base + initramfs first:
+#   ./create_rootfs.sh && ./build_initramfs.sh
 
 set -euo pipefail
 
@@ -28,6 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ASSETS_DIR="$SCRIPT_DIR/../assets"
 FC_DIR="$SCRIPT_DIR/../../firecracker/build/cargo_target/x86_64-unknown-linux-musl/debug"
 BASE_IMAGE="$ASSETS_DIR/ubuntu-24.04-rootfs.ext4"
+INITRAMFS="$ASSETS_DIR/tiko-initramfs.cpio.gz"
 
 # ── Args ────────────────────────────────────────────────────────────────────
 VM_ID="${VM_ID:-0}"
@@ -49,7 +66,7 @@ if [ "$VM_ID" -gt 250 ]; then
 fi
 
 # ── Per-VM derived values ────────────────────────────────────────────────────
-ROOTFS_COPY="$ASSETS_DIR/rootfs-${VM_ID}.ext4"
+OVERLAY_IMAGE="$ASSETS_DIR/overlay-${VM_ID}.ext4"
 API_SOCKET="/tmp/fc-${VM_ID}.socket"
 TAP_DEV="tap${VM_ID}"
 SUBNET="172.16.${VM_ID}"
@@ -65,23 +82,62 @@ export TIKO_ORG_ID="${TIKO_ORG_ID:-12}"
 export TIKO_DB_ID="${TIKO_DB_ID:-$VM_ID}"
 export TIKO_PROJECT_ID="${TIKO_PROJECT_ID:-56}"
 
-# ── Rootfs copy (ext4 is single-writer; sharing one image corrupts it) ────────
+# ── Prechecks ────────────────────────────────────────────────────────────────
+[ -f "$BASE_IMAGE" ] || { echo "base image not found: $BASE_IMAGE (run create_rootfs.sh first)" >&2; exit 1; }
+[ -f "$INITRAMFS" ]  || { echo "initramfs not found: $INITRAMFS (run build_initramfs.sh first)" >&2; exit 1; }
+
+# ── Per-VM overlay image (the only per-VM storage) ───────────────────────────
+# Sparse: only blocks the guest actually writes consume host disk. Default
+# 2 GB; override with OVERLAY_SIZE_MB.
+OVERLAY_SIZE_MB="${OVERLAY_SIZE_MB:-2048}"
+
 if [ "$FRESH" -eq 1 ]; then
-    rm -f "$ROOTFS_COPY"
+    rm -f "$OVERLAY_IMAGE"
 fi
-if [ ! -f "$ROOTFS_COPY" ]; then
-    echo ">>> VM ${VM_ID}: copying base image -> $(basename "$ROOTFS_COPY")..."
-    [ -f "$BASE_IMAGE" ] || { echo "base image not found: $BASE_IMAGE (run create_rootfs.sh first)" >&2; exit 1; }
-    cp --sparse=always "$BASE_IMAGE" "$ROOTFS_COPY"
+if [ ! -f "$OVERLAY_IMAGE" ]; then
+    echo ">>> VM ${VM_ID}: creating overlay image ($(basename "$OVERLAY_IMAGE"), ${OVERLAY_SIZE_MB} MB sparse)..."
+    truncate -s "${OVERLAY_SIZE_MB}M" "$OVERLAY_IMAGE"
+    mkfs.ext4 -q "$OVERLAY_IMAGE"
 fi
 
-# ── Inject per-VM network config + Tiko identity into the copy ────────────────
-echo ">>> VM ${VM_ID}: injecting network + Tiko identity..."
-ROOTFS_MNT="$(mktemp -d)"
-sudo mount "$ROOTFS_COPY" "$ROOTFS_MNT"
+# Seed the per-VM files into the overlay's `upper/` tree. overlayfs merges the
+# upper directory with the RO base: a file present in upper shadows the same
+# path in the base, so this is how each VM gets its own network config,
+# hostname, and Tiko identity without touching the shared base image.
+#
+# IMPORTANT: overlayfs takes a *merged* directory's ownership/mode from the
+# UPPER entry. So any directory we pre-create under upper/ as root would
+# otherwise shadow the base's ownership — e.g. /var/lib/postgresql is
+# postgres-owned in the base but would become root-owned. We therefore mount
+# the base RO and replicate ownership+mode (--reference) for every dir/file we
+# place in upper/, keeping the overlay's metadata identical to the base.
+echo ">>> VM ${VM_ID}: seeding overlay (network + Tiko identity)..."
+OV_MNT="$(mktemp -d)"
+BASE_RO="$(mktemp -d)"
+sudo mount "$OVERLAY_IMAGE" "$OV_MNT"
+sudo mount -o ro,loop "$BASE_IMAGE" "$BASE_RO"
+cleanup_overlay() {
+    sudo umount "$OV_MNT" 2>/dev/null || true
+    sudo umount "$BASE_RO" 2>/dev/null || true
+    rmdir "$OV_MNT" "$BASE_RO" 2>/dev/null || true
+}
+trap cleanup_overlay EXIT
+
+# Replicate a directory from the base into upper/, preserving ownership + mode.
+mirror_dir() {
+    local rel="$1"
+    local src="$BASE_RO/$rel" dst="$OV_MNT/upper/$rel"
+    sudo mkdir -p "$dst"
+    [ -e "$src" ] && sudo chown --reference="$src" "$dst" && sudo chmod --reference="$src" "$dst" || true
+}
+
+for d in etc etc/systemd etc/systemd/network var var/lib var/lib/postgresql; do
+    mirror_dir "$d"
+done
+sudo mkdir -p "$OV_MNT/work"
 
 # Guest static networking on this VM's /24.
-sudo tee "$ROOTFS_MNT/etc/systemd/network/20-eth0.network" >/dev/null <<NETWORK
+sudo tee "$OV_MNT/upper/etc/systemd/network/20-eth0.network" >/dev/null <<NETWORK
 [Match]
 Name=eth0
 
@@ -90,22 +146,29 @@ Address=${GUEST_IP}/24
 Gateway=${GUEST_GW}
 DNS=1.1.1.1
 NETWORK
+sudo chown --reference="$BASE_RO/etc/systemd/network/20-eth0.network" \
+    "$OV_MNT/upper/etc/systemd/network/20-eth0.network" 2>/dev/null || true
 
 # Per-VM hostname.
-echo "tiko-vm-${VM_ID}" | sudo tee "$ROOTFS_MNT/etc/hostname" >/dev/null
+echo "tiko-vm-${VM_ID}" | sudo tee "$OV_MNT/upper/etc/hostname" >/dev/null
+sudo chown --reference="$BASE_RO/etc/hostname" "$OV_MNT/upper/etc/hostname" 2>/dev/null || true
 
 # Per-VM Tiko identity (single source of truth, sourced by init_pg.sh /
 # start_pg.sh via tiko_env.sh, and by .bash_profile).
-sudo tee "$ROOTFS_MNT/var/lib/postgresql/tiko.env" >/dev/null <<TIKO_ENV
+sudo tee "$OV_MNT/upper/var/lib/postgresql/tiko.env" >/dev/null <<TIKO_ENV
 TIKO_ORG_ID=${TIKO_ORG_ID}
 TIKO_DB_ID=${TIKO_DB_ID}
 TIKO_PROJECT_ID=${TIKO_PROJECT_ID}
 TIKO_STORAGE_ROOT=/mnt/s3files/tiko_root
 TIKO_LOCAL_PATH=/var/lib/postgresql/tiko_local
 TIKO_ENV
+sudo chown --reference="$BASE_RO/var/lib/postgresql/tiko.env" \
+    "$OV_MNT/upper/var/lib/postgresql/tiko.env" 2>/dev/null || true
 
-sudo umount "$ROOTFS_MNT"
-rmdir "$ROOTFS_MNT"
+sudo umount "$OV_MNT"
+sudo umount "$BASE_RO"
+rmdir "$OV_MNT" "$BASE_RO" 2>/dev/null || true
+trap - EXIT
 
 # ── Host networking: per-VM tap + NAT ────────────────────────────────────────
 echo ">>> VM ${VM_ID}: host tap ${TAP_DEV} (${TAP_IP})..."
@@ -127,13 +190,16 @@ sudo iptables -C FORWARD -i "$DEFAULT_IFACE" -o "$TAP_DEV" -m state --state RELA
     || sudo iptables -A FORWARD -i "$DEFAULT_IFACE" -o "$TAP_DEV" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # ── Firecracker config (per-VM) ──────────────────────────────────────────────
+# Two drives: the shared RO base (vda) + the per-VM RW overlay (vdb). The
+# initramfs assembles an overlayfs root from them, so boot_args no longer names
+# a root device — /init handles that.
 echo ">>> VM ${VM_ID}: writing firecracker config..."
 cat > "$VM_CONFIG" <<CONFIG
 {
     "boot-source": {
         "kernel_image_path": "$ASSETS_DIR/vmlinux-6.1",
-        "boot_args": "root=/dev/vda rw console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0",
-        "initrd_path": null
+        "initrd_path": "$INITRAMFS",
+        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0"
     },
     "drives": [
         {
@@ -141,8 +207,19 @@ cat > "$VM_CONFIG" <<CONFIG
             "partuuid": null,
             "is_root_device": true,
             "cache_type": "Unsafe",
+            "is_read_only": true,
+            "path_on_host": "$BASE_IMAGE",
+            "io_engine": "Sync",
+            "rate_limiter": null,
+            "socket": null
+        },
+        {
+            "drive_id": "overlay",
+            "partuuid": null,
+            "is_root_device": false,
+            "cache_type": "Unsafe",
             "is_read_only": false,
-            "path_on_host": "$ROOTFS_COPY",
+            "path_on_host": "$OVERLAY_IMAGE",
             "io_engine": "Sync",
             "rate_limiter": null,
             "socket": null

@@ -4,12 +4,13 @@
 #
 # Starts a fresh firecracker process (no boot — state is restored from the
 # snapshot), loads the microVM-state + guest-memory files, and resumes. The
-# original VM must be stopped first (snapshot/resume onto the same RW rootfs
-# while the original still writes would corrupt it).
+# original VM must be stopped first: both the snapshot and a live VM would
+# attach the same per-VM RW overlay image (assets/overlay-<id>.ext4), and two
+# writers would corrupt it.
 #
-# The snapshot already encodes the device config (rootfs path, tap name, MAC,
+# The snapshot already encodes the device config (drives, tap name, MAC,
 # machine-config), so we only ensure the host-side prerequisites the snapshot
-# references still exist: the rootfs-<id>.ext4 file and the tap<id> device.
+# references still exist: the overlay-<id>.ext4 file and the tap<id> device.
 #
 # Usage:
 #   ./resume_vm.sh [VM_ID]
@@ -34,7 +35,7 @@ TAP_DEV="tap${VM_ID}"
 SUBNET="172.16.${VM_ID}"
 TAP_IP="${SUBNET}.1/24"
 GUEST_IP="${SUBNET}.2"
-ROOTFS_COPY="$ASSETS_DIR/rootfs-${VM_ID}.ext4"
+ROOTFS_COPY="$ASSETS_DIR/overlay-${VM_ID}.ext4"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-$ASSETS_DIR/snapshots/vm-${VM_ID}}"
 STATE_FILE="$SNAPSHOT_DIR/snap.bin"
 MEM_FILE="$SNAPSHOT_DIR/mem.bin"
@@ -45,13 +46,13 @@ if [ ! -f "$STATE_FILE" ] || [ ! -f "$MEM_FILE" ]; then
     exit 1
 fi
 if [ ! -f "$ROOTFS_COPY" ]; then
-    echo "rootfs $ROOTFS_COPY missing — the snapshot references it; cannot resume." >&2
-    echo "  (start_vm.sh creates it; don't delete rootfs-<id>.ext4 before resuming)" >&2
+    echo "overlay $ROOTFS_COPY missing — the snapshot references it; cannot resume." >&2
+    echo "  (start_vm.sh creates it; don't delete overlay-<id>.ext4 before resuming)" >&2
     exit 1
 fi
 if pgrep -f -- "--api-sock $API_SOCKET" >/dev/null; then
     echo "a firecracker is still bound to $API_SOCKET — stop VM ${VM_ID} first (shutdown_vm.sh ${VM_ID})." >&2
-    echo "  resuming while the original runs would corrupt the shared RW rootfs." >&2
+    echo "  resuming while the original runs would corrupt the shared RW overlay." >&2
     exit 1
 fi
 
