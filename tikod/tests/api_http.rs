@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use tikod::api::{ApiClient, ApiServer};
-use tikod::control::{Control, IdlePolicy};
+use tikod::control::Control;
 use tikod::node::Node;
 use tikod::vmm::firecracker::FirecrackerVmm;
 use tikod::vmm::{Snapshot, VmConfig, VmmError};
@@ -28,7 +28,7 @@ async fn spawn_server() -> ApiClient {
     ));
     let vmm = Arc::new(FirecrackerVmm::new(dir.clone()));
     let node = Arc::new(Node::new(vmm, dir.join("snapshots")));
-    let control = Arc::new(Control::new(IdlePolicy::default()));
+    let control = Arc::new(Control::new());
     let server = Arc::new(ApiServer::new(node, control));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

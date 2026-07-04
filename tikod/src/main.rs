@@ -8,7 +8,6 @@
 //!   --listen <ADDR>        Address for the PG proxy to listen on (default: 127.0.0.1:5432)
 //!   --api-listen <ADDR>    Address for the HTTP control API (default: 127.0.0.1:9000)
 //!   --agent-port <PORT>    Guest tikoguest agent port for /vms/{id}/db/* (default: 9000)
-//!   --idle-timeout <SECS>  Auto-pause after N seconds of inactivity (default: 300)
 //!   --backend <NAME>       Force a VMM backend: auto|vz|firecracker (default: auto)
 //! ```
 
@@ -21,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 use tikod::api::ApiServer;
 use tikod::config::TikodConfig;
-use tikod::control::{Control, IdlePolicy};
+use tikod::control::Control;
 use tikod::node::Node;
 use tikod::proxy::{Proxy, ProxyConfig};
 use tikod::vmm::{default_vmm, Vmm};
@@ -45,10 +44,6 @@ struct Args {
     /// Port the in-guest `tikoguest` agent listens on (used for /vms/{id}/db/*).
     #[arg(long, default_value_t = 9000)]
     agent_port: u16,
-
-    /// Auto-pause after N seconds of inactivity.
-    #[arg(long, default_value_t = 300)]
-    idle_timeout: u64,
 }
 
 #[tokio::main]
@@ -72,16 +67,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen_addr,
             ..Default::default()
         },
-        idle_policy: IdlePolicy {
-            idle_timeout_secs: args.idle_timeout,
-        },
     };
 
     tracing::info!(
         data_dir = %config.data_dir.display(),
         listen = %config.proxy.listen_addr,
         api_listen = %api_listen_addr,
-        idle_timeout = config.idle_policy.idle_timeout_secs,
         platform = std::env::consts::OS,
         "starting tikod"
     );
@@ -94,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = Arc::new(Node::new(vmm, data_dir.join("snapshots")));
 
     // Create control plane.
-    let control = Arc::new(Control::new(config.idle_policy.clone()));
+    let control = Arc::new(Control::new());
 
     // Start the HTTP control API in a background task.
     let api_server = Arc::new(
@@ -110,42 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and run proxy.
     let proxy = Proxy::new(node.clone(), control.clone(), config.proxy.clone());
 
-    // Spawn the idle-checker background task.
-    let control_bg = control.clone();
-    let node_bg = node.clone();
-    tokio::spawn(async move {
-        idle_checker(control_bg, node_bg).await;
-    });
-
     // Run the proxy (blocks until interrupted).
     proxy.run().await?;
 
     Ok(())
-}
-
-/// Background task that periodically checks for idle VMs and scales them
-/// to zero.
-async fn idle_checker(control: Arc<Control>, node: Arc<Node>) {
-    let check_interval = std::time::Duration::from_secs(30);
-
-    loop {
-        tokio::time::sleep(check_interval).await;
-
-        let idle = control.idle_vms();
-        if idle.is_empty() {
-            continue;
-        }
-
-        for vm_id in idle {
-            tracing::info!(vm_id = %vm_id, "auto-pausing idle VM");
-            match node.scale_to_zero(&vm_id).await {
-                Ok(snapshot) => {
-                    control.set_snapshot(&vm_id, snapshot.state_path.to_string_lossy().into_owned());
-                }
-                Err(e) => {
-                    tracing::warn!(vm_id = %vm_id, error = %e, "failed to auto-pause");
-                }
-            }
-        }
-    }
 }

@@ -55,6 +55,7 @@
 //! | Method | Path                            | From            | Returns / Body                              |
 //! |--------|---------------------------------|-----------------|---------------------------------------------|
 //! | `POST` | `/vms/{vm_id}/reports`          | observer loop   | 204  body: metrics JSON (404 if unregistered) |
+//! | `POST` | `/vms/{vm_id}/snapshot-request` | scaler loop     | 202  body: `{reason, metrics}` (idempotent; 404 if unregistered) |
 //!
 //! # Error responses
 //!
@@ -267,6 +268,9 @@ impl ApiServer {
             // Agent-inbound: metrics report from the guest's observer loop.
             ("POST", ["reports"]) => self.record_report(vm_id, req).await,
 
+            // Agent-inbound: snapshot-request from the guest's scaler loop.
+            ("POST", ["snapshot-request"]) => self.snapshot_request(vm_id, req).await,
+
             _ => {
                 let path = format!("/vms/{vm_id}/{}", rest.join("/"));
                 not_found(method, &path)
@@ -292,6 +296,76 @@ impl ApiServer {
                 })
                 .to_string()
                 .into_bytes(),
+            }
+        }
+    }
+
+    /// `POST /vms/{vm_id}/snapshot-request` — the guest agent's scaler loop
+    /// signals that the VM is idle and ready to be snapshotted. tikod acks
+    /// `202` **before** starting `scale_to_zero` so the agent reads the ack
+    /// before the VM is frozen. The handler is idempotent: a duplicate request
+    /// (e.g. ack lost, agent retried) returns 202 without double-triggering.
+    async fn snapshot_request(&self, vm_id: &VmId, req: &Request) -> Response {
+        let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return bad_request("invalid snapshot-request body; expected JSON"),
+        };
+
+        match self.control.try_mark_snapshot_requested(vm_id) {
+            None => Response {
+                status: 404,
+                body: serde_json::json!({
+                    "error": {"kind": "not_found", "message": format!("VM {vm_id} not registered")}
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            Some(true) => {
+                // Already requested — idempotent 202, no double-trigger.
+                tracing::debug!(vm_id = %vm_id, "duplicate snapshot-request — idempotent 202");
+                Response {
+                    status: 202,
+                    body: serde_json::json!({"status": "already_requested", "vm_id": vm_id})
+                        .to_string()
+                        .into_bytes(),
+                }
+            }
+            Some(false) => {
+                // New request — ack 202 first, then scale async.
+                let reason = body
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let node = self.node.clone();
+                let control = self.control.clone();
+                let vm_id_owned = vm_id.clone();
+                tokio::spawn(async move {
+                    tracing::info!(vm_id = %vm_id_owned, reason = %reason, "processing snapshot request");
+                    match node.scale_to_zero(&vm_id_owned).await {
+                        Ok(snap) => {
+                            control.set_snapshot(
+                                &vm_id_owned,
+                                snap.state_path.to_string_lossy().into_owned(),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                vm_id = %vm_id_owned,
+                                error = %e,
+                                "scale_to_zero failed after snapshot request"
+                            );
+                        }
+                    }
+                    control.clear_snapshot_requested(&vm_id_owned);
+                });
+
+                Response {
+                    status: 202,
+                    body: serde_json::json!({"status": "accepted", "vm_id": vm_id})
+                        .to_string()
+                        .into_bytes(),
+                }
             }
         }
     }

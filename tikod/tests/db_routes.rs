@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use tikod::api::ApiServer;
-use tikod::control::{Control, IdlePolicy};
+use tikod::control::Control;
 use tikod::node::Node;
 use tikod::vmm::{Snapshot, VmConfig, VmId, VmInfo, Vmm, VmmError, VmState};
 
@@ -230,8 +230,7 @@ async fn harness() -> (SocketAddr, FakeAgent) {
 
     let vmm: Arc<dyn Vmm> = Arc::new(MockVmm { guest_ip, known });
     let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-db-test")));
-    let control = Arc::new(Control::new(IdlePolicy::default()));
-    // Point the agent port at the fake agent.
+    let control = Arc::new(Control::new());
     let server = Arc::new(ApiServer::new(node, control).with_agent_port(agent.listen.port()));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -340,7 +339,7 @@ async fn db_route_with_no_guest_ip_is_502() {
         known: ["vm-1".to_string()].into_iter().collect(),
     });
     let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-db-test-noip")));
-    let control = Arc::new(Control::new(IdlePolicy::default()));
+    let control = Arc::new(Control::new());
     let server = Arc::new(ApiServer::new(node, control));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_addr = listener.local_addr().unwrap();
@@ -361,7 +360,7 @@ async fn db_route_unreachable_agent_is_502() {
         known: ["vm-1".to_string()].into_iter().collect(),
     });
     let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-db-test-dead")));
-    let control = Arc::new(Control::new(IdlePolicy::default()));
+    let control = Arc::new(Control::new());
     // Use a port almost certainly nothing listens on.
     let server = Arc::new(ApiServer::new(node, control).with_agent_port(9));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -420,7 +419,7 @@ async fn get_vms_merges_live_and_registry() {
         known: ["vm-live".to_string()].into_iter().collect(),
     });
     let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-list-test")));
-    let control = Arc::new(Control::new(IdlePolicy::default()));
+    let control = Arc::new(Control::new());
     // Registry has the live VM (metadata) + a scaled-to-zero VM (no live proc).
     control.register("vm-live".to_string(), "acme".into(), "main".into(), 5432);
     // A scaled-to-zero VM: registered (so it has metadata) + a snapshot, but not
@@ -468,7 +467,7 @@ async fn post_reports_stores_metrics() {
         known: ["vm-1".to_string()].into_iter().collect(),
     });
     let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-report-test")));
-    let control = Arc::new(Control::new(IdlePolicy::default()));
+    let control = Arc::new(Control::new());
     control.register("vm-1".into(), "acme".into(), "main".into(), 5432);
 
     let server = Arc::new(ApiServer::new(node, control));
@@ -504,5 +503,43 @@ async fn post_reports_stores_metrics() {
 
     // POST with invalid JSON → 400.
     let (status, _) = api_request(api_addr, "POST", "/vms/vm-1/reports", Some("not json")).await;
+    assert_eq!(status, 400);
+}
+
+/// `POST /vms/{id}/snapshot-request` acks 202 and validates input.
+/// The scale_to_zero is spawned async — we verify the ack behavior, not the
+/// full scale (that requires a real VMM backend). Idempotency is tested in
+/// the control module's unit tests (the async task clears the guard too fast
+/// to test it here with a mock VMM).
+#[tokio::test]
+async fn post_snapshot_request_acks_202() {
+    let vmm: Arc<dyn Vmm> = Arc::new(MockVmm {
+        guest_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        known: ["vm-1".to_string()].into_iter().collect(),
+    });
+    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-snap-test")));
+    let control = Arc::new(Control::new());
+    control.register("vm-1".into(), "acme".into(), "main".into(), 5432);
+
+    let server = Arc::new(ApiServer::new(node, control));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+
+    let body = serde_json::json!({"reason": "idle", "metrics": {"connections": 0}});
+
+    // Request → 202 (accepted).
+    let (status, resp) = api_request(api_addr, "POST", "/vms/vm-1/snapshot-request", Some(&body.to_string())).await;
+    assert_eq!(status, 202, "{resp}");
+    assert!(resp.contains("accepted"), "{resp}");
+
+    // Unregistered VM → 404.
+    let (status, _) = api_request(api_addr, "POST", "/vms/vm-ghost/snapshot-request", Some(&body.to_string())).await;
+    assert_eq!(status, 404);
+
+    // Invalid JSON → 400.
+    let (status, _) = api_request(api_addr, "POST", "/vms/vm-1/snapshot-request", Some("not json")).await;
     assert_eq!(status, 400);
 }

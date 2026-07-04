@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 
 use tikod::api::{ApiClient, ApiServer};
-use tikod::control::{Control, IdlePolicy};
+use tikod::control::Control;
 use tikod::node::Node;
 use tikod::vmm::firecracker::FirecrackerVmm;
 use tikod::vmm::{Snapshot, VmConfig, VmmError, VmState};
@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // test never collides with a concurrently running tikod.
     let vmm: Arc<FirecrackerVmm> = Arc::new(FirecrackerVmm::new(data_dir.clone()));
     let node = Arc::new(Node::new(vmm, data_dir.join("snapshots")));
-    let control = Arc::new(Control::new(IdlePolicy::default()));
+    let control = Arc::new(Control::new());
 
     let api_listener = TcpListener::bind("127.0.0.1:0").await?;
     let api_addr = api_listener.local_addr()?;

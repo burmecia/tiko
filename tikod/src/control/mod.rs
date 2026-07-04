@@ -1,8 +1,7 @@
-//! Control plane: VM registry and idle policy.
+//! Control plane: VM registry.
 //!
-//! Tracks VM state and enforces the auto-pause (scale-to-zero) policy.
-//! In v1 this is entirely in-memory and single-node — no persistence,
-//! no clustering.
+//! Tracks VM state and metadata. In v1 this is entirely in-memory and
+//! single-node — no persistence, no clustering.
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────┐
@@ -11,18 +10,14 @@
 //! │  │ VM Registry: { vm_id → VmRecord }              ││
 //! │  │  - tenant_id, branch_id                         ││
 //! │  │  - state: Running | Paused | Stopped            ││
-//! │  │  - last_active_at (for idle detection)          ││
 //! │  │  - snapshot_id (if paused)                      ││
-//! │  └─────────────────────────────────────────────────┘│
-//! │  ┌─────────────────────────────────────────────────┐│
-//! │  │ Idle Policy:                                    ││
-//! │  │  - idle_timeout_secs (default 300 / 5 min)      ││
-//! │  │  - checks last_active_at; triggers pause        ││
+//! │  │  - last_report_at / last_metrics (from agent)   ││
+//! │  │  - snapshot_requested (idempotency guard)       ││
 //! │  └─────────────────────────────────────────────────┘│
 //! └─────────────────────────────────────────────────────┘
 //! ```
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use tracing::{debug, info};
@@ -48,36 +43,27 @@ pub struct VmRecord {
     pub last_report_at: Option<Instant>,
     /// Last metrics report body (raw JSON from the agent).
     pub last_metrics: Option<serde_json::Value>,
+    /// Idempotency guard: true while a snapshot-request from the agent is being
+    /// processed (between ack and scale_to_zero completion).
+    pub snapshot_requested: bool,
 }
 
-/// Configuration for the idle (auto-pause) policy.
-#[derive(Debug, Clone)]
-pub struct IdlePolicy {
-    /// Seconds of inactivity before auto-pausing a VM.
-    pub idle_timeout_secs: u64,
-}
-
-impl Default for IdlePolicy {
-    fn default() -> Self {
-        Self {
-            idle_timeout_secs: 300, // 5 minutes
-        }
-    }
-}
-
-/// In-memory VM registry with idle tracking.
+/// In-memory VM registry.
 pub struct Control {
     /// VM records keyed by VmId.
     vms: DashMap<VmId, VmRecord>,
-    /// Idle policy configuration.
-    idle_policy: IdlePolicy,
+}
+
+impl Default for Control {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Control {
-    pub fn new(idle_policy: IdlePolicy) -> Self {
+    pub fn new() -> Self {
         Self {
             vms: DashMap::new(),
-            idle_policy,
         }
     }
 
@@ -101,6 +87,7 @@ impl Control {
                 snapshot_id: None,
                 last_report_at: None,
                 last_metrics: None,
+                snapshot_requested: false,
             },
         );
     }
@@ -129,22 +116,6 @@ impl Control {
             rec.last_active_at = Instant::now();
             debug!(vm_id = %vm_id, conns = rec.connection_count, "client disconnected");
         }
-    }
-
-    /// Returns VM IDs that have been idle longer than the policy timeout
-    /// and have zero active connections. These are candidates for
-    /// scale-to-zero.
-    pub fn idle_vms(&self) -> Vec<VmId> {
-        let timeout = Duration::from_secs(self.idle_policy.idle_timeout_secs);
-        let now = Instant::now();
-
-        self.vms
-            .iter()
-            .filter(|entry| {
-                entry.connection_count == 0 && now.duration_since(entry.last_active_at) > timeout
-            })
-            .map(|entry| entry.key().clone())
-            .collect()
     }
 
     /// Get the record for a VM.
@@ -178,5 +149,61 @@ impl Control {
         } else {
             false
         }
+    }
+
+    /// Try to mark a snapshot-request as in-progress. Returns:
+    /// - `None` — VM not found in the registry (caller returns 404).
+    /// - `Some(true)` — already requested (idempotent — caller returns 202 but
+    ///   does NOT spawn another scale_to_zero).
+    /// - `Some(false)` — new request, flag now set (caller spawns scale_to_zero).
+    pub fn try_mark_snapshot_requested(&self, vm_id: &VmId) -> Option<bool> {
+        if let Some(mut rec) = self.vms.get_mut(vm_id) {
+            let was = rec.snapshot_requested;
+            rec.snapshot_requested = true;
+            Some(was)
+        } else {
+            None
+        }
+    }
+
+    /// Clear the snapshot-requested flag (after scale_to_zero completes or
+    /// fails).
+    pub fn clear_snapshot_requested(&self, vm_id: &VmId) {
+        if let Some(mut rec) = self.vms.get_mut(vm_id) {
+            rec.snapshot_requested = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_request_idempotency() {
+        let ctrl = Control::new();
+        ctrl.register("vm-1".into(), "acme".into(), "main".into(), 5432);
+
+        // Unknown VM → None.
+        assert!(ctrl.try_mark_snapshot_requested(&"vm-ghost".into()).is_none());
+
+        // First request → Some(false) (new).
+        assert_eq!(
+            ctrl.try_mark_snapshot_requested(&"vm-1".into()),
+            Some(false)
+        );
+
+        // Second request → Some(true) (already requested — idempotent).
+        assert_eq!(
+            ctrl.try_mark_snapshot_requested(&"vm-1".into()),
+            Some(true)
+        );
+
+        // After clearing, next request is new again.
+        ctrl.clear_snapshot_requested(&"vm-1".into());
+        assert_eq!(
+            ctrl.try_mark_snapshot_requested(&"vm-1".into()),
+            Some(false)
+        );
     }
 }

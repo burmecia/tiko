@@ -32,6 +32,7 @@ use tikoguest::http::HttpClient;
 use tikoguest::observer;
 use tikoguest::pgmetrics::{PgMetrics, PgMetricsConfig};
 use tikoguest::pgops::PgCtl;
+use tikoguest::scaler::{self, ScalerPolicy};
 use tikoguest::server::PgServer;
 
 /// Guest-side agent for tikod.
@@ -74,6 +75,10 @@ struct Args {
     #[arg(long, default_value_t = 30, env = "TIKOGUEST_OBSERVE_INTERVAL")]
     observe_interval: u64,
 
+    /// Scaler loop interval (seconds). 0 disables the scaler.
+    #[arg(long, default_value_t = 30, env = "TIKOGUEST_SCALE_INTERVAL")]
+    scale_interval: u64,
+
     /// libpq connection string for metrics collection. Defaults to the unix
     /// socket as the `postgres` user, database `tt`.
     #[arg(long, env = "TIKOGUEST_PG_CONN")]
@@ -111,33 +116,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Background tasks ───────────────────────────────────────────────────
     //
-    // The observer loop pushes PG metrics to tikod. It only starts when the
-    // agent knows its own VM ID and tikod's address — both come from tiko.env
+    // The observer loop pushes PG metrics to tikod; the scaler loop evaluates
+    // snapshot eligibility and sends snapshot-request signals. Both start only
+    // when the agent knows its own VM ID and tikod's address — from tiko.env
     // (written by start_vm.sh) or the process env. Without them the agent
     // still serves its HTTP API (useful for testing and fresh VMs).
 
-    if args.observe_interval > 0 {
-        let tiko_env = ctl.tiko_env();
-        let vm_id = env::lookup_optional(tiko_env, "TIKO_VM_ID");
-        let tikod_addr = env::lookup_optional(tiko_env, "TIKOD_ADDR");
+    let tiko_env = ctl.tiko_env();
+    let vm_id = env::lookup_optional(tiko_env, "TIKO_VM_ID");
+    let tikod_addr = env::lookup_optional(tiko_env, "TIKOD_ADDR");
 
-        match (vm_id, tikod_addr) {
-            (Some(vm_id), Some(addr)) => {
-                let Ok(tikod_addr) = addr.parse::<SocketAddr>() else {
-                    tracing::warn!(addr = %addr, "TIKOD_ADDR is not a valid SocketAddr — observer disabled");
-                    return start_server(listen_addr, ctl).await;
-                };
+    match (vm_id, tikod_addr) {
+        (Some(vm_id), Some(addr)) => {
+            let Ok(tikod_addr) = addr.parse::<SocketAddr>() else {
+                tracing::warn!(addr = %addr, "TIKOD_ADDR is not a valid SocketAddr — background tasks disabled");
+                return start_server(listen_addr, ctl).await;
+            };
 
-                let pg_config = match &args.pg_conn {
-                    Some(conn) => PgMetricsConfig {
-                        connection_string: conn.clone(),
-                        db_name: "tt".into(),
-                    },
-                    None => PgMetricsConfig::default(),
-                };
-                let pg_metrics = PgMetrics::new(pg_config);
+            let pg_config = match &args.pg_conn {
+                Some(conn) => PgMetricsConfig {
+                    connection_string: conn.clone(),
+                    db_name: "tt".into(),
+                },
+                None => PgMetricsConfig::default(),
+            };
+
+            if args.observe_interval > 0 {
+                let pg_metrics = PgMetrics::new(pg_config.clone());
                 let tikod_client = HttpClient::new(tikod_addr);
-
                 tracing::info!(
                     vm_id = %vm_id,
                     tikod = %tikod_addr,
@@ -146,17 +152,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 tokio::spawn(observer::observer_loop(
                     pg_metrics,
-                    vm_id,
+                    vm_id.clone(),
                     tikod_client,
                     Duration::from_secs(args.observe_interval),
                 ));
             }
-            _ => {
+
+            if args.scale_interval > 0 {
+                let pg_metrics = PgMetrics::new(pg_config);
+                let tikod_client = HttpClient::new(tikod_addr);
                 tracing::info!(
-                    "observer loop disabled — TIKO_VM_ID or TIKOD_ADDR not set \
-                     (agent still serves HTTP API)"
+                    vm_id = %vm_id,
+                    tikod = %tikod_addr,
+                    interval_secs = args.scale_interval,
+                    "starting scaler loop"
                 );
+                tokio::spawn(scaler::scaler_loop(
+                    pg_metrics,
+                    vm_id,
+                    tikod_client,
+                    Duration::from_secs(args.scale_interval),
+                    ScalerPolicy::default(),
+                ));
             }
+        }
+        _ => {
+            tracing::info!(
+                "background tasks disabled — TIKO_VM_ID or TIKOD_ADDR not set \
+                 (agent still serves HTTP API)"
+            );
         }
     }
 

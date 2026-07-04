@@ -161,6 +161,8 @@ TIKO_DB_ID=${TIKO_DB_ID}
 TIKO_PROJECT_ID=${TIKO_PROJECT_ID}
 TIKO_STORAGE_ROOT=/mnt/s3files/tiko_root
 TIKO_LOCAL_PATH=/var/lib/postgresql/tiko_local
+TIKO_VM_ID=vm-${VM_ID}
+TIKOD_ADDR=${SUBNET}.1:9000
 TIKO_ENV
 sudo chown --reference="$BASE_RO/var/lib/postgresql/tiko.env" \
     "$OV_MNT/upper/var/lib/postgresql/tiko.env" 2>/dev/null || true
