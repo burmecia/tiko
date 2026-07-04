@@ -21,21 +21,17 @@
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
 //! (`TIKO_ORG_ID` / `TIKO_DB_ID` / `TIKO_PROJECT_ID` / `TIKO_STORAGE_ROOT` /
 //! `TIKO_LOCAL_PATH`), loaded from `tiko.env` so the in-guest tikoworker
-//! extension sees the correct org/db/project. See `pgops::load_tiko_env`.
+//! extension sees the correct org/db/project. See `env::load_tiko_env`.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 
+use crate::http::{read_request, write_response, ok_json, no_content, bad_request, not_found, Request, Response};
 use crate::pgops::{PgCtl, PgCtlError, PgCtlResult, StopMode};
-
-/// Maximum accepted request header block size.
-const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// HTTP control server wrapping a [`PgCtl`].
 pub struct PgServer {
@@ -222,150 +218,6 @@ struct StopBody {
 #[derive(serde::Deserialize)]
 struct InitBody {
     force: Option<bool>,
-}
-
-// ============================================================================
-// HTTP/1.1 parsing & writing (same shape as tikod/src/api/server.rs)
-// ============================================================================
-
-struct Request {
-    method: String,
-    path: String,
-    #[allow(dead_code)]
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-struct Response {
-    status: u16,
-    body: Vec<u8>,
-}
-
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            return Err(std::io::Error::other("client closed before sending full headers"));
-        }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
-        if buf.len() > MAX_HEADER_BYTES {
-            return Err(std::io::Error::other("request headers too large"));
-        }
-    }
-
-    let header_str = String::from_utf8_lossy(&buf);
-    let mut lines = header_str.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
-
-    if method.is_empty() || path.is_empty() {
-        return Err(std::io::Error::other("malformed request line"));
-    }
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
-        }
-    }
-
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        stream.read_exact(&mut body).await?;
-    }
-
-    Ok(Some(Request {
-        method,
-        path,
-        headers,
-        body,
-    }))
-}
-
-async fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let status_text = status_text(status);
-    let head = format!(
-        "HTTP/1.1 {status} {status_text}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        len = body.len(),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-fn status_text(code: u16) -> &'static str {
-    match code {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        _ => "Error",
-    }
-}
-
-// ── Response constructors ────────────────────────────────────────────────
-
-fn ok_json(value: serde_json::Value) -> Response {
-    Response {
-        status: 200,
-        body: value.to_string().into_bytes(),
-    }
-}
-
-fn no_content() -> Response {
-    Response {
-        status: 204,
-        body: Vec::new(),
-    }
-}
-
-fn bad_request(message: &str) -> Response {
-    Response {
-        status: 400,
-        body: serde_json::json!({"error": {"kind": "bad_request", "message": message}})
-            .to_string()
-            .into_bytes(),
-    }
-}
-
-fn not_found(method: &str, path: &str) -> Response {
-    Response {
-        status: 404,
-        body: serde_json::json!({
-            "error": {"kind": "not_found", "message": format!("no route for {method} {path}")}
-        })
-        .to_string()
-        .into_bytes(),
-    }
 }
 
 fn err_resp(err: &PgCtlError) -> Response {

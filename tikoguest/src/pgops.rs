@@ -107,11 +107,8 @@ impl PgCtl {
             .map(|p| p.join("postgresql.tiko.conf"))
             .unwrap_or_else(|| config_file.clone());
         // The per-VM identity file (written by start_vm.sh) lives in PGHOME.
-        let tiko_env_path = data_dir
-            .parent()
-            .map(|p| p.join("tiko.env"))
-            .unwrap_or_else(|| PathBuf::from("tiko.env"));
-        let tiko_env = load_tiko_env(&tiko_env_path, &data_dir);
+        let tiko_env_path = crate::env::default_tiko_env_path(&data_dir);
+        let tiko_env = crate::env::load_tiko_env(&tiko_env_path, &data_dir);
         Self {
             pg_ctl,
             initdb: PathBuf::from("initdb"),
@@ -145,7 +142,7 @@ impl PgCtl {
     /// Reload Tiko identity env vars from a non-default `tiko.env` path. Use
     /// when `--tiko-env` points somewhere other than `<data_dir_parent>/tiko.env.
     pub fn with_tiko_env_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.tiko_env = load_tiko_env(path.as_ref(), &self.data_dir);
+        self.tiko_env = crate::env::load_tiko_env(path.as_ref(), &self.data_dir);
         self
     }
 
@@ -422,88 +419,6 @@ impl PgCtl {
 /// paths in this crate are config-controlled ASCII.
 fn arg_path(p: &Path) -> String {
     p.to_string_lossy().into_owned()
-}
-
-/// Resolve the per-VM Tiko identity env map, mirroring `tiko_env.sh`:
-///
-/// Precedence for each var: **inherited process env > `tiko.env` file value >
-/// default**. Inherited-wins lets the systemd unit (or `TIKO_DB_ID=7 tikoguest`)
-/// override the file; otherwise the per-VM file (written by `start_vm.sh`) is
-/// the source of truth; otherwise the `tiko_env.sh` defaults apply.
-///
-/// The result is attached to every spawned `pg_ctl` / `initdb` so the in-guest
-/// tikoworker extension reads the correct org/db/project + storage roots.
-fn load_tiko_env(tiko_env_path: &Path, data_dir: &Path) -> HashMap<String, String> {
-    let file_values = parse_env_file(tiko_env_path);
-    // PGHOME = the data dir's parent (matches tiko_env.sh's PGHOME).
-    let pg_home = data_dir.parent().unwrap_or_else(|| Path::new("/var/lib/postgresql"));
-    let defaults: [(&str, String); 5] = [
-        ("TIKO_ORG_ID", "12".into()),
-        ("TIKO_DB_ID", "34".into()),
-        ("TIKO_PROJECT_ID", "56".into()),
-        (
-            "TIKO_STORAGE_ROOT",
-            "/mnt/s3files/tiko_root".into(), // tiko_env.sh: $S3FILES/tiko_root
-        ),
-        (
-            "TIKO_LOCAL_PATH",
-            pg_home.join("tiko_local").to_string_lossy().into_owned(),
-        ),
-    ];
-
-    let mut out = HashMap::new();
-    for (key, default) in defaults {
-        let val = std::env::var(key)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| file_values.get(key).cloned())
-            .unwrap_or(default);
-        out.insert(key.to_string(), val);
-    }
-    // Also forward any *other* TIKO_* keys present in the file (forward-compat).
-    for (k, v) in file_values {
-        if k.starts_with("TIKO_") && !out.contains_key(&k) {
-            out.insert(k, v);
-        }
-    }
-    if !tiko_env_path.exists() {
-        debug!(path = ?tiko_env_path, "tiko.env absent; using identity defaults");
-    } else {
-        debug!(path = ?tiko_env_path, vars = ?out, "loaded tiko identity env");
-    }
-    out
-}
-
-/// Parse a `KEY=VALUE` env file (the format `start_vm.sh` writes for
-/// `tiko.env`). Blank lines and `#` comments are skipped. Errors are logged and
-/// yield an empty map rather than failing startup.
-fn parse_env_file(path: &Path) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return out;
-    };
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            warn!(path = ?path, line = i + 1, "skipping malformed env line");
-            continue;
-        };
-        let k = k.trim();
-        let mut v = v.trim().to_string();
-        if v.len() >= 2
-            && ((v.starts_with('"') && v.ends_with('"'))
-                || (v.starts_with('\'') && v.ends_with('\'')))
-        {
-            v = v[1..v.len() - 1].to_string();
-        }
-        if !k.is_empty() {
-            out.insert(k.to_string(), v);
-        }
-    }
-    out
 }
 
 /// Append `line` to `path`, creating the file if missing. Used during `init`
