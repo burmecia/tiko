@@ -9,6 +9,8 @@
 //! | Method | Path           | Handler      | Body / Returns                                          |
 //! |--------|----------------|--------------|---------------------------------------------------------|
 //! | `GET`  | `/health`      | liveness     | `{"status":"ok","initialized":bool,"running":bool}`     |
+//! | `GET`  | `/services`    | service list | `{"services":[{name,status},...]}`                      |
+//! | `*`    | `/services/{name}/*` | service dispatch | forwarded to registered [`Service`](crate::service::Service) |
 //! | `GET`  | `/pg/status`   | full status  | `{"initialized","running","ready","pid","version",...}` |
 //! | `POST` | `/pg/init`     | initdb       | 204  body: `{"force":bool}` (409 if running/initialized) |
 //! | `POST` | `/pg/start`    | pg_ctl start | 204                                                     |
@@ -32,15 +34,26 @@ use tracing::{debug, error, info};
 
 use crate::http::{read_request, write_response, ok_json, no_content, bad_request, not_found, Request, Response};
 use crate::pgops::{PgCtl, PgCtlError, PgCtlResult, StopMode};
+use crate::service::ServiceRegistry;
 
-/// HTTP control server wrapping a [`PgCtl`].
+/// HTTP control server wrapping a [`PgCtl`] + [`ServiceRegistry`].
 pub struct PgServer {
     ctl: PgCtl,
+    services: ServiceRegistry,
 }
 
 impl PgServer {
     pub fn new(ctl: PgCtl) -> Self {
-        Self { ctl }
+        Self {
+            ctl,
+            services: ServiceRegistry::new(),
+        }
+    }
+
+    /// Register an in-VM service for `/services/{name}/*` dispatch.
+    pub fn with_service(mut self, service: Arc<dyn crate::service::Service>) -> Self {
+        self.services.register(service);
+        self
     }
 
     pub async fn run(self: Arc<Self>, listen_addr: SocketAddr) -> std::io::Result<()> {
@@ -93,6 +106,17 @@ impl PgServer {
 
         match (method, segs.as_slice()) {
             ("GET", ["health"]) => self.health().await,
+
+            // Service registry: list registered services.
+            ("GET", ["services"]) => self.list_services(),
+
+            // Service dispatch: /services/{name}/* → registered service.
+            (_, ["services", name, rest @ ..]) => {
+                match self.services.route(name, method, rest, &req.body) {
+                    Some(resp) => resp,
+                    None => not_found(method, &format!("/services/{name}")),
+                }
+            }
 
             ("GET", ["pg", "status"]) => self.status().await,
             ("POST", ["pg", "start"]) => match self.ctl.start().await {
@@ -169,6 +193,17 @@ impl PgServer {
             "initialized": initialized,
             "running": running,
         }))
+    }
+
+    /// `GET /services` — list registered services and their status.
+    fn list_services(&self) -> Response {
+        let services: Vec<_> = self
+            .services
+            .list()
+            .into_iter()
+            .map(|(name, status)| serde_json::json!({"name": name, "status": status}))
+            .collect();
+        ok_json(serde_json::json!({"services": services}))
     }
 
     /// `GET /pg/status` — full status (spawns `pg_ctl status`).

@@ -12,3 +12,4 @@ pub mod pgmetrics;
 pub mod pgops;
 pub mod scaler;
 pub mod server;
+pub mod service;
