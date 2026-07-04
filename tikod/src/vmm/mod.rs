@@ -19,6 +19,7 @@ pub mod firecracker;
 #[cfg(target_os = "macos")]
 pub mod apple_vz;
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -56,6 +57,19 @@ impl std::fmt::Display for VmState {
             VmState::Stopped => write!(f, "stopped"),
         }
     }
+}
+
+/// A live VM's summary, returned by [`Vmm::list_vms`]. This is the authoritative
+/// inventory of VMs the backend currently knows about (running, paused, or
+/// stopped-but-not-yet-destroyed) — the basis for tikod's swarm-wide `GET /vms`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmInfo {
+    /// Unique identifier for this VM instance.
+    pub vm_id: VmId,
+    /// Current lifecycle state.
+    pub state: VmState,
+    /// Guest IP address, if the backend has assigned one.
+    pub guest_ip: Option<IpAddr>,
 }
 
 /// Configuration for creating a new VM.
@@ -168,7 +182,13 @@ pub trait Vmm: Send + Sync {
     async fn vm_state(&self, vm_id: &VmId) -> VmmResult<VmState>;
 
     /// Guest IP address if available (for proxy forwarding).
-    async fn vm_guest_ip(&self, vm_id: &VmId) -> VmmResult<Option<std::net::IpAddr>>;
+    async fn vm_guest_ip(&self, vm_id: &VmId) -> VmmResult<Option<IpAddr>>;
+
+    /// List every VM the backend currently knows about (running, paused, or
+    /// stopped-but-not-destroyed). This is the authoritative per-backend
+    /// inventory — tikod merges it with its control registry to produce the
+    /// swarm-wide `GET /vms` view.
+    async fn list_vms(&self) -> VmmResult<Vec<VmInfo>>;
 }
 
 /// Returns the platform-default VMM backend.

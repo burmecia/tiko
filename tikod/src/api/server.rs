@@ -1,11 +1,18 @@
-//! HTTP control API for VM lifecycle management.
+//! HTTP control API — tikod is the single control point for a swarm of VMs.
 //!
-//! Exposes the [`Vmm`](crate::vmm::Vmm) trait and the higher-level
-//! [`Node`](crate::node::Node) orchestration over a Firecracker-style REST API.
-//! Like the Firecracker backend client in `vmm::firecracker`, this server uses
-//! raw HTTP/1.1 over TCP — no external HTTP library is needed.
+//! Both VM lifecycle ([`Vmm`](crate::vmm::Vmm) / [`Node`](crate::node::Node))
+//! and in-guest Postgres control ([`DbControl`](crate::dbcontrol::DbControl) →
+//! the per-VM `pgctl` agent) are exposed here. Clients never talk to a VM or its
+//! Postgres directly — every operation goes through this API, and tikod fans it
+//! out to the right guest over the guest IP. Like the Firecracker backend
+//! client, this server uses raw HTTP/1.1 over TCP — no external HTTP library.
 //!
-//! # Routes
+//! ```text
+//! Client ──HTTP──→ tikod API ──┬─ Vmm/Node ──→ backend (Firecracker/VZ)
+//!                              └─ DbControl ──→ guest_ip:9000 ──→ pgctl ──→ pg_ctl
+//! ```
+//!
+//! # VM lifecycle routes
 //!
 //! | Method | Path                        | Handler           | Returns                                  |
 //! |--------|-----------------------------|-------------------|------------------------------------------|
@@ -24,12 +31,32 @@
 //! | `PUT`  | `/vms/{vm_id}/snapshot`     | snapshot_vm       | `Snapshot`                               |
 //! | `PUT`  | `/vms/{vm_id}/scale-to-zero`| pause+snap+destroy| `Snapshot`                               |
 //!
+//! # Postgres control routes (forwarded to the guest `pgctl` agent)
+//!
+//! All `/vms/{vm_id}/db/*` routes resolve the VM's guest IP via the Vmm layer,
+//! then proxy to that guest's `pgctl` agent (`guest_ip:agent_port`, default 9000
+//! — see [`DEFAULT_AGENT_PORT`](crate::dbcontrol::DEFAULT_AGENT_PORT)). The
+//! agent's status code and structured error body are forwarded verbatim.
+//!
+//! | Method | Path                            | Agent endpoint | Returns / Body                                            |
+//! |--------|---------------------------------|----------------|-----------------------------------------------------------|
+//! | `GET`  | `/vms/{vm_id}/db/health`        | `/health`      | `{"status","initialized","running"}`                      |
+//! | `GET`  | `/vms/{vm_id}/db/status`        | `/pg/status`   | `{"initialized","running","ready","pid","version",...}`   |
+//! | `POST` | `/vms/{vm_id}/db/init`          | `/pg/init`     | 204  body: `{"force":bool}` (409 if running/initialized)   |
+//! | `POST` | `/vms/{vm_id}/db/start`         | `/pg/start`    | 204                                                       |
+//! | `POST` | `/vms/{vm_id}/db/stop`          | `/pg/stop`     | 204  body: `{"mode":"fast\|smart\|immediate"}`            |
+//! | `POST` | `/vms/{vm_id}/db/restart`       | `/pg/restart`  | 204                                                       |
+//! | `POST` | `/vms/{vm_id}/db/reload`        | `/pg/reload`   | 204                                                       |
+//! | `GET`  | `/vms/{vm_id}/db/config`        | `/pg/config`   | `{"settings":{name:value,...}}`                           |
+//! | `PUT`  | `/vms/{vm_id}/db/config`        | `/pg/config`   | 204  body: `{"settings":{name:value}}` (then reloads)     |
+//!
 //! # Error responses
 //!
 //! All errors use `{"error":{"kind":...,"message":...}}` with structured fields
 //! (`vm_id`, `current`, `expected`) so clients can reconstruct the original
 //! [`VmmError`](crate::vmm::VmmError) variant. Status codes: 400 invalid config /
-//! bad request, 404 not found, 409 invalid state, 500 backend / I/O.
+//! bad request, 404 not found, 409 invalid state, 500 backend / I/O, 502 agent
+//! unreachable (no guest IP or agent connection failed).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -40,6 +67,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::control::Control;
+use crate::dbcontrol::{DbControl, DbControlError, DEFAULT_AGENT_PORT};
 use crate::node::Node;
 use crate::vmm::{Snapshot, VmConfig, VmId, VmmError};
 
@@ -51,11 +79,23 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub struct ApiServer {
     node: Arc<Node>,
     control: Arc<Control>,
+    /// Port the in-guest `pgctl` agent listens on; used for `/vms/{id}/db/*`.
+    agent_port: u16,
 }
 
 impl ApiServer {
     pub fn new(node: Arc<Node>, control: Arc<Control>) -> Self {
-        Self { node, control }
+        Self {
+            node,
+            control,
+            agent_port: DEFAULT_AGENT_PORT,
+        }
+    }
+
+    /// Override the guest-agent port (default [`DEFAULT_AGENT_PORT`]).
+    pub fn with_agent_port(mut self, port: u16) -> Self {
+        self.agent_port = port;
+        self
     }
 
     /// Bind to `listen_addr` and serve forever. Logs the resolved address.
@@ -117,7 +157,7 @@ impl ApiServer {
             ("GET", ["health"]) => ok_json(serde_json::json!({"status": "ok"})),
 
             // Collection-level routes.
-            ("GET", ["vms"]) => self.list_vms(),
+            ("GET", ["vms"]) => self.list_vms().await,
             ("PUT", ["vms"]) => match parse_json::<VmConfig>(&req.body) {
                 Ok(config) => match self.node.vmm().create_vm(config).await {
                     Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
@@ -150,6 +190,12 @@ impl ApiServer {
                 },
                 Err(r) => r,
             },
+
+            // DB control routes: /vms/{vm_id}/db/{...} → in-guest pgctl agent.
+            (_, ["vms", vm_id, "db", rest @ ..]) => {
+                self.route_db(method, &VmId::from(*vm_id), rest, req)
+                    .await
+            }
 
             // Per-VM routes: /vms/{vm_id}[/{action}].
             (_, ["vms", vm_id, rest @ ..]) => {
@@ -218,23 +264,225 @@ impl ApiServer {
         }
     }
 
-    /// `GET /vms` — best-effort registry listing. State is queried lazily so a
-    /// transient backend lookup failure degrades to `state: unknown` rather than
-    /// failing the whole list.
-    fn list_vms(&self) -> Response {
-        let records = self.control.list();
-        let mut arr = Vec::with_capacity(records.len());
-        for (vm_id, rec) in records {
-            arr.push(serde_json::json!({
-                "vm_id": vm_id,
-                "tenant_id": rec.tenant_id,
-                "branch_id": rec.branch_id,
-                "connection_count": rec.connection_count,
-                "snapshot_id": rec.snapshot_id,
-            }));
+    /// `GET /vms` — authoritative swarm inventory: the union of live VMs known
+    /// to the backend ([`Node::list_vms`]) and registered VMs in the control
+    /// plane (which includes scaled-to-zero VMs with no live process). Live
+    /// state/guest_ip come from the backend; tenant/branch/connection/snapshot
+    /// metadata come from the registry where available.
+    async fn list_vms(&self) -> Response {
+        // Live VMs from the backend (authoritative for state + guest IP).
+        let live: std::collections::HashMap<VmId, crate::vmm::VmInfo> = match self.node.list_vms().await {
+            Ok(list) => list.into_iter().map(|i| (i.vm_id.clone(), i)).collect(),
+            Err(e) => return err_resp(&e),
+        };
+        let registry = self.control.list();
+
+        // Merge: every live VM, then every registered VM not currently live
+        // (e.g. scaled to zero — present only as a snapshot).
+        let mut entries = serde_json::Map::new();
+        for (vm_id, info) in &live {
+            let rec = registry.iter().find(|(id, _)| id == vm_id).map(|(_, r)| r);
+            entries.insert(
+                vm_id.clone(),
+                serde_json::json!({
+                    "vm_id": vm_id,
+                    "state": info.state,
+                    "guest_ip": info.guest_ip,
+                    "tenant_id": rec.map(|r| r.tenant_id.clone()),
+                    "branch_id": rec.map(|r| r.branch_id.clone()),
+                    "connection_count": rec.map(|r| r.connection_count),
+                    "snapshot_id": rec.and_then(|r| r.snapshot_id.clone()),
+                }),
+            );
         }
-        ok_json(serde_json::json!({"vms": arr}))
+        for (vm_id, rec) in registry {
+            if live.contains_key(&vm_id) {
+                continue;
+            }
+            entries.insert(
+                vm_id.clone(),
+                serde_json::json!({
+                    "vm_id": vm_id,
+                    "state": null,
+                    "guest_ip": null,
+                    "tenant_id": rec.tenant_id,
+                    "branch_id": rec.branch_id,
+                    "connection_count": rec.connection_count,
+                    "snapshot_id": rec.snapshot_id,
+                }),
+            );
+        }
+
+        // Sort by vm_id for a stable response.
+        let mut vms: Vec<_> = entries.into_values().collect();
+        vms.sort_by(|a, b| {
+            a.get("vm_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("vm_id").and_then(|v| v.as_str()).unwrap_or(""))
+        });
+        ok_json(serde_json::json!({"vms": vms}))
     }
+
+    /// Dispatch `/vms/{vm_id}/db/{...}` routes to the in-guest `pgctl` agent.
+    /// Resolves the guest IP first; VM-not-found / no-IP surface as errors
+    /// before any agent call is attempted.
+    async fn route_db(&self, method: &str, vm_id: &VmId, rest: &[&str], req: &Request) -> Response {
+        let guest_ip = match self.node.guest_ip(vm_id).await {
+            Ok(Some(ip)) => ip,
+            Ok(None) => {
+                return Response {
+                    status: 502,
+                    body: serde_json::json!({
+                        "error": {
+                            "kind": "agent_unreachable",
+                            "message": format!("no guest IP discovered for VM {vm_id}"),
+                        }
+                    })
+                    .to_string()
+                    .into_bytes(),
+                };
+            }
+            Err(e) => return err_resp(&e),
+        };
+        let db = DbControl::for_guest(guest_ip, self.agent_port);
+
+        let path = format!("/vms/{vm_id}/db/{}", rest.join("/"));
+        match (method, rest) {
+            ("GET", ["health"]) => forward(db.health().await),
+            ("GET", ["status"]) => forward(db.status().await),
+            ("POST", ["start"]) => forward_void(db.start().await),
+            ("POST", ["stop"]) => {
+                let mode = match parse_stop_mode(req) {
+                    Ok(m) => m,
+                    Err(r) => return r,
+                };
+                forward_void(db.stop(mode).await)
+            }
+            ("POST", ["restart"]) => forward_void(db.restart().await),
+            ("POST", ["reload"]) => forward_void(db.reload().await),
+            ("POST", ["init"]) => {
+                let force = match parse_init_force(req) {
+                    Ok(f) => f,
+                    Err(r) => return r,
+                };
+                forward_void(db.init(force).await)
+            }
+            ("GET", ["config"]) => forward(db.get_config().await),
+            ("PUT", ["config"]) => match parse_config_settings(req) {
+                Ok(settings) => forward_void(db.set_config(&settings).await),
+                Err(r) => r,
+            },
+            _ => not_found(method, &path),
+        }
+    }
+}
+
+/// Forward a `DbResult<T: Serialize>` to a Response: Ok → 200 JSON, Err → mapped.
+fn forward<T: serde::Serialize>(res: Result<T, DbControlError>) -> Response {
+    match res {
+        Ok(v) => ok_value(&v),
+        Err(e) => db_err_resp(e),
+    }
+}
+
+/// Forward a `DbResult<()>`: Ok → 204, Err → mapped.
+fn forward_void(res: Result<(), DbControlError>) -> Response {
+    match res {
+        Ok(()) => no_content(),
+        Err(e) => db_err_resp(e),
+    }
+}
+
+/// Map a [`DbControlError`] to a Response. VM errors reuse the Vmm mapping;
+/// transport failures are 502 (bad gateway); agent errors forward the agent's
+/// own status code and `kind`.
+fn db_err_resp(e: DbControlError) -> Response {
+    match e {
+        DbControlError::Vm(vmerr) => err_resp(&vmerr),
+        DbControlError::Transport(m) => Response {
+            status: 502,
+            body: serde_json::json!({
+                "error": {"kind": "agent_unreachable", "message": m}
+            })
+            .to_string()
+            .into_bytes(),
+        },
+        DbControlError::Agent {
+            status,
+            kind,
+            message,
+        } => Response {
+            status,
+            body: serde_json::json!({
+                "error": {"kind": kind, "message": message}
+            })
+            .to_string()
+            .into_bytes(),
+        },
+    }
+}
+
+/// Parse `{"force": bool}` from a `/pg/init` request. Missing body / missing
+/// field defaults to `false`; a present-but-non-bool value is a 400.
+fn parse_init_force(req: &Request) -> Result<bool, Response> {
+    if req.body.is_empty() {
+        return Ok(false);
+    }
+    #[derive(serde::Deserialize)]
+    struct Body {
+        force: Option<bool>,
+    }
+    serde_json::from_slice::<Body>(&req.body)
+        .map(|b| b.force.unwrap_or(false))
+        .map_err(|_| Response {
+            status: 400,
+            body: serde_json::json!({
+                "error": {"kind": "bad_request", "message": "invalid init body; expected {\"force\":bool}"}
+            })
+            .to_string()
+            .into_bytes(),
+        })
+}
+
+/// Parse `{"mode":"fast|smart|immediate"}` from a `/pg/stop` request. Missing
+/// body defaults to [`crate::dbcontrol::StopMode::Fast`]; a present-but-invalid
+/// value is a 400.
+fn parse_stop_mode(req: &Request) -> Result<crate::dbcontrol::StopMode, Response> {
+    use crate::dbcontrol::StopMode;
+    if req.body.is_empty() {
+        return Ok(StopMode::default());
+    }
+    #[derive(serde::Deserialize)]
+    struct Body {
+        mode: StopMode,
+    }
+    serde_json::from_slice::<Body>(&req.body).map(|b| b.mode).map_err(|_| Response {
+        status: 400,
+        body: serde_json::json!({
+            "error": {"kind": "bad_request", "message": "invalid stop body; expected {\"mode\":\"fast|smart|immediate\"}"}
+        })
+        .to_string()
+        .into_bytes(),
+    })
+}
+
+/// Parse `{"settings":{...}}` from a `/pg/config` PUT.
+fn parse_config_settings(req: &Request) -> Result<std::collections::BTreeMap<String, String>, Response> {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        settings: std::collections::BTreeMap<String, String>,
+    }
+    serde_json::from_slice::<Body>(&req.body)
+        .map(|b| b.settings)
+        .map_err(|e| Response {
+            status: 400,
+            body: serde_json::json!({
+                "error": {"kind": "bad_request", "message": format!("invalid config body: {e}")}
+            })
+            .to_string()
+            .into_bytes(),
+        })
 }
 
 // ============================================================================

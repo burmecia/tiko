@@ -7,6 +7,7 @@
 //!   --data-dir <PATH>      Directory for snapshots and runtime artifacts
 //!   --listen <ADDR>        Address for the PG proxy to listen on (default: 127.0.0.1:5432)
 //!   --api-listen <ADDR>    Address for the HTTP control API (default: 127.0.0.1:9000)
+//!   --agent-port <PORT>    Guest pgctl agent port for /vms/{id}/db/* (default: 9000)
 //!   --idle-timeout <SECS>  Auto-pause after N seconds of inactivity (default: 300)
 //!   --backend <NAME>       Force a VMM backend: auto|vz|firecracker (default: auto)
 //! ```
@@ -40,6 +41,10 @@ struct Args {
     /// Address for the HTTP control API (VM lifecycle).
     #[arg(long, default_value = "127.0.0.1:9000")]
     api_listen: String,
+
+    /// Port the in-guest `pgctl` agent listens on (used for /vms/{id}/db/*).
+    #[arg(long, default_value_t = 9000)]
+    agent_port: u16,
 
     /// Auto-pause after N seconds of inactivity.
     #[arg(long, default_value_t = 300)]
@@ -92,7 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control = Arc::new(Control::new(config.idle_policy.clone()));
 
     // Start the HTTP control API in a background task.
-    let api_server = Arc::new(ApiServer::new(node.clone(), control.clone()));
+    let api_server = Arc::new(
+        ApiServer::new(node.clone(), control.clone())
+            .with_agent_port(args.agent_port),
+    );
     tokio::spawn(async move {
         if let Err(e) = api_server.run(api_listen_addr).await {
             tracing::error!(error = %e, "API server exited");

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use crate::vmm::{Snapshot, VmConfig, VmId, VmState, Vmm};
+use crate::vmm::{Snapshot, VmConfig, VmId, VmInfo, VmState, Vmm};
 
 /// High-level VM lifecycle manager.
 ///
@@ -111,6 +111,12 @@ impl Node {
     /// Query VM state.
     pub async fn state(&self, vm_id: &VmId) -> Result<VmState, crate::vmm::VmmError> {
         self.vmm.vm_state(vm_id).await
+    }
+
+    /// List every live VM the backend knows about. This is the authoritative
+    /// per-node inventory; the control plane merges it with its registry.
+    pub async fn list_vms(&self) -> Result<Vec<VmInfo>, crate::vmm::VmmError> {
+        self.vmm.list_vms().await
     }
 
     /// Reference to the underlying VMM backend.

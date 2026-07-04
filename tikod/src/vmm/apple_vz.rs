@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use super::{Snapshot, VmConfig, VmId, VmState, Vmm, VmmError, VmmResult};
+use super::{Snapshot, VmConfig, VmId, VmInfo, VmState, Vmm, VmmError, VmmResult};
 
 // ============================================================================
 // CoreFoundation Run Loop FFI
@@ -338,6 +338,9 @@ enum VzCommand {
         vm_id: VmId,
         reply: oneshot::Sender<VmmResult<Option<IpAddr>>>,
     },
+    List {
+        reply: oneshot::Sender<VmmResult<Vec<VmInfo>>>,
+    },
 }
 
 /// Internal VM state on the VZ thread.
@@ -467,6 +470,10 @@ impl Vmm for AppleVzVmm {
             reply: tx,
         })
         .await
+    }
+
+    async fn list_vms(&self) -> VmmResult<Vec<VmInfo>> {
+        self.send(|tx| VzCommand::List { reply: tx }).await
     }
 }
 
@@ -669,6 +676,18 @@ fn vz_worker_thread(
                         Some(entry) => Ok(entry.guest_ip),
                         None => Err(VmmError::VmNotFound(vm_id)),
                     };
+                    let _ = reply.send(result);
+                }
+
+                VzCommand::List { reply } => {
+                    let result: VmmResult<Vec<VmInfo>> = Ok(vms
+                        .iter()
+                        .map(|(vm_id, entry)| VmInfo {
+                            vm_id: vm_id.clone(),
+                            state: map_vz_state(entry.vm.state()),
+                            guest_ip: entry.guest_ip,
+                        })
+                        .collect());
                     let _ = reply.send(result);
                 }
             }

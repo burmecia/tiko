@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing::{info, debug, warn};
 
-use super::{Snapshot, VmConfig, VmId, VmState, Vmm, VmmError, VmmResult};
+use super::{Snapshot, VmConfig, VmId, VmInfo, VmState, Vmm, VmmError, VmmResult};
 
 // ============================================================================
 // FcApiClient — minimal HTTP/1.1 client over Unix socket
@@ -1260,5 +1260,20 @@ impl Vmm for FirecrackerVmm {
         let vms = self.vms.lock().unwrap();
         let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
         Ok(Some(entry.guest_ip))
+    }
+
+    async fn list_vms(&self) -> VmmResult<Vec<VmInfo>> {
+        // Snapshot the (id, state, guest_ip) of every tracked VM under the lock.
+        // State is the cached transition state — callers wanting the live FC
+        // state can hit GET /vms/{id} (which queries Firecracker) per VM.
+        let vms = self.vms.lock().unwrap();
+        Ok(vms
+            .iter()
+            .map(|(vm_id, entry)| VmInfo {
+                vm_id: vm_id.clone(),
+                state: entry.state,
+                guest_ip: Some(entry.guest_ip),
+            })
+            .collect())
     }
 }

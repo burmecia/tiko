@@ -1,0 +1,19 @@
+[Unit]
+Description=Tiko Postgres control agent (pgctl)
+Documentation=https://github.com/burmecia/tiko
+# The agent only needs the network to be up so tikod can reach it; it does not
+# itself depend on the S3 Files mount (that is Postgres's concern).
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as postgres so `pg_ctl` and config-file writes have the right owner.
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/pgctl --listen 0.0.0.0:9000
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
