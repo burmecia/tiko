@@ -642,12 +642,34 @@ fn seed_overlay(overlay: &Path, base: &Path, net: &VmNet, vm_index: u8) -> VmmRe
         let _ = run_shell(&format!(
             "chown --reference={bro}/etc/hostname {ov}/upper/etc/hostname 2>/dev/null; true"
         ));
+
+        // Per-VM Tiko identity. The guest's tikoguest agent reads this to know
+        // its own VM ID and tikod's address (for observer/scaler loops), plus
+        // the org/db/project identity passed to the tikoworker extension.
+        // Mirrors start_vm.sh's tiko.env heredoc.
+        let tiko_env = format!(
+            "TIKO_ORG_ID=12\n\
+             TIKO_DB_ID={vm_index}\n\
+             TIKO_PROJECT_ID=56\n\
+             TIKO_STORAGE_ROOT=/mnt/s3files/tiko_root\n\
+             TIKO_LOCAL_PATH=/var/lib/postgresql/tiko_local\n\
+             TIKO_VM_ID=vm-{vm_index}\n\
+             TIKOD_ADDR={gateway}:9000\n"
+        );
+        run_shell(&format!(
+            "tee {ov}/upper/var/lib/postgresql/tiko.env >/dev/null <<'TIKOENV'\n{tiko_env}TIKOENV"
+        ))?;
+        let _ = run_shell(&format!(
+            "chown --reference={bro}/var/lib/postgresql/tiko.env \
+             {ov}/upper/var/lib/postgresql/tiko.env 2>/dev/null; true"
+        ));
+
         Ok::<(), VmmError>(())
     })();
     cleanup();
     seed_err?;
 
-    debug!(path = %overlay.display(), guest = %net.guest_ip, "overlay seeded with per-VM network + hostname");
+    debug!(path = %overlay.display(), guest = %net.guest_ip, "overlay seeded with per-VM network + hostname + tiko identity");
     Ok(())
 }
 

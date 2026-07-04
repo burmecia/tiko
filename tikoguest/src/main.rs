@@ -79,6 +79,11 @@ struct Args {
     #[arg(long, default_value_t = 30, env = "TIKOGUEST_SCALE_INTERVAL")]
     scale_interval: u64,
 
+    /// Consecutive idle ticks before requesting a snapshot (default 10 = 5 min
+    /// at 30s interval).
+    #[arg(long, default_value_t = 10, env = "TIKOGUEST_SCALE_THRESHOLD_TICKS")]
+    scale_threshold_ticks: u64,
+
     /// libpq connection string for metrics collection. Defaults to the unix
     /// socket as the `postgres` user, database `tt`.
     #[arg(long, env = "TIKOGUEST_PG_CONN")]
@@ -161,10 +166,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if args.scale_interval > 0 {
                 let pg_metrics = PgMetrics::new(pg_config);
                 let tikod_client = HttpClient::new(tikod_addr);
+                let policy = ScalerPolicy {
+                    idle_threshold_ticks: args.scale_threshold_ticks,
+                    ..ScalerPolicy::default()
+                };
                 tracing::info!(
                     vm_id = %vm_id,
                     tikod = %tikod_addr,
                     interval_secs = args.scale_interval,
+                    threshold_ticks = policy.idle_threshold_ticks,
                     "starting scaler loop"
                 );
                 tokio::spawn(scaler::scaler_loop(
@@ -172,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     vm_id,
                     tikod_client,
                     Duration::from_secs(args.scale_interval),
-                    ScalerPolicy::default(),
+                    policy,
                 ));
             }
         }

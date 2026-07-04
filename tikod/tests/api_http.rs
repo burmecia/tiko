@@ -161,19 +161,25 @@ async fn unknown_route_is_404() {
     );
 }
 
+/// Invalid JSON on /vms/provision is still 400 (not a crash).
 #[tokio::test]
-async fn empty_body_provision_is_bad_request() {
+async fn invalid_json_provision_is_bad_request() {
     let client = spawn_server().await;
-    let resp = raw_round_trip(
-        client.addr(),
-        b"POST /vms/provision HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    let body = b"{not valid json";
+    let mut req = format!(
+        "POST /vms/provision HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
     )
-    .await;
+    .into_bytes();
+    req.extend_from_slice(body);
+    let resp = raw_round_trip(client.addr(), &req).await;
     assert!(
         resp.starts_with("HTTP/1.1 400"),
         "expected 400, got: {}",
         &resp[..resp.len().min(80)]
     );
+    assert!(resp.contains("bad_request"), "missing bad_request kind: {resp}");
 }
 
 #[tokio::test]

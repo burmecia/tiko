@@ -18,8 +18,8 @@
 //! |--------|-----------------------------|-------------------|------------------------------------------|
 //! | `GET`  | `/health`                   | liveness probe    | `{"status":"ok"}`                        |
 //! | `GET`  | `/vms`                      | list VMs          | `{"vms":[{vm_id,...},...]}`              |
-//! | `PUT`  | `/vms`                      | create_vm         | `{"vm_id":"..."}`  body: `VmConfig`      |
-//! | `POST` | `/vms/provision`            | create + start    | `{"vm_id":"..."}`  body: `VmConfig`      |
+//! | `PUT`  | `/vms`                      | create_vm         | `{"vm_id":"..."}`  body optional (auto-generates id) |
+//! | `POST` | `/vms/provision`            | create + start    | `{"vm_id":"..."}`  body optional (auto-generates id) |
 //! | `POST` | `/vms/restore`              | restore_vm        | `{"vm_id":"..."}`  body: `Snapshot`      |
 //! | `POST` | `/vms/scale-from-zero`      | restore + resume  | `{"vm_id":"..."}`  body: `Snapshot`      |
 //! | `GET`  | `/vms/{vm_id}`              | vm_state          | `{"vm_id":"...","state":"running"}`      |
@@ -67,6 +67,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -88,6 +89,9 @@ pub struct ApiServer {
     control: Arc<Control>,
     /// Port the in-guest `tikoguest` agent listens on; used for `/vms/{id}/db/*`.
     agent_port: u16,
+    /// Directory containing kernel/rootfs/initramfs assets for the preset
+    /// [`VmConfig`]. Used by `PUT /vms` and `POST /vms/provision`.
+    assets_dir: PathBuf,
 }
 
 impl ApiServer {
@@ -96,6 +100,7 @@ impl ApiServer {
             node,
             control,
             agent_port: DEFAULT_AGENT_PORT,
+            assets_dir: PathBuf::from("tikod/assets"),
         }
     }
 
@@ -103,6 +108,66 @@ impl ApiServer {
     pub fn with_agent_port(mut self, port: u16) -> Self {
         self.agent_port = port;
         self
+    }
+
+    /// Override the assets directory for the preset [`VmConfig`].
+    pub fn with_assets_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.assets_dir = dir.into();
+        self
+    }
+
+    /// Build the fixed preset [`VmConfig`] for a given vm_id from the assets
+    /// directory. Used by `PUT /vms` and `POST /vms/provision` so clients
+    /// don't need to know kernel/rootfs paths.
+    fn default_vm_config(&self, vm_id: VmId) -> VmConfig {
+        let a = &self.assets_dir;
+        VmConfig {
+            vm_id,
+            kernel_path: a.join("vmlinux-6.1"),
+            kernel_cmdline:
+                "console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0".into(),
+            rootfs_path: a.join("ubuntu-24.04-rootfs.ext4"),
+            memory_mb: 512,
+            vcpus: 2,
+            drives: vec![],
+            initrd_path: Some(a.join("tiko-initramfs.cpio.gz")),
+        }
+    }
+
+    /// Parse the request body for `PUT /vms` / `POST /vms/provision`. Accepts:
+    /// - empty body → auto-generate `"vm-{N}"` (next free index)
+    /// - `{"vm_id":"vm-5"}` → use the given id
+    /// - anything else → 400
+    async fn resolve_create_request(&self, req: &Request) -> Result<VmId, Response> {
+        if req.body.is_empty() {
+            return Ok(self.auto_vm_id().await);
+        }
+        #[derive(serde::Deserialize)]
+        struct CreateVmRequest {
+            vm_id: Option<VmId>,
+        }
+        let parsed: CreateVmRequest = serde_json::from_slice(&req.body).map_err(|e| {
+            bad_request(&format!("invalid body; expected {{\"vm_id\":\"...\"}}: {e}"))
+        })?;
+        match parsed.vm_id {
+            Some(id) => Ok(id),
+            None => Ok(self.auto_vm_id().await),
+        }
+    }
+
+    /// Generate `"vm-{N}"` where N is the smallest non-negative integer not
+    /// already used by a live or registered VM.
+    async fn auto_vm_id(&self) -> VmId {
+        let used: std::collections::HashSet<u32> = match self.node.list_vms().await {
+            Ok(list) => list
+                .iter()
+                .filter_map(|info| info.vm_id.strip_prefix("vm-"))
+                .filter_map(|s| s.parse().ok())
+                .collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+        let next = (0u32..).find(|i| !used.contains(i)).unwrap_or(0);
+        format!("vm-{next}")
     }
 
     /// Bind to `listen_addr` and serve forever. Logs the resolved address.
@@ -146,6 +211,15 @@ impl ApiServer {
         debug!(client = %addr, method = %req.method, path = %req.path, "API request");
 
         let resp = self.route(&req).await;
+        let body_preview = preview_body(&resp.body);
+        debug!(
+            client = %addr,
+            method = %req.method,
+            path = %req.path,
+            status = resp.status,
+            body = %body_preview,
+            "API response"
+        );
         write_response(&mut stream, resp.status, &resp.body).await
     }
 
@@ -165,24 +239,32 @@ impl ApiServer {
 
             // Collection-level routes.
             ("GET", ["vms"]) => self.list_vms().await,
-            ("PUT", ["vms"]) => match parse_json::<VmConfig>(&req.body) {
-                Ok(config) => match self.node.vmm().create_vm(config).await {
+            ("PUT", ["vms"]) => {
+                let vm_id = match self.resolve_create_request(req).await {
+                    Ok(id) => id,
+                    Err(r) => return r,
+                };
+                let config = self.default_vm_config(vm_id);
+                match self.node.vmm().create_vm(config).await {
                     Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
                     Err(e) => err_resp(&e),
-                },
-                Err(r) => r,
-            },
-            ("POST", ["vms", "provision"]) => match parse_json::<VmConfig>(&req.body) {
-                Ok(config) => match self.node.provision(config).await {
+                }
+            }
+            ("POST", ["vms", "provision"]) => {
+                let vm_id = match self.resolve_create_request(req).await {
+                    Ok(id) => id,
+                    Err(r) => return r,
+                };
+                let config = self.default_vm_config(vm_id);
+                match self.node.provision(config).await {
                     Ok(id) => {
                         self.control
                             .register(id.clone(), String::new(), String::new(), 5432);
                         ok_json(serde_json::json!({"vm_id": id}))
                     }
                     Err(e) => err_resp(&e),
-                },
-                Err(r) => r,
-            },
+                }
+            }
             ("POST", ["vms", "restore"]) => match parse_json::<Snapshot>(&req.body) {
                 Ok(snap) => match self.node.vmm().restore_vm(&snap).await {
                     Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
@@ -270,6 +352,32 @@ impl ApiServer {
 
             // Agent-inbound: snapshot-request from the guest's scaler loop.
             ("POST", ["snapshot-request"]) => self.snapshot_request(vm_id, req).await,
+
+            // Register an externally-started VM in the control registry (no
+            // VMM backend involvement). Used for VMs started by start_vm.sh.
+            ("POST", ["register"]) => {
+                #[derive(serde::Deserialize)]
+                struct RegisterBody {
+                    tenant_id: Option<String>,
+                    branch_id: Option<String>,
+                    pg_port: Option<u16>,
+                }
+                let body: RegisterBody = if req.body.is_empty() {
+                    RegisterBody { tenant_id: None, branch_id: None, pg_port: None }
+                } else {
+                    match serde_json::from_slice(&req.body) {
+                        Ok(b) => b,
+                        Err(_) => return bad_request("invalid register body"),
+                    }
+                };
+                self.control.register(
+                    vm_id.clone(),
+                    body.tenant_id.unwrap_or_default(),
+                    body.branch_id.unwrap_or_default(),
+                    body.pg_port.unwrap_or(5432),
+                );
+                ok_json(serde_json::json!({"vm_id": vm_id, "registered": true}))
+            }
 
             _ => {
                 let path = format!("/vms/{vm_id}/{}", rest.join("/"));
@@ -702,6 +810,7 @@ fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
@@ -709,6 +818,17 @@ fn status_text(code: u16) -> &'static str {
         409 => "Conflict",
         500 => "Internal Server Error",
         _ => "Error",
+    }
+}
+
+/// Truncate a response body for log preview (avoids dumping huge JSON).
+fn preview_body(body: &[u8]) -> String {
+    const MAX: usize = 500;
+    let text = String::from_utf8_lossy(body);
+    if text.len() <= MAX {
+        text.into_owned()
+    } else {
+        format!("{}...(truncated {} bytes)", &text[..MAX], text.len())
     }
 }
 

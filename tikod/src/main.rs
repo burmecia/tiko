@@ -8,6 +8,7 @@
 //!   --listen <ADDR>        Address for the PG proxy to listen on (default: 127.0.0.1:5432)
 //!   --api-listen <ADDR>    Address for the HTTP control API (default: 127.0.0.1:9000)
 //!   --agent-port <PORT>    Guest tikoguest agent port for /vms/{id}/db/* (default: 9000)
+//!   --assets-dir <PATH>    Kernel/rootfs/initramfs for preset VmConfig (default: tikod/assets)
 //!   --backend <NAME>       Force a VMM backend: auto|vz|firecracker (default: auto)
 //! ```
 
@@ -38,12 +39,17 @@ struct Args {
     listen: String,
 
     /// Address for the HTTP control API (VM lifecycle).
-    #[arg(long, default_value = "127.0.0.1:9000")]
+    #[arg(long, default_value = "0.0.0.0:9000")]
     api_listen: String,
 
     /// Port the in-guest `tikoguest` agent listens on (used for /vms/{id}/db/*).
     #[arg(long, default_value_t = 9000)]
     agent_port: u16,
+
+    /// Directory containing kernel/rootfs/initramfs assets for the preset
+    /// VmConfig (used by `PUT /vms` and `POST /vms/provision`).
+    #[arg(long, default_value = "tikod/assets")]
+    assets_dir: String,
 }
 
 #[tokio::main]
@@ -90,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start the HTTP control API in a background task.
     let api_server = Arc::new(
         ApiServer::new(node.clone(), control.clone())
-            .with_agent_port(args.agent_port),
+            .with_agent_port(args.agent_port)
+            .with_assets_dir(&args.assets_dir),
     );
     tokio::spawn(async move {
         if let Err(e) = api_server.run(api_listen_addr).await {
@@ -101,8 +108,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and run proxy.
     let proxy = Proxy::new(node.clone(), control.clone(), config.proxy.clone());
 
-    // Run the proxy (blocks until interrupted).
-    proxy.run().await?;
+    // Run the proxy until Ctrl+C / SIGINT.
+    tokio::select! {
+        result = proxy.run() => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "proxy exited");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received Ctrl+C, shutting down");
+        }
+    }
 
     Ok(())
 }
