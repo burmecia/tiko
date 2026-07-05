@@ -12,7 +12,8 @@
 //! │  │  - state: Running | Paused | Stopped            ││
 //! │  │  - snapshot_id (if paused)                      ││
 //! │  │  - last_report_at / last_metrics (from agent)   ││
-//! │  │  - snapshot_requested (idempotency guard)       ││
+//! │  │  - pause_requested (idempotency guard)          ││
+//! │  │  - pause_epoch (incremented on each pause)      ││
 //! │  └─────────────────────────────────────────────────┘│
 //! └─────────────────────────────────────────────────────┘
 //! ```
@@ -47,15 +48,17 @@ pub struct VmRecord {
     pub last_report_at: Option<Instant>,
     /// Last metrics report body (raw JSON from the agent).
     pub last_metrics: Option<serde_json::Value>,
-    /// Idempotency guard: true while a snapshot-request from the agent is being
-    /// processed (between ack and scale_to_zero completion).
-    pub snapshot_requested: bool,
-    /// Monotonic counter bumped on every successful cold restore
-    /// (`scale_from_zero`). Guest agents poll it via
-    /// `GET /vms/{vm_id}/restore-epoch` to detect that they were restored from
-    /// a snapshot and reset stale in-memory state (e.g. the scaler's
-    /// `requested` flag / `idle_ticks`). See [`Control::bump_restore_epoch`].
-    pub restore_epoch: u64,
+    /// Idempotency guard: true while a pause-request from the agent is being
+    /// processed (between ack and warm-window completion).
+    pub pause_requested: bool,
+    /// Monotonic counter bumped on every pause (`POST /pause-request`). The
+    /// guest detects the change via the `pause_epoch` field returned by
+    /// `POST /reports` and resets stale in-memory state (e.g. the scaler's
+    /// `idle_ticks`). Covers both pause→resume (traffic during warm window)
+    /// and pause→snapshot→restore cycles, because the bump happens at pause
+    /// time — before the guest is frozen — so the guest's stale local copy
+    /// always mismatches on the first tick after resume/restore.
+    pub pause_epoch: u64,
 }
 
 /// In-memory VM registry.
@@ -124,8 +127,8 @@ impl Control {
                 snapshot: None,
                 last_report_at: None,
                 last_metrics: None,
-                snapshot_requested: false,
-                restore_epoch: 0,
+                pause_requested: false,
+                pause_epoch: 0,
             },
         );
     }
@@ -185,60 +188,59 @@ impl Control {
         self.vms.get(vm_id).and_then(|r| r.snapshot.clone())
     }
 
-    /// Store a metrics report from the guest agent. Returns `true` if the VM
-    /// was found in the registry, `false` if it's unknown (caller should 404).
-    pub fn record_report(&self, vm_id: &VmId, metrics: serde_json::Value) -> bool {
+    /// Store a metrics report from the guest agent. Returns `Some(pause_epoch)`
+    /// if the VM was found (so the caller can include it in the response for
+    /// the guest's epoch-mismatch detection), or `None` if it's unknown (caller
+    /// should 404).
+    pub fn record_report(&self, vm_id: &VmId, metrics: serde_json::Value) -> Option<u64> {
         if let Some(mut rec) = self.vms.get_mut(vm_id) {
             rec.last_report_at = Some(Instant::now());
             rec.last_metrics = Some(metrics);
             debug!(vm_id = %vm_id, "recorded metrics report");
-            true
+            Some(rec.pause_epoch)
         } else {
-            false
+            None
         }
     }
 
-    /// Try to mark a snapshot-request as in-progress. Returns:
+    /// Try to mark a pause-request as in-progress. Returns:
     /// - `None` — VM not found in the registry (caller returns 404).
     /// - `Some(true)` — already requested (idempotent — caller returns 202 but
-    ///   does NOT spawn another scale_to_zero).
-    /// - `Some(false)` — new request, flag now set (caller spawns scale_to_zero).
-    pub fn try_mark_snapshot_requested(&self, vm_id: &VmId) -> Option<bool> {
+    ///   does NOT trigger another pause).
+    /// - `Some(false)` — new request, flag now set (caller pauses the VM).
+    pub fn try_mark_pause_requested(&self, vm_id: &VmId) -> Option<bool> {
         if let Some(mut rec) = self.vms.get_mut(vm_id) {
-            let was = rec.snapshot_requested;
-            rec.snapshot_requested = true;
+            let was = rec.pause_requested;
+            rec.pause_requested = true;
             Some(was)
         } else {
             None
         }
     }
 
-    /// Clear the snapshot-requested flag (after scale_to_zero completes or
-    /// fails).
-    pub fn clear_snapshot_requested(&self, vm_id: &VmId) {
+    /// Clear the pause-requested flag (after warm-window completes or fails).
+    pub fn clear_pause_requested(&self, vm_id: &VmId) {
         if let Some(mut rec) = self.vms.get_mut(vm_id) {
-            rec.snapshot_requested = false;
+            rec.pause_requested = false;
         }
     }
 
-    /// Bump the restore epoch for `vm_id`. Called after a successful cold
-    /// restore (the leader in `Node::wake`'s single-flight path). Guest agents
-    /// polling [`restore_epoch`] detect the change and reset stale state.
+    /// Bump the pause epoch for `vm_id`. Called each time tikod pauses the VM
+    /// (on receiving a new pause-request). The guest detects the change via
+    /// the `pause_epoch` field in the `POST /reports` response and resets
+    /// stale state.
     ///
-    /// No-op if the VM isn't registered (a restore of an unknown VM is
-    /// impossible in practice — the snapshot is looked up from the registry).
-    ///
-    /// [`restore_epoch`]: Control::restore_epoch
-    pub fn bump_restore_epoch(&self, vm_id: &VmId) {
+    /// No-op if the VM isn't registered.
+    pub fn bump_pause_epoch(&self, vm_id: &VmId) {
         if let Some(mut rec) = self.vms.get_mut(vm_id) {
-            rec.restore_epoch = rec.restore_epoch.saturating_add(1);
-            debug!(vm_id = %vm_id, epoch = rec.restore_epoch, "bumped restore epoch");
+            rec.pause_epoch = rec.pause_epoch.saturating_add(1);
+            debug!(vm_id = %vm_id, epoch = rec.pause_epoch, "bumped pause epoch");
         }
     }
 
-    /// Current restore epoch for `vm_id`, or `None` if the VM isn't registered.
-    pub fn restore_epoch(&self, vm_id: &VmId) -> Option<u64> {
-        self.vms.get(vm_id).map(|r| r.restore_epoch)
+    /// Current pause epoch for `vm_id`, or `None` if the VM isn't registered.
+    pub fn pause_epoch(&self, vm_id: &VmId) -> Option<u64> {
+        self.vms.get(vm_id).map(|r| r.pause_epoch)
     }
 
     /// Per-VM single-flight restore lock. Callers hold the returned mutex while
@@ -326,53 +328,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_request_idempotency() {
+    fn pause_request_idempotency() {
         let ctrl = Control::new();
         ctrl.register("vm-1".into(), "acme".into(), "main".into(), 5432);
 
         // Unknown VM → None.
-        assert!(ctrl.try_mark_snapshot_requested(&"vm-ghost".into()).is_none());
+        assert!(ctrl.try_mark_pause_requested(&"vm-ghost".into()).is_none());
 
         // First request → Some(false) (new).
         assert_eq!(
-            ctrl.try_mark_snapshot_requested(&"vm-1".into()),
+            ctrl.try_mark_pause_requested(&"vm-1".into()),
             Some(false)
         );
 
         // Second request → Some(true) (already requested — idempotent).
         assert_eq!(
-            ctrl.try_mark_snapshot_requested(&"vm-1".into()),
+            ctrl.try_mark_pause_requested(&"vm-1".into()),
             Some(true)
         );
 
         // After clearing, next request is new again.
-        ctrl.clear_snapshot_requested(&"vm-1".into());
+        ctrl.clear_pause_requested(&"vm-1".into());
         assert_eq!(
-            ctrl.try_mark_snapshot_requested(&"vm-1".into()),
+            ctrl.try_mark_pause_requested(&"vm-1".into()),
             Some(false)
         );
     }
 
     #[test]
-    fn restore_epoch_starts_zero_and_increments() {
+    fn pause_epoch_starts_zero_and_increments() {
         let ctrl = Control::new();
         ctrl.register("vm-1".into(), "acme".into(), "main".into(), 5432);
 
         // Freshly registered → epoch 0.
-        assert_eq!(ctrl.restore_epoch(&"vm-1".into()), Some(0));
+        assert_eq!(ctrl.pause_epoch(&"vm-1".into()), Some(0));
 
         // Each bump increments by one.
-        ctrl.bump_restore_epoch(&"vm-1".into());
-        ctrl.bump_restore_epoch(&"vm-1".into());
-        assert_eq!(ctrl.restore_epoch(&"vm-1".into()), Some(2));
+        ctrl.bump_pause_epoch(&"vm-1".into());
+        ctrl.bump_pause_epoch(&"vm-1".into());
+        assert_eq!(ctrl.pause_epoch(&"vm-1".into()), Some(2));
     }
 
     #[test]
-    fn restore_epoch_unknown_vm_is_none() {
+    fn pause_epoch_unknown_vm_is_none() {
         let ctrl = Control::new();
-        assert_eq!(ctrl.restore_epoch(&"vm-ghost".into()), None);
+        assert_eq!(ctrl.pause_epoch(&"vm-ghost".into()), None);
         // Bumping an unknown VM is a no-op (not a panic).
-        ctrl.bump_restore_epoch(&"vm-ghost".into());
-        assert_eq!(ctrl.restore_epoch(&"vm-ghost".into()), None);
+        ctrl.bump_pause_epoch(&"vm-ghost".into());
+        assert_eq!(ctrl.pause_epoch(&"vm-ghost".into()), None);
     }
 }

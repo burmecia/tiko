@@ -2,17 +2,19 @@
 //!
 //! Runs inside each Tiko VM as the `postgres` user. Serves:
 //! - **Inbound HTTP API** (tikod → agent): `pg_ctl` lifecycle, config R/W.
-//! - **Observer loop** (agent → tikod): periodic PG metrics push to
-//!   `POST /vms/{id}/reports`.
+//! - **Scaler loop** (agent → tikod): periodic PG metrics push to
+//!   `POST /vms/{id}/reports` (with pause-epoch check) and pause-request
+//!   signals to `POST /vms/{id}/pause-request` when idle.
 //!
 //! ```text
 //! tikod ──HTTP──→ guest:9000 ──→ tikoguest ──→ pg_ctl / postgresql.tiko.conf
 //!                                       └──→ Postgres (PGDATA=/var/lib/postgresql/tt)
 //!
-//! tikoguest ──HTTP──→ tikod /vms/{id}/reports   (observer: metrics push)
+//! tikoguest ──HTTP──→ tikod /vms/{id}/reports        (scaler: metrics + epoch check)
+//! tikoguest ──HTTP──→ tikod /vms/{id}/pause-request  (scaler: idle signal)
 //! ```
 //!
-//! The observer loop starts only when `TIKO_VM_ID` and `TIKOD_ADDR` are
+//! The scaler loop starts only when `TIKO_VM_ID` and `TIKOD_ADDR` are
 //! available (from `tiko.env` or the process env). Without them the agent
 //! still serves its HTTP API — useful for testing and fresh VMs.
 //!
@@ -29,7 +31,6 @@ use tracing_subscriber::EnvFilter;
 
 use tikoguest::env;
 use tikoguest::http::HttpClient;
-use tikoguest::observer;
 use tikoguest::pgmetrics::{PgMetrics, PgMetricsConfig};
 use tikoguest::pgops::PgCtl;
 use tikoguest::scaler::{self, ScalerPolicy};
@@ -71,17 +72,15 @@ struct Args {
     #[arg(long, env = "TIKO_ENV_FILE")]
     tiko_env: Option<PathBuf>,
 
-    /// Observer loop interval (seconds). 0 disables the observer.
+    /// Scaler loop interval (seconds). 0 disables the scaler. The loop pushes
+    /// metrics to tikod, checks the pause epoch, and evaluates idle policy in
+    /// one pass.
     #[arg(long, default_value_t = 30, env = "TIKOGUEST_OBSERVE_INTERVAL")]
     observe_interval: u64,
 
-    /// Scaler loop interval (seconds). 0 disables the scaler.
-    #[arg(long, default_value_t = 30, env = "TIKOGUEST_SCALE_INTERVAL")]
-    scale_interval: u64,
-
-    /// Consecutive idle ticks before requesting a snapshot (default 10 = 5 min
+    /// Consecutive idle ticks before requesting a pause (default 4 = 2 min
     /// at 30s interval).
-    #[arg(long, default_value_t = 10, env = "TIKOGUEST_SCALE_THRESHOLD_TICKS")]
+    #[arg(long, default_value_t = 4, env = "TIKOGUEST_SCALE_THRESHOLD_TICKS")]
     scale_threshold_ticks: u64,
 
     /// libpq connection string for metrics collection. Defaults to the unix
@@ -121,11 +120,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Background tasks ───────────────────────────────────────────────────
     //
-    // The observer loop pushes PG metrics to tikod; the scaler loop evaluates
-    // snapshot eligibility and sends snapshot-request signals. Both start only
-    // when the agent knows its own VM ID and tikod's address — from tiko.env
-    // (written by start_vm.sh) or the process env. Without them the agent
-    // still serves its HTTP API (useful for testing and fresh VMs).
+    // The scaler loop pushes PG metrics to tikod (receiving the pause epoch
+    // back) and evaluates idle policy in a single pass per tick. When idle
+    // for enough ticks, it sends a pause-request. It starts only when the
+    // agent knows its own VM ID and tikod's address — from tiko.env (written
+    // by start_vm.sh) or the process env. Without them the agent still
+    // serves its HTTP API (useful for testing and fresh VMs).
 
     let tiko_env = ctl.tiko_env();
     let vm_id = env::lookup_optional(tiko_env, "TIKO_VM_ID");
@@ -138,32 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return start_server(listen_addr, ctl).await;
             };
 
-            let pg_config = match &args.pg_conn {
-                Some(conn) => PgMetricsConfig {
-                    connection_string: conn.clone(),
-                    db_name: "tt".into(),
-                },
-                None => PgMetricsConfig::default(),
-            };
-
             if args.observe_interval > 0 {
-                let pg_metrics = PgMetrics::new(pg_config.clone());
-                let tikod_client = HttpClient::new(tikod_addr);
-                tracing::info!(
-                    vm_id = %vm_id,
-                    tikod = %tikod_addr,
-                    interval_secs = args.observe_interval,
-                    "starting observer loop"
-                );
-                tokio::spawn(observer::observer_loop(
-                    pg_metrics,
-                    vm_id.clone(),
-                    tikod_client,
-                    Duration::from_secs(args.observe_interval),
-                ));
-            }
-
-            if args.scale_interval > 0 {
+                let pg_config = match &args.pg_conn {
+                    Some(conn) => PgMetricsConfig {
+                        connection_string: conn.clone(),
+                        db_name: "tt".into(),
+                    },
+                    None => PgMetricsConfig::default(),
+                };
                 let pg_metrics = PgMetrics::new(pg_config);
                 let tikod_client = HttpClient::new(tikod_addr);
                 let policy = ScalerPolicy {
@@ -173,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(
                     vm_id = %vm_id,
                     tikod = %tikod_addr,
-                    interval_secs = args.scale_interval,
+                    interval_secs = args.observe_interval,
                     threshold_ticks = policy.idle_threshold_ticks,
                     "starting scaler loop"
                 );
@@ -181,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pg_metrics,
                     vm_id,
                     tikod_client,
-                    Duration::from_secs(args.scale_interval),
+                    Duration::from_secs(args.observe_interval),
                     policy,
                 ));
             }

@@ -5,7 +5,7 @@
 //!   constructors — used by [`server`](crate::server) to handle inbound requests
 //!   from tikod.
 //! - **Client side**: [`HttpClient`] — used by the observer and scaler loops to
-//!   push reports and snapshot-request signals to tikod.
+//!   push reports and pause-request signals to tikod.
 //!
 //! Raw HTTP/1.1 over TCP — no external HTTP library, consistent with tikod's
 //! API server and [`GuestClient`](crate::guestcontrol).
@@ -187,10 +187,10 @@ pub struct HttpResponse {
 
 /// Minimal HTTP/1.1 client for outbound pushes to tikod.
 ///
-/// Used by the observer loop (`POST /vms/{id}/reports`) and the scaler loop
-/// (`POST /vms/{id}/snapshot-request`). Each call opens a fresh connection
-/// (`Connection: close`) — the push volume is low (one request per tick) so
-/// keep-alive adds complexity without benefit.
+/// Used by the scaler loop (`POST /vms/{id}/reports` for metrics + epoch,
+/// `POST /vms/{id}/pause-request` for idle signaling). Each call opens a fresh
+/// connection (`Connection: close`) — the push volume is low (one or two
+/// requests per tick) so keep-alive adds complexity without benefit.
 pub struct HttpClient {
     target: SocketAddr,
 }

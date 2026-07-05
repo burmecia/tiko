@@ -192,10 +192,9 @@ impl Node {
         control.reset_cancellers(vm_id);
         // Clear warm-paused (cold restore produces a Running VM).
         control.clear_warm_paused(vm_id);
-        // Signal the restore to the guest: bumping the epoch lets the guest's
-        // scaler loop detect (via `GET /restore-epoch`) that it was restored
-        // and reset its stale `requested`/`idle_ticks` state.
-        control.bump_restore_epoch(vm_id);
+        // No epoch bump here — the pause epoch was already bumped at pause
+        // time (when the VM was warm-paused before snapshotting). The guest
+        // detects the stale mismatch on its first tick after restore.
         Ok(())
     }
 

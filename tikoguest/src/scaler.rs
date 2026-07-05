@@ -1,29 +1,29 @@
-//! Scaler loop: evaluate snapshot eligibility and signal tikod.
+//! Scaler loop: periodic PG metrics report + idle evaluation.
 //!
 //! Every `interval` (default 30s), the loop:
 //! 1. Collects PG metrics via [`PgMetrics`].
-//! 2. Evaluates the [`ScalerPolicy`]: is the VM idle enough to snapshot?
-//! 3. If eligible: sends `POST /vms/{vm_id}/snapshot-request` to tikod,
-//!    retrying on failure (3 attempts, 1s→2s→4s backoff). This is
-//!    **send-and-forget**: tikod dedups via `snapshot_requested` (idempotent
-//!    202 for duplicates), so the guest fires every eligible tick without
-//!    tracking whether it already requested.
+//! 2. Sends `POST /vms/{vm_id}/reports` with the metrics to tikod. The
+//!    response includes the current `pause_epoch` — this combines the status
+//!    report and epoch check into a single HTTP round-trip.
+//! 3. Compares the returned epoch with a local copy. If they differ, the VM
+//!    was paused (and possibly snapshotted + restored) since the last tick —
+//!    reset `idle_ticks`.
+//! 4. Evaluates the [`ScalerPolicy`]: is the VM idle enough to pause?
+//! 5. If eligible: sends `POST /vms/{vm_id}/pause-request` (send-and-forget).
+//!    tikod dedups via `pause_requested` (idempotent 202 for duplicates).
 //!
-//! tikod acks `202` **before** warm-pausing, so the agent reads the ack before
-//! the VM is frozen. If tikod fails to scale, that's tikod's responsibility —
-//! the agent's job is to signal.
+//! tikod decides when to snapshot: on receiving a pause-request, it pauses
+//! the VM immediately and starts a 2-min warm window. If no client arrives
+//! during the window → snapshot (cold scale-to-zero). If a client arrives →
+//! resume. The guest's job is purely to signal "I'm idle."
 //!
-//! # Restore detection
+//! # Pause epoch detection
 //!
-//! Because `idle_ticks` is in-memory, it survives a snapshot/restore *stale*:
-//! the snapshot is taken while the VM is idle, so on restore `idle_ticks` is
-//! still >= threshold and the scaler would prematurely re-request. Each tick,
-//! the loop polls tikod's restore epoch
-//! (`GET /vms/{vm_id}/restore-epoch`). tikod bumps the epoch on every
-//! successful cold restore (`Node::wake`); a mismatch means "I was restored"
-//! and the scaler resets `idle_ticks`. The `last_seen_epoch` is itself
-//! in-memory, so it is stale after restore — which is exactly why the
-//! mismatch is detected.
+//! `idle_ticks` is in-memory, so it survives a pause/restore *stale*. tikod
+//! bumps `pause_epoch` each time it pauses the VM. Because the bump happens
+//! at pause time (before the guest is frozen), the guest's local copy is
+//! always stale on the first tick after resume/restore. The mismatch is
+//! detected and `idle_ticks` is reset, preventing a premature re-request.
 
 use std::time::Duration;
 
@@ -33,11 +33,11 @@ use tracing::{debug, info, warn};
 use crate::http::{HttpClient, HttpError};
 use crate::pgmetrics::{Metrics, PgMetrics};
 
-/// Policy for snapshot eligibility. Defaults: 0 connections, 0 active backends,
+/// Policy for idle evaluation. Defaults: 0 connections, 0 active backends,
 /// 0 long-running tx, 4 idle ticks (= 2 min at 30s interval).
 #[derive(Clone, Debug)]
 pub struct ScalerPolicy {
-    /// Consecutive idle ticks before requesting a snapshot.
+    /// Consecutive idle ticks before requesting a pause.
     pub idle_threshold_ticks: u64,
     /// Max connections to be considered idle.
     pub max_connections: i64,
@@ -58,14 +58,18 @@ impl Default for ScalerPolicy {
     }
 }
 
-/// Request body sent to tikod.
+/// Request body sent to tikod for a pause-request.
 #[derive(Serialize)]
-struct SnapshotRequest {
+struct PauseRequest {
     reason: String,
     metrics: Metrics,
 }
 
 /// Run the scaler loop. Blocks forever (until the process is killed).
+///
+/// This unified loop replaces the former separate observer and scaler loops.
+/// It pushes metrics to tikod (receiving the pause epoch back) and evaluates
+/// idle policy in a single pass per tick.
 pub async fn scaler_loop(
     pg: PgMetrics,
     vm_id: String,
@@ -73,8 +77,8 @@ pub async fn scaler_loop(
     interval: Duration,
     policy: ScalerPolicy,
 ) {
-    let path = format!("/vms/{vm_id}/snapshot-request");
-    let epoch_path = format!("/vms/{vm_id}/restore-epoch");
+    let reports_path = format!("/vms/{vm_id}/reports");
+    let pause_path = format!("/vms/{vm_id}/pause-request");
     info!(
         vm_id = %vm_id,
         interval_secs = interval.as_secs(),
@@ -83,9 +87,8 @@ pub async fn scaler_loop(
     );
 
     let mut idle_ticks: u64 = 0;
-    // Last restore epoch seen from tikod. Because this is in-memory, it
-    // survives a snapshot/restore *stale* — so on the first tick after
-    // restore it mismatches tikod's bumped epoch and we reset. Starts at 0
+    // Last pause epoch seen from tikod. In-memory, so stale after resume/
+    // restore — which is exactly why the mismatch is detected. Starts at 0
     // (the value `register` assigns); a fresh-boot VM also has epoch 0, so
     // there is no false reset on first run.
     let mut last_seen_epoch: u64 = 0;
@@ -93,37 +96,45 @@ pub async fn scaler_loop(
     loop {
         tokio::time::sleep(interval).await;
 
-        // Restore detection: if tikod bumped the epoch since our last tick,
-        // we were restored from a snapshot. Reset stale scaler state so we
-        // can request scale-to-zero again in the new lifecycle. A failed
-        // query is non-fatal — we just retry next tick.
-        if let Ok(resp) = tikod.send_json("GET", &epoch_path, None).await {
-            if resp.status == 200 {
-                if let Some(epoch) = parse_epoch(&resp.body)
+        let metrics = pg.collect().await;
+
+        // Combined status report + epoch check. The response body contains
+        // the current pause epoch — a mismatch means the VM was paused (and
+        // possibly restored) since our last tick.
+        let metrics_body = serde_json::to_value(&metrics).unwrap_or_default();
+        match tikod.send_json("POST", &reports_path, Some(&metrics_body)).await {
+            Ok(resp) if resp.status == 200 => {
+                if let Some(epoch) = parse_pause_epoch(&resp.body)
                     && epoch != last_seen_epoch
                 {
                     info!(
                         vm_id = %vm_id,
                         epoch,
                         prev = last_seen_epoch,
-                        "restore detected — resetting scaler state"
+                        "pause/restore detected — resetting scaler state"
                     );
                     idle_ticks = 0;
                     last_seen_epoch = epoch;
                 }
-            } else if resp.status != 404 {
+            }
+            Ok(resp) => {
                 debug!(
                     vm_id = %vm_id,
                     status = resp.status,
-                    "restore-epoch query returned non-200"
+                    "reports returned non-200 — skipping epoch check this tick"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    vm_id = %vm_id,
+                    error = %e,
+                    "failed to push report — skipping epoch check this tick"
                 );
             }
         }
 
-        let metrics = pg.collect().await;
-
         if !metrics.available {
-            warn!("PG unavailable — skipping scaler tick");
+            warn!("PG unavailable — skipping idle evaluation");
             continue;
         }
 
@@ -138,20 +149,20 @@ pub async fn scaler_loop(
             debug!(idle_ticks, threshold = policy.idle_threshold_ticks, "VM is idle");
 
             if idle_ticks >= policy.idle_threshold_ticks {
-                let body = SnapshotRequest {
+                let body = PauseRequest {
                     reason: "idle".into(),
-                    metrics,
+                    metrics: metrics.clone(),
                 };
                 let json = serde_json::to_value(&body).unwrap_or_default();
 
-                match send_with_retry(&tikod, &path, &json, 3).await {
+                match send_with_retry(&tikod, &pause_path, &json, 3).await {
                     Ok(()) => {
-                        debug!(vm_id = %vm_id, "snapshot request sent (tikod dedups)");
+                        debug!(vm_id = %vm_id, "pause request sent (tikod dedups)");
                     }
                     Err(e) => {
                         warn!(
                             error = %e,
-                            "snapshot request failed after retries — will retry next tick"
+                            "pause request failed after retries — will retry next tick"
                         );
                     }
                 }
@@ -188,11 +199,11 @@ async fn send_with_retry(
                     attempt = attempt + 1,
                     status = resp.status,
                     body = %String::from_utf8_lossy(&resp.body),
-                    "tikod rejected snapshot request"
+                    "tikod rejected pause request"
                 );
             }
             Err(e) => {
-                warn!(attempt = attempt + 1, error = %e, "snapshot request transport error");
+                warn!(attempt = attempt + 1, error = %e, "pause request transport error");
             }
         }
         if attempt + 1 < max_attempts {
@@ -201,16 +212,16 @@ async fn send_with_retry(
         }
     }
     Err(HttpError::Transport(format!(
-        "snapshot request failed after {max_attempts} attempts"
+        "pause request failed after {max_attempts} attempts"
     )))
 }
 
-/// Parse the `epoch` field from a `GET /restore-epoch` response body
-/// (`{"vm_id":"...","epoch":N}`). Returns `None` on any parse failure — the
-/// caller treats None as "no epoch info" and skips the reset this tick.
-fn parse_epoch(body: &[u8]) -> Option<u64> {
+/// Parse the `pause_epoch` field from a `POST /reports` response body
+/// (`{"pause_epoch":N}`). Returns `None` on any parse failure — the caller
+/// treats None as "no epoch info" and skips the reset this tick.
+fn parse_pause_epoch(body: &[u8]) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    v.get("epoch")?.as_u64()
+    v.get("pause_epoch")?.as_u64()
 }
 
 #[cfg(test)]
@@ -218,31 +229,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_epoch_extracts_value() {
-        let body = br#"{"vm_id":"vm-1","epoch":7}"#;
-        assert_eq!(parse_epoch(body), Some(7));
+    fn parse_pause_epoch_extracts_value() {
+        let body = br#"{"pause_epoch":7}"#;
+        assert_eq!(parse_pause_epoch(body), Some(7));
     }
 
     #[test]
-    fn parse_epoch_zero() {
-        let body = br#"{"vm_id":"vm-1","epoch":0}"#;
-        assert_eq!(parse_epoch(body), Some(0));
+    fn parse_pause_epoch_zero() {
+        let body = br#"{"pause_epoch":0}"#;
+        assert_eq!(parse_pause_epoch(body), Some(0));
     }
 
     #[test]
-    fn parse_epoch_missing_field() {
-        let body = br#"{"vm_id":"vm-1"}"#;
-        assert_eq!(parse_epoch(body), None);
+    fn parse_pause_epoch_missing_field() {
+        let body = br#"{"foo":"bar"}"#;
+        assert_eq!(parse_pause_epoch(body), None);
     }
 
     #[test]
-    fn parse_epoch_malformed_json() {
-        assert_eq!(parse_epoch(b"not json"), None);
+    fn parse_pause_epoch_malformed_json() {
+        assert_eq!(parse_pause_epoch(b"not json"), None);
     }
 
     #[test]
-    fn parse_epoch_non_numeric() {
-        let body = br#"{"epoch":"oops"}"#;
-        assert_eq!(parse_epoch(body), None);
+    fn parse_pause_epoch_non_numeric() {
+        let body = br#"{"pause_epoch":"oops"}"#;
+        assert_eq!(parse_pause_epoch(body), None);
     }
 }

@@ -54,8 +54,8 @@
 //!
 //! | Method | Path                            | From            | Returns / Body                              |
 //! |--------|---------------------------------|-----------------|---------------------------------------------|
-//! | `POST` | `/vms/{vm_id}/reports`          | observer loop   | 204  body: metrics JSON (404 if unregistered) |
-//! | `POST` | `/vms/{vm_id}/snapshot-request` | scaler loop     | 202  body: `{reason, metrics}` (idempotent; 404 if unregistered) |
+//! | `POST` | `/vms/{vm_id}/reports`          | scaler loop     | 200  body: `{"pause_epoch":N}` (404 if unregistered) |
+//! | `POST` | `/vms/{vm_id}/pause-request`    | scaler loop     | 202  body: `{reason, metrics}` (idempotent; 404 if unregistered) |
 //!
 //! # Error responses
 //!
@@ -318,22 +318,6 @@ impl ApiServer {
                 Ok(ip) => ok_json(serde_json::json!({"vm_id": vm_id, "ip": ip})),
                 Err(e) => err_resp(&e),
             },
-            // Restore epoch: a monotonic counter bumped on each cold restore.
-            // The guest's scaler loop polls this to detect that it was restored
-            // from a snapshot and reset its stale `requested`/`idle_ticks`.
-            ("GET", ["restore-epoch"]) => match self.control.restore_epoch(vm_id) {
-                Some(epoch) => {
-                    ok_json(serde_json::json!({"vm_id": vm_id, "epoch": epoch}))
-                }
-                None => Response {
-                    status: 404,
-                    body: serde_json::json!({
-                        "error": {"kind": "not_found", "message": format!("VM {vm_id} not registered")}
-                    })
-                    .to_string()
-                    .into_bytes(),
-                },
-            },
             ("PUT", ["start"]) => match vmm.start_vm(vm_id).await {
                 Ok(()) => no_content(),
                 Err(e) => err_resp(&e),
@@ -382,11 +366,13 @@ impl ApiServer {
                 }
             }
 
-            // Agent-inbound: metrics report from the guest's observer loop.
+            // Agent-inbound: metrics report from the guest's scaler loop.
+            // Returns the current pause epoch so the guest can detect
+            // pause/restore cycles and reset stale state.
             ("POST", ["reports"]) => self.record_report(vm_id, req).await,
 
-            // Agent-inbound: snapshot-request from the guest's scaler loop.
-            ("POST", ["snapshot-request"]) => self.snapshot_request(vm_id, req).await,
+            // Agent-inbound: pause-request from the guest's scaler loop.
+            ("POST", ["pause-request"]) => self.pause_request(vm_id, req).await,
 
             // Register an externally-started VM in the control registry (no
             // VMM backend involvement). Used for VMs started by start_vm.sh.
@@ -422,39 +408,51 @@ impl ApiServer {
     }
 
     /// `POST /vms/{vm_id}/reports` — receives a metrics report from the guest
-    /// agent's observer loop. Stores it in the control registry; returns 404
-    /// if the VM isn't registered.
+    /// agent's scaler loop. Returns the current pause epoch so the guest can
+    /// detect pause/restore cycles (mismatch with local copy → reset
+    /// `idle_ticks`). Returns 404 if the VM isn't registered.
     async fn record_report(&self, vm_id: &VmId, req: &Request) -> Response {
         let metrics: serde_json::Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(_) => return bad_request("invalid report body; expected JSON metrics"),
         };
-        if self.control.record_report(vm_id, metrics) {
-            no_content()
-        } else {
-            Response {
+        match self.control.record_report(vm_id, metrics) {
+            Some(epoch) => Response {
+                status: 200,
+                body: serde_json::json!({"pause_epoch": epoch})
+                    .to_string()
+                    .into_bytes(),
+            },
+            None => Response {
                 status: 404,
                 body: serde_json::json!({
                     "error": {"kind": "not_found", "message": format!("VM {vm_id} not registered")}
                 })
                 .to_string()
                 .into_bytes(),
-            }
+            },
         }
     }
 
-    /// `POST /vms/{vm_id}/snapshot-request` — the guest agent's scaler loop
-    /// signals that the VM is idle and ready to be snapshotted. tikod acks
-    /// `202` **before** starting `scale_to_zero` so the agent reads the ack
-    /// before the VM is frozen. The handler is idempotent: a duplicate request
-    /// (e.g. ack lost, agent retried) returns 202 without double-triggering.
-    async fn snapshot_request(&self, vm_id: &VmId, req: &Request) -> Response {
+    /// `POST /vms/{vm_id}/pause-request` — the guest agent's scaler loop
+    /// signals that the VM is idle and ready to be paused. tikod acks `202`
+    /// **before** pausing so the agent reads the ack before the VM is frozen.
+    /// The handler is idempotent: a duplicate request (e.g. ack lost, agent
+    /// retried) returns 202 without double-triggering.
+    ///
+    /// On a new request tikod:
+    /// 1. Bumps the pause epoch (guest detects mismatch → resets `idle_ticks`).
+    /// 2. Notifies the proxy (`mark_warm_paused`) to disable keepalive.
+    /// 3. Pauses the VM immediately (warm-pause: freeze, keep in memory).
+    /// 4. Starts a 2-min countdown. If no client wakes the VM → snapshot
+    ///    (cold scale-to-zero). If a client arrives → resume (wake-on-stale).
+    async fn pause_request(&self, vm_id: &VmId, req: &Request) -> Response {
         let body: serde_json::Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
-            Err(_) => return bad_request("invalid snapshot-request body; expected JSON"),
+            Err(_) => return bad_request("invalid pause-request body; expected JSON"),
         };
 
-        match self.control.try_mark_snapshot_requested(vm_id) {
+        match self.control.try_mark_pause_requested(vm_id) {
             None => Response {
                 status: 404,
                 body: serde_json::json!({
@@ -465,7 +463,7 @@ impl ApiServer {
             },
             Some(true) => {
                 // Already requested — idempotent 202, no double-trigger.
-                tracing::debug!(vm_id = %vm_id, "duplicate snapshot-request — idempotent 202");
+                tracing::debug!(vm_id = %vm_id, "duplicate pause-request — idempotent 202");
                 Response {
                     status: 202,
                     body: serde_json::json!({"status": "already_requested", "vm_id": vm_id})
@@ -474,12 +472,16 @@ impl ApiServer {
                 }
             }
             Some(false) => {
-                // New request — ack 202 first, then warm-pause + cold timer.
+                // New request — bump epoch, ack 202, then pause + warm countdown.
                 let reason = body
                     .get("reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
+                // Bump the pause epoch BEFORE pausing. The guest's local copy
+                // is stale after resume/restore, so the mismatch is detected
+                // on the first tick and idle_ticks is reset.
+                self.control.bump_pause_epoch(vm_id);
                 // Notify the proxy to disable keepalive (the VM is about to
                 // freeze; a frozen VM won't ACK keepalive probes). Connections
                 // are NOT cancelled — they survive the pause and are resumed
@@ -489,14 +491,14 @@ impl ApiServer {
                 let control = self.control.clone();
                 let vm_id_owned = vm_id.clone();
                 tokio::spawn(async move {
-                    tracing::info!(vm_id = %vm_id_owned, reason = %reason, "processing snapshot request (warm-pause)");
+                    tracing::info!(vm_id = %vm_id_owned, reason = %reason, "processing pause request (warm-pause)");
                     // Phase 1 (warm): freeze the VM, keep it in memory.
                     if let Err(e) = node.warm_pause(&vm_id_owned).await {
                         tracing::warn!(
                             vm_id = %vm_id_owned, error = %e, "warm_pause failed"
                         );
                         control.clear_warm_paused(&vm_id_owned);
-                        control.clear_snapshot_requested(&vm_id_owned);
+                        control.clear_pause_requested(&vm_id_owned);
                         return;
                     }
                     // Phase 2 (cold): after the warm window, snapshot + destroy
@@ -519,7 +521,7 @@ impl ApiServer {
                                 tracing::warn!(
                                     vm_id = %vm_id_owned,
                                     error = %e,
-                                    "cold_scale_to_zero failed after snapshot request"
+                                    "cold_scale_to_zero failed after pause request"
                                 );
                             }
                         }
@@ -529,7 +531,7 @@ impl ApiServer {
                             "VM woken during warm window — skipping cold scale"
                         );
                     }
-                    control.clear_snapshot_requested(&vm_id_owned);
+                    control.clear_pause_requested(&vm_id_owned);
                 });
 
                 Response {

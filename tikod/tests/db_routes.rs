@@ -494,7 +494,7 @@ async fn post_reports_stores_metrics() {
         let _ = server.serve(listener).await;
     });
 
-    // POST a metrics report for a registered VM → 204.
+    // POST a metrics report for a registered VM → 200 (with pause_epoch).
     let body = serde_json::json!({
         "available": true,
         "connections": 3,
@@ -505,7 +505,8 @@ async fn post_reports_stores_metrics() {
         "wal_lsn": "0/3000000"
     });
     let (status, resp) = api_request(api_addr, "POST", "/vms/vm-1/reports", Some(&body.to_string())).await;
-    assert_eq!(status, 204, "{resp}");
+    assert_eq!(status, 200, "{resp}");
+    assert!(resp.contains(r#""pause_epoch":0"#), "{resp}");
 
     // GET /vms shows the report info.
     let (status, list_body) = api_request(api_addr, "GET", "/vms", None).await;
@@ -523,13 +524,13 @@ async fn post_reports_stores_metrics() {
     assert_eq!(status, 400);
 }
 
-/// `POST /vms/{id}/snapshot-request` acks 202 and validates input.
-/// The scale_to_zero is spawned async — we verify the ack behavior, not the
+/// `POST /vms/{id}/pause-request` acks 202 and validates input.
+/// The warm-pause is spawned async — we verify the ack behavior, not the
 /// full scale (that requires a real VMM backend). Idempotency is tested in
 /// the control module's unit tests (the async task clears the guard too fast
 /// to test it here with a mock VMM).
 #[tokio::test]
-async fn post_snapshot_request_acks_202() {
+async fn post_pause_request_acks_202() {
     let vmm: Arc<dyn Vmm> = Arc::new(MockVmm {
         guest_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         known: ["vm-1".to_string()].into_iter().collect(),
@@ -548,15 +549,15 @@ async fn post_snapshot_request_acks_202() {
     let body = serde_json::json!({"reason": "idle", "metrics": {"connections": 0}});
 
     // Request → 202 (accepted).
-    let (status, resp) = api_request(api_addr, "POST", "/vms/vm-1/snapshot-request", Some(&body.to_string())).await;
+    let (status, resp) = api_request(api_addr, "POST", "/vms/vm-1/pause-request", Some(&body.to_string())).await;
     assert_eq!(status, 202, "{resp}");
     assert!(resp.contains("accepted"), "{resp}");
 
     // Unregistered VM → 404.
-    let (status, _) = api_request(api_addr, "POST", "/vms/vm-ghost/snapshot-request", Some(&body.to_string())).await;
+    let (status, _) = api_request(api_addr, "POST", "/vms/vm-ghost/pause-request", Some(&body.to_string())).await;
     assert_eq!(status, 404);
 
     // Invalid JSON → 400.
-    let (status, _) = api_request(api_addr, "POST", "/vms/vm-1/snapshot-request", Some("not json")).await;
+    let (status, _) = api_request(api_addr, "POST", "/vms/vm-1/pause-request", Some("not json")).await;
     assert_eq!(status, 400);
 }
