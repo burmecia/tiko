@@ -12,7 +12,7 @@ use tikod::api::{ApiClient, ApiServer};
 use tikod::control::Control;
 use tikod::node::Node;
 use tikod::vmm::firecracker::FirecrackerVmm;
-use tikod::vmm::{Snapshot, VmConfig, VmmError};
+use tikod::vmm::VmmError;
 
 /// Bring up an in-process API server on an ephemeral port and return a client
 /// pointed at it. The listener is bound before the serve task is spawned, so the
@@ -38,21 +38,6 @@ async fn spawn_server() -> ApiClient {
     });
 
     ApiClient::new(addr)
-}
-
-/// Minimal config (paths need not exist — these tests never drive create_vm to
-/// the point where assets matter).
-fn cfg(vm_id: &str) -> VmConfig {
-    VmConfig {
-        vm_id: vm_id.to_string(),
-        kernel_path: "/nonexistent/vmlinux".into(),
-        kernel_cmdline: "console=ttyS0".into(),
-        rootfs_path: "/nonexistent/rootfs.ext4".into(),
-        memory_mb: 128,
-        vcpus: 1,
-        drives: vec![],
-        initrd_path: None,
-    }
 }
 
 #[tokio::test]
@@ -97,14 +82,11 @@ async fn unknown_vm_returns_vm_not_found() {
 async fn restore_missing_snapshot_returns_snapshot_not_found() {
     let client = spawn_server().await;
 
-    let bogus = Snapshot {
-        vm_id: "ghost-99".into(),
-        state_path: "/tmp/tikod-api-test-nope.snap".into(),
-        mem_path: "/tmp/tikod-api-test-nope.mem".into(),
-        config: cfg("ghost-99"),
-    };
+    // No snapshot is registered for "ghost-99" (it was never scaled to zero),
+    // so `PUT /vms/ghost-99/restore` must round-trip back as SnapshotNotFound.
+    let ghost = "ghost-99".to_string();
     assert!(
-        matches!(client.restore_vm(&bogus).await, Err(VmmError::SnapshotNotFound(id)) if id == "ghost-99")
+        matches!(client.restore_vm(&ghost).await, Err(VmmError::SnapshotNotFound(id)) if id == ghost)
     );
 }
 

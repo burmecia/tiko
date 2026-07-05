@@ -243,10 +243,61 @@ fn derive_net(vm_index: u8) -> VmNet {
     }
 }
 
-/// Create a TAP device and configure NAT. Idempotent: if the tap or NAT rule
-/// already exists (e.g. left over from a crashed run), it is reused rather
-/// than causing a failure. Mirrors `start_vm.sh`'s `ip link show` /
-/// `iptables -C` guards.
+/// Resolve the host's default-route interface (the one carrying the default
+/// route), mirroring `start_vm.sh`'s
+/// `ip route show default | awk '/default/ {print $5; exit}'`. Delegates the
+/// actual parsing to [`parse_default_iface`] (pure, unit-tested) and only
+/// runs `ip route` here.
+fn default_iface() -> VmmResult<String> {
+    let out = run_shell("ip route show default")?;
+    parse_default_iface(&out).ok_or_else(|| {
+        VmmError::Backend(
+            "no default route found; cannot derive default interface for FORWARD rules".into(),
+        )
+    })
+}
+
+/// Pure parser for the output of `ip route show default`. Returns the token
+/// after `dev` on the first line beginning with `default`. A typical line:
+///
+/// ```text
+/// default via 172.31.16.1 dev ens5 proto dhcp src 172.31.21.123 metric 100
+/// ```
+///
+/// Returns `None` when there is no default route or the line has no `dev`
+/// token. Split out from [`default_iface`] so the parsing can be tested
+/// without running `ip`.
+fn parse_default_iface(ip_route_output: &str) -> Option<String> {
+    for line in ip_route_output.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("default") {
+            continue;
+        }
+        let mut iter = trimmed.split_whitespace();
+        while let Some(tok) = iter.next() {
+            if tok == "dev"
+                && let Some(iface) = iter.next()
+                && !iface.is_empty()
+            {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Create a TAP device and configure NAT. Idempotent: if the tap or any of the
+/// NAT/FORWARD rules already exist (e.g. left over from a crashed run), they
+/// are reused rather than causing a failure. Mirrors `start_vm.sh`'s /
+/// `resume_vm.sh`'s `ip link show` / `iptables -C` guards.
+///
+/// Besides the SNAT (`MASQUERADE`) rule, this installs two FORWARD-chain
+/// ACCEPT rules — outbound (`tap → default iface`) and return
+/// (`default iface → tap`, `RELATED,ESTABLISHED`). Without them, a host whose
+/// FORWARD policy is `DROP` (the default on EC2 and anywhere Docker is
+/// installed) silently black-holes the guest's outbound packets, which breaks
+/// the `s3files` mount at `/mnt/s3files` at boot (the `nofail` fstab option
+/// hides the failure, so the mount point simply never appears).
 fn create_tap(tap_name: &str, gateway_ip: &str, subnet: &str) -> VmmResult<()> {
     let tap_exists = run_shell(&format!("ip link show {tap_name} >/dev/null 2>&1")).is_ok();
     if !tap_exists {
@@ -268,20 +319,87 @@ fn create_tap(tap_name: &str, gateway_ip: &str, subnet: &str) -> VmmResult<()> {
             &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
         )?;
     }
+    // FORWARD rules: let the guest reach external hosts (e.g. the S3 Files
+    // mount target) through the host's NAT, and let return traffic back in.
+    // Best-effort + idempotent (the `iptables -C ... || iptables -A ...`
+    // idiom), mirroring `start_vm.sh` / `resume_vm.sh`.
+    add_forward_rules(tap_name);
     // Ensure the host forwards packets between the tap and the default route.
     // Idempotent.
     let _ = run_shell("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1");
     Ok(())
 }
 
-/// Destroy a TAP device and remove NAT rules.
+/// Destroy a TAP device and remove its NAT + FORWARD rules. Best-effort:
+/// errors are logged-and-ignored so a partial cleanup still tears down the
+/// rest. Mirrors `shutdown_vm.sh`'s per-VM teardown.
 fn destroy_tap(tap_name: &str, subnet: &str) {
+    // Per-VM FORWARD rules (tap-specific) — remove before the tap goes away.
+    remove_forward_rules(tap_name);
     let _ = run_cmd(
         "iptables",
         &["-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
     );
     let _ = run_cmd("ip", &["link", "set", tap_name, "down"]);
     let _ = run_cmd("ip", &["tuntap", "del", tap_name, "mode", "tap"]);
+}
+
+/// Idempotently add the two per-VM FORWARD ACCEPT rules for `tap_name`, keyed
+/// off the host's current default-route interface. Warns (but does not fail)
+/// if the default route can't be determined or iptables rejects a rule — the
+/// guest still comes up, and on a host whose FORWARD policy is ACCEPT (no
+/// Docker, default EC2 iptables) outbound traffic works regardless.
+fn add_forward_rules(tap_name: &str) {
+    let out_iface = match default_iface() {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(
+                tap = tap_name, error = %e,
+                "no default route found; skipping FORWARD rules — \
+                 guest cannot reach external hosts (e.g. S3 Files mount) \
+                 if the host FORWARD policy is DROP"
+            );
+            return;
+        }
+    };
+    let rules = [
+        format!(
+            "iptables -C FORWARD -i {tap_name} -o {out_iface} -j ACCEPT 2>/dev/null \
+             || iptables -A FORWARD -i {tap_name} -o {out_iface} -j ACCEPT"
+        ),
+        format!(
+            "iptables -C FORWARD -i {out_iface} -o {tap_name} \
+             -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+             || iptables -A FORWARD -i {out_iface} -o {tap_name} \
+             -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        ),
+    ];
+    for rule in rules {
+        if let Err(e) = run_shell(&rule) {
+            warn!(
+                tap = tap_name, out_iface = %out_iface, error = %e,
+                "failed to install FORWARD ACCEPT rule; \
+                 guest outbound traffic may be blocked if FORWARD policy is DROP"
+            );
+        }
+    }
+}
+
+/// Best-effort removal of the two per-VM FORWARD ACCEPT rules installed by
+/// [`add_forward_rules`]. Re-derives the default interface so the exact
+/// `-i/-o` match used at creation is reproduced; any mismatch (e.g. the
+/// default route changed) is non-fatal — stale rules are harmless and can be
+/// flushed manually if needed.
+fn remove_forward_rules(tap_name: &str) {
+    if let Ok(out_iface) = default_iface() {
+        let _ = run_shell(&format!(
+            "iptables -D FORWARD -i {tap_name} -o {out_iface} -j ACCEPT 2>/dev/null || true"
+        ));
+        let _ = run_shell(&format!(
+            "iptables -D FORWARD -i {out_iface} -o {tap_name} \
+             -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
+        ));
+    }
 }
 
 /// Run a system command via sudo, returning an error on non-zero exit.
@@ -1297,5 +1415,48 @@ impl Vmm for FirecrackerVmm {
                 guest_ip: Some(entry.guest_ip),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_default_iface_picks_dev_token() {
+        // Typical EC2 output (single default route).
+        let out = "default via 172.31.16.1 dev ens5 proto dhcp src 172.31.21.123 metric 100\n";
+        assert_eq!(parse_default_iface(out).as_deref(), Some("ens5"));
+    }
+
+    #[test]
+    fn parse_default_iface_ignores_indented_non_default_lines() {
+        // Only a line *starting* with `default` counts — other routes that
+        // happen to mention `dev` must not be picked up.
+        let out = "10.0.0.0/8 via 10.0.0.1 dev eth0 metric 100\n";
+        assert!(parse_default_iface(out).is_none());
+    }
+
+    #[test]
+    fn parse_default_iface_handles_leading_whitespace() {
+        // Some `ip` builds indent routes with spaces; trim_start handles it.
+        let out = "   default via 10.0.0.1 dev eth0 metric 0\n";
+        assert_eq!(parse_default_iface(out).as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn parse_default_iface_takes_first_default() {
+        // Multiple default routes: return the first one's device (mirrors
+        // `awk '... {print; exit}'`).
+        let out = "default via 10.0.0.1 dev eth0 metric 100\n\
+                   default via 10.0.0.2 dev eth1 metric 200\n";
+        assert_eq!(parse_default_iface(out).as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn parse_default_iface_empty_output() {
+        // No default route at all.
+        assert!(parse_default_iface("").is_none());
+        assert!(parse_default_iface("192.168.1.0/24 dev eth0 proto kernel\n").is_none());
     }
 }

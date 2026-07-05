@@ -22,7 +22,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use tracing::{debug, info};
 
-use crate::vmm::VmId;
+use crate::vmm::{Snapshot, VmId};
 
 /// Metadata for a registered VM.
 #[derive(Debug, Clone)]
@@ -37,8 +37,10 @@ pub struct VmRecord {
     pub last_active_at: Instant,
     /// Whether the VM currently has active client connections.
     pub connection_count: u32,
-    /// Snapshot ID if the VM is paused/snapshotted.
-    pub snapshot_id: Option<String>,
+    /// Full snapshot descriptor if the VM is paused/snapshotted (set after
+    /// `scale_to_zero`). Kept here so clients can restore/scale-from-zero by
+    /// `vm_id` alone — they never need to know `state_path`/`mem_path`/config.
+    pub snapshot: Option<Snapshot>,
     /// Last time the guest agent pushed a metrics report.
     pub last_report_at: Option<Instant>,
     /// Last metrics report body (raw JSON from the agent).
@@ -84,7 +86,7 @@ impl Control {
                 pg_port,
                 last_active_at: Instant::now(),
                 connection_count: 0,
-                snapshot_id: None,
+                snapshot: None,
                 last_report_at: None,
                 last_metrics: None,
                 snapshot_requested: false,
@@ -131,11 +133,20 @@ impl Control {
             .collect()
     }
 
-    /// Mark a VM as having a snapshot (after scale-to-zero).
-    pub fn set_snapshot(&self, vm_id: &VmId, snapshot_id: String) {
+    /// Store the full snapshot descriptor for a VM (after scale-to-zero). The
+    /// snapshot is later retrieved by [`get_snapshot`] so clients can restore /
+    /// scale-from-zero by `vm_id` alone — no snapshot details cross the wire.
+    pub fn set_snapshot(&self, vm_id: &VmId, snapshot: Snapshot) {
         if let Some(mut rec) = self.vms.get_mut(vm_id) {
-            rec.snapshot_id = Some(snapshot_id);
+            rec.snapshot = Some(snapshot);
         }
+    }
+
+    /// Retrieve the stored snapshot for a VM (for `PUT /vms/{vm_id}/restore`
+    /// and `PUT /vms/{vm_id}/scale-from-zero`). Returns `None` if the VM isn't
+    /// registered or has no snapshot (never scaled to zero).
+    pub fn get_snapshot(&self, vm_id: &VmId) -> Option<Snapshot> {
+        self.vms.get(vm_id).and_then(|r| r.snapshot.clone())
     }
 
     /// Store a metrics report from the guest agent. Returns `true` if the VM

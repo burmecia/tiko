@@ -6,7 +6,7 @@
 //! end-to-end test of the API layer, not a direct VMM call test.
 //!
 //! ```text
-//! Stage A–E  single-VM full lifecycle   create→start→pause→resume→snapshot→destroy→restore→resume→destroy
+//! Stage A–E  single-VM full lifecycle   create→start→pause→resume→scale-to-zero→restore→resume→destroy
 //! Stage F    error paths                VmNotFound / InvalidState / SnapshotNotFound
 //! Stage G    concurrency                3 VMs through the full lifecycle in parallel
 //! Stage H    idempotency                start-when-running / pause-when-paused
@@ -39,7 +39,7 @@ use tikod::api::{ApiClient, ApiServer};
 use tikod::control::Control;
 use tikod::node::Node;
 use tikod::vmm::firecracker::FirecrackerVmm;
-use tikod::vmm::{Snapshot, VmConfig, VmmError, VmState};
+use tikod::vmm::{VmConfig, VmmError, VmState};
 
 /// Kernel cmdline for the two-drive overlay model. No `root=` is needed: the
 /// initramfs (`assets/tiko-initramfs.cpio.gz`) assembles an overlayfs root from
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// fanned out by the concurrency stage.
 ///
 /// create → start → (reachable) → pause → (unreachable) → resume →
-/// (reachable) → pause → snapshot → destroy → restore → resume →
+/// (reachable) → pause → scale-to-zero → restore → resume →
 /// (reachable) → destroy
 async fn full_lifecycle(
     client: &ApiClient,
@@ -186,16 +186,18 @@ async fn full_lifecycle(
     assert_state(client, &id, VmState::Running).await?;
     await_port_open(ip, 22, Duration::from_secs(30)).await?;
 
-    // C. snapshot (must be Paused first).
+    // C. scale to zero: pause → snapshot → destroy, and the snapshot is
+    //    recorded in the tikod registry so a later restore can look it up by
+    //    vm_id alone (no snapshot details cross the wire to the client).
     client
         .pause_vm(&id)
         .await
-        .map_err(|e| format!("pause_vm before snapshot ({vm_id}): {e}"))?;
+        .map_err(|e| format!("pause_vm before scale-to-zero ({vm_id}): {e}"))?;
     assert_state(client, &id, VmState::Paused).await?;
     let snap = client
-        .snapshot_vm(&id)
+        .scale_to_zero(&id)
         .await
-        .map_err(|e| format!("snapshot_vm({vm_id}): {e}"))?;
+        .map_err(|e| format!("scale_to_zero({vm_id}): {e}"))?;
     if !snap.state_path.exists() {
         return Err(format!(
             "snapshot state_path missing: {}",
@@ -210,20 +212,15 @@ async fn full_lifecycle(
     }
     let mem_bytes = snap.mem_path.metadata().map(|m| m.len()).unwrap_or(0);
     tracing::info!(
-        "{vm_id}: snapshot files present (state={}, mem={mem_bytes} bytes)",
+        "{vm_id}: scaled to zero; snapshot files present (state={}, mem={mem_bytes} bytes)",
         snap.state_path.display()
     );
-
-    // D. destroy.
-    client
-        .destroy_vm(&id)
-        .await
-        .map_err(|e| format!("destroy_vm({vm_id}): {e}"))?;
     assert_gone(client, &id).await?;
 
-    // E. restore → resume → reachable. Same deterministic IP (vm_id unchanged).
+    // D. restore from the registry-stored snapshot (looked up by vm_id) →
+    //    resume → reachable. Same deterministic IP (vm_id unchanged).
     let restored = client
-        .restore_vm(&snap)
+        .restore_vm(&id)
         .await
         .map_err(|e| format!("restore_vm({vm_id}): {e}"))?;
     assert_state(client, &restored, VmState::Paused).await?;
@@ -297,22 +294,21 @@ async fn stage_errors(
         .await
         .map_err(|e| format!("destroy_vm(err-snap-11): {e}"))?;
 
-    // 3. restore_vm from a nonexistent snapshot file → SnapshotNotFound.
-    let bogus = Snapshot {
-        vm_id: "ghost-99".into(),
-        state_path: Path::new("/tmp/tikod-boot-test/nope.snap").into(),
-        mem_path: Path::new("/tmp/tikod-boot-test/nope.mem").into(),
-        config: make_config("ghost-99", kernel, rootfs, initrd),
-    };
+    // 3. restore_vm on a VM with no stored snapshot → SnapshotNotFound.
+    //    ghost-99 was never scaled to zero, so the registry has no snapshot
+    //    for it (and indeed isn't registered at all) → SnapshotNotFound.
     expect_err(
-        "restore_vm(missing file)",
-        client.restore_vm(&bogus).await,
+        "restore_vm(no snapshot)",
+        client.restore_vm(&"ghost-99".to_string()).await,
         |e| matches!(e, VmmError::SnapshotNotFound(_)),
         "SnapshotNotFound",
     );
 
-    // 4. restore_vm while the original VM is still live → InvalidState
-    //    (the snapshot and the live VM would share one RW overlay).
+    // 4. restore_vm while a new VM with the same id is live → InvalidState
+    //    (the snapshot and the live VM would share one RW overlay). The only
+    //    way to reach this through the API: scale to zero (records snapshot +
+    //    destroys original), then create a fresh VM with the same id, then
+    //    restore — the registry snapshot and the live VM now coexist.
     let id = client
         .create_vm(make_config("err-restore-12", kernel, rootfs, initrd))
         .await
@@ -325,13 +321,18 @@ async fn stage_errors(
         .pause_vm(&id)
         .await
         .map_err(|e| format!("pause_vm(err-restore-12): {e}"))?;
-    let snap = client
-        .snapshot_vm(&id)
+    client
+        .scale_to_zero(&id)
         .await
-        .map_err(|e| format!("snapshot_vm(err-restore-12): {e}"))?;
+        .map_err(|e| format!("scale_to_zero(err-restore-12): {e}"))?;
+    let id2 = client
+        .create_vm(make_config("err-restore-12", kernel, rootfs, initrd))
+        .await
+        .map_err(|e| format!("recreate_vm(err-restore-12): {e}"))?;
+    debug_assert_eq!(id, id2, "create_vm should reuse the requested vm_id");
     expect_err(
         "restore_vm(while original live)",
-        client.restore_vm(&snap).await,
+        client.restore_vm(&id).await,
         |e| matches!(e, VmmError::InvalidState { .. }),
         "InvalidState",
     );

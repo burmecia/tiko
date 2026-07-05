@@ -11,6 +11,7 @@ Type=simple
 # Runs as postgres so `pg_ctl` and config-file writes have the right owner.
 User=postgres
 Group=postgres
+Environment=RUST_LOG=tikoguest=debug
 ExecStart=/usr/local/bin/tikoguest --listen 0.0.0.0:9000
 Restart=on-failure
 RestartSec=2

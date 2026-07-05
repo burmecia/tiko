@@ -425,7 +425,24 @@ async fn get_vms_merges_live_and_registry() {
     // A scaled-to-zero VM: registered (so it has metadata) + a snapshot, but not
     // in the backend's live set.
     control.register("vm-paused".to_string(), "acme".into(), "feat".into(), 5432);
-    control.set_snapshot(&"vm-paused".to_string(), "/tmp/snap.mem".into());
+    control.set_snapshot(
+        &"vm-paused".to_string(),
+        Snapshot {
+            vm_id: "vm-paused".into(),
+            state_path: "/tmp/snap.mem".into(),
+            mem_path: "/tmp/snap.mem".into(),
+            config: VmConfig {
+                vm_id: "vm-paused".into(),
+                kernel_path: "/nonexistent/vmlinux".into(),
+                kernel_cmdline: "console=ttyS0".into(),
+                rootfs_path: "/nonexistent/rootfs.ext4".into(),
+                memory_mb: 128,
+                vcpus: 1,
+                drives: vec![],
+                initrd_path: None,
+            },
+        },
+    );
 
     let server = Arc::new(ApiServer::new(node, control));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -20,16 +20,16 @@
 //! | `GET`  | `/vms`                      | list VMs          | `{"vms":[{vm_id,...},...]}`              |
 //! | `PUT`  | `/vms`                      | create_vm         | `{"vm_id":"..."}`  body optional (auto-generates id) |
 //! | `POST` | `/vms/provision`            | create + start    | `{"vm_id":"..."}`  body optional (auto-generates id) |
-//! | `POST` | `/vms/restore`              | restore_vm        | `{"vm_id":"..."}`  body: `Snapshot`      |
-//! | `POST` | `/vms/scale-from-zero`      | restore + resume  | `{"vm_id":"..."}`  body: `Snapshot`      |
 //! | `GET`  | `/vms/{vm_id}`              | vm_state          | `{"vm_id":"...","state":"running"}`      |
 //! | `DELETE`| `/vms/{vm_id}`             | destroy_vm        | 204                                      |
 //! | `GET`  | `/vms/{vm_id}/ip`           | vm_guest_ip       | `{"vm_id":"...","ip":"1.2.3.4"\|null}`   |
 //! | `PUT`  | `/vms/{vm_id}/start`        | start_vm          | 204                                      |
 //! | `PUT`  | `/vms/{vm_id}/pause`        | pause_vm          | 204                                      |
 //! | `PUT`  | `/vms/{vm_id}/resume`       | resume_vm         | 204                                      |
+//! | `PUT`  | `/vms/{vm_id}/restore`      | restore_vm        | `{"vm_id":"..."}`  (snapshot from registry)  |
 //! | `PUT`  | `/vms/{vm_id}/snapshot`     | snapshot_vm       | `Snapshot`                               |
-//! | `PUT`  | `/vms/{vm_id}/scale-to-zero`| pause+snap+destroy| `Snapshot`                               |
+//! | `PUT`  | `/vms/{vm_id}/scale-to-zero`| pause+snap+destroy| `Snapshot` (stored in registry)          |
+//! | `PUT`  | `/vms/{vm_id}/scale-from-zero`| restore + resume | `{"vm_id":"..."}`  (snapshot from registry) |
 //!
 //! # Postgres control routes (forwarded to the guest `tikoguest` agent)
 //!
@@ -77,7 +77,7 @@ use tracing::{debug, error, info, warn};
 use crate::control::Control;
 use crate::guestcontrol::{GuestClient, GuestClientError, DEFAULT_AGENT_PORT};
 use crate::node::Node;
-use crate::vmm::{Snapshot, VmConfig, VmId, VmmError};
+use crate::vmm::{VmConfig, VmId, VmmError};
 
 /// Maximum accepted request header block size (protects against runaway reads).
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -265,20 +265,12 @@ impl ApiServer {
                     Err(e) => err_resp(&e),
                 }
             }
-            ("POST", ["vms", "restore"]) => match parse_json::<Snapshot>(&req.body) {
-                Ok(snap) => match self.node.vmm().restore_vm(&snap).await {
-                    Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
-                    Err(e) => err_resp(&e),
-                },
-                Err(r) => r,
-            },
-            ("POST", ["vms", "scale-from-zero"]) => match parse_json::<Snapshot>(&req.body) {
-                Ok(snap) => match self.node.scale_from_zero(&snap).await {
-                    Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
-                    Err(e) => err_resp(&e),
-                },
-                Err(r) => r,
-            },
+            // Legacy `POST /vms/restore` / `POST /vms/scale-from-zero` (full
+            // `Snapshot` in the body) were replaced by path-keyed,
+            // body-less `PUT /vms/{vm_id}/restore` and
+            // `PUT /vms/{vm_id}/scale-from-zero` (see `route_vm`). The snapshot
+            // is now looked up in the registry by vm_id, so clients never need
+            // to carry snapshot details.
 
             // DB control routes: /vms/{vm_id}/db/{...} → in-guest tikoguest agent.
             (_, ["vms", vm_id, "db", rest @ ..]) => {
@@ -332,16 +324,33 @@ impl ApiServer {
                 Ok(()) => no_content(),
                 Err(e) => err_resp(&e),
             },
+            // Restore from the registry-stored snapshot (Paused state). The
+            // snapshot is looked up by vm_id, so the request carries no body —
+            // the client never needs snapshot paths/config. 404 if no snapshot
+            // is registered for this VM (e.g. it was never scaled to zero).
+            ("PUT", ["restore"]) => match self.control.get_snapshot(vm_id) {
+                Some(snap) => match vmm.restore_vm(&snap).await {
+                    Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
+                    Err(e) => err_resp(&e),
+                },
+                None => snapshot_not_found(vm_id),
+            },
+            // Scale from zero: restore from the registry-stored snapshot, then
+            // resume. Same registry lookup + 404 contract as `restore`.
+            ("PUT", ["scale-from-zero"]) => match self.control.get_snapshot(vm_id) {
+                Some(snap) => match self.node.scale_from_zero(&snap).await {
+                    Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
+                    Err(e) => err_resp(&e),
+                },
+                None => snapshot_not_found(vm_id),
+            },
             ("PUT", ["snapshot"]) => match vmm.snapshot_vm(vm_id).await {
                 Ok(snap) => ok_value(&snap),
                 Err(e) => err_resp(&e),
             },
             ("PUT", ["scale-to-zero"]) => match self.node.scale_to_zero(vm_id).await {
                 Ok(snap) => {
-                    self.control.set_snapshot(
-                        vm_id,
-                        snap.state_path.to_string_lossy().into_owned(),
-                    );
+                    self.control.set_snapshot(vm_id, snap.clone());
                     ok_value(&snap)
                 }
                 Err(e) => err_resp(&e),
@@ -452,10 +461,7 @@ impl ApiServer {
                     tracing::info!(vm_id = %vm_id_owned, reason = %reason, "processing snapshot request");
                     match node.scale_to_zero(&vm_id_owned).await {
                         Ok(snap) => {
-                            control.set_snapshot(
-                                &vm_id_owned,
-                                snap.state_path.to_string_lossy().into_owned(),
-                            );
+                            control.set_snapshot(&vm_id_owned, snap);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -505,7 +511,7 @@ impl ApiServer {
                     "tenant_id": rec.map(|r| r.tenant_id.clone()),
                     "branch_id": rec.map(|r| r.branch_id.clone()),
                     "connection_count": rec.map(|r| r.connection_count),
-                    "snapshot_id": rec.and_then(|r| r.snapshot_id.clone()),
+                    "snapshot_id": rec.and_then(|r| r.snapshot.as_ref().map(|s| s.state_path.to_string_lossy().into_owned())),
                     "last_report_secs_ago": rec.and_then(|r| r.last_report_at.map(|t| t.elapsed().as_secs())),
                     "last_metrics": rec.and_then(|r| r.last_metrics.clone()),
                 }),
@@ -524,7 +530,7 @@ impl ApiServer {
                     "tenant_id": rec.tenant_id,
                     "branch_id": rec.branch_id,
                     "connection_count": rec.connection_count,
-                    "snapshot_id": rec.snapshot_id,
+                    "snapshot_id": rec.snapshot.as_ref().map(|s| s.state_path.to_string_lossy().into_owned()),
                     "last_report_secs_ago": rec.last_report_at.map(|t| t.elapsed().as_secs()),
                     "last_metrics": rec.last_metrics.clone(),
                 }),
@@ -892,20 +898,25 @@ fn not_found(method: &str, path: &str) -> Response {
     }
 }
 
-/// Parse a JSON request body, returning a ready `Response` on failure so callers
-/// can early-return without constructing an error variant themselves.
-fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
-    serde_json::from_slice(body).map_err(|e| Response {
-        status: 400,
+/// 404 response for a restore/scale-from-zero on a VM with no stored snapshot.
+///
+/// Mirrors [`VmmError::SnapshotNotFound`] so the HTTP client decodes it back
+/// into the same variant as the pre-refactor behavior (a missing snapshot file
+/// also maps to `SnapshotNotFound`). Keeps the `vm_id` structured field so
+/// callers can identify which VM had no snapshot.
+fn snapshot_not_found(vm_id: &VmId) -> Response {
+    Response {
+        status: 404,
         body: serde_json::json!({
             "error": {
-                "kind": "bad_request",
-                "message": format!("invalid JSON body: {e}"),
+                "kind": "snapshot_not_found",
+                "message": format!("no snapshot registered for VM {vm_id} (scale to zero first)"),
+                "vm_id": vm_id,
             }
         })
         .to_string()
         .into_bytes(),
-    })
+    }
 }
 
 /// Map a [`VmmError`] to an HTTP response, preserving enough structured data for

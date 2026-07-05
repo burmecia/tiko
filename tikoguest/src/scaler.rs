@@ -22,7 +22,7 @@ use crate::http::{HttpClient, HttpError};
 use crate::pgmetrics::{Metrics, PgMetrics};
 
 /// Policy for snapshot eligibility. Defaults: 0 connections, 0 active backends,
-/// 0 long-running tx, 10 idle ticks (= 5 min at 30s interval).
+/// 0 long-running tx, 4 idle ticks (= 2 min at 30s interval).
 #[derive(Clone, Debug)]
 pub struct ScalerPolicy {
     /// Consecutive idle ticks before requesting a snapshot.
@@ -38,10 +38,10 @@ pub struct ScalerPolicy {
 impl Default for ScalerPolicy {
     fn default() -> Self {
         Self {
-            idle_threshold_ticks: 10, // 10 * 30s = 5 min
-            max_connections: 0,
-            max_active_backends: 0,
-            max_long_running_tx: 0,
+            idle_threshold_ticks: 4, // 4 * 30s = 2 min
+            max_connections: 5,
+            max_active_backends: 5,
+            max_long_running_tx: 5,
         }
     }
 }
@@ -78,13 +78,15 @@ pub async fn scaler_loop(
         let metrics = pg.collect().await;
 
         if !metrics.available {
-            debug!("PG unavailable — skipping scaler tick");
+            warn!("PG unavailable — skipping scaler tick");
             continue;
         }
 
         let is_idle = metrics.connections <= policy.max_connections
             && metrics.active_backends <= policy.max_active_backends
             && metrics.long_running_tx <= policy.max_long_running_tx;
+
+        debug!("pg metrics: {:?}, idle_ticks: {}, is_idle: {}", metrics, idle_ticks, is_idle);
 
         if is_idle {
             idle_ticks += 1;

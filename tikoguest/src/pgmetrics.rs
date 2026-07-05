@@ -73,8 +73,8 @@ pub struct PgMetricsConfig {
 impl Default for PgMetricsConfig {
     fn default() -> Self {
         Self {
-            connection_string: "host=/var/run/postgresql user=postgres dbname=tt".into(),
-            db_name: "tt".into(),
+            connection_string: "host=localhost user=postgres dbname=postgres".into(),
+            db_name: "postgres".into(),
         }
     }
 }
@@ -109,7 +109,7 @@ impl PgMetrics {
                 self.query_metrics(&client).await
             }
             Err(e) => {
-                debug!(error = %e, "failed to connect to postgres for metrics");
+                warn!(error = %e, "failed to connect to postgres for metrics");
                 Metrics::unavailable()
             }
         }
