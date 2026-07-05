@@ -3,7 +3,7 @@
 //! Accepts client connections on a single port and routes each to the
 //! PostgreSQL backend of the target VM. The VM is selected by the
 //! `tiko.endpoint=<vm_id>` token in the startup packet's `options` field. If
-//! the VM is paused or scaled to zero, the proxy wakes it (resuming or
+//! the VM is paused or frozen, the proxy wakes it (resuming or
 //! restoring from snapshot) while holding the client socket — exploiting
 //! libpq's default `connect_timeout=0` (wait indefinitely).
 //!
@@ -289,7 +289,7 @@ async fn handle_connection(
     // milliseconds of warm-pause — well before the kernel's keepalive probe.
     //
     // The whole splice races against the per-VM cancel signal (cold
-    // scale-to-zero): when fired, the splice is dropped and both sockets
+    // freeze): when fired, the splice is dropped and both sockets
     // close, prompting the client to reconnect through wake.
     let thermal_rx = connected_vm_id.as_ref().map(|id| control.subscribe_warm(id));
 
@@ -356,7 +356,7 @@ async fn handle_connection(
         tokio::select! {
             biased;
             _ = cancel_signal.notified() => {
-                debug!(client = %client_addr, "connection cancelled (VM scaling to zero)");
+                debug!(client = %client_addr, "connection cancelled (VM freezing)");
             }
             result = splice => {
                 if let Ok((_, Some((pid, secret)))) = result {
@@ -384,7 +384,7 @@ async fn handle_connection(
 }
 
 /// Resolve a VM target to a backend socket address. Performs wake-on-connect
-/// (resume / scale-from-zero, single-flighted via `Control`) bounded by
+/// (resume / thaw, single-flighted via `Control`) bounded by
 /// `resume_timeout_secs`. Records `on_connect` on success.
 async fn resolve_vm(
     vm_id: &VmId,
@@ -430,10 +430,10 @@ async fn resolve_vm(
 // ── TCP keepalive (Part A) ──────────────────────────────────────────────────
 //
 // Aggressive keepalive on the backend socket so that a dead backend (VM crash,
-// network loss — anything NOT covered by the cancel signal from scale-to-zero)
+// network loss — anything NOT covered by the cancel signal from freeze)
 // is detected within ~20s instead of hanging for TCP's default retransmission
 // timeout (~15 min). This is a safety net; the primary mechanism is
-// [`Control::cancel_vm_connections`] fired at the start of scale-to-zero.
+// [`Control::cancel_vm_connections`] fired at the start of freeze.
 
 #[cfg(unix)]
 fn set_backend_keepalive(stream: &TcpStream) {

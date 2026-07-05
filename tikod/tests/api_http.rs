@@ -82,7 +82,7 @@ async fn unknown_vm_returns_vm_not_found() {
 async fn restore_missing_snapshot_returns_snapshot_not_found() {
     let client = spawn_server().await;
 
-    // No snapshot is registered for "ghost-99" (it was never scaled to zero),
+    // No snapshot is registered for "ghost-99" (it was never frozen),
     // so `PUT /vms/ghost-99/restore` must round-trip back as SnapshotNotFound.
     let ghost = "ghost-99".to_string();
     assert!(

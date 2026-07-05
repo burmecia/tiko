@@ -70,7 +70,7 @@ impl ApiClient {
     }
 
     /// `PUT /vms/{id}/restore` — restore a VM from the snapshot stored in the
-    /// tikod registry (set by a prior scale-to-zero). The snapshot descriptor
+    /// tikod registry (set by a prior freeze). The snapshot descriptor
     /// lives server-side, so the client only supplies the vm_id (in the path).
     pub async fn restore_vm(&self, vm_id: &VmId) -> VmmResult<VmId> {
         let resp = self.request("PUT", &path(vm_id, "restore"), None).await?;
@@ -118,22 +118,22 @@ impl ApiClient {
             .ok_or_else(|| VmmError::Backend("response missing vm_id".into()))
     }
 
-    /// `PUT /vms/{id}/scale-to-zero` — pause → snapshot → destroy.
-    pub async fn scale_to_zero(&self, vm_id: &VmId) -> VmmResult<Snapshot> {
+    /// `PUT /vms/{id}/freeze` — pause → snapshot → destroy.
+    pub async fn freeze(&self, vm_id: &VmId) -> VmmResult<Snapshot> {
         let resp = self
-            .request("PUT", &path(vm_id, "scale-to-zero"), None)
+            .request("PUT", &path(vm_id, "freeze"), None)
             .await?;
         serde_json::from_value(resp).map_err(|e| {
             VmmError::Backend(format!("failed to decode snapshot response: {e}"))
         })
     }
 
-    /// `PUT /vms/{id}/scale-from-zero` — restore from the registry-stored
+    /// `PUT /vms/{id}/thaw` — restore from the registry-stored
     /// snapshot, then resume. Snapshot is resolved server-side from the vm_id
     /// (in the path), so the client supplies no body.
-    pub async fn scale_from_zero(&self, vm_id: &VmId) -> VmmResult<VmId> {
+    pub async fn thaw(&self, vm_id: &VmId) -> VmmResult<VmId> {
         let resp = self
-            .request("PUT", &path(vm_id, "scale-from-zero"), None)
+            .request("PUT", &path(vm_id, "thaw"), None)
             .await?;
         resp.get("vm_id")
             .and_then(|v| v.as_str().map(String::from))

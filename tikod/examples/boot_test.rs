@@ -6,7 +6,7 @@
 //! end-to-end test of the API layer, not a direct VMM call test.
 //!
 //! ```text
-//! Stage A–E  single-VM full lifecycle   create→start→pause→resume→scale-to-zero→restore→resume→destroy
+//! Stage A–E  single-VM full lifecycle   create→start→pause→resume→freeze→restore→resume→destroy
 //! Stage F    error paths                VmNotFound / InvalidState / SnapshotNotFound
 //! Stage G    concurrency                3 VMs through the full lifecycle in parallel
 //! Stage H    idempotency                start-when-running / pause-when-paused
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// fanned out by the concurrency stage.
 ///
 /// create → start → (reachable) → pause → (unreachable) → resume →
-/// (reachable) → pause → scale-to-zero → restore → resume →
+/// (reachable) → pause → freeze → restore → resume →
 /// (reachable) → destroy
 async fn full_lifecycle(
     client: &ApiClient,
@@ -186,18 +186,18 @@ async fn full_lifecycle(
     assert_state(client, &id, VmState::Running).await?;
     await_port_open(ip, 22, Duration::from_secs(30)).await?;
 
-    // C. scale to zero: pause → snapshot → destroy, and the snapshot is
+    // C. freeze: pause → snapshot → destroy, and the snapshot is
     //    recorded in the tikod registry so a later restore can look it up by
     //    vm_id alone (no snapshot details cross the wire to the client).
     client
         .pause_vm(&id)
         .await
-        .map_err(|e| format!("pause_vm before scale-to-zero ({vm_id}): {e}"))?;
+        .map_err(|e| format!("pause_vm before freeze ({vm_id}): {e}"))?;
     assert_state(client, &id, VmState::Paused).await?;
     let snap = client
-        .scale_to_zero(&id)
+        .freeze(&id)
         .await
-        .map_err(|e| format!("scale_to_zero({vm_id}): {e}"))?;
+        .map_err(|e| format!("freeze({vm_id}): {e}"))?;
     if !snap.state_path.exists() {
         return Err(format!(
             "snapshot state_path missing: {}",
@@ -212,7 +212,7 @@ async fn full_lifecycle(
     }
     let mem_bytes = snap.mem_path.metadata().map(|m| m.len()).unwrap_or(0);
     tracing::info!(
-        "{vm_id}: scaled to zero; snapshot files present (state={}, mem={mem_bytes} bytes)",
+        "{vm_id}: frozen; snapshot files present (state={}, mem={mem_bytes} bytes)",
         snap.state_path.display()
     );
     assert_gone(client, &id).await?;
@@ -295,7 +295,7 @@ async fn stage_errors(
         .map_err(|e| format!("destroy_vm(err-snap-11): {e}"))?;
 
     // 3. restore_vm on a VM with no stored snapshot → SnapshotNotFound.
-    //    ghost-99 was never scaled to zero, so the registry has no snapshot
+    //    ghost-99 was never frozen, so the registry has no snapshot
     //    for it (and indeed isn't registered at all) → SnapshotNotFound.
     expect_err(
         "restore_vm(no snapshot)",
@@ -306,7 +306,7 @@ async fn stage_errors(
 
     // 4. restore_vm while a new VM with the same id is live → InvalidState
     //    (the snapshot and the live VM would share one RW overlay). The only
-    //    way to reach this through the API: scale to zero (records snapshot +
+    //    way to reach this through the API: freeze (records snapshot +
     //    destroys original), then create a fresh VM with the same id, then
     //    restore — the registry snapshot and the live VM now coexist.
     let id = client
@@ -322,9 +322,9 @@ async fn stage_errors(
         .await
         .map_err(|e| format!("pause_vm(err-restore-12): {e}"))?;
     client
-        .scale_to_zero(&id)
+        .freeze(&id)
         .await
-        .map_err(|e| format!("scale_to_zero(err-restore-12): {e}"))?;
+        .map_err(|e| format!("freeze(err-restore-12): {e}"))?;
     let id2 = client
         .create_vm(make_config("err-restore-12", kernel, rootfs, initrd))
         .await

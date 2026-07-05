@@ -29,8 +29,8 @@ STATE_STYLE = {
     "stopped":      (5, "●", "stopped"),
 }
 
-# Scaled-to-zero: no live state but registered with a snapshot
-SCALED_ZERO_STYLE = (6, "○", "scaled-0")
+# Frozen: no live state but registered with a snapshot
+FROZEN_STYLE = (6, "○", "frozen")
 
 
 # ── API client ──────────────────────────────────────────────────────────────
@@ -112,9 +112,9 @@ def get_state_style(vm):
     state = vm.get("state")
     if state and state in STATE_STYLE:
         return STATE_STYLE[state]
-    # No live state but registered → scaled to zero
+    # No live state but registered → frozen
     if vm.get("snapshot_id") or vm.get("tenant_id"):
-        return SCALED_ZERO_STYLE
+        return FROZEN_STYLE
     return (5, "?", "unknown")
 
 
@@ -217,7 +217,7 @@ def main_loop(stdscr, args):
     curses.init_pair(3, curses.COLOR_CYAN, -1)     # starting/restoring
     curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # snapshotting
     curses.init_pair(5, curses.COLOR_RED, -1)      # stopped/error / db down
-    curses.init_pair(6, curses.COLOR_BLUE, -1)     # scaled to zero
+    curses.init_pair(6, curses.COLOR_BLUE, -1)     # frozen
 
     api_url = args.api
     error_msg = None

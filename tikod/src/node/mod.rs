@@ -2,8 +2,8 @@
 //!
 //! Wraps a [`Vmm`] backend with higher-level orchestration:
 //! - Provisioning (create + start)
-//! - Scale-to-zero (pause → snapshot → release resources)
-//! - Scale-from-zero (restore → resume)
+//! - Freeze (pause → snapshot → release resources)
+//! - Thaw (restore → resume)
 //! - VM endpoint discovery (for proxy forwarding)
 //!
 //! ```text
@@ -22,7 +22,7 @@ use crate::vmm::{Snapshot, VmConfig, VmId, VmInfo, VmState, Vmm};
 
 /// High-level VM lifecycle manager.
 ///
-/// Owns the VMM backend and adds orchestration logic for scale-to-zero,
+/// Owns the VMM backend and adds orchestration logic for freeze,
 /// snapshot caching, and endpoint discovery.
 pub struct Node {
     /// The VMM backend (AppleVzVmm on macOS, FirecrackerVmm on Linux).
@@ -46,15 +46,15 @@ impl Node {
         Ok(vm_id)
     }
 
-    /// Scale to zero: pause → snapshot → destroy (release RAM/CPU).
+    /// Freeze: pause → snapshot → destroy (release RAM/CPU).
     ///
     /// The VM's state is preserved in the snapshot file on local disk.
-    /// Call [`scale_from_zero`] to resume.
+    /// Call [`thaw`] to resume.
     ///
     /// This is the *immediate* (cold) path, bypassing the warm-pause window.
-    /// Used by the manual `PUT /scale-to-zero` route.
-    pub async fn scale_to_zero(&self, vm_id: &VmId) -> Result<Snapshot, crate::vmm::VmmError> {
-        info!(vm_id = %vm_id, "scaling to zero");
+    /// Used by the manual `PUT /freeze` route.
+    pub async fn freeze(&self, vm_id: &VmId) -> Result<Snapshot, crate::vmm::VmmError> {
+        info!(vm_id = %vm_id, "freezing");
 
         // Ensure VM is paused before snapshotting.
         let state = self.vmm.vm_state(vm_id).await?;
@@ -65,16 +65,16 @@ impl Node {
         let snapshot = self.vmm.snapshot_vm(vm_id).await?;
         self.vmm.destroy_vm(vm_id).await?;
 
-        info!(vm_id = %vm_id, "scaled to zero");
+        info!(vm_id = %vm_id, "frozen");
         Ok(snapshot)
     }
 
     /// Warm-pause: freeze the VM but keep it in memory. TCP connections
     /// survive (frozen, not broken). The VM can be transparently resumed by
     /// the proxy's wake-on-stale. If the warm window expires without activity,
-    /// the caller transitions to [`cold_scale_to_zero`].
+    /// the caller transitions to [`cold_freeze`].
     ///
-    /// [`cold_scale_to_zero`]: Node::cold_scale_to_zero
+    /// [`cold_freeze`]: Node::cold_freeze
     pub async fn warm_pause(&self, vm_id: &VmId) -> Result<(), crate::vmm::VmmError> {
         info!(vm_id = %vm_id, "warm-pausing (freeze, keep in memory)");
         if self.vmm.vm_state(vm_id).await? == VmState::Running {
@@ -83,11 +83,11 @@ impl Node {
         Ok(())
     }
 
-    /// Cold scale-to-zero: snapshot + destroy a paused VM, releasing RAM/CPU.
+    /// Cold freeze: snapshot + destroy a paused VM, releasing RAM/CPU.
     /// The caller must have already warm-paused the VM and cancelled its
     /// connections. Stores the resulting snapshot in the registry.
-    pub async fn cold_scale_to_zero(&self, vm_id: &VmId) -> Result<Snapshot, crate::vmm::VmmError> {
-        info!(vm_id = %vm_id, "cold scale-to-zero (snapshot + destroy)");
+    pub async fn cold_freeze(&self, vm_id: &VmId) -> Result<Snapshot, crate::vmm::VmmError> {
+        info!(vm_id = %vm_id, "cold freeze (snapshot + destroy)");
 
         // Ensure paused (idempotent — warm_pause may have already done it).
         let state = self.vmm.vm_state(vm_id).await?;
@@ -98,18 +98,18 @@ impl Node {
         let snapshot = self.vmm.snapshot_vm(vm_id).await?;
         self.vmm.destroy_vm(vm_id).await?;
 
-        info!(vm_id = %vm_id, "cold-scaled to zero");
+        info!(vm_id = %vm_id, "cold-frozen");
         Ok(snapshot)
     }
 
-    /// Scale from zero: restore from snapshot → resume.
-    pub async fn scale_from_zero(&self, snapshot: &Snapshot) -> Result<VmId, crate::vmm::VmmError> {
-        info!(vm_id = %snapshot.vm_id, "scaling from zero");
+    /// Thaw: restore from snapshot → resume.
+    pub async fn thaw(&self, snapshot: &Snapshot) -> Result<VmId, crate::vmm::VmmError> {
+        info!(vm_id = %snapshot.vm_id, "thawing");
 
         let vm_id = self.vmm.restore_vm(snapshot).await?;
         self.vmm.resume_vm(&vm_id).await?;
 
-        info!(vm_id = %vm_id, "scaled from zero");
+        info!(vm_id = %vm_id, "thawed");
         Ok(vm_id)
     }
 
@@ -137,7 +137,7 @@ impl Node {
     /// - `Running` → no-op.
     /// - `Paused`  → resume.
     /// - `Stopped` / not-present → restore from the registry-stored snapshot
-    ///   (`scale_from_zero`). This is the true scale-from-zero path that
+    ///   (`thaw`). This is the true thaw path that
     ///   [`ensure_running`] does not cover.
     ///
     /// The cold-restore path is **single-flighted** via [`Control::restore_lock`]:
@@ -155,7 +155,7 @@ impl Node {
             Ok(VmState::Running) => return Ok(()),
             Ok(VmState::Paused) => {
                 self.vmm.resume_vm(vm_id).await?;
-                // Fresh cancel signal: a prior scale-to-zero attempt (if any)
+                // Fresh cancel signal: a prior freeze attempt (if any)
                 // is now stale — new connections should not be cancelled.
                 control.reset_cancellers(vm_id);
                 // Clear warm-paused so the proxy re-enables keepalive and stops
@@ -187,7 +187,7 @@ impl Node {
         let snapshot = control
             .get_snapshot(vm_id)
             .ok_or_else(|| crate::vmm::VmmError::SnapshotNotFound(vm_id.clone()))?;
-        self.scale_from_zero(&snapshot).await?;
+        self.thaw(&snapshot).await?;
         // Fresh cancel signal for the restored VM.
         control.reset_cancellers(vm_id);
         // Clear warm-paused (cold restore produces a Running VM).

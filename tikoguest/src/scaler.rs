@@ -14,7 +14,7 @@
 //!
 //! tikod decides when to snapshot: on receiving a pause-request, it pauses
 //! the VM immediately and starts a 2-min warm window. If no client arrives
-//! during the window → snapshot (cold scale-to-zero). If a client arrives →
+//! during the window → snapshot (cold freeze). If a client arrives →
 //! resume. The guest's job is purely to signal "I'm idle."
 //!
 //! # Pause epoch detection

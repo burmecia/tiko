@@ -13,7 +13,7 @@ TCP forwarder** to a **"frame-aware during handshake, blind splice after
 `ReadyForQuery`"** proxy. The proxy reads just enough of the PG wire startup to
 extract a routing key — the `vm_id` — from the startup packet's `options` field
 (`-c tiko.endpoint=<vm_id>`), looks up the target VM, performs wake-on-connect
-(including true scale-from-zero), then splices raw bytes for the rest of the
+(including true thaw), then splices raw bytes for the rest of the
 connection. Auth is **passthrough** in v1 (the password is forwarded to the VM
 untouched).
 
@@ -36,7 +36,7 @@ Known gaps this strategy resolves:
    `tenant_id`/`branch_id` fields in `VmRecord` are invisible to the proxy.
 2. **Wake-on-connect only handles `Paused`** — `Node::ensure_running`
    (`node/mod.rs:82`) returns `InvalidState` for `Stopped`, the very state a
-   scaled-to-zero VM is in. The docstring overstates current capability.
+   frozen VM is in. The docstring overstates current capability.
 3. **`resume_timeout_secs` is declared (`proxy/mod.rs:53`) but never enforced.**
 4. **No `control.on_disconnect()` call** — `connection_count` would leak the
    moment VM routing is enabled, breaking any idle/auto-pause policy.
@@ -49,7 +49,7 @@ Known gaps this strategy resolves:
 
 - One listening port routes to N VMs, keyed by `vm_id`.
 - Wake-on-connect covers **all** VM states: `Running`, `Paused`, and `Stopped`
-  (true scale-from-zero) — closing the doc/reality gap.
+  (true thaw) — closing the doc/reality gap.
 - Concurrent clients to a cold VM get a single coordinated restore, not N
   racing restores (single-flight, owned by `Node`/`Control`).
 - Cancel requests (`CancelRequest`) reach the correct backend VM.
@@ -82,7 +82,7 @@ Client ──TCP──→ Proxy (:5432)
                  │  5. Node::wake(vm_id, control):
                  │       Running  → forward
                  │       Paused   → resume
-                 │       Stopped  → scale_from_zero(snapshot)  [single-flight]
+                 │       Stopped  → thaw(snapshot)  [single-flight]
                  │     wrapped in timeout(resume_timeout_secs)
                  │  6. connect backend (guest_ip:5432)
                  │  7. replay buffered startup bytes to backend
@@ -142,7 +142,7 @@ pub async fn wake(&self, vm_id: &VmId, control: &Control) -> Result<(), VmError>
         Ok(VmState::Stopped) | Err(VmmError::NotFound) => {
             let snap = control.get_snapshot(vm_id)
                 .ok_or(VmmError::NoSnapshot { vm_id: vm_id.clone() })?;
-            self.scale_from_zero(&snap).await?;   // restore + resume
+            self.thaw(&snap).await?;   // restore + resume
             Ok(())
         }
         other => Err(VmmError::InvalidState { /* ... */ }),
@@ -154,7 +154,7 @@ This fixes the current bug where `ensure_running` (`node/mod.rs:82`) returns
 `InvalidState` for the very `Stopped` state the proxy advertises it can wake.
 
 **Single-flight ownership: `Node`/`Control` (not the proxy).** Both the proxy
-and the HTTP `PUT /vms/{vm_id}/scale-from-zero` route call `Node::wake`, so both
+and the HTTP `PUT /vms/{vm_id}/thaw` route call `Node::wake`, so both
 must share one in-flight guard. The coordinator lives in `Control` (the shared
 state plane) so the two planes agree:
 
@@ -167,13 +167,13 @@ where `RestoreCoord` carries a `Notify` plus a result slot. `Node::wake`
 consults `Control`:
 
 - If an in-flight restore exists for `vm_id`, attach to its `Notify` and await.
-- Otherwise register itself as the leader, run `scale_from_zero`, store the
+- Otherwise register itself as the leader, run `thaw`, store the
   result, `notify_waiters()`, and remove the entry.
 
 The HTTP restore route delegates to the same `Node::wake`, so it gets
 single-flight for free and cannot race the proxy.
 
-`vm_id` is stable across scale-to-zero cycles because `Node::scale_from_zero`
+`vm_id` is stable across freeze cycles because `Node::thaw`
 returns `snapshot.vm_id` (`node/mod.rs:71,73`), so the mapping remains valid
 after restore.
 
@@ -261,7 +261,7 @@ Minimal changes, because the routing key *is* the vm_id:
 | `tikod/src/proxy/error.rs` *(new)* | Build PG `ErrorResponse` bytes for the cases in §7 |
 | `tikod/src/control/mod.rs` | `restores: DashMap<VmId, Arc<RestoreCoord>>` + single-flight accessors |
 | `tikod/src/node/mod.rs` | `Node::wake(vm_id, control)` unifying `Running`/`Paused`/`Stopped`; consults `Control` single-flight |
-| `tikod/src/api/server.rs` | HTTP `scale-from-zero`/`restore` routes delegate to `Node::wake` (share single-flight with proxy) |
+| `tikod/src/api/server.rs` | HTTP `thaw`/`restore` routes delegate to `Node::wake` (share single-flight with proxy) |
 | `tikod/src/main.rs` | No change — `default_target` retained as dev-only fallback |
 | `tikod/Cargo.toml` | No new deps for Phases 0–2 (hand-rolled parser). Revisit if Phase 3 adds TLS/auth. |
 
@@ -276,7 +276,7 @@ Minimal changes, because the routing key *is* the vm_id:
   verbatim, (d) `connection_count` returns to 0 after disconnect, (e) timeout
   produces a PG error packet.
 - **Wake**: a fake `Vmm` returning `Stopped` + a stored snapshot → assert
-  `scale_from_zero` invoked exactly once under N concurrent connections
+  `thaw` invoked exactly once under N concurrent connections
   (single-flight).
 - **Cancel**: two connections with distinct PIDs → assert a cancel for pid A
   routes to backend A, not B.
@@ -286,7 +286,7 @@ Minimal changes, because the routing key *is* the vm_id:
 | # | Question | Decision |
 |---|---|---|
 | 1 | Routing key namespace | Use **`vm_id`** everywhere. Future `vm_id` will be the user-facing, globally-unique `db_id` (encoded), serving as both routing key and DB identity. No separate `endpoint_id`. |
-| 2 | Single-flight ownership | **`Node`/`Control`** — so the proxy and the HTTP `scale-from-zero` route share one in-flight guard. |
+| 2 | Single-flight ownership | **`Node`/`Control`** — so the proxy and the HTTP `thaw` route share one in-flight guard. |
 | 3 | TLS | **Scoped out** for v1. Proxy replies `'N'` to `SSLRequest`. Future phase adds TLS + SNI routing. |
 | 4 | Unknown-endpoint policy | **Reject hard** — PG `FATAL` for both missing `tiko.endpoint` and unknown `vm_id`. `default_target` retained only as a dev/test escape hatch. |
 | 5 | Stopped VM with no snapshot | **PG `FATAL`** with a clear message (`VM <id> has no snapshot; cannot restore`). |

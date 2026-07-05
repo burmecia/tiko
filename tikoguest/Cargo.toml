@@ -1,6 +1,6 @@
 [package]
 name = "tikoguest"
-description = "Guest-side agent for tikod: Postgres control, observability, scale-to-zero"
+description = "Guest-side agent for tikod: Postgres control, observability, freeze"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }

@@ -41,7 +41,7 @@ pub struct VmRecord {
     /// Whether the VM currently has active client connections.
     pub connection_count: u32,
     /// Full snapshot descriptor if the VM is paused/snapshotted (set after
-    /// `scale_to_zero`). Kept here so clients can restore/scale-from-zero by
+    /// `freeze`). Kept here so clients can restore/thaw by
     /// `vm_id` alone — they never need to know `state_path`/`mem_path`/config.
     pub snapshot: Option<Snapshot>,
     /// Last time the guest agent pushed a metrics report.
@@ -172,9 +172,9 @@ impl Control {
             .collect()
     }
 
-    /// Store the full snapshot descriptor for a VM (after scale-to-zero). The
+    /// Store the full snapshot descriptor for a VM (after freeze). The
     /// snapshot is later retrieved by [`get_snapshot`] so clients can restore /
-    /// scale-from-zero by `vm_id` alone — no snapshot details cross the wire.
+    /// thaw by `vm_id` alone — no snapshot details cross the wire.
     pub fn set_snapshot(&self, vm_id: &VmId, snapshot: Snapshot) {
         if let Some(mut rec) = self.vms.get_mut(vm_id) {
             rec.snapshot = Some(snapshot);
@@ -182,8 +182,8 @@ impl Control {
     }
 
     /// Retrieve the stored snapshot for a VM (for `PUT /vms/{vm_id}/restore`
-    /// and `PUT /vms/{vm_id}/scale-from-zero`). Returns `None` if the VM isn't
-    /// registered or has no snapshot (never scaled to zero).
+    /// and `PUT /vms/{vm_id}/thaw`). Returns `None` if the VM isn't
+    /// registered or has no snapshot (never frozen).
     pub fn get_snapshot(&self, vm_id: &VmId) -> Option<Snapshot> {
         self.vms.get(vm_id).and_then(|r| r.snapshot.clone())
     }
@@ -265,7 +265,7 @@ impl Control {
 
     /// Wake all connections currently waiting on `vm_id`'s cancel signal, so
     /// they close their client sockets promptly. Called at the start of
-    /// scale-to-zero, *before* pausing the VM. Connections that subscribe
+    /// freeze, *before* pausing the VM. Connections that subscribe
     /// after this call (and before [`reset_cancellers`]) will simply fail on
     /// the dead backend and reconnect through wake.
     pub fn cancel_vm_connections(&self, vm_id: &VmId) {
@@ -277,7 +277,7 @@ impl Control {
 
     /// Swap in a fresh cancel signal for `vm_id`. Called after a successful
     /// wake (resume / restore) so that connections to the now-running VM are
-    /// not affected by a prior scale-to-zero cancel. Replacing (rather than
+    /// not affected by a prior freeze cancel. Replacing (rather than
     /// reusing) the `Notify` means stale waiters from the cancelled generation
     /// are never spuriously woken by later activity.
     pub fn reset_cancellers(&self, vm_id: &VmId) {
@@ -317,7 +317,7 @@ impl Control {
 
     /// Read the current thermal state: `true` if warm-paused, `false`
     /// otherwise (running or unknown). Used by the warm timer to decide
-    /// whether to proceed to cold scale-to-zero.
+    /// whether to proceed to cold freeze.
     pub fn is_warm_paused(&self, vm_id: &VmId) -> bool {
         self.warm.get(vm_id).is_some_and(|tx| *tx.borrow())
     }

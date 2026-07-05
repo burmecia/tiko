@@ -409,7 +409,7 @@ async fn all_db_routes_are_forwarded() {
 
 /// `GET /vms` is the authoritative swarm inventory: union of live VMs (from the
 /// Vmm backend) and registered VMs (from the control registry, which includes
-/// scaled-to-zero VMs with no live process). Live state/guest_ip come from the
+/// frozen VMs with no live process). Live state/guest_ip come from the
 /// backend; registry-only entries surface with `state:null` + their snapshot.
 #[tokio::test]
 async fn get_vms_merges_live_and_registry() {
@@ -420,9 +420,9 @@ async fn get_vms_merges_live_and_registry() {
     });
     let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-list-test")));
     let control = Arc::new(Control::new());
-    // Registry has the live VM (metadata) + a scaled-to-zero VM (no live proc).
+    // Registry has the live VM (metadata) + a frozen VM (no live proc).
     control.register("vm-live".to_string(), "acme".into(), "main".into(), 5432);
-    // A scaled-to-zero VM: registered (so it has metadata) + a snapshot, but not
+    // A frozen VM: registered (so it has metadata) + a snapshot, but not
     // in the backend's live set.
     control.register("vm-paused".to_string(), "acme".into(), "feat".into(), 5432);
     control.set_snapshot(
@@ -460,7 +460,7 @@ async fn get_vms_merges_live_and_registry() {
     assert!(body.contains(r#""guest_ip":"172.16.0.2""#), "{body}");
     assert!(body.contains(r#""tenant_id":"acme""#), "{body}");
 
-    // Scaled-to-zero VM: registry-only — state/guest_ip null, snapshot present.
+    // Frozen VM: registry-only — state/guest_ip null, snapshot present.
     assert!(body.contains(r#""vm_id":"vm-paused""#), "{body}");
     assert!(body.contains(r#""snapshot_id":"/tmp/snap.mem""#), "{body}");
     // Find the vm-paused object and confirm state is null.
@@ -471,8 +471,8 @@ async fn get_vms_merges_live_and_registry() {
         .iter()
         .find(|e| e["vm_id"] == "vm-paused")
         .expect("vm-paused missing");
-    assert!(paused["state"].is_null(), "scaled-to-zero state should be null");
-    assert!(paused["guest_ip"].is_null(), "scaled-to-zero guest_ip should be null");
+    assert!(paused["state"].is_null(), "frozen state should be null");
+    assert!(paused["guest_ip"].is_null(), "frozen guest_ip should be null");
 }
 
 /// `POST /vms/{id}/reports` stores agent-pushed metrics in the control registry.

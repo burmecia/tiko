@@ -28,8 +28,8 @@
 //! | `PUT`  | `/vms/{vm_id}/resume`       | resume_vm         | 204                                      |
 //! | `PUT`  | `/vms/{vm_id}/restore`      | restore_vm        | `{"vm_id":"..."}`  (snapshot from registry)  |
 //! | `PUT`  | `/vms/{vm_id}/snapshot`     | snapshot_vm       | `Snapshot`                               |
-//! | `PUT`  | `/vms/{vm_id}/scale-to-zero`| pause+snap+destroy| `Snapshot` (stored in registry)          |
-//! | `PUT`  | `/vms/{vm_id}/scale-from-zero`| restore + resume | `{"vm_id":"..."}`  (snapshot from registry) |
+//! | `PUT`  | `/vms/{vm_id}/freeze`| pause+snap+destroy| `Snapshot` (stored in registry)          |
+//! | `PUT`  | `/vms/{vm_id}/thaw`| restore + resume | `{"vm_id":"..."}`  (snapshot from registry) |
 //!
 //! # Postgres control routes (forwarded to the guest `tikoguest` agent)
 //!
@@ -76,7 +76,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 /// Warm-pause window: how long a warm-paused VM is kept in memory before
-/// cold scale-to-zero (snapshot + destroy). During this window, existing
+/// cold freeze (snapshot + destroy). During this window, existing
 /// client connections survive and are transparently resumed.
 const WARM_PAUSE_SECS: u64 = 120;
 
@@ -271,10 +271,10 @@ impl ApiServer {
                     Err(e) => err_resp(&e),
                 }
             }
-            // Legacy `POST /vms/restore` / `POST /vms/scale-from-zero` (full
+            // Legacy `POST /vms/restore` / `POST /vms/thaw` (full
             // `Snapshot` in the body) were replaced by path-keyed,
             // body-less `PUT /vms/{vm_id}/restore` and
-            // `PUT /vms/{vm_id}/scale-from-zero` (see `route_vm`). The snapshot
+            // `PUT /vms/{vm_id}/thaw` (see `route_vm`). The snapshot
             // is now looked up in the registry by vm_id, so clients never need
             // to carry snapshot details.
 
@@ -333,7 +333,7 @@ impl ApiServer {
             // Restore from the registry-stored snapshot (Paused state). The
             // snapshot is looked up by vm_id, so the request carries no body —
             // the client never needs snapshot paths/config. 404 if no snapshot
-            // is registered for this VM (e.g. it was never scaled to zero).
+            // is registered for this VM (e.g. it was never frozen).
             ("PUT", ["restore"]) => match self.control.get_snapshot(vm_id) {
                 Some(snap) => match vmm.restore_vm(&snap).await {
                     Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
@@ -341,11 +341,11 @@ impl ApiServer {
                 },
                 None => snapshot_not_found(vm_id),
             },
-            // Scale from zero: restore from the registry-stored snapshot, then
+            // Thaw: restore from the registry-stored snapshot, then
             // resume. Routed through `Node::wake` so the single-flight restore
             // lock is shared with the proxy — concurrent requests (and
             // concurrent client connections) perform at most one restore.
-            ("PUT", ["scale-from-zero"]) => match self.node.wake(vm_id, &self.control).await {
+            ("PUT", ["thaw"]) => match self.node.wake(vm_id, &self.control).await {
                 Ok(()) => ok_json(serde_json::json!({"vm_id": vm_id})),
                 Err(e) => err_resp(&e),
             },
@@ -353,11 +353,11 @@ impl ApiServer {
                 Ok(snap) => ok_value(&snap),
                 Err(e) => err_resp(&e),
             },
-            ("PUT", ["scale-to-zero"]) => {
+            ("PUT", ["freeze"]) => {
                 // Close active proxied connections before pausing, so clients
                 // get a prompt reset and reconnect through wake.
                 self.control.cancel_vm_connections(vm_id);
-                match self.node.scale_to_zero(vm_id).await {
+                match self.node.freeze(vm_id).await {
                     Ok(snap) => {
                         self.control.set_snapshot(vm_id, snap.clone());
                         ok_value(&snap)
@@ -445,7 +445,7 @@ impl ApiServer {
     /// 2. Notifies the proxy (`mark_warm_paused`) to disable keepalive.
     /// 3. Pauses the VM immediately (warm-pause: freeze, keep in memory).
     /// 4. Starts a 2-min countdown. If no client wakes the VM → snapshot
-    ///    (cold scale-to-zero). If a client arrives → resume (wake-on-stale).
+    ///    (cold freeze). If a client arrives → resume (wake-on-stale).
     async fn pause_request(&self, vm_id: &VmId, req: &Request) -> Response {
         let body: serde_json::Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
@@ -507,13 +507,13 @@ impl ApiServer {
                     if control.is_warm_paused(&vm_id_owned) {
                         tracing::info!(
                             vm_id = %vm_id_owned,
-                            "warm window expired — cold scale-to-zero"
+                            "warm window expired — cold freeze"
                         );
                         control.clear_warm_paused(&vm_id_owned);
                         // NOW close surviving connections (the VM is about to be
                         // destroyed; clients reconnect through wake).
                         control.cancel_vm_connections(&vm_id_owned);
-                        match node.cold_scale_to_zero(&vm_id_owned).await {
+                        match node.cold_freeze(&vm_id_owned).await {
                             Ok(snap) => {
                                 control.set_snapshot(&vm_id_owned, snap);
                             }
@@ -521,7 +521,7 @@ impl ApiServer {
                                 tracing::warn!(
                                     vm_id = %vm_id_owned,
                                     error = %e,
-                                    "cold_scale_to_zero failed after pause request"
+                                    "cold_freeze failed after pause request"
                                 );
                             }
                         }
@@ -546,7 +546,7 @@ impl ApiServer {
 
     /// `GET /vms` — authoritative swarm inventory: the union of live VMs known
     /// to the backend ([`Node::list_vms`]) and registered VMs in the control
-    /// plane (which includes scaled-to-zero VMs with no live process). Live
+    /// plane (which includes frozen VMs with no live process). Live
     /// state/guest_ip come from the backend; tenant/branch/connection/snapshot
     /// metadata come from the registry where available.
     async fn list_vms(&self) -> Response {
@@ -558,7 +558,7 @@ impl ApiServer {
         let registry = self.control.list();
 
         // Merge: every live VM, then every registered VM not currently live
-        // (e.g. scaled to zero — present only as a snapshot).
+        // (e.g. frozen — present only as a snapshot).
         let mut entries = serde_json::Map::new();
         for (vm_id, info) in &live {
             let rec = registry.iter().find(|(id, _)| id == vm_id).map(|(_, r)| r);
@@ -960,7 +960,7 @@ fn not_found(method: &str, path: &str) -> Response {
     }
 }
 
-/// 404 response for a restore/scale-from-zero on a VM with no stored snapshot.
+/// 404 response for a restore/thaw on a VM with no stored snapshot.
 ///
 /// Mirrors [`VmmError::SnapshotNotFound`] so the HTTP client decodes it back
 /// into the same variant as the pre-refactor behavior (a missing snapshot file
@@ -972,7 +972,7 @@ fn snapshot_not_found(vm_id: &VmId) -> Response {
         body: serde_json::json!({
             "error": {
                 "kind": "snapshot_not_found",
-                "message": format!("no snapshot registered for VM {vm_id} (scale to zero first)"),
+                "message": format!("no snapshot registered for VM {vm_id} (freeze first)"),
                 "vm_id": vm_id,
             }
         })

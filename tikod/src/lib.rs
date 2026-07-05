@@ -1,7 +1,7 @@
 //! `tikod` — Tiko compute control plane.
 //!
 //! Single-binary process that combines:
-//! - **proxy/** — PG wire-protocol proxy with wake-on-connect (scale-to-zero)
+//! - **proxy/** — PG wire-protocol proxy with wake-on-connect (freeze)
 //! - **control/** — VM registry, idle policy, auto-pause enforcement
 //! - **node/** — Firecracker/VZ lifecycle management, snapshot cache
 //! - **vmm/** — VMM abstraction trait with platform-specific backends
