@@ -95,6 +95,64 @@ impl Node {
         }
     }
 
+    /// Wake a VM for forwarding: ensure it is `Running`, regardless of current
+    /// state. Used by the proxy's wake-on-connect and the HTTP restore route.
+    ///
+    /// - `Running` → no-op.
+    /// - `Paused`  → resume.
+    /// - `Stopped` / not-present → restore from the registry-stored snapshot
+    ///   (`scale_from_zero`). This is the true scale-from-zero path that
+    ///   [`ensure_running`] does not cover.
+    ///
+    /// The cold-restore path is **single-flighted** via [`Control::restore_lock`]:
+    /// concurrent callers (e.g. many clients hitting a cold VM at once) share
+    /// one restore. After acquiring the lock the leader re-checks state, so a
+    /// waiter that lost the race observes the VM as `Running` and returns
+    /// without restoring again.
+    pub async fn wake(
+        &self,
+        vm_id: &VmId,
+        control: &crate::control::Control,
+    ) -> Result<(), crate::vmm::VmmError> {
+        // Fast path: present and runnable.
+        match self.vmm.vm_state(vm_id).await {
+            Ok(VmState::Running) => return Ok(()),
+            Ok(VmState::Paused) => {
+                self.vmm.resume_vm(vm_id).await?;
+                return Ok(());
+            }
+            Ok(other) => {
+                return Err(crate::vmm::VmmError::InvalidState {
+                    vm_id: vm_id.clone(),
+                    current: other,
+                    expected: VmState::Running,
+                });
+            }
+            Err(crate::vmm::VmmError::VmNotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Cold path: VM is gone — restore under a single-flight lock.
+        let lock = control.restore_lock(vm_id);
+        let _guard = lock.lock().await;
+
+        // Re-check after acquiring the lock: another caller may have restored
+        // the VM while we were waiting.
+        if let Ok(VmState::Running) = self.vmm.vm_state(vm_id).await {
+            return Ok(());
+        }
+
+        let snapshot = control
+            .get_snapshot(vm_id)
+            .ok_or_else(|| crate::vmm::VmmError::SnapshotNotFound(vm_id.clone()))?;
+        self.scale_from_zero(&snapshot).await?;
+        // Signal the restore to the guest: bumping the epoch lets the guest's
+        // scaler loop detect (via `GET /restore-epoch`) that it was restored
+        // and reset its stale `requested`/`idle_ticks` state.
+        control.bump_restore_epoch(vm_id);
+        Ok(())
+    }
+
     /// Get the guest IP address of a VM (for proxy forwarding).
     pub async fn guest_ip(
         &self,

@@ -1,30 +1,49 @@
-//! PostgreSQL wire-protocol proxy with wake-on-connect.
+//! PostgreSQL wire-protocol proxy with wake-on-connect and VM routing.
 //!
-//! Accepts client connections on a local port and forwards them to the
-//! target VM's PostgreSQL backend. If the VM is paused (scaled to zero),
-//! the proxy triggers a resume and holds the client socket until the VM
-//! is ready, then transparently forwards.
+//! Accepts client connections on a single port and routes each to the
+//! PostgreSQL backend of the target VM. The VM is selected by the
+//! `tiko.endpoint=<vm_id>` token in the startup packet's `options` field. If
+//! the VM is paused or scaled to zero, the proxy wakes it (resuming or
+//! restoring from snapshot) while holding the client socket — exploiting
+//! libpq's default `connect_timeout=0` (wait indefinitely).
 //!
-//! v1 is a transparent TCP proxy (no auth, no PG protocol parsing).
-//! Connection holding works because PostgreSQL's `libpq` default
-//! `connect_timeout=0` (wait indefinitely) — the proxy can stall the
-//! startup handshake for seconds while the VM resumes.
+//! The proxy is **protocol-aware only during the handshake**: it reads just
+//! enough of the client's opening bytes to extract the routing key and decline
+//! SSL, then replays those bytes to the chosen backend and switches to a blind
+//! byte splice for the rest of the connection. While splicing the backend's
+//! handshake replies it also intercepts `BackendKeyData` so that
+//! `CancelRequest`s (psql Ctrl-C) route to the correct VM.
 //!
 //! ```text
-//! Client ──TCP──→ Proxy (listen :5432)
-//!                   │
-//!                   ├─ VM running?  ──yes──→ forward bytes (tokio::io::copy)
-//!                   │
-//!                   └─ VM paused?   ──resume──→ wait ──→ forward bytes
-//!                                          (hold client socket)
+//! Client ──TCP──→ Proxy (:5432)
+//!                  │
+//!                  │  read startup: SSL?→'N'; Cancel?→cancel path; else parse
+//!                  │  extract tiko.endpoint=<vm_id>  (else dev `default_target`)
+//!                  │  lookup VM; Node::wake (Running/Paused/Stopped→restore)
+//!                  │  connect backend, replay startup, splice bytes
+//!                  │  (frame-scan until ReadyForQuery, then pure copy)
+//!                  ▼
+//!               VM PG backend
 //! ```
 
-use std::net::SocketAddr;
+mod cancel;
+mod error;
+mod startup;
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
+
+use cancel::{copy_until_ready, forward_cancel, CancelTable};
+use error::{
+    error_packet, fatal_missing_endpoint, fatal_unknown_vm, fatal_wake_timeout,
+    wake_error_packet,
+};
+use startup::{read_first_message, FirstMessage, StartupMessage};
 
 use crate::control::Control;
 use crate::node::Node;
@@ -33,12 +52,16 @@ use crate::vmm::VmId;
 /// Default PostgreSQL port.
 const PG_PORT: u16 = 5432;
 
+/// Severity used for connection-rejection error packets.
+const FATAL: &str = "FATAL";
+
 /// Connection forward target.
 #[derive(Debug, Clone)]
 pub enum ForwardTarget {
     /// Forward to a specific VM by ID (looked up in the registry).
     Vm(VmId),
-    /// Forward to a fixed address (e.g. for testing without a VM).
+    /// Forward to a fixed address (dev/test escape hatch when no
+    /// `tiko.endpoint` is supplied by the client).
     Direct(SocketAddr),
 }
 
@@ -47,10 +70,21 @@ pub enum ForwardTarget {
 pub struct ProxyConfig {
     /// Address to listen on for client connections.
     pub listen_addr: SocketAddr,
-    /// Default target when no VM routing is specified.
+    /// Fallback target for connections that omit `tiko.endpoint`. Only used
+    /// when [`dev_allow_missing_endpoint`] is true.
+    ///
+    /// [`dev_allow_missing_endpoint`]: ProxyConfig::dev_allow_missing_endpoint
     pub default_target: ForwardTarget,
-    /// Maximum time to wait for a VM to resume before giving up (seconds).
+    /// Maximum time to wait for a VM to wake (resume / restore) before
+    /// rejecting the client with a PG `FATAL` error.
     pub resume_timeout_secs: u64,
+    /// Dev/test escape hatch. When `false` (the default, for production), a
+    /// connection without a `tiko.endpoint` routing option is rejected with a
+    /// PG `FATAL` error. When `true`, such connections fall back to
+    /// [`default_target`] instead — useful for local development without a VM.
+    ///
+    /// [`default_target`]: ProxyConfig::default_target
+    pub dev_allow_missing_endpoint: bool,
 }
 
 impl Default for ProxyConfig {
@@ -59,6 +93,7 @@ impl Default for ProxyConfig {
             listen_addr: "127.0.0.1:5432".parse().unwrap(),
             default_target: ForwardTarget::Direct("127.0.0.1:15432".parse().unwrap()),
             resume_timeout_secs: 30,
+            dev_allow_missing_endpoint: false,
         }
     }
 }
@@ -68,6 +103,7 @@ pub struct Proxy {
     node: Arc<Node>,
     control: Arc<Control>,
     config: ProxyConfig,
+    cancel_table: Arc<CancelTable>,
 }
 
 impl Proxy {
@@ -76,6 +112,7 @@ impl Proxy {
             node,
             control,
             config,
+            cancel_table: CancelTable::shared(),
         }
     }
 
@@ -90,11 +127,18 @@ impl Proxy {
                     let node = self.node.clone();
                     let control = self.control.clone();
                     let config = self.config.clone();
+                    let cancel_table = self.cancel_table.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_connection(client_stream, client_addr, &node, &control, &config)
-                                .await
+                        if let Err(e) = handle_connection(
+                            client_stream,
+                            client_addr,
+                            &node,
+                            &control,
+                            &config,
+                            &cancel_table,
+                        )
+                        .await
                         {
                             error!(client = %client_addr, error = %e, "connection handling failed");
                         }
@@ -108,94 +152,194 @@ impl Proxy {
     }
 }
 
-/// Handle a single client connection: determine target, wake VM if needed,
-/// forward bytes bidirectionally.
+/// Outcome of resolving a VM routing target.
+enum RouteOutcome {
+    /// Forward to this backend address.
+    Addr(SocketAddr),
+    /// Reject the client: a PG error packet to write before closing.
+    Reject(Vec<u8>),
+}
+
+/// Handle a single client connection: read startup, route, wake the VM if
+/// needed, then splice bytes bidirectionally.
 async fn handle_connection(
     client_stream: TcpStream,
     client_addr: SocketAddr,
     node: &Node,
     control: &Control,
     config: &ProxyConfig,
+    cancel_table: &CancelTable,
 ) -> io::Result<()> {
     debug!(client = %client_addr, "new connection");
-
-    // Determine the forward target.
-    let backend_addr = resolve_target(&config.default_target, node, control).await?;
-
-    // Connect to the backend (VM's PG port).
-    debug!(client = %client_addr, backend = %backend_addr, "connecting to backend");
-    let backend_stream = TcpStream::connect(backend_addr).await?;
-    backend_stream.set_nodelay(true)?;
-
-    // Forward bytes in both directions until either side closes.
     let (mut client_read, mut client_write) = client_stream.into_split();
+
+    // 1. Read the client's startup (handling the SSL/GSS prelude and cancels).
+    let startup: StartupMessage = loop {
+        match read_first_message(&mut client_read).await {
+            Ok(Some(FirstMessage::SslRequest)) | Ok(Some(FirstMessage::GssEncRequest)) => {
+                // v1 is plaintext-only: decline TLS/GSS and expect a StartupMessage.
+                client_write.write_all(b"N").await?;
+                continue;
+            }
+            Ok(Some(FirstMessage::Cancel { pid, secret })) => {
+                if let Err(e) = forward_cancel(pid, secret, cancel_table).await {
+                    debug!(client = %client_addr, error = %e, "cancel forward failed");
+                }
+                return Ok(()); // cancel connections close immediately
+            }
+            Ok(Some(FirstMessage::Startup(msg))) => break msg,
+            Ok(None) => {
+                debug!(client = %client_addr, "client closed before sending startup");
+                return Ok(());
+            }
+            Err(e) => {
+                debug!(client = %client_addr, error = %e, "startup parse failed");
+                return Ok(());
+            }
+        }
+    };
+
+    // 2. Resolve the backend: VM routing key, else reject hard (or, in dev
+    //    mode, the configured `default_target`).
+    let mut connected_vm_id: Option<VmId> = None;
+    let backend_addr: SocketAddr = match startup.vm_id() {
+        Some(id) => {
+            let id: VmId = id.to_string();
+            match resolve_vm(&id, node, control, config).await {
+                RouteOutcome::Addr(addr) => {
+                    connected_vm_id = Some(id);
+                    addr
+                }
+                RouteOutcome::Reject(pkt) => {
+                    let _ = client_write.write_all(&pkt).await;
+                    return Ok(());
+                }
+            }
+        }
+        None => {
+            if config.dev_allow_missing_endpoint {
+                match &config.default_target {
+                    ForwardTarget::Direct(addr) => *addr,
+                    ForwardTarget::Vm(id) => match resolve_vm(id, node, control, config).await {
+                        RouteOutcome::Addr(addr) => {
+                            connected_vm_id = Some(id.clone());
+                            addr
+                        }
+                        RouteOutcome::Reject(pkt) => {
+                            let _ = client_write.write_all(&pkt).await;
+                            return Ok(());
+                        }
+                    },
+                }
+            } else {
+                let _ = client_write.write_all(&fatal_missing_endpoint()).await;
+                return Ok(());
+            }
+        }
+    };
+
+    // 3. Connect to the backend.
+    debug!(client = %client_addr, backend = %backend_addr, "connecting to backend");
+    let backend_stream = match TcpStream::connect(backend_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            let pkt = error_packet(
+                FATAL,
+                "08006",
+                &format!("cannot connect to backend {backend_addr}: {e}"),
+            );
+            let _ = client_write.write_all(&pkt).await;
+            return Ok(());
+        }
+    };
+    backend_stream.set_nodelay(true)?;
     let (mut backend_read, mut backend_write) = backend_stream.into_split();
+
+    // 4. Replay the buffered startup packet verbatim.
+    if let Err(e) = backend_write.write_all(&startup.raw).await {
+        let pkt = error_packet(
+            FATAL,
+            "08006",
+            &format!("failed to forward startup to backend: {e}"),
+        );
+        let _ = client_write.write_all(&pkt).await;
+        return Ok(());
+    }
+
+    // 5. Splice. The backend→client direction is frame-scanned until
+    //    ReadyForQuery (capturing BackendKeyData for cancel routing) and then
+    //    becomes a plain byte copy. The captured `(pid, secret)` is returned so
+    //    we can evict the cancel-table entry when the connection closes.
+    let backend_to_client = async {
+        let key = copy_until_ready(&mut backend_read, &mut client_write, backend_addr, cancel_table)
+            .await?;
+        io::copy(&mut backend_read, &mut client_write).await?;
+        client_write.shutdown().await?;
+        Ok::<_, io::Error>(key)
+    };
 
     let client_to_backend = async {
         io::copy(&mut client_read, &mut backend_write).await?;
-        backend_write.shutdown().await
-    };
-
-    let backend_to_client = async {
-        io::copy(&mut backend_read, &mut client_write).await?;
-        client_write.shutdown().await
+        backend_write.shutdown().await?;
+        Ok::<_, io::Error>(())
     };
 
     debug!(client = %client_addr, "proxying established");
-    let _: ((), ()) = tokio::try_join!(client_to_backend, backend_to_client)?;
+    let (_client_side, backend_key) = tokio::try_join!(client_to_backend, backend_to_client)?;
 
+    // 6. Tear-down: evict the cancel-key entry and notify the control plane
+    //    that the client has gone away, so the connection counter (used by the
+    //    idle/auto-pause policy) stays accurate.
+    if let Some((pid, secret)) = backend_key {
+        cancel_table.remove(pid, secret);
+    }
+    if let Some(id) = connected_vm_id.as_ref() {
+        control.on_disconnect(id);
+    }
     debug!(client = %client_addr, "connection closed");
     Ok(())
 }
 
-/// Resolve a [`ForwardTarget`] to a socket address. For VM targets, this
-/// triggers wake-on-connect: if the VM is paused, resume it first.
-async fn resolve_target(
-    target: &ForwardTarget,
+/// Resolve a VM target to a backend socket address. Performs wake-on-connect
+/// (resume / scale-from-zero, single-flighted via `Control`) bounded by
+/// `resume_timeout_secs`. Records `on_connect` on success.
+async fn resolve_vm(
+    vm_id: &VmId,
     node: &Node,
     control: &Control,
-) -> io::Result<SocketAddr> {
-    match target {
-        ForwardTarget::Direct(addr) => Ok(*addr),
-        ForwardTarget::Vm(vm_id) => {
-            // Wake-on-connect: ensure the VM is running.
-            match node.state(vm_id).await {
-                Ok(crate::vmm::VmState::Running) => {
-                    debug!(vm_id = %vm_id, "VM already running");
-                }
-                Ok(crate::vmm::VmState::Paused) => {
-                    info!(vm_id = %vm_id, "VM paused — triggering resume (wake-on-connect)");
-                    node.ensure_running(vm_id).await.map_err(|e| {
-                        io::Error::other(format!("failed to resume VM {vm_id}: {e}"))
-                    })?;
-                    info!(vm_id = %vm_id, "VM resumed");
-                }
-                Ok(state) => {
-                    return Err(io::Error::other(format!(
-                        "VM {vm_id} is in state {state}, cannot forward"
-                    )));
-                }
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "cannot query VM {vm_id} state: {e}"
-                    )));
-                }
-            }
+    config: &ProxyConfig,
+) -> RouteOutcome {
+    // Unknown VM — reject hard.
+    if control.get(vm_id).is_none() {
+        return RouteOutcome::Reject(fatal_unknown_vm(vm_id));
+    }
 
-            // Look up the guest IP.
-            let guest_ip = node.guest_ip(vm_id).await.map_err(|e| {
-                io::Error::other(format!("cannot get guest IP for {vm_id}: {e}"))
-            })?;
-
-            let ip = guest_ip.unwrap_or_else(|| {
-                warn!(vm_id = %vm_id, "no guest IP discovered, using localhost");
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            });
-
-            // Notify control plane of activity.
-            control.on_connect(vm_id);
-
-            Ok(SocketAddr::new(ip, PG_PORT))
+    // Wake (Running → noop; Paused → resume; Stopped → restore), bounded.
+    let wake = node.wake(vm_id, control);
+    match tokio::time::timeout(Duration::from_secs(config.resume_timeout_secs), wake).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return RouteOutcome::Reject(wake_error_packet(vm_id, &e)),
+        Err(_) => {
+            return RouteOutcome::Reject(fatal_wake_timeout(vm_id, config.resume_timeout_secs))
         }
     }
+
+    let guest_ip = match node.guest_ip(vm_id).await {
+        Ok(ip) => ip,
+        Err(e) => {
+            return RouteOutcome::Reject(error_packet(
+                FATAL,
+                "08006",
+                &format!("cannot get guest IP for VM {vm_id}: {e}"),
+            ))
+        }
+    };
+
+    let ip = guest_ip.unwrap_or_else(|| {
+        warn!(vm_id = %vm_id, "no guest IP discovered, using localhost");
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    });
+
+    control.on_connect(vm_id);
+    RouteOutcome::Addr(SocketAddr::new(ip, PG_PORT))
 }

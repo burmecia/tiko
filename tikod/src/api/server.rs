@@ -312,6 +312,22 @@ impl ApiServer {
                 Ok(ip) => ok_json(serde_json::json!({"vm_id": vm_id, "ip": ip})),
                 Err(e) => err_resp(&e),
             },
+            // Restore epoch: a monotonic counter bumped on each cold restore.
+            // The guest's scaler loop polls this to detect that it was restored
+            // from a snapshot and reset its stale `requested`/`idle_ticks`.
+            ("GET", ["restore-epoch"]) => match self.control.restore_epoch(vm_id) {
+                Some(epoch) => {
+                    ok_json(serde_json::json!({"vm_id": vm_id, "epoch": epoch}))
+                }
+                None => Response {
+                    status: 404,
+                    body: serde_json::json!({
+                        "error": {"kind": "not_found", "message": format!("VM {vm_id} not registered")}
+                    })
+                    .to_string()
+                    .into_bytes(),
+                },
+            },
             ("PUT", ["start"]) => match vmm.start_vm(vm_id).await {
                 Ok(()) => no_content(),
                 Err(e) => err_resp(&e),
@@ -336,13 +352,12 @@ impl ApiServer {
                 None => snapshot_not_found(vm_id),
             },
             // Scale from zero: restore from the registry-stored snapshot, then
-            // resume. Same registry lookup + 404 contract as `restore`.
-            ("PUT", ["scale-from-zero"]) => match self.control.get_snapshot(vm_id) {
-                Some(snap) => match self.node.scale_from_zero(&snap).await {
-                    Ok(id) => ok_json(serde_json::json!({"vm_id": id})),
-                    Err(e) => err_resp(&e),
-                },
-                None => snapshot_not_found(vm_id),
+            // resume. Routed through `Node::wake` so the single-flight restore
+            // lock is shared with the proxy — concurrent requests (and
+            // concurrent client connections) perform at most one restore.
+            ("PUT", ["scale-from-zero"]) => match self.node.wake(vm_id, &self.control).await {
+                Ok(()) => ok_json(serde_json::json!({"vm_id": vm_id})),
+                Err(e) => err_resp(&e),
             },
             ("PUT", ["snapshot"]) => match vmm.snapshot_vm(vm_id).await {
                 Ok(snap) => ok_value(&snap),

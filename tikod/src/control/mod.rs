@@ -17,9 +17,11 @@
 //! └─────────────────────────────────────────────────────┘
 //! ```
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::vmm::{Snapshot, VmId};
@@ -48,12 +50,25 @@ pub struct VmRecord {
     /// Idempotency guard: true while a snapshot-request from the agent is being
     /// processed (between ack and scale_to_zero completion).
     pub snapshot_requested: bool,
+    /// Monotonic counter bumped on every successful cold restore
+    /// (`scale_from_zero`). Guest agents poll it via
+    /// `GET /vms/{vm_id}/restore-epoch` to detect that they were restored from
+    /// a snapshot and reset stale in-memory state (e.g. the scaler's
+    /// `requested` flag / `idle_ticks`). See [`Control::bump_restore_epoch`].
+    pub restore_epoch: u64,
 }
 
 /// In-memory VM registry.
 pub struct Control {
     /// VM records keyed by VmId.
     vms: DashMap<VmId, VmRecord>,
+    /// Single-flight restore locks, keyed by VmId. The first caller to wake a
+    /// cold (Stopped) VM becomes the leader and performs the restore while
+    /// holding the mutex; concurrent callers await the same lock and then
+    /// observe the VM as Running (re-checked in [`crate::node::Node::wake`]).
+    /// Entries persist (one per VM that was ever cold-restored) — bounded by
+    /// the number of VMs and cheap (an empty async mutex each).
+    restores: DashMap<VmId, Arc<Mutex<()>>>,
 }
 
 impl Default for Control {
@@ -66,6 +81,7 @@ impl Control {
     pub fn new() -> Self {
         Self {
             vms: DashMap::new(),
+            restores: DashMap::new(),
         }
     }
 
@@ -90,6 +106,7 @@ impl Control {
                 last_report_at: None,
                 last_metrics: None,
                 snapshot_requested: false,
+                restore_epoch: 0,
             },
         );
     }
@@ -184,6 +201,36 @@ impl Control {
             rec.snapshot_requested = false;
         }
     }
+
+    /// Bump the restore epoch for `vm_id`. Called after a successful cold
+    /// restore (the leader in `Node::wake`'s single-flight path). Guest agents
+    /// polling [`restore_epoch`] detect the change and reset stale state.
+    ///
+    /// No-op if the VM isn't registered (a restore of an unknown VM is
+    /// impossible in practice — the snapshot is looked up from the registry).
+    ///
+    /// [`restore_epoch`]: Control::restore_epoch
+    pub fn bump_restore_epoch(&self, vm_id: &VmId) {
+        if let Some(mut rec) = self.vms.get_mut(vm_id) {
+            rec.restore_epoch = rec.restore_epoch.saturating_add(1);
+            debug!(vm_id = %vm_id, epoch = rec.restore_epoch, "bumped restore epoch");
+        }
+    }
+
+    /// Current restore epoch for `vm_id`, or `None` if the VM isn't registered.
+    pub fn restore_epoch(&self, vm_id: &VmId) -> Option<u64> {
+        self.vms.get(vm_id).map(|r| r.restore_epoch)
+    }
+
+    /// Per-VM single-flight restore lock. Callers hold the returned mutex while
+    /// performing a cold restore so that concurrent connections to the same
+    /// Stopped VM share one restore rather than racing. See [`Node::wake`].
+    pub fn restore_lock(&self, vm_id: &VmId) -> Arc<Mutex<()>> {
+        self.restores
+            .entry(vm_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +263,28 @@ mod tests {
             ctrl.try_mark_snapshot_requested(&"vm-1".into()),
             Some(false)
         );
+    }
+
+    #[test]
+    fn restore_epoch_starts_zero_and_increments() {
+        let ctrl = Control::new();
+        ctrl.register("vm-1".into(), "acme".into(), "main".into(), 5432);
+
+        // Freshly registered → epoch 0.
+        assert_eq!(ctrl.restore_epoch(&"vm-1".into()), Some(0));
+
+        // Each bump increments by one.
+        ctrl.bump_restore_epoch(&"vm-1".into());
+        ctrl.bump_restore_epoch(&"vm-1".into());
+        assert_eq!(ctrl.restore_epoch(&"vm-1".into()), Some(2));
+    }
+
+    #[test]
+    fn restore_epoch_unknown_vm_is_none() {
+        let ctrl = Control::new();
+        assert_eq!(ctrl.restore_epoch(&"vm-ghost".into()), None);
+        // Bumping an unknown VM is a no-op (not a panic).
+        ctrl.bump_restore_epoch(&"vm-ghost".into());
+        assert_eq!(ctrl.restore_epoch(&"vm-ghost".into()), None);
     }
 }

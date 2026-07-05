@@ -7,11 +7,23 @@
 //!    `POST /vms/{vm_id}/snapshot-request` to tikod, retrying on failure
 //!    (3 attempts, 1s→2s→4s backoff).
 //! 4. On 2xx ack: sets `requested = true` — stops sending until PG becomes
-//!    active again (connections > 0), which resets the state.
+//!    active again (connections > threshold), which resets the state.
 //!
 //! tikod acks `202` **before** starting `scale_to_zero`, so the agent reads the
 //! ack before the VM is frozen. If tikod fails to scale, that's tikod's
 //! responsibility — the agent's job is to signal.
+//!
+//! # Restore detection
+//!
+//! Because `requested`/`idle_ticks` are in-memory, they survive a
+//! snapshot/restore *stale*: the snapshot is taken after `requested = true`
+//! is set, so on restore the flag is stuck and the VM would never re-request.
+//! Each tick, the loop polls tikod's restore epoch
+//! (`GET /vms/{vm_id}/restore-epoch`). tikod bumps the epoch on every
+//! successful cold restore (`Node::wake`); a mismatch means "I was restored"
+//! and the scaler resets `requested`/`idle_ticks`. The `last_seen_epoch` is
+//! itself in-memory, so it is stale after restore — which is exactly why the
+//! mismatch is detected.
 
 use std::time::Duration;
 
@@ -62,6 +74,7 @@ pub async fn scaler_loop(
     policy: ScalerPolicy,
 ) {
     let path = format!("/vms/{vm_id}/snapshot-request");
+    let epoch_path = format!("/vms/{vm_id}/restore-epoch");
     info!(
         vm_id = %vm_id,
         interval_secs = interval.as_secs(),
@@ -71,9 +84,43 @@ pub async fn scaler_loop(
 
     let mut idle_ticks: u64 = 0;
     let mut requested = false;
+    // Last restore epoch seen from tikod. Because this is in-memory, it
+    // survives a snapshot/restore *stale* — so on the first tick after
+    // restore it mismatches tikod's bumped epoch and we reset. Starts at 0
+    // (the value `register` assigns); a fresh-boot VM also has epoch 0, so
+    // there is no false reset on first run.
+    let mut last_seen_epoch: u64 = 0;
 
     loop {
         tokio::time::sleep(interval).await;
+
+        // Restore detection: if tikod bumped the epoch since our last tick,
+        // we were restored from a snapshot. Reset stale scaler state so we
+        // can request scale-to-zero again in the new lifecycle. A failed
+        // query is non-fatal — we just retry next tick.
+        if let Ok(resp) = tikod.send_json("GET", &epoch_path, None).await {
+            if resp.status == 200 {
+                if let Some(epoch) = parse_epoch(&resp.body)
+                    && epoch != last_seen_epoch
+                {
+                    info!(
+                        vm_id = %vm_id,
+                        epoch,
+                        prev = last_seen_epoch,
+                        "restore detected — resetting scaler state"
+                    );
+                    requested = false;
+                    idle_ticks = 0;
+                    last_seen_epoch = epoch;
+                }
+            } else if resp.status != 404 {
+                debug!(
+                    vm_id = %vm_id,
+                    status = resp.status,
+                    "restore-epoch query returned non-200"
+                );
+            }
+        }
 
         let metrics = pg.collect().await;
 
@@ -160,4 +207,46 @@ async fn send_with_retry(
     Err(HttpError::Transport(format!(
         "snapshot request failed after {max_attempts} attempts"
     )))
+}
+
+/// Parse the `epoch` field from a `GET /restore-epoch` response body
+/// (`{"vm_id":"...","epoch":N}`). Returns `None` on any parse failure — the
+/// caller treats None as "no epoch info" and skips the reset this tick.
+fn parse_epoch(body: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.get("epoch")?.as_u64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_epoch_extracts_value() {
+        let body = br#"{"vm_id":"vm-1","epoch":7}"#;
+        assert_eq!(parse_epoch(body), Some(7));
+    }
+
+    #[test]
+    fn parse_epoch_zero() {
+        let body = br#"{"vm_id":"vm-1","epoch":0}"#;
+        assert_eq!(parse_epoch(body), Some(0));
+    }
+
+    #[test]
+    fn parse_epoch_missing_field() {
+        let body = br#"{"vm_id":"vm-1"}"#;
+        assert_eq!(parse_epoch(body), None);
+    }
+
+    #[test]
+    fn parse_epoch_malformed_json() {
+        assert_eq!(parse_epoch(b"not json"), None);
+    }
+
+    #[test]
+    fn parse_epoch_non_numeric() {
+        let body = br#"{"epoch":"oops"}"#;
+        assert_eq!(parse_epoch(body), None);
+    }
 }
