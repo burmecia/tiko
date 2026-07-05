@@ -3,26 +3,26 @@
 //! Every `interval` (default 30s), the loop:
 //! 1. Collects PG metrics via [`PgMetrics`].
 //! 2. Evaluates the [`ScalerPolicy`]: is the VM idle enough to snapshot?
-//! 3. If eligible and not already requested: sends
-//!    `POST /vms/{vm_id}/snapshot-request` to tikod, retrying on failure
-//!    (3 attempts, 1s→2s→4s backoff).
-//! 4. On 2xx ack: sets `requested = true` — stops sending until PG becomes
-//!    active again (connections > threshold), which resets the state.
+//! 3. If eligible: sends `POST /vms/{vm_id}/snapshot-request` to tikod,
+//!    retrying on failure (3 attempts, 1s→2s→4s backoff). This is
+//!    **send-and-forget**: tikod dedups via `snapshot_requested` (idempotent
+//!    202 for duplicates), so the guest fires every eligible tick without
+//!    tracking whether it already requested.
 //!
-//! tikod acks `202` **before** starting `scale_to_zero`, so the agent reads the
-//! ack before the VM is frozen. If tikod fails to scale, that's tikod's
-//! responsibility — the agent's job is to signal.
+//! tikod acks `202` **before** warm-pausing, so the agent reads the ack before
+//! the VM is frozen. If tikod fails to scale, that's tikod's responsibility —
+//! the agent's job is to signal.
 //!
 //! # Restore detection
 //!
-//! Because `requested`/`idle_ticks` are in-memory, they survive a
-//! snapshot/restore *stale*: the snapshot is taken after `requested = true`
-//! is set, so on restore the flag is stuck and the VM would never re-request.
-//! Each tick, the loop polls tikod's restore epoch
+//! Because `idle_ticks` is in-memory, it survives a snapshot/restore *stale*:
+//! the snapshot is taken while the VM is idle, so on restore `idle_ticks` is
+//! still >= threshold and the scaler would prematurely re-request. Each tick,
+//! the loop polls tikod's restore epoch
 //! (`GET /vms/{vm_id}/restore-epoch`). tikod bumps the epoch on every
 //! successful cold restore (`Node::wake`); a mismatch means "I was restored"
-//! and the scaler resets `requested`/`idle_ticks`. The `last_seen_epoch` is
-//! itself in-memory, so it is stale after restore — which is exactly why the
+//! and the scaler resets `idle_ticks`. The `last_seen_epoch` is itself
+//! in-memory, so it is stale after restore — which is exactly why the
 //! mismatch is detected.
 
 use std::time::Duration;
@@ -83,7 +83,6 @@ pub async fn scaler_loop(
     );
 
     let mut idle_ticks: u64 = 0;
-    let mut requested = false;
     // Last restore epoch seen from tikod. Because this is in-memory, it
     // survives a snapshot/restore *stale* — so on the first tick after
     // restore it mismatches tikod's bumped epoch and we reset. Starts at 0
@@ -109,7 +108,6 @@ pub async fn scaler_loop(
                         prev = last_seen_epoch,
                         "restore detected — resetting scaler state"
                     );
-                    requested = false;
                     idle_ticks = 0;
                     last_seen_epoch = epoch;
                 }
@@ -137,9 +135,9 @@ pub async fn scaler_loop(
 
         if is_idle {
             idle_ticks += 1;
-            debug!(idle_ticks, threshold = policy.idle_threshold_ticks, requested, "VM is idle");
+            debug!(idle_ticks, threshold = policy.idle_threshold_ticks, "VM is idle");
 
-            if idle_ticks >= policy.idle_threshold_ticks && !requested {
+            if idle_ticks >= policy.idle_threshold_ticks {
                 let body = SnapshotRequest {
                     reason: "idle".into(),
                     metrics,
@@ -148,8 +146,7 @@ pub async fn scaler_loop(
 
                 match send_with_retry(&tikod, &path, &json, 3).await {
                     Ok(()) => {
-                        info!(vm_id = %vm_id, "snapshot request acknowledged by tikod");
-                        requested = true;
+                        debug!(vm_id = %vm_id, "snapshot request sent (tikod dedups)");
                     }
                     Err(e) => {
                         warn!(
@@ -160,11 +157,10 @@ pub async fn scaler_loop(
                 }
             }
         } else {
-            if idle_ticks > 0 || requested {
-                debug!(idle_ticks, requested, "VM became active — resetting scaler state");
+            if idle_ticks > 0 {
+                debug!(idle_ticks, "VM became active — resetting scaler state");
             }
             idle_ticks = 0;
-            requested = false;
         }
     }
 }
