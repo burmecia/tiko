@@ -119,6 +119,9 @@ impl Node {
             Ok(VmState::Running) => return Ok(()),
             Ok(VmState::Paused) => {
                 self.vmm.resume_vm(vm_id).await?;
+                // Fresh cancel signal: a prior scale-to-zero attempt (if any)
+                // is now stale — new connections should not be cancelled.
+                control.reset_cancellers(vm_id);
                 return Ok(());
             }
             Ok(other) => {
@@ -146,6 +149,8 @@ impl Node {
             .get_snapshot(vm_id)
             .ok_or_else(|| crate::vmm::VmmError::SnapshotNotFound(vm_id.clone()))?;
         self.scale_from_zero(&snapshot).await?;
+        // Fresh cancel signal for the restored VM.
+        control.reset_cancellers(vm_id);
         // Signal the restore to the guest: bumping the epoch lets the guest's
         // scaler loop detect (via `GET /restore-epoch`) that it was restored
         // and reset its stale `requested`/`idle_ticks` state.

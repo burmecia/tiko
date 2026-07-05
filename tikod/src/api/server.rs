@@ -363,13 +363,18 @@ impl ApiServer {
                 Ok(snap) => ok_value(&snap),
                 Err(e) => err_resp(&e),
             },
-            ("PUT", ["scale-to-zero"]) => match self.node.scale_to_zero(vm_id).await {
-                Ok(snap) => {
-                    self.control.set_snapshot(vm_id, snap.clone());
-                    ok_value(&snap)
+            ("PUT", ["scale-to-zero"]) => {
+                // Close active proxied connections before pausing, so clients
+                // get a prompt reset and reconnect through wake.
+                self.control.cancel_vm_connections(vm_id);
+                match self.node.scale_to_zero(vm_id).await {
+                    Ok(snap) => {
+                        self.control.set_snapshot(vm_id, snap.clone());
+                        ok_value(&snap)
+                    }
+                    Err(e) => err_resp(&e),
                 }
-                Err(e) => err_resp(&e),
-            },
+            }
 
             // Agent-inbound: metrics report from the guest's observer loop.
             ("POST", ["reports"]) => self.record_report(vm_id, req).await,
@@ -469,6 +474,9 @@ impl ApiServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
+                // Close active proxied connections before the VM is frozen,
+                // so clients get a prompt reset and reconnect through wake.
+                self.control.cancel_vm_connections(vm_id);
                 let node = self.node.clone();
                 let control = self.control.clone();
                 let vm_id_owned = vm_id.clone();

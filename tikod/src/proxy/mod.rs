@@ -253,6 +253,10 @@ async fn handle_connection(
         }
     };
     backend_stream.set_nodelay(true)?;
+    // Part A: aggressive TCP keepalive so a dead backend (crash, network loss)
+    // is detected within ~20s rather than hanging for minutes.
+    #[cfg(unix)]
+    set_backend_keepalive(&backend_stream);
     let (mut backend_read, mut backend_write) = backend_stream.into_split();
 
     // 4. Replay the buffered startup packet verbatim.
@@ -270,29 +274,58 @@ async fn handle_connection(
     //    ReadyForQuery (capturing BackendKeyData for cancel routing) and then
     //    becomes a plain byte copy. The captured `(pid, secret)` is returned so
     //    we can evict the cancel-table entry when the connection closes.
-    let backend_to_client = async {
-        let key = copy_until_ready(&mut backend_read, &mut client_write, backend_addr, cancel_table)
-            .await?;
-        io::copy(&mut backend_read, &mut client_write).await?;
-        client_write.shutdown().await?;
-        Ok::<_, io::Error>(key)
-    };
+    //
+    //    Part B: if this is a VM-routed connection, the splice races against
+    //    the per-VM cancel signal. When scale-to-zero fires
+    //    `cancel_vm_connections`, the splice is dropped immediately and both
+    //    sockets are closed — the client gets a prompt reset and reconnects
+    //    through the wake path, instead of hanging on a frozen backend.
+    let splice = async {
+        let backend_to_client = async {
+            let key =
+                copy_until_ready(&mut backend_read, &mut client_write, backend_addr, cancel_table)
+                    .await?;
+            io::copy(&mut backend_read, &mut client_write).await?;
+            client_write.shutdown().await?;
+            Ok::<_, io::Error>(key)
+        };
 
-    let client_to_backend = async {
-        io::copy(&mut client_read, &mut backend_write).await?;
-        backend_write.shutdown().await?;
-        Ok::<_, io::Error>(())
+        let client_to_backend = async {
+            io::copy(&mut client_read, &mut backend_write).await?;
+            backend_write.shutdown().await?;
+            Ok::<_, io::Error>(())
+        };
+
+        tokio::try_join!(client_to_backend, backend_to_client)
     };
 
     debug!(client = %client_addr, "proxying established");
-    let (_client_side, backend_key) = tokio::try_join!(client_to_backend, backend_to_client)?;
 
-    // 6. Tear-down: evict the cancel-key entry and notify the control plane
-    //    that the client has gone away, so the connection counter (used by the
-    //    idle/auto-pause policy) stays accurate.
-    if let Some((pid, secret)) = backend_key {
-        cancel_table.remove(pid, secret);
+    if let Some(cancel_signal) = connected_vm_id.as_ref().map(|id| control.subscribe_cancel(id)) {
+        // VM-routed: race the splice against the cancel signal.
+        tokio::select! {
+            biased;
+            _ = cancel_signal.notified() => {
+                debug!(client = %client_addr, "connection cancelled (VM scaling to zero)");
+            }
+            result = splice => {
+                if let Ok((_, Some((pid, secret)))) = result {
+                    cancel_table.remove(pid, secret);
+                }
+            }
+        }
+    } else {
+        // Direct routing (dev): plain splice, no cancel.
+        if let Ok((_, Some((pid, secret)))) = splice.await {
+            cancel_table.remove(pid, secret);
+        }
     }
+
+    // 6. Tear-down: notify the control plane that the client has gone away,
+    //    so the connection counter (used by the idle/auto-pause policy) stays
+    //    accurate. For a normal close the cancel-table entry was already
+    //    evicted above; for a cancelled close the backend it pointed to is
+    //    being destroyed anyway, so the stale entry is harmless.
     if let Some(id) = connected_vm_id.as_ref() {
         control.on_disconnect(id);
     }
@@ -342,4 +375,49 @@ async fn resolve_vm(
 
     control.on_connect(vm_id);
     RouteOutcome::Addr(SocketAddr::new(ip, PG_PORT))
+}
+
+// ── TCP keepalive (Part A) ──────────────────────────────────────────────────
+//
+// Aggressive keepalive on the backend socket so that a dead backend (VM crash,
+// network loss — anything NOT covered by the cancel signal from scale-to-zero)
+// is detected within ~20s instead of hanging for TCP's default retransmission
+// timeout (~15 min). This is a safety net; the primary mechanism is
+// [`Control::cancel_vm_connections`] fired at the start of scale-to-zero.
+
+#[cfg(unix)]
+fn set_backend_keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    // Helper: set an integer socket option.
+    let setopt = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| {
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    };
+
+    // Enable keepalive.
+    setopt(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+
+    // Platform-specific tuning: 10s idle, then 3 probes × 3s = ~19s to detect.
+    #[cfg(target_os = "linux")]
+    {
+        setopt(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 10);
+        setopt(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 3);
+        setopt(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS uses TCP_KEEPALIVE for the idle time (equivalent of Linux TCP_KEEPIDLE).
+        setopt(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, 10);
+        setopt(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 3);
+        setopt(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+    }
 }

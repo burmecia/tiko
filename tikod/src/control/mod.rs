@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info};
 
 use crate::vmm::{Snapshot, VmId};
@@ -69,6 +69,15 @@ pub struct Control {
     /// Entries persist (one per VM that was ever cold-restored) — bounded by
     /// the number of VMs and cheap (an empty async mutex each).
     restores: DashMap<VmId, Arc<Mutex<()>>>,
+    /// Per-VM connection-cancellation signals. Each active proxied connection
+    /// holds a clone of the `Arc<Notify>` and waits on `.notified()` while
+    /// splicing. When [`cancel_vm_connections`] fires, all waiters wake and
+    /// close their client sockets promptly — so the client sees a connection
+    /// reset and reconnects through the wake path, instead of hanging on a
+    /// frozen/destroyed backend. [`reset_cancellers`] swaps in a fresh Notify
+    /// after a successful wake so new connections aren't affected by a stale
+    /// signal.
+    cancellers: DashMap<VmId, Arc<Notify>>,
 }
 
 impl Default for Control {
@@ -82,6 +91,7 @@ impl Control {
         Self {
             vms: DashMap::new(),
             restores: DashMap::new(),
+            cancellers: DashMap::new(),
         }
     }
 
@@ -230,6 +240,37 @@ impl Control {
             .entry(vm_id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Get this VM's connection-cancel signal (creating one if absent). Each
+    /// proxied connection clones the returned `Arc<Notify>` and waits on
+    /// `.notified()` while splicing. See [`Self::cancel_vm_connections`].
+    pub fn subscribe_cancel(&self, vm_id: &VmId) -> Arc<Notify> {
+        self.cancellers
+            .entry(vm_id.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    /// Wake all connections currently waiting on `vm_id`'s cancel signal, so
+    /// they close their client sockets promptly. Called at the start of
+    /// scale-to-zero, *before* pausing the VM. Connections that subscribe
+    /// after this call (and before [`reset_cancellers`]) will simply fail on
+    /// the dead backend and reconnect through wake.
+    pub fn cancel_vm_connections(&self, vm_id: &VmId) {
+        if let Some(notify) = self.cancellers.get(vm_id) {
+            debug!(vm_id = %vm_id, "cancelling active connections");
+            notify.notify_waiters();
+        }
+    }
+
+    /// Swap in a fresh cancel signal for `vm_id`. Called after a successful
+    /// wake (resume / restore) so that connections to the now-running VM are
+    /// not affected by a prior scale-to-zero cancel. Replacing (rather than
+    /// reusing) the `Notify` means stale waiters from the cancelled generation
+    /// are never spuriously woken by later activity.
+    pub fn reset_cancellers(&self, vm_id: &VmId) {
+        self.cancellers.insert(vm_id.clone(), Arc::new(Notify::new()));
     }
 }
 
