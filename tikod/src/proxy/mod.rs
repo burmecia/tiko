@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{self, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
@@ -254,9 +254,17 @@ async fn handle_connection(
     };
     backend_stream.set_nodelay(true)?;
     // Part A: aggressive TCP keepalive so a dead backend (crash, network loss)
-    // is detected within ~20s rather than hanging for minutes.
+    // is detected within ~20s rather than hanging for minutes. The proxy
+    // toggles this off when the VM is warm-paused (see wake-on-stale loop
+    // below) so the frozen VM isn't declared dead.
     #[cfg(unix)]
     set_backend_keepalive(&backend_stream);
+    // Capture the fd before into_split() for keepalive toggling.
+    #[cfg(unix)]
+    let backend_fd = {
+        use std::os::fd::AsRawFd;
+        backend_stream.as_raw_fd()
+    };
     let (mut backend_read, mut backend_write) = backend_stream.into_split();
 
     // 4. Replay the buffered startup packet verbatim.
@@ -270,16 +278,21 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // 5. Splice. The backend→client direction is frame-scanned until
-    //    ReadyForQuery (capturing BackendKeyData for cancel routing) and then
-    //    becomes a plain byte copy. The captured `(pid, secret)` is returned so
-    //    we can evict the cancel-table entry when the connection closes.
+    // 5. Splice with wake-on-stale, keepalive toggle, and cancellation.
     //
-    //    Part B: if this is a VM-routed connection, the splice races against
-    //    the per-VM cancel signal. When scale-to-zero fires
-    //    `cancel_vm_connections`, the splice is dropped immediately and both
-    //    sockets are closed — the client gets a prompt reset and reconnects
-    //    through the wake path, instead of hanging on a frozen backend.
+    // For VM-routed connections, the client→backend direction uses a
+    // wake-on-stale loop: it polls the per-VM thermal state (warm-paused?)
+    // before each read, toggles TCP keepalive off when paused (so a frozen VM
+    // isn't declared dead), resumes the VM before forwarding client data, and
+    // re-enables keepalive once running. The thermal watch's `changed()` is
+    // also raced against `client_read.read()` so the proxy reacts within
+    // milliseconds of warm-pause — well before the kernel's keepalive probe.
+    //
+    // The whole splice races against the per-VM cancel signal (cold
+    // scale-to-zero): when fired, the splice is dropped and both sockets
+    // close, prompting the client to reconnect through wake.
+    let thermal_rx = connected_vm_id.as_ref().map(|id| control.subscribe_warm(id));
+
     let splice = async {
         let backend_to_client = async {
             let key =
@@ -291,7 +304,44 @@ async fn handle_connection(
         };
 
         let client_to_backend = async {
-            io::copy(&mut client_read, &mut backend_write).await?;
+            if let (Some(mut thermal), Some(vm_id)) = (thermal_rx, connected_vm_id.as_ref()) {
+                // Wake-on-stale loop for VM-routed connections.
+                let mut buf = [0u8; 8192];
+                let mut keepalive_on = true;
+                loop {
+                    let paused = *thermal.borrow();
+                    // Toggle keepalive on thermal transitions: enabled when
+                    // Running, disabled when WarmPaused.
+                    #[cfg(unix)]
+                    if keepalive_on == paused {
+                        keepalive_on = !paused;
+                        set_keepalive_enabled(backend_fd, keepalive_on);
+                    }
+                    // Wake-on-stale: resume the VM before forwarding data.
+                    if paused {
+                        debug!(client = %client_addr, vm_id = %vm_id, "backend warm-paused — resuming");
+                        if let Err(e) = node.wake(vm_id, control).await {
+                            return Err(io::Error::other(format!(
+                                "wake-on-stale failed for {vm_id}: {e}"
+                            )));
+                        }
+                    }
+                    // Read from client, racing against thermal changes so we
+                    // react to warm-pause promptly even while idle.
+                    tokio::select! {
+                        biased;
+                        _ = thermal.changed() => continue,
+                        r = client_read.read(&mut buf) => {
+                            let n = r?;
+                            if n == 0 { break; }
+                            backend_write.write_all(&buf[..n]).await?;
+                        }
+                    }
+                }
+            } else {
+                // Direct routing (dev): plain copy, no thermal awareness.
+                io::copy(&mut client_read, &mut backend_write).await?;
+            }
             backend_write.shutdown().await?;
             Ok::<_, io::Error>(())
         };
@@ -419,5 +469,22 @@ fn set_backend_keepalive(stream: &TcpStream) {
         setopt(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, 10);
         setopt(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 3);
         setopt(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+    }
+}
+
+/// Toggle `SO_KEEPALIVE` on/off for a backend socket. The tuning values (idle,
+/// interval, count) persist on the socket — only the enable flag flips. Used by
+/// the wake-on-stale loop to disable keepalive while the VM is warm-paused (so
+/// the frozen VM isn't declared dead) and re-enable it when the VM resumes.
+#[cfg(unix)]
+fn set_keepalive_enabled(fd: std::os::fd::RawFd, enabled: bool) {
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &(if enabled { 1 } else { 0 } as libc::c_int) as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }

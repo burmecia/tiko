@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify};
 use tracing::{debug, info};
 
 use crate::vmm::{Snapshot, VmId};
@@ -78,6 +78,14 @@ pub struct Control {
     /// after a successful wake so new connections aren't affected by a stale
     /// signal.
     cancellers: DashMap<VmId, Arc<Notify>>,
+    /// Per-VM thermal-state signals (`false` = Running, `true` = WarmPaused).
+    /// The proxy subscribes and uses it to (a) toggle TCP keepalive on/off and
+    /// (b) wake-on-stale (resume the VM before forwarding client data). See
+    /// [`mark_warm_paused`] / [`clear_warm_paused`].
+    ///
+    /// [`mark_warm_paused`]: Control::mark_warm_paused
+    /// [`clear_warm_paused`]: Control::clear_warm_paused
+    warm: DashMap<VmId, watch::Sender<bool>>,
 }
 
 impl Default for Control {
@@ -92,6 +100,7 @@ impl Control {
             vms: DashMap::new(),
             restores: DashMap::new(),
             cancellers: DashMap::new(),
+            warm: DashMap::new(),
         }
     }
 
@@ -271,6 +280,44 @@ impl Control {
     /// are never spuriously woken by later activity.
     pub fn reset_cancellers(&self, vm_id: &VmId) {
         self.cancellers.insert(vm_id.clone(), Arc::new(Notify::new()));
+    }
+
+    /// Subscribe to `vm_id`'s thermal-state signal. Returns a `watch::Receiver`
+    /// that yields `true` while the VM is warm-paused and `false` while
+    /// running. The proxy uses this to toggle keepalive and to wake-on-stale.
+    pub fn subscribe_warm(&self, vm_id: &VmId) -> watch::Receiver<bool> {
+        self.warm
+            .entry(vm_id.clone())
+            .or_insert_with(|| watch::channel(false).0)
+            .subscribe()
+    }
+
+    /// Mark `vm_id` as warm-paused. Notifies all subscribers (proxied
+    /// connections) so they can disable TCP keepalive before the kernel's
+    /// keepalive probe would kill the frozen connection.
+    pub fn mark_warm_paused(&self, vm_id: &VmId) {
+        if let Some(tx) = self.warm.get(vm_id) {
+            let _ = tx.send(true);
+        } else {
+            let (tx, _rx) = watch::channel(true);
+            self.warm.insert(vm_id.clone(), tx);
+        }
+        debug!(vm_id = %vm_id, "marked warm-paused");
+    }
+
+    /// Mark `vm_id` as running (clear warm-paused). Called after a successful
+    /// wake (resume). Notifies subscribers to re-enable keepalive.
+    pub fn clear_warm_paused(&self, vm_id: &VmId) {
+        if let Some(tx) = self.warm.get(vm_id) {
+            let _ = tx.send(false);
+        }
+    }
+
+    /// Read the current thermal state: `true` if warm-paused, `false`
+    /// otherwise (running or unknown). Used by the warm timer to decide
+    /// whether to proceed to cold scale-to-zero.
+    pub fn is_warm_paused(&self, vm_id: &VmId) -> bool {
+        self.warm.get(vm_id).is_some_and(|tx| *tx.borrow())
     }
 }
 

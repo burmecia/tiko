@@ -69,10 +69,16 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
+
+/// Warm-pause window: how long a warm-paused VM is kept in memory before
+/// cold scale-to-zero (snapshot + destroy). During this window, existing
+/// client connections survive and are transparently resumed.
+const WARM_PAUSE_SECS: u64 = 120;
 
 use crate::control::Control;
 use crate::guestcontrol::{GuestClient, GuestClientError, DEFAULT_AGENT_PORT};
@@ -468,31 +474,60 @@ impl ApiServer {
                 }
             }
             Some(false) => {
-                // New request — ack 202 first, then scale async.
+                // New request — ack 202 first, then warm-pause + cold timer.
                 let reason = body
                     .get("reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                // Close active proxied connections before the VM is frozen,
-                // so clients get a prompt reset and reconnect through wake.
-                self.control.cancel_vm_connections(vm_id);
+                // Notify the proxy to disable keepalive (the VM is about to
+                // freeze; a frozen VM won't ACK keepalive probes). Connections
+                // are NOT cancelled — they survive the pause and are resumed
+                // transparently by wake-on-stale.
+                self.control.mark_warm_paused(vm_id);
                 let node = self.node.clone();
                 let control = self.control.clone();
                 let vm_id_owned = vm_id.clone();
                 tokio::spawn(async move {
-                    tracing::info!(vm_id = %vm_id_owned, reason = %reason, "processing snapshot request");
-                    match node.scale_to_zero(&vm_id_owned).await {
-                        Ok(snap) => {
-                            control.set_snapshot(&vm_id_owned, snap);
+                    tracing::info!(vm_id = %vm_id_owned, reason = %reason, "processing snapshot request (warm-pause)");
+                    // Phase 1 (warm): freeze the VM, keep it in memory.
+                    if let Err(e) = node.warm_pause(&vm_id_owned).await {
+                        tracing::warn!(
+                            vm_id = %vm_id_owned, error = %e, "warm_pause failed"
+                        );
+                        control.clear_warm_paused(&vm_id_owned);
+                        control.clear_snapshot_requested(&vm_id_owned);
+                        return;
+                    }
+                    // Phase 2 (cold): after the warm window, snapshot + destroy
+                    // if the VM is still paused (no client woke it).
+                    tokio::time::sleep(Duration::from_secs(WARM_PAUSE_SECS)).await;
+                    if control.is_warm_paused(&vm_id_owned) {
+                        tracing::info!(
+                            vm_id = %vm_id_owned,
+                            "warm window expired — cold scale-to-zero"
+                        );
+                        control.clear_warm_paused(&vm_id_owned);
+                        // NOW close surviving connections (the VM is about to be
+                        // destroyed; clients reconnect through wake).
+                        control.cancel_vm_connections(&vm_id_owned);
+                        match node.cold_scale_to_zero(&vm_id_owned).await {
+                            Ok(snap) => {
+                                control.set_snapshot(&vm_id_owned, snap);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    vm_id = %vm_id_owned,
+                                    error = %e,
+                                    "cold_scale_to_zero failed after snapshot request"
+                                );
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                vm_id = %vm_id_owned,
-                                error = %e,
-                                "scale_to_zero failed after snapshot request"
-                            );
-                        }
+                    } else {
+                        tracing::info!(
+                            vm_id = %vm_id_owned,
+                            "VM woken during warm window — skipping cold scale"
+                        );
                     }
                     control.clear_snapshot_requested(&vm_id_owned);
                 });

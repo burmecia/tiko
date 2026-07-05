@@ -50,6 +50,9 @@ impl Node {
     ///
     /// The VM's state is preserved in the snapshot file on local disk.
     /// Call [`scale_from_zero`] to resume.
+    ///
+    /// This is the *immediate* (cold) path, bypassing the warm-pause window.
+    /// Used by the manual `PUT /scale-to-zero` route.
     pub async fn scale_to_zero(&self, vm_id: &VmId) -> Result<Snapshot, crate::vmm::VmmError> {
         info!(vm_id = %vm_id, "scaling to zero");
 
@@ -63,6 +66,39 @@ impl Node {
         self.vmm.destroy_vm(vm_id).await?;
 
         info!(vm_id = %vm_id, "scaled to zero");
+        Ok(snapshot)
+    }
+
+    /// Warm-pause: freeze the VM but keep it in memory. TCP connections
+    /// survive (frozen, not broken). The VM can be transparently resumed by
+    /// the proxy's wake-on-stale. If the warm window expires without activity,
+    /// the caller transitions to [`cold_scale_to_zero`].
+    ///
+    /// [`cold_scale_to_zero`]: Node::cold_scale_to_zero
+    pub async fn warm_pause(&self, vm_id: &VmId) -> Result<(), crate::vmm::VmmError> {
+        info!(vm_id = %vm_id, "warm-pausing (freeze, keep in memory)");
+        if self.vmm.vm_state(vm_id).await? == VmState::Running {
+            self.vmm.pause_vm(vm_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Cold scale-to-zero: snapshot + destroy a paused VM, releasing RAM/CPU.
+    /// The caller must have already warm-paused the VM and cancelled its
+    /// connections. Stores the resulting snapshot in the registry.
+    pub async fn cold_scale_to_zero(&self, vm_id: &VmId) -> Result<Snapshot, crate::vmm::VmmError> {
+        info!(vm_id = %vm_id, "cold scale-to-zero (snapshot + destroy)");
+
+        // Ensure paused (idempotent — warm_pause may have already done it).
+        let state = self.vmm.vm_state(vm_id).await?;
+        if state == VmState::Running {
+            self.vmm.pause_vm(vm_id).await?;
+        }
+
+        let snapshot = self.vmm.snapshot_vm(vm_id).await?;
+        self.vmm.destroy_vm(vm_id).await?;
+
+        info!(vm_id = %vm_id, "cold-scaled to zero");
         Ok(snapshot)
     }
 
@@ -122,6 +158,9 @@ impl Node {
                 // Fresh cancel signal: a prior scale-to-zero attempt (if any)
                 // is now stale — new connections should not be cancelled.
                 control.reset_cancellers(vm_id);
+                // Clear warm-paused so the proxy re-enables keepalive and stops
+                // treating the backend as stale.
+                control.clear_warm_paused(vm_id);
                 return Ok(());
             }
             Ok(other) => {
@@ -151,6 +190,8 @@ impl Node {
         self.scale_from_zero(&snapshot).await?;
         // Fresh cancel signal for the restored VM.
         control.reset_cancellers(vm_id);
+        // Clear warm-paused (cold restore produces a Running VM).
+        control.clear_warm_paused(vm_id);
         // Signal the restore to the guest: bumping the epoch lets the guest's
         // scaler loop detect (via `GET /restore-epoch`) that it was restored
         // and reset its stale `requested`/`idle_ticks` state.
