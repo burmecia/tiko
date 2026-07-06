@@ -205,6 +205,20 @@ sudo mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 sudo ln -sf /etc/systemd/system/tikoguest.service \
     "$ROOTFS/etc/systemd/system/multi-user.target.wants/tikoguest.service"
 
+echo ">>> Installing CLI tools..."
+( cd "$SCRIPT_DIR/../.." && cargo build --release -p cli )
+sudo mkdir -p "$ROOTFS/usr/local/libexec"
+for bin in tiko_tlseg_viewer; do
+    sudo install -m755 "$SCRIPT_DIR/../../target/release/$bin" "$ROOTFS/usr/local/bin/$bin"
+done
+# tiko_pitr / tiko_branch / tiko_restore: real binary in libexec, wrapper at
+# /usr/local/bin sources tiko_env.sh so identity/storage/PGDATA are set up
+# automatically.
+for bin in tiko_pitr tiko_branch tiko_restore; do
+    sudo install -m755 "$SCRIPT_DIR/../../target/release/$bin" "$ROOTFS/usr/local/libexec/$bin"
+    sudo install -m755 "$SCRIPT_DIR/$bin.sh" "$ROOTFS/usr/local/bin/$bin"
+done
+
 echo ">>> Configuring S3 Files auto-mount..."
 
 # Credentials: prefer env vars, else a gitignored assets/s3files-creds.env
