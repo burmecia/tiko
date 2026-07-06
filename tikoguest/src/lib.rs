@@ -5,6 +5,7 @@
 //! identity) modules. The `tikoguest` binary in `src/main.rs` wires these
 //! together.
 
+pub mod backup;
 pub mod env;
 pub mod http;
 pub mod pgmetrics;

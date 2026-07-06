@@ -29,6 +29,7 @@ use std::time::Duration;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use tikoguest::backup;
 use tikoguest::env;
 use tikoguest::http::HttpClient;
 use tikoguest::pgmetrics::{PgMetrics, PgMetricsConfig};
@@ -87,6 +88,16 @@ struct Args {
     /// socket as the `postgres` user, database `tt`.
     #[arg(long, env = "TIKOGUEST_PG_CONN")]
     pg_conn: Option<String>,
+
+    /// `tiko_pitr` executable (the `/usr/local/bin` wrapper that sources
+    /// `tiko_env.sh`). Used by the base-backup loop.
+    #[arg(long, default_value = "/usr/local/bin/tiko_pitr", env = "TIKO_PITR_BIN")]
+    tiko_pitr: PathBuf,
+
+    /// Base-backup loop interval in seconds. 0 disables the loop. Each cycle
+    /// spawns `tiko_pitr backup` to take a base backup + base manifest for PITR.
+    #[arg(long, default_value_t = 120, env = "TIKOGUEST_BACKUP_INTERVAL")]
+    backup_interval: u64,
 }
 
 #[tokio::main]
@@ -174,6 +185,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  (agent still serves HTTP API)"
             );
         }
+    }
+
+    // ── Base-backup loop ────────────────────────────────────────────────────
+    //
+    // Periodically runs `tiko_pitr backup` to take a base backup + base
+    // manifest for PITR. Unconditional (not gated on TIKO_VM_ID/TIKOD_ADDR —
+    // PITR is data protection, independent of tikod). The loop starts with a
+    // sleep so PG has time to come up on boot.
+
+    if args.backup_interval > 0 {
+        tracing::info!(
+            interval_secs = args.backup_interval,
+            "starting base-backup loop"
+        );
+        tokio::spawn(backup::backup_loop(
+            args.tiko_pitr,
+            Duration::from_secs(args.backup_interval),
+        ));
     }
 
     start_server(listen_addr, ctl).await
