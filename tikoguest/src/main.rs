@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(vm_id), Some(addr)) => {
             let Ok(tikod_addr) = addr.parse::<SocketAddr>() else {
                 tracing::warn!(addr = %addr, "TIKOD_ADDR is not a valid SocketAddr — background tasks disabled");
-                return start_server(listen_addr, ctl).await;
+                return start_server(listen_addr, ctl, args.tiko_pitr).await;
             };
 
             if args.observe_interval > 0 {
@@ -200,16 +200,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "starting base-backup loop"
         );
         tokio::spawn(backup::backup_loop(
-            args.tiko_pitr,
+            args.tiko_pitr.clone(),
             Duration::from_secs(args.backup_interval),
         ));
     }
 
-    start_server(listen_addr, ctl).await
+    start_server(listen_addr, ctl, args.tiko_pitr).await
 }
 
-async fn start_server(listen_addr: SocketAddr, ctl: PgCtl) -> Result<(), Box<dyn std::error::Error>> {
-    let server = Arc::new(PgServer::new(ctl));
+async fn start_server(
+    listen_addr: SocketAddr,
+    ctl: PgCtl,
+    tiko_pitr: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let server = Arc::new(PgServer::new(ctl, tiko_pitr));
     server.run(listen_addr).await?;
     Ok(())
 }

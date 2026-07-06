@@ -19,6 +19,9 @@
 //! | `POST` | `/pg/reload`   | reload config| 204                                                     |
 //! | `GET`  | `/pg/config`   | read config  | `{"settings":{name:value,...}}`                         |
 //! | `PUT`  | `/pg/config`   | write config | 204  body: `{"settings":{name:value}}` (then reloads)   |
+//! | `GET`  | `/pitr/list`   | list backups | 200  `{"stdout":...,"stderr":...}`                     |
+//! | `POST` | `/pitr/backup` | take backup  | 200  `{"stdout":...,"stderr":...}`                     |
+//! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}`          |
 //!
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
 //! (`TIKO_ORG_ID` / `TIKO_DB_ID` / `TIKO_PROJECT_ID` / `TIKO_STORAGE_ROOT` /
@@ -27,9 +30,11 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 use tracing::{debug, error, info};
 
 use crate::http::{read_request, write_response, ok_json, no_content, bad_request, not_found, Request, Response};
@@ -40,13 +45,16 @@ use crate::service::ServiceRegistry;
 pub struct PgServer {
     ctl: PgCtl,
     services: ServiceRegistry,
+    /// Path to the `tiko_pitr` wrapper (`/usr/local/bin/tiko_pitr`).
+    tiko_pitr: PathBuf,
 }
 
 impl PgServer {
-    pub fn new(ctl: PgCtl) -> Self {
+    pub fn new(ctl: PgCtl, tiko_pitr: PathBuf) -> Self {
         Self {
             ctl,
             services: ServiceRegistry::new(),
+            tiko_pitr,
         }
     }
 
@@ -179,6 +187,10 @@ impl PgServer {
                 Err(r) => r,
             },
 
+            ("GET", ["pitr", "list"]) => self.pitr_list().await,
+            ("POST", ["pitr", "backup"]) => self.pitr_backup().await,
+            ("POST", ["pitr", "recover"]) => self.pitr_recover(&req.body).await,
+
             _ => not_found(method, path),
         }
     }
@@ -224,6 +236,66 @@ impl PgServer {
             "data_dir": self.ctl.data_dir.to_string_lossy(),
             "config_file": self.ctl.config_file.to_string_lossy(),
         }))
+    }
+
+    /// `GET /pitr/list` — spawn `tiko_pitr list` and return its output.
+    async fn pitr_list(&self) -> Response {
+        let mut cmd = Command::new(&self.tiko_pitr);
+        cmd.arg("list");
+        run_pitr(cmd).await
+    }
+
+    /// `POST /pitr/backup` — spawn `tiko_pitr backup` and return its output.
+    async fn pitr_backup(&self) -> Response {
+        let mut cmd = Command::new(&self.tiko_pitr);
+        cmd.arg("backup");
+        run_pitr(cmd).await
+    }
+
+    /// `POST /pitr/recover` — spawn `tiko_pitr recover` with the target parsed
+    /// from the JSON body (`time` or `lsn`, optional `timeline` /
+    /// `recovery_timeout`). Other recover args use the wrapper's env defaults.
+    async fn pitr_recover(&self, body: &[u8]) -> Response {
+        #[derive(serde::Deserialize)]
+        struct RecoverBody {
+            time: Option<String>,
+            lsn: Option<String>,
+            timeline: Option<String>,
+            recovery_timeout: Option<u64>,
+        }
+
+        let body: RecoverBody = if body.is_empty() {
+            return bad_request("recover requires 'time' or 'lsn'");
+        } else {
+            match serde_json::from_slice(body) {
+                Ok(b) => b,
+                Err(e) => return bad_request(&format!("invalid recover body: {e}")),
+            }
+        };
+
+        let mut cmd = Command::new(&self.tiko_pitr);
+        cmd.arg("recover");
+        match (body.time.as_deref(), body.lsn.as_deref()) {
+            (Some(t), None) => {
+                cmd.arg("--time").arg(t);
+            }
+            (None, Some(l)) => {
+                cmd.arg("--lsn").arg(l);
+            }
+            (Some(_), Some(_)) => {
+                return bad_request("'time' and 'lsn' are mutually exclusive");
+            }
+            (None, None) => {
+                return bad_request("recover requires 'time' or 'lsn'");
+            }
+        }
+        if let Some(tl) = &body.timeline {
+            cmd.arg("--timeline").arg(tl);
+        }
+        if let Some(timeout) = body.recovery_timeout {
+            cmd.arg("--recovery-timeout").arg(timeout.to_string());
+        }
+        run_pitr(cmd).await
     }
 
     fn parse_config_body(&self, body: &[u8]) -> Result<BTreeMap<String, String>, Response> {
@@ -277,3 +349,38 @@ fn err_resp(err: &PgCtlError) -> Response {
 // Re-export the result alias so callers wiring the server can name it.
 #[allow(dead_code)]
 pub type ServerResult<T> = PgCtlResult<T>;
+
+/// Run a `tiko_pitr` subcommand and format the result as an HTTP [`Response`].
+///
+/// - Exit 0 → `200 {"stdout":...,"stderr":...}`
+/// - Exit non-0 → `500 {"error":{"kind":"pitr_error","exit_code":N,...}}`
+/// - Spawn failure → `500 {"error":{"kind":"spawn_error","message":...}}`
+async fn run_pitr(mut cmd: Command) -> Response {
+    match cmd.output().await {
+        Ok(out) if out.status.success() => ok_json(serde_json::json!({
+            "stdout": String::from_utf8_lossy(&out.stdout),
+            "stderr": String::from_utf8_lossy(&out.stderr),
+        })),
+        Ok(out) => Response {
+            status: 500,
+            body: serde_json::json!({
+                "error": {
+                    "kind": "pitr_error",
+                    "exit_code": out.status.code(),
+                    "stdout": String::from_utf8_lossy(&out.stdout),
+                    "stderr": String::from_utf8_lossy(&out.stderr),
+                }
+            })
+            .to_string()
+            .into_bytes(),
+        },
+        Err(e) => Response {
+            status: 500,
+            body: serde_json::json!({
+                "error": {"kind": "spawn_error", "message": e.to_string()}
+            })
+            .to_string()
+            .into_bytes(),
+        },
+    }
+}

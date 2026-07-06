@@ -94,7 +94,7 @@ impl Fixture {
 
         let ctl = PgCtl::new(pg_ctl.clone(), data_dir.clone(), log_path, config_file.clone())
             .with_initdb(initdb.clone());
-        let server = Arc::new(PgServer::new(ctl));
+        let server = Arc::new(PgServer::new(ctl, PathBuf::from("tiko_pitr")));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
