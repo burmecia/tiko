@@ -30,12 +30,15 @@ echo "Building Tiko smgr + worker + cli..."
 if ! (cargo build -p smgr -p worker -p cli) >/dev/null; then
   echo "Build failed" >&2; exit 1
 fi
-cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${PG_LIB_DIR}"
 
 echo "Building PostgreSQL..."
 rm -f postgres/src/backend/postgres
 if ! (cd postgres && make -j4 && make install) >/dev/null; then
   echo "Postgres build/install failed" >&2; exit 1
+fi
+
+if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
+    cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${PG_LIB_DIR}"
 fi
 
 # Fresh parent cluster + shared storage root.
@@ -57,7 +60,7 @@ sleep 2
 #    parent's base manifest (ChunkRef.db_id=parent → COW).
 echo "--- tiko_branch ---"
 "${TIKO_BIN_DIR}/tiko_branch" \
-  --db-id 35 --project-id 56 \
+  --db-id 35 \
   --pgdata tt_branch --branch-port 5433 \
   --pg-basebackup "${PG_BIN_DIR}/pg_basebackup" \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"

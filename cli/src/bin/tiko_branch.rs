@@ -69,14 +69,15 @@ struct BranchArgs {
     /// The NEW database id for the branch (`TIKO_DB_ID`). Required.
     #[arg(long)]
     db_id: u64,
-    /// The NEW project id for the branch (`TIKO_PROJECT_ID`). Required.
+    /// The NEW project id for the branch (`TIKO_PROJECT_ID`). Defaults to
+    /// `db_id` when omitted.
     #[arg(long)]
-    project_id: u64,
+    project_id: Option<u64>,
     /// Branch PostgreSQL data directory (created if absent).
     #[arg(long)]
     pgdata: PathBuf,
     /// Port the branch PostgreSQL listens on. MUST differ from the parent.
-    #[arg(long, default_value_t = 5433)]
+    #[arg(long, default_value_t = 5432)]
     branch_port: u16,
     /// Per-branch local cache path (`TIKO_LOCAL_PATH`: `base_manifest.tikm`,
     /// `draft.spill`, `chunk_cache`). Defaults to `<pgdata>/tiko`.
@@ -131,7 +132,9 @@ fn main() {
 fn run_branch(store: &Store, parent: &ParentArgs, branch: &BranchArgs) -> Result<()> {
     // A branch shares the parent's org; only db_id/project_id differ.
     let org_id = env::read_u64(env::ENV_ORG_ID);
-    let branch_ns = DbNamespace::new(org_id, branch.db_id, branch.project_id);
+    // Default the branch's project_id to its db_id when not specified.
+    let project_id = branch.project_id.unwrap_or(branch.db_id);
+    let branch_ns = DbNamespace::new(org_id, branch.db_id, project_id);
     let storage_root = storage_root_path();
     let branch_local = branch
         .local_path
@@ -139,7 +142,7 @@ fn run_branch(store: &Store, parent: &ParentArgs, branch: &BranchArgs) -> Result
         .unwrap_or_else(|| branch.pgdata.join("tiko"));
     eprintln!(
         "tiko_branch: branching parent into db_id={} project_id={} (port {})",
-        branch.db_id, branch.project_id, branch.branch_port
+        branch.db_id, project_id, branch.branch_port
     );
 
     // 1. pg_basebackup -X stream against the parent. The checkpoint auto-forms
@@ -220,7 +223,7 @@ fn run_branch(store: &Store, parent: &ParentArgs, branch: &BranchArgs) -> Result
         .arg("-o")
         .arg(format!("-c port={}", branch.branch_port))
         .env("TIKO_DB_ID", branch.db_id.to_string())
-        .env("TIKO_PROJECT_ID", branch.project_id.to_string())
+        .env("TIKO_PROJECT_ID", project_id.to_string())
         .env(
             "TIKO_STORAGE_ROOT",
             storage_root_abs.to_string_lossy().to_string(),
