@@ -19,9 +19,9 @@
 //! | `POST` | `/pg/reload`   | reload config| 204                                                     |
 //! | `GET`  | `/pg/config`   | read config  | `{"settings":{name:value,...}}`                         |
 //! | `PUT`  | `/pg/config`   | write config | 204  body: `{"settings":{name:value}}` (then reloads)   |
-//! | `GET`  | `/pitr/list`   | list backups | 200  `{"stdout":...,"stderr":...}`                     |
-//! | `POST` | `/pitr/backup` | take backup  | 200  `{"stdout":...,"stderr":...}`                     |
-//! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}`          |
+//! | `GET`  | `/pitr/list`   | list backups | 200  `tiko_pitr list` JSON passed through (see [`Self::pitr_list`]) |
+//! | `POST` | `/pitr/backup` | take backup  | 200  `tiko_pitr backup` JSON passed through |
+//! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` |
 //!
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
 //! (`TIKO_ORG_ID` / `TIKO_DB_ID` / `TIKO_PROJECT_ID` / `TIKO_STORAGE_ROOT` /
@@ -352,28 +352,71 @@ pub type ServerResult<T> = PgCtlResult<T>;
 
 /// Run a `tiko_pitr` subcommand and format the result as an HTTP [`Response`].
 ///
-/// - Exit 0 → `200 {"stdout":...,"stderr":...}`
-/// - Exit non-0 → `500 {"error":{"kind":"pitr_error","exit_code":N,...}}`
-/// - Spawn failure → `500 {"error":{"kind":"spawn_error","message":...}}`
+/// `tiko_pitr` always emits a JSON object on stdout (success or failure). To
+/// keep the HTTP response as clean JSON instead of a string-wrapped blob, we
+/// parse that stdout JSON and pass it through directly:
+///
+/// - Exit 0 + valid JSON → `200 <parsed json>`
+/// - Exit non-0 + valid JSON → `500 <parsed json>` (already an `{"error":...}`
+///   object; `tiko_pitr`'s progress/diagnostics on stderr is folded in under
+///   `"stderr"` for debugging when present).
+/// - Non-JSON stdout (older `tiko_pitr`, panic, etc.) → fall back to the
+///   legacy `{stdout, stderr}` envelope.
+/// - Spawn failure → `500 {"error":{"kind":"spawn_error",...}}`.
 async fn run_pitr(mut cmd: Command) -> Response {
     match cmd.output().await {
-        Ok(out) if out.status.success() => ok_json(serde_json::json!({
-            "stdout": String::from_utf8_lossy(&out.stdout),
-            "stderr": String::from_utf8_lossy(&out.stderr),
-        })),
-        Ok(out) => Response {
-            status: 500,
-            body: serde_json::json!({
-                "error": {
-                    "kind": "pitr_error",
-                    "exit_code": out.status.code(),
-                    "stdout": String::from_utf8_lossy(&out.stdout),
-                    "stderr": String::from_utf8_lossy(&out.stderr),
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let http_status = if out.status.success() { 200 } else { 500 };
+
+            match serde_json::from_str::<serde_json::Value>(&stdout) {
+                Ok(mut value) => {
+                    // On failure, attach stderr (progress + diagnostics) to the
+                    // error object so clients can see why it failed. Success
+                    // responses pass through unmodified — stderr there is just
+                    // progress noise.
+                    if !out.status.success() && !stderr.is_empty()
+                        && let Some(obj) = value.as_object_mut()
+                    {
+                        obj.entry("stderr")
+                            .or_insert(serde_json::Value::String(stderr.to_string()));
+                    }
+                    let body = serde_json::to_vec(&value).unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "error": {
+                                "kind": "pitr_error",
+                                "exit_code": out.status.code(),
+                            }
+                        })
+                        .to_string()
+                        .into_bytes()
+                    });
+                    Response { status: http_status, body }
                 }
-            })
-            .to_string()
-            .into_bytes(),
-        },
+                Err(_) => {
+                    // Not JSON — fall back to wrapping stdout/stderr verbatim.
+                    let body = if out.status.success() {
+                        serde_json::json!({ "stdout": stdout, "stderr": stderr })
+                    } else {
+                        serde_json::json!({
+                            "error": {
+                                "kind": "pitr_error",
+                                "exit_code": out.status.code(),
+                                "stdout": stdout,
+                                "stderr": stderr,
+                            }
+                        })
+                    };
+                    Response {
+                        status: http_status,
+                        body: body.to_string().into_bytes(),
+                    }
+                }
+            }
+        }
         Err(e) => Response {
             status: 500,
             body: serde_json::json!({

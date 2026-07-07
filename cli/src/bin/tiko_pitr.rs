@@ -13,6 +13,12 @@
 //!     WAL to the target, then promote. On failure, PGDATA + the prior base
 //!     manifest are restored and the instance is left stopped.
 //!
+//! **Output model:** every subcommand emits a single JSON object on stdout
+//! (pretty-printed) so HTTP consumers (tikoguest's `/pitr/*` routes) can parse
+//! the result directly instead of screen-scraping. Human-readable progress and
+//! diagnostics go to stderr. On any failure the stdout object is
+//! `{"error":{"message":"..."}}` and the process exits non-zero.
+//!
 //! Storage is configured from the environment exactly as `tiko_restore`
 //! expects (`Store::init()`): `TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH`/`PGDATA`,
 //! `TIKO_ORG_ID`, `TIKO_DB_ID`, `TIKO_PROJECT_ID`.
@@ -22,6 +28,7 @@ use std::process::exit;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 use core::error::{Error, Result};
 use core::io::store::Store;
@@ -115,46 +122,126 @@ struct RecoverArgs {
     recovery_timeout: u64,
 }
 
-fn run_list(store: &Store) -> Result<()> {
-    let fmt_ts = |ts: i64| {
-        DateTime::<Utc>::from_timestamp(ts, 0)
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| ts.to_string())
-    };
+// ── JSON output DTOs ─────────────────────────────────────────────────────────
+//
+// The CLI emits one of these on stdout for each subcommand. Fields use the
+// human-readable PostgreSQL forms (RFC3339 timestamps, `X/Y` LSNs, hex
+// timeline ids) so consumers can display them without reformatting.
 
+/// `list` response: every base backup (newest-first) plus the recoverable
+/// window. `window` is `null` (and `window_error` set) when archived WAL
+/// coverage isn't available yet.
+#[derive(Serialize)]
+struct ListOutput {
+    backups: Vec<BackupDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<WindowDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BackupDto {
+    /// RFC3339 creation timestamp.
+    created_at: String,
+    /// Fixed-width hex timeline id (e.g. `"00000001"`).
+    timeline: String,
+    /// PostgreSQL `X/Y` checkpoint LSN the backup was taken at.
+    checkpoint_lsn: String,
+    /// PostgreSQL `X/Y` REDO LSN (where WAL replay starts).
+    redo_lsn: String,
+}
+
+#[derive(Serialize)]
+struct WindowDto {
+    timeline: String,
+    /// RFC3339 lower bound of the recoverable window.
+    earliest_ts: String,
+    /// RFC3339 upper bound (WAL head).
+    latest_ts: String,
+    /// PostgreSQL `X/Y` earliest recoverable LSN.
+    earliest_lsn: String,
+    /// PostgreSQL `X/Y` latest recoverable LSN.
+    latest_lsn: String,
+}
+
+/// `backup` response: coordinates of the just-uploaded base backup.
+#[derive(Serialize)]
+struct BackupOutput {
+    timeline: String,
+    checkpoint_lsn: String,
+    redo_lsn: String,
+    created_at: String,
+    /// Compressed tarball size in bytes.
+    bytes_compressed: usize,
+}
+
+/// `recover` response: where recovery landed.
+#[derive(Serialize)]
+struct RecoverOutput {
+    /// Always `"recovered"` (only emitted on success).
+    status: String,
+    /// `"time"` or `"lsn"` — which target form was used.
+    target_kind: String,
+    /// RFC3339 timestamp (time target) or PostgreSQL `X/Y` (lsn target).
+    target_value: String,
+    timeline: String,
+    /// Checkpoint LSN of the base backup recovered from.
+    base_checkpoint_lsn: String,
+}
+
+/// Render a Unix-seconds timestamp as RFC3339 UTC, falling back to the raw
+/// integer if the instant is out of `chrono`'s representable range.
+fn fmt_unix_ts(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// Pretty-print a DTO as JSON on stdout.
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    let s = serde_json::to_string_pretty(value)
+        .map_err(|e| Error::other(format!("json serialize failed: {e}")))?;
+    println!("{s}");
+    Ok(())
+}
+
+fn run_list(store: &Store) -> Result<()> {
     // All base backups, newest-first (across every timeline).
     let mut backups = store.list_backups()?;
-    if backups.is_empty() {
-        println!("no base backups found");
-        return Ok(());
-    }
     backups.sort_by(|a, b| b.ckpt.cmp(&a.ckpt));
-    println!("base backups ({}):", backups.len());
-    for b in &backups {
-        println!(
-            "  {}  timeline {}  checkpoint {}  redo {}",
-            fmt_ts(b.created_at),
-            b.ckpt.timeline_id.to_hex(),
-            b.ckpt.lsn.to_pg_string(),
-            b.redo_ckpt.lsn.to_pg_string(),
-        );
-    }
+    let backups_dto: Vec<BackupDto> = backups
+        .iter()
+        .map(|b| BackupDto {
+            created_at: fmt_unix_ts(b.created_at),
+            timeline: b.ckpt.timeline_id.to_hex(),
+            checkpoint_lsn: b.ckpt.lsn.to_pg_string(),
+            redo_lsn: b.redo_ckpt.lsn.to_pg_string(),
+        })
+        .collect();
 
     // The single recoverable window [earliest backup, WAL head]. Best-effort:
     // `list` still shows the backups above even when WAL coverage isn't
     // available yet (e.g. right after a backup, before the WAL tail archives).
-    match store.recovery_window() {
-        Ok(w) => println!(
-            "\nrecoverable window (timeline {}): {} .. {}\n  lsn {} .. {}",
-            w.timeline.to_hex(),
-            fmt_ts(w.earliest_ts),
-            fmt_ts(w.latest_ts),
-            w.earliest_ckpt.lsn.to_pg_string(),
-            w.latest_lsn.to_pg_string(),
+    let (window, window_error) = match store.recovery_window() {
+        Ok(w) => (
+            Some(WindowDto {
+                timeline: w.timeline.to_hex(),
+                earliest_ts: fmt_unix_ts(w.earliest_ts),
+                latest_ts: fmt_unix_ts(w.latest_ts),
+                earliest_lsn: w.earliest_ckpt.lsn.to_pg_string(),
+                latest_lsn: w.latest_lsn.to_pg_string(),
+            }),
+            None,
         ),
-        Err(e) => println!("\nrecoverable window unavailable: {e}"),
-    }
-    Ok(())
+        Err(e) => (None, Some(e.to_string())),
+    };
+
+    print_json(&ListOutput {
+        backups: backups_dto,
+        window,
+        window_error,
+    })
 }
 
 // ── backup ───────────────────────────────────────────────────────────────────
@@ -204,7 +291,14 @@ fn run_backup(store: &Store, args: &BackupArgs) -> Result<()> {
         "tiko_pitr: uploaded base backup at {ckpt} ({} bytes compressed)",
         tar_zst.len()
     );
-    Ok(())
+
+    print_json(&BackupOutput {
+        timeline: ckpt.timeline_id.to_hex(),
+        checkpoint_lsn: ckpt.lsn.to_pg_string(),
+        redo_lsn: redo_ckpt.lsn.to_pg_string(),
+        created_at: fmt_unix_ts(created_at),
+        bytes_compressed: tar_zst.len(),
+    })
 }
 
 fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
@@ -220,7 +314,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     //    and select the base backup to recover from — the latest backup at or
     //    before the target (standard PITR: minimises WAL replay). clap
     //    guarantees exactly one of --time / --lsn is set.
-    let (base_ckpt, tar_bytes, target, target_label) = if let Some(time_str) = &args.time {
+    let (base_ckpt, tar_bytes, target, target_kind, target_value) = if let Some(time_str) = &args.time {
         let target_ts = pitr::parse_pg_timestamp(time_str)?;
         if target_ts < window.earliest_ts || target_ts > window.latest_ts {
             return Err(Error::other(format!(
@@ -235,7 +329,8 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             bc,
             bytes,
             pitr::RecoveryTarget::Time(target_ts),
-            format!("time '{time_str}'"),
+            "time",
+            fmt_unix_ts(target_ts),
         )
     } else {
         let l = Lsn::parse_either(args.lsn.as_ref().unwrap()).map_err(Error::other)?;
@@ -252,9 +347,11 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             bc,
             bytes,
             pitr::RecoveryTarget::Lsn(l),
-            format!("lsn {}", l.to_pg_string()),
+            "lsn",
+            l.to_pg_string(),
         )
     };
+    let target_label = format!("{target_kind} {target_value}");
     eprintln!(
         "tiko_pitr: recovering to {target_label} on timeline {} from base backup {base_ckpt}",
         timeline
@@ -313,7 +410,13 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             eprintln!(
                 "tiko_pitr: recovery to {target_label} complete; database promoted and running"
             );
-            Ok(())
+            print_json(&RecoverOutput {
+                status: "recovered".to_string(),
+                target_kind: target_kind.to_string(),
+                target_value: target_value.clone(),
+                timeline: timeline.to_hex(),
+                base_checkpoint_lsn: base_ckpt.lsn.to_pg_string(),
+            })
         }
         Err(e) => {
             eprintln!("tiko_pitr: recovery failed: {e}");
@@ -407,21 +510,25 @@ fn backup_path(pgdata: &Path) -> PathBuf {
 
 fn main() {
     let cli = Cli::parse();
-    let store = match Store::init() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("tiko_pitr: store init failed: {e}");
-            exit(1);
-        }
-    };
 
-    let res = match &cli.command {
-        Cmd::List => run_list(store),
-        Cmd::Backup(args) => run_backup(store, args),
-        Cmd::Recover(args) => run_recover(store, args),
-    };
+    let res = (|| -> Result<()> {
+        let store = Store::init()?;
+        match &cli.command {
+            Cmd::List => run_list(&store)?,
+            Cmd::Backup(args) => run_backup(&store, args)?,
+            Cmd::Recover(args) => run_recover(&store, args)?,
+        }
+        Ok(())
+    })();
 
     if let Err(e) = res {
+        // Emit a structured JSON error on stdout (so HTTP consumers can parse
+        // the reason directly) and a human-readable line on stderr. Exit
+        // non-zero so tikoguest's run_pitr maps this to a 5xx.
+        let body = serde_json::json!({ "error": { "message": e.to_string() } });
+        let stdout = serde_json::to_string(&body)
+            .unwrap_or_else(|_| r#"{"error":{"message":"unknown error"}}"#.to_string());
+        println!("{stdout}");
         eprintln!("tiko_pitr: {e}");
         exit(1);
     }

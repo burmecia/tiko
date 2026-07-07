@@ -92,7 +92,9 @@ $PG_BIN_DIR/psql -d postgres -Atqc "select pg_switch_wal()" >/dev/null
 echo "--- waiting for recoverable window ---"
 window_ready=0
 for _ in $(seq 1 60); do
-  if "${TIKO_BIN_DIR}/tiko_pitr" list 2>/dev/null | grep -q "recoverable window (timeline"; then
+  # `tiko_pitr list` emits JSON; the recoverable window is populated once the
+  # "latest_lsn" field appears (it's omitted while WAL coverage is incomplete).
+  if "${TIKO_BIN_DIR}/tiko_pitr" list 2>/dev/null | grep -q '"latest_lsn"'; then
     window_ready=1
     break
   fi
