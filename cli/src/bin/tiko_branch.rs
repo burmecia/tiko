@@ -385,6 +385,7 @@ fn start_branch_pg(
     let storage_root_abs = cwd.join(storage_root_path());
     let branch_local_abs = cwd.join(local_path);
 
+    let org_id = env::read_u64(env::ENV_ORG_ID);
     let status = Command::new(pg_ctl)
         .arg("start")
         .arg("-D")
@@ -394,6 +395,7 @@ fn start_branch_pg(
         .arg("-w")
         .arg("-o")
         .arg(format!("-c port={}", branch_port))
+        .env("TIKO_ORG_ID", org_id.to_string())
         .env("TIKO_DB_ID", db_id.to_string())
         .env("TIKO_PROJECT_ID", project_id.to_string())
         .env(
