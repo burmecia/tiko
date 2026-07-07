@@ -42,7 +42,8 @@ if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
 fi
 
 # Fresh parent cluster + shared storage root.
-rm -rf tt tt_branch "${TIKO_STORAGE_ROOT}" parent.log
+TIKO_PACK="${PWD}/tt_branch_pack.tar.zst"
+rm -rf tt tt_branch "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" parent.log
 $PG_BIN_DIR/initdb -D tt --auth=trust --no-instructions
 cp ./postgresql.conf.sample tt/postgresql.conf
 
@@ -56,13 +57,28 @@ sleep 2
 # 2. Create the branch (db_id=35, port 5433) WHILE the parent keeps running.
 #    pg_basebackup -X stream makes the backup self-contained (backup_label +
 #    WAL), so the branch recovers to consistency and promotes with no
-#    recovery.signal/target. tiko_branch seeds the branch namespace with the
-#    parent's base manifest (ChunkRef.db_id=parent → COW).
-echo "--- tiko_branch ---"
-"${TIKO_BIN_DIR}/tiko_branch" \
+#    recovery.signal/target. Split into three steps:
+#      a) `backup`  — pg_basebackup + pack to a tar.zst file (no Tiko storage).
+#      b) `restore` — unpack the pack, seed the branch namespace with the
+#         parent's base manifest (ChunkRef.db_id=parent → COW), run recovery and
+#         promote, then STOP the branch (run `restart` to bring it back up).
+#      c) `restart` — start the stopped branch PostgreSQL (final step).
+echo "--- tiko_branch backup ---"
+"${TIKO_BIN_DIR}/tiko_branch" backup \
+  --pack "${TIKO_PACK}" \
+  --pg-basebackup "${PG_BIN_DIR}/pg_basebackup"
+
+echo "--- tiko_branch restore ---"
+"${TIKO_BIN_DIR}/tiko_branch" restore \
+  --pack "${TIKO_PACK}" \
   --db-id 35 \
   --pgdata tt_branch --branch-port 5433 \
-  --pg-basebackup "${PG_BIN_DIR}/pg_basebackup" \
+  --pg-ctl "${PG_BIN_DIR}/pg_ctl"
+
+echo "--- tiko_branch restart ---"
+"${TIKO_BIN_DIR}/tiko_branch" restart \
+  --db-id 35 \
+  --pgdata tt_branch --branch-port 5433 \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"
 
 # 3. Verify the branch reads the parent's data via copy-on-write.
@@ -93,4 +109,5 @@ fi
 # Cleanup.
 $PG_BIN_DIR/pg_ctl -D tt_branch stop -m fast -w
 $PG_BIN_DIR/pg_ctl -D tt stop -m fast -w
+rm -f "${TIKO_PACK}"
 echo "Branch test passed. ✅"

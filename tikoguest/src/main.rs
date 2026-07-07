@@ -94,6 +94,11 @@ struct Args {
     #[arg(long, default_value = "/usr/local/bin/tiko_pitr", env = "TIKO_PITR_BIN")]
     tiko_pitr: PathBuf,
 
+    /// `tiko_branch` executable (the `/usr/local/bin` wrapper that sources
+    /// `tiko_env.sh`). Used by the `/branch/*` API endpoints.
+    #[arg(long, default_value = "/usr/local/bin/tiko_branch", env = "TIKO_BRANCH_BIN")]
+    tiko_branch: PathBuf,
+
     /// Base-backup loop interval in seconds. 0 disables the loop. Each cycle
     /// spawns `tiko_pitr backup` to take a base backup + base manifest for PITR.
     #[arg(long, default_value_t = 120, env = "TIKOGUEST_BACKUP_INTERVAL")]
@@ -146,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(vm_id), Some(addr)) => {
             let Ok(tikod_addr) = addr.parse::<SocketAddr>() else {
                 tracing::warn!(addr = %addr, "TIKOD_ADDR is not a valid SocketAddr — background tasks disabled");
-                return start_server(listen_addr, ctl, args.tiko_pitr).await;
+                return start_server(listen_addr, ctl, args.tiko_pitr, args.tiko_branch).await;
             };
 
             if args.observe_interval > 0 {
@@ -205,15 +210,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    start_server(listen_addr, ctl, args.tiko_pitr).await
+    start_server(listen_addr, ctl, args.tiko_pitr, args.tiko_branch).await
 }
 
 async fn start_server(
     listen_addr: SocketAddr,
     ctl: PgCtl,
     tiko_pitr: PathBuf,
+    tiko_branch: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server = Arc::new(PgServer::new(ctl, tiko_pitr));
+    let server = Arc::new(PgServer::new(ctl, tiko_pitr, tiko_branch));
     server.run(listen_addr).await?;
     Ok(())
 }

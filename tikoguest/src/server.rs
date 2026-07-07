@@ -23,6 +23,8 @@
 //! | `POST` | `/pitr/backup` | take backup  | 200  `tiko_pitr backup` JSON passed through |
 //! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` (db left stopped) |
 //! | `POST` | `/pitr/restart`| start db     | 200  starts the db left stopped by `recover` |
+//! | `PUT`  | `/branch/backup` | pack parent | 200  no body; saves pack to `TIKO_STORAGE_ROOT`, returns `{"pack":"..."}` |
+//! | `POST` | `/branch/restore`| setup branch| 200  body: `{"pack":"...","db_id":N,...}` (db left stopped) |
 //!
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
 //! (`TIKO_ORG_ID` / `TIKO_DB_ID` / `TIKO_PROJECT_ID` / `TIKO_STORAGE_ROOT` /
@@ -31,7 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -48,14 +50,17 @@ pub struct PgServer {
     services: ServiceRegistry,
     /// Path to the `tiko_pitr` wrapper (`/usr/local/bin/tiko_pitr`).
     tiko_pitr: PathBuf,
+    /// Path to the `tiko_branch` wrapper (`/usr/local/bin/tiko_branch`).
+    tiko_branch: PathBuf,
 }
 
 impl PgServer {
-    pub fn new(ctl: PgCtl, tiko_pitr: PathBuf) -> Self {
+    pub fn new(ctl: PgCtl, tiko_pitr: PathBuf, tiko_branch: PathBuf) -> Self {
         Self {
             ctl,
             services: ServiceRegistry::new(),
             tiko_pitr,
+            tiko_branch,
         }
     }
 
@@ -193,6 +198,9 @@ impl PgServer {
             ("POST", ["pitr", "recover"]) => self.pitr_recover(&req.body).await,
             ("POST", ["pitr", "restart"]) => self.pitr_restart().await,
 
+            ("PUT", ["branch", "backup"]) => self.branch_backup().await,
+            ("POST", ["branch", "restore"]) => self.branch_restore(&req.body).await,
+
             _ => not_found(method, path),
         }
     }
@@ -244,14 +252,14 @@ impl PgServer {
     async fn pitr_list(&self) -> Response {
         let mut cmd = Command::new(&self.tiko_pitr);
         cmd.arg("list");
-        run_pitr(cmd).await
+        run_external(cmd, "pitr_error").await
     }
 
     /// `POST /pitr/backup` — spawn `tiko_pitr backup` and return its output.
     async fn pitr_backup(&self) -> Response {
         let mut cmd = Command::new(&self.tiko_pitr);
         cmd.arg("backup");
-        run_pitr(cmd).await
+        run_external(cmd, "pitr_error").await
     }
 
     /// `POST /pitr/recover` — spawn `tiko_pitr recover` with the target parsed
@@ -297,7 +305,7 @@ impl PgServer {
         if let Some(timeout) = body.recovery_timeout {
             cmd.arg("--recovery-timeout").arg(timeout.to_string());
         }
-        run_pitr(cmd).await
+        run_external(cmd, "pitr_error").await
     }
 
     /// `POST /pitr/restart` — spawn `tiko_pitr restart` to start the database
@@ -306,7 +314,147 @@ impl PgServer {
     async fn pitr_restart(&self) -> Response {
         let mut cmd = Command::new(&self.tiko_pitr);
         cmd.arg("restart");
-        run_pitr(cmd).await
+        run_external(cmd, "pitr_error").await
+    }
+
+    /// `PUT /branch/backup` — spawn `tiko_branch backup` against the local
+    /// (parent) PostgreSQL to produce a compressed `tar.zst` pack file in the
+    /// shared `TIKO_STORAGE_ROOT` (an S3 mount visible to all VMs, so the child
+    /// can read it from its own VM). Returns the pack file path as JSON so
+    /// tikod can pass it to the child VM's `/branch/restore`. No request body.
+    async fn branch_backup(&self) -> Response {
+        // Derive the pack path from TIKO_STORAGE_ROOT + the parent's db_id.
+        let Some(storage_root) = self.ctl.tiko_env.get("TIKO_STORAGE_ROOT")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        else {
+            return Response {
+                status: 500,
+                body: serde_json::json!({
+                    "error": {"kind": "config_error", "message": "TIKO_STORAGE_ROOT is not set"}
+                })
+                .to_string()
+                .into_bytes(),
+            };
+        };
+        let db_id = self
+            .ctl
+            .tiko_env
+            .get("TIKO_DB_ID")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let pack_path = storage_root.join("branch_packs").join(format!("{db_id}.tar.zst"));
+
+        let pg_basebackup = sibling_binary(&self.ctl.pg_ctl, "pg_basebackup");
+        let mut cmd = Command::new(&self.tiko_branch);
+        cmd.arg("backup")
+            .arg("--pack")
+            .arg(&pack_path)
+            .arg("--pg-basebackup")
+            .arg(&pg_basebackup)
+            .envs(&self.ctl.tiko_env);
+
+        match cmd.output().await {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if out.status.success() {
+                    ok_json(serde_json::json!({
+                        "pack": pack_path.to_string_lossy(),
+                    }))
+                } else {
+                    Response {
+                        status: 500,
+                        body: serde_json::json!({
+                            "error": {
+                                "kind": "branch_error",
+                                "exit_code": out.status.code(),
+                                "stderr": stderr,
+                            }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    }
+                }
+            }
+            Err(e) => Response {
+                status: 500,
+                body: serde_json::json!({
+                    "error": {"kind": "spawn_error", "message": e.to_string()}
+                })
+                .to_string()
+                .into_bytes(),
+            },
+        }
+    }
+
+    /// `POST /branch/restore` — spawn `tiko_branch restore` to unpack a pack
+    /// file into the branch PGDATA, seed the branch namespace from the parent's
+    /// base manifest, and run recovery. The branch promotes and is left
+    /// stopped. Runs on the CHILD/branch VM.
+    ///
+    /// `tiko_branch restore`'s `Store::init()` reads `TIKO_DB_ID` /
+    /// `TIKO_PROJECT_ID` from env to find the PARENT's base manifest (the branch
+    /// copy-on-write source). The child VM's `tiko_env` carries the branch's
+    /// own identity, so the caller must supply `parent_db_id` /
+    /// `parent_project_id` to override the env for the parent lookup.
+    async fn branch_restore(&self, body: &[u8]) -> Response {
+        #[derive(serde::Deserialize)]
+        struct RestoreBody {
+            pack: PathBuf,
+            /// The NEW branch database id (`--db-id`). Required.
+            db_id: u64,
+            /// The NEW branch project id (`--project-id`). Defaults to `db_id`.
+            project_id: Option<u64>,
+            /// The PARENT's database id — overrides `TIKO_DB_ID` in the spawned
+            /// env so `Store::init()` finds the parent's base manifest.
+            /// Defaults to the child's `tiko_env` `TIKO_DB_ID`.
+            parent_db_id: Option<u64>,
+            /// The PARENT's project id — overrides `TIKO_PROJECT_ID` in the
+            /// spawned env. Defaults to the child's `tiko_env` value.
+            parent_project_id: Option<u64>,
+            /// Port the branch PostgreSQL listens on. Defaults to 5432.
+            branch_port: Option<u16>,
+        }
+        let body: RestoreBody = if body.is_empty() {
+            return bad_request("branch restore requires 'pack' and 'db_id'");
+        } else {
+            match serde_json::from_slice(body) {
+                Ok(b) => b,
+                Err(e) => return bad_request(&format!("invalid branch restore body: {e}")),
+            }
+        };
+
+        let mut cmd = Command::new(&self.tiko_branch);
+        cmd.arg("restore")
+            .arg("--pack")
+            .arg(&body.pack)
+            .arg("--db-id")
+            .arg(body.db_id.to_string())
+            .arg("--pgdata")
+            .arg(&self.ctl.data_dir)
+            .arg("--pg-ctl")
+            .arg(&self.ctl.pg_ctl);
+        if let Some(pid) = body.project_id {
+            cmd.arg("--project-id").arg(pid.to_string());
+        }
+        if let Some(port) = body.branch_port {
+            cmd.arg("--branch-port").arg(port.to_string());
+        }
+
+        // Override TIKO_DB_ID / TIKO_PROJECT_ID with the parent's identity so
+        // Store::init() resolves the parent's namespace (where the base manifest
+        // lives). TIKO_ORG_ID / TIKO_STORAGE_ROOT are shared and pass through
+        // unchanged from the child's tiko_env.
+        let mut env = self.ctl.tiko_env.clone();
+        if let Some(parent_db) = body.parent_db_id {
+            env.insert("TIKO_DB_ID".into(), parent_db.to_string());
+        }
+        if let Some(parent_proj) = body.parent_project_id {
+            env.insert("TIKO_PROJECT_ID".into(), parent_proj.to_string());
+        }
+        cmd.envs(&env);
+
+        run_external(cmd, "branch_error").await
     }
 
     fn parse_config_body(&self, body: &[u8]) -> Result<BTreeMap<String, String>, Response> {
@@ -361,20 +509,24 @@ fn err_resp(err: &PgCtlError) -> Response {
 #[allow(dead_code)]
 pub type ServerResult<T> = PgCtlResult<T>;
 
-/// Run a `tiko_pitr` subcommand and format the result as an HTTP [`Response`].
+/// Run a `tiko_pitr` / `tiko_branch` subcommand and format the result as an
+/// HTTP [`Response`].
 ///
-/// `tiko_pitr` always emits a JSON object on stdout (success or failure). To
-/// keep the HTTP response as clean JSON instead of a string-wrapped blob, we
-/// parse that stdout JSON and pass it through directly:
+/// Both CLIs may emit a JSON object on stdout (`tiko_pitr` always does;
+/// `tiko_branch` does not — its output is stderr-only). To keep the HTTP
+/// response as clean JSON, we parse stdout JSON and pass it through directly:
 ///
 /// - Exit 0 + valid JSON → `200 <parsed json>`
 /// - Exit non-0 + valid JSON → `500 <parsed json>` (already an `{"error":...}`
-///   object; `tiko_pitr`'s progress/diagnostics on stderr is folded in under
+///   object; the CLI's progress/diagnostics on stderr is folded in under
 ///   `"stderr"` for debugging when present).
-/// - Non-JSON stdout (older `tiko_pitr`, panic, etc.) → fall back to the
+/// - Non-JSON stdout (older CLI, `tiko_branch`, panic, etc.) → fall back to the
 ///   legacy `{stdout, stderr}` envelope.
 /// - Spawn failure → `500 {"error":{"kind":"spawn_error",...}}`.
-async fn run_pitr(mut cmd: Command) -> Response {
+///
+/// `error_kind` labels the error object kind for non-JSON failures (e.g.
+/// `"pitr_error"`, `"branch_error"`) so clients can distinguish the source.
+async fn run_external(mut cmd: Command, error_kind: &str) -> Response {
     match cmd.output().await {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -398,7 +550,7 @@ async fn run_pitr(mut cmd: Command) -> Response {
                             "stdout": stdout,
                             "stderr": stderr,
                             "error": {
-                                "kind": "pitr_error",
+                                "kind": error_kind,
                                 "exit_code": out.status.code(),
                             }
                         })
@@ -414,7 +566,7 @@ async fn run_pitr(mut cmd: Command) -> Response {
                     } else {
                         serde_json::json!({
                             "error": {
-                                "kind": "pitr_error",
+                                "kind": error_kind,
                                 "exit_code": out.status.code(),
                                 "stdout": stdout,
                                 "stderr": stderr,
@@ -436,5 +588,14 @@ async fn run_pitr(mut cmd: Command) -> Response {
             .to_string()
             .into_bytes(),
         },
+    }
+}
+
+/// Derive a sibling binary (e.g. `pg_basebackup`) of `pg_ctl`: same parent
+/// directory. Falls back to `name` on `PATH` if `pg_ctl` has no parent.
+fn sibling_binary(pg_ctl: &Path, name: &str) -> PathBuf {
+    match pg_ctl.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
     }
 }
