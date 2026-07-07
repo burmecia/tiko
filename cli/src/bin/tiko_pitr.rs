@@ -10,8 +10,11 @@
 //!     chunk-ref map at the same LSN.
 //!   * `recover (--time <TS> | --lsn <LSN>) [--timeline <HEX>]` — restore the
 //!     latest backup at/before the target, install its base manifest, replay
-//!     WAL to the target, then promote. On failure, PGDATA + the prior base
-//!     manifest are restored and the instance is left stopped.
+//!     WAL to the target, and promote. The database is left **stopped** after
+//!     a successful recovery (run `restart` to bring it back up). On failure,
+//!     PGDATA + the prior base manifest are restored and the instance is left
+//!     stopped.
+//!   * `restart` — start the database that a successful `recover` left stopped.
 //!
 //! **Output model:** every subcommand emits a single JSON object on stdout
 //! (pretty-printed) so HTTP consumers (tikoguest's `/pitr/*` routes) can parse
@@ -58,8 +61,11 @@ enum Cmd {
     List,
     /// Take a base backup (`pg_basebackup`) and upload it to Tiko storage.
     Backup(BackupArgs),
-    /// Recover the instance to a point in the window, then restart normally.
+    /// Recover the instance to a point in the window; leaves the database
+    /// stopped (promoted but not running). Run `restart` to bring it back up.
     Recover(RecoverArgs),
+    /// Start the database left stopped by a successful `recover`.
+    Restart(RestartArgs),
 }
 
 #[derive(Args)]
@@ -120,6 +126,26 @@ struct RecoverArgs {
     /// promote before declaring failure.
     #[arg(long, default_value_t = 300)]
     recovery_timeout: u64,
+    /// File the recovering postmaster logs to (`pg_ctl -l`). Defaults to
+    /// `<pgdata>/log.log` so postgres output never spills to this process's
+    /// stderr.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct RestartArgs {
+    /// PostgreSQL data directory. Defaults to `$PGDATA`.
+    #[arg(long, env = "PGDATA")]
+    pgdata: PathBuf,
+    /// Path to `pg_ctl`. Defaults to `pg_ctl` on `PATH`.
+    #[arg(long, default_value = "pg_ctl")]
+    pg_ctl: PathBuf,
+    /// File the postmaster logs to (`pg_ctl -l`). Defaults to
+    /// `<pgdata>/log.log` so postgres output never spills to this process's
+    /// stderr.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 // ── JSON output DTOs ─────────────────────────────────────────────────────────
@@ -188,6 +214,13 @@ struct RecoverOutput {
     timeline: String,
     /// Checkpoint LSN of the base backup recovered from.
     base_checkpoint_lsn: String,
+}
+
+/// `restart` response: the database was started.
+#[derive(Serialize)]
+struct RestartOutput {
+    /// Always `"started"` (only emitted on success).
+    status: String,
 }
 
 /// Render a Unix-seconds timestamp as RFC3339 UTC, falling back to the raw
@@ -367,6 +400,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         .tiko_restore
         .clone()
         .unwrap_or_else(default_tiko_restore);
+    let log_file = resolve_log_file(args.log_file.as_deref(), pgdata);
     let conf = pgdata.join(pitr::RECOVERY_CONF_FILE);
     let backup = backup_path(pgdata);
 
@@ -400,6 +434,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         args.port,
         &psql,
         &tiko_restore,
+        &log_file,
         args.recovery_timeout,
     );
     match outcome {
@@ -408,7 +443,8 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             let _ = std::fs::remove_file(pgdata.join("recovery.signal"));
             let _ = std::fs::remove_dir_all(&backup);
             eprintln!(
-                "tiko_pitr: recovery to {target_label} complete; database promoted and running"
+                "tiko_pitr: recovery to {target_label} complete; database promoted and stopped \
+                 (run `tiko_pitr restart` to start it)"
             );
             print_json(&RecoverOutput {
                 status: "recovered".to_string(),
@@ -440,10 +476,34 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     }
 }
 
+/// Resolve the postmaster log file for a subcommand: an explicit `--log-file`
+/// if given, otherwise `<pgdata>/log.log`. We always pass `-l` to `pg_ctl
+/// start` so postgres stderr (which carries `log_min_messages` output) lands in
+/// a file instead of this process's stderr.
+fn resolve_log_file(explicit: Option<&Path>, pgdata: &Path) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| pgdata.join("log.log"))
+}
+
+/// Start the database that a successful `recover` left stopped. Just a
+/// `pg_ctl start` against the already-recovered PGDATA, exposed as a
+/// subcommand so the recover/restart split is symmetric for callers (and for
+/// tikoguest's `/pitr/restart` route).
+fn run_restart(args: &RestartArgs) -> Result<()> {
+    let log_file = resolve_log_file(args.log_file.as_deref(), &args.pgdata);
+    cli::pgops::start_pg(&args.pg_ctl, &args.pgdata, Some(&log_file))?;
+    eprintln!("tiko_pitr: database started");
+    print_json(&RestartOutput {
+        status: "started".to_string(),
+    })
+}
+
 /// Wipe PGDATA (keeping `tiko/`), extract the base backup tarball, install the
 /// base manifest at `base_ckpt`, write the recovery conf, start PostgreSQL,
-/// and wait for promotion. Returns `Ok` only if PostgreSQL reached the target
-/// and promoted within the timeout.
+/// wait for promotion, then stop it. Returns `Ok` only if PostgreSQL reached
+/// the target, promoted within the timeout, and stopped cleanly — leaving
+/// PGDATA recovered and quiesced for `tiko_pitr restart`.
 fn recover_inner(
     store: &Store,
     conf: &Path,
@@ -456,6 +516,7 @@ fn recover_inner(
     port: u16,
     psql: &Path,
     tiko_restore: &Path,
+    log_file: &Path,
     recovery_timeout: u64,
 ) -> Result<()> {
     // Wipe everything except `tiko/` and replace with the base backup. The
@@ -482,12 +543,20 @@ fn recover_inner(
 
     // Start in the background and poll until promotion. With
     // recovery_target_action='promote', postgres does not exit on its own; it
-    // ends recovery by promoting and continuing as a primary.
-    cli::pgops::start_pg(pg_ctl, pgdata)?;
+    // ends recovery by promoting and continuing as a primary. Logs are
+    // redirected to `log_file` so the (debug-level) recovery output doesn't
+    // spill to this process's stderr.
+    cli::pgops::start_pg(pg_ctl, pgdata, Some(log_file))?;
     if let Err(e) = cli::pgops::wait_for_promotion(psql, port, recovery_timeout) {
         let _ = cli::pgops::stop_pg(pg_ctl, pgdata);
         return Err(e);
     }
+    // Recovery target reached and the instance promoted. Stop it so the
+    // database is left quiesced; the caller brings it back up explicitly via
+    // `tiko_pitr restart`. Splitting recover/restart lets the caller choose
+    // when the recovered instance comes online (and keeps `recover` from
+    // leaving a running primary the caller may not be ready to serve).
+    cli::pgops::stop_pg(pg_ctl, pgdata)?;
     Ok(())
 }
 
@@ -512,11 +581,23 @@ fn main() {
     let cli = Cli::parse();
 
     let res = (|| -> Result<()> {
-        let store = Store::init()?;
         match &cli.command {
-            Cmd::List => run_list(&store)?,
-            Cmd::Backup(args) => run_backup(&store, args)?,
-            Cmd::Recover(args) => run_recover(&store, args)?,
+            // `restart` is just `pg_ctl start` on the already-recovered
+            // PGDATA; it doesn't touch Tiko storage, so don't require
+            // `Store::init()` (or the TIKO_* env) to succeed for it.
+            Cmd::Restart(args) => run_restart(args)?,
+            Cmd::List => {
+                let store = Store::init()?;
+                run_list(&store)?;
+            }
+            Cmd::Backup(args) => {
+                let store = Store::init()?;
+                run_backup(&store, args)?;
+            }
+            Cmd::Recover(args) => {
+                let store = Store::init()?;
+                run_recover(&store, args)?;
+            }
         }
         Ok(())
     })();

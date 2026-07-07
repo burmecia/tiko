@@ -175,13 +175,24 @@ pub fn stop_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
     ))
 }
 
-/// `pg_ctl -D <pgdata> -w start` for normal startup.
-pub fn start_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
-    let status = Command::new(pg_ctl)
-        .arg("start")
-        .arg("-D")
-        .arg(pgdata)
-        .arg("-w")
+/// `pg_ctl -D <pgdata> [-l <log_file>] -w start` for normal startup.
+///
+/// When `log_file` is `Some`, the postmaster's stdout/stderr are redirected to
+/// that file via pg_ctl's `-l` (which appends with `>> ... 2>&1`). When it is
+/// `None`, pg_ctl leaves the postmaster's stderr attached to *this* process's
+/// stderr — which, per `pg_ctl.c`'s `start_postmaster()` (no `-l` branch), is
+/// not redirected to `/dev/null`. That is rarely what you want: postgres
+/// `log_min_messages=debug1` output would spill to the caller's stderr, and in
+/// `tiko_pitr`'s case end up folded into tikoguest's HTTP error responses.
+/// Pass a log file unless you have a reason not to.
+pub fn start_pg(pg_ctl: &Path, pgdata: &Path, log_file: Option<&Path>) -> Result<()> {
+    let mut cmd = Command::new(pg_ctl);
+    cmd.arg("start").arg("-D").arg(pgdata);
+    if let Some(log) = log_file {
+        cmd.arg("-l").arg(log);
+    }
+    cmd.arg("-w");
+    let status = cmd
         .status()
         .map_err(|e| Error::other(format!("failed to spawn pg_ctl: {e}")))?;
     if !status.success() {

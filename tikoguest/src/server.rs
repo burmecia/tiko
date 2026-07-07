@@ -21,7 +21,8 @@
 //! | `PUT`  | `/pg/config`   | write config | 204  body: `{"settings":{name:value}}` (then reloads)   |
 //! | `GET`  | `/pitr/list`   | list backups | 200  `tiko_pitr list` JSON passed through (see [`Self::pitr_list`]) |
 //! | `POST` | `/pitr/backup` | take backup  | 200  `tiko_pitr backup` JSON passed through |
-//! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` |
+//! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` (db left stopped) |
+//! | `POST` | `/pitr/restart`| start db     | 200  starts the db left stopped by `recover` |
 //!
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
 //! (`TIKO_ORG_ID` / `TIKO_DB_ID` / `TIKO_PROJECT_ID` / `TIKO_STORAGE_ROOT` /
@@ -190,6 +191,7 @@ impl PgServer {
             ("GET", ["pitr", "list"]) => self.pitr_list().await,
             ("POST", ["pitr", "backup"]) => self.pitr_backup().await,
             ("POST", ["pitr", "recover"]) => self.pitr_recover(&req.body).await,
+            ("POST", ["pitr", "restart"]) => self.pitr_restart().await,
 
             _ => not_found(method, path),
         }
@@ -295,6 +297,15 @@ impl PgServer {
         if let Some(timeout) = body.recovery_timeout {
             cmd.arg("--recovery-timeout").arg(timeout.to_string());
         }
+        run_pitr(cmd).await
+    }
+
+    /// `POST /pitr/restart` — spawn `tiko_pitr restart` to start the database
+    /// that a successful `recover` left stopped. No body; `--pgdata` /
+    /// `--pg-ctl` come from the wrapper's env defaults.
+    async fn pitr_restart(&self) -> Response {
+        let mut cmd = Command::new(&self.tiko_pitr);
+        cmd.arg("restart");
         run_pitr(cmd).await
     }
 

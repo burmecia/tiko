@@ -113,9 +113,13 @@ echo "--- tiko_pitr list ---"
 
 # 5. Recover to the target LSN. This stops PG, restores the latest backup at/before
 #    the target, installs its base manifest, deletes the pre-recovery segments,
-#    replays WAL, and promotes.
+#    replays WAL, promotes, and then STOPS the db. `restart` brings it back up
+#    so the verification queries below can connect.
 echo "--- tiko_pitr recover --lsn ${TARGET_LSN} ---"
-"${TIKO_BIN_DIR}/tiko_pitr" recover --pgdata tt --pg-ctl "${PG_BIN_DIR}/pg_ctl" --lsn "${TARGET_LSN}"
+"${TIKO_BIN_DIR}/tiko_pitr" recover --pgdata tt --pg-ctl "${PG_BIN_DIR}/pg_ctl" --log-file log.log --lsn "${TARGET_LSN}"
+
+echo "--- tiko_pitr restart ---"
+"${TIKO_BIN_DIR}/tiko_pitr" restart --pgdata tt --pg-ctl "${PG_BIN_DIR}/pg_ctl" --log-file log.log
 
 # 6. Verify the recovered state.
 #    - count = 201: the 200 pre-backup rows (read via the base manifest) + the
