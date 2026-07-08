@@ -1,5 +1,6 @@
 use core::chunk::RelFork;
-use core::ops;
+use core::io_control::IoControl;
+use core::{env, local_path, ops, storage_root_path};
 use pgsys::{
     common::{BlockNumber, ForkNumber},
     logging::pg_log_error,
@@ -21,8 +22,23 @@ pub extern "C-unwind" fn tiko_nblocks(
     match ops::get_nblocks(&relfork) {
         Ok(n) => n,
         Err(err) => {
+            // Dump env + cache state so failures (often a missing/wrong
+            // namespace or an uninitialised cache during early startup /
+            // shutdown) are diagnosable from the log alone.
+            let env_val = |name: &str| {
+                std::env::var(name).unwrap_or_else(|_| "<unset>".into())
+            };
             pg_log_error(&format!(
-                "tiko_nblocks: failed for relfork {relfork}: {err}",
+                "tiko_nblocks: failed for relfork {relfork}: {err} \
+                 [cache_available={} \
+                  TIKO_ORG_ID={} TIKO_DB_ID={} TIKO_PROJECT_ID={} \
+                  storage_root={} local_path={}]",
+                IoControl::cache_is_available(),
+                env_val(env::ENV_ORG_ID),
+                env_val(env::ENV_DB_ID),
+                env_val(env::ENV_PROJECT_ID),
+                storage_root_path().display(),
+                local_path().display(),
             ));
             0
         }

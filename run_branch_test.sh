@@ -71,6 +71,7 @@ echo "--- tiko_branch backup ---"
 echo "--- tiko_branch restore ---"
 "${TIKO_BIN_DIR}/tiko_branch" restore \
   --pack "${TIKO_PACK}" \
+  --parent-db-id 34 \
   --db-id 35 \
   --pgdata tt_branch --branch-port 5433 \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"

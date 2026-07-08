@@ -24,7 +24,7 @@
 //! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` (db left stopped) |
 //! | `POST` | `/pitr/restart`| start db     | 200  starts the db left stopped by `recover` |
 //! | `PUT`  | `/branch/backup` | pack parent | 200  no body; saves pack to `TIKO_STORAGE_ROOT`, returns `{"pack":"..."}` |
-//! | `POST` | `/branch/restore`| setup branch| 200  body: `{"pack":"...","db_id":N,...}` (db left stopped) |
+//! | `POST` | `/branch/restore`| setup branch| 200  body: `{"pack":"...","db_id":N,"parent_db_id":N,...}` (db left stopped) |
 //!
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
 //! (`TIKO_ORG_ID` / `TIKO_DB_ID` / `TIKO_PROJECT_ID` / `TIKO_STORAGE_ROOT` /
@@ -392,31 +392,29 @@ impl PgServer {
     /// base manifest, and run recovery. The branch promotes and is left
     /// stopped. Runs on the CHILD/branch VM.
     ///
-    /// `tiko_branch restore`'s `Store::init()` reads `TIKO_DB_ID` /
-    /// `TIKO_PROJECT_ID` from env to find the PARENT's base manifest (the branch
-    /// copy-on-write source). The child VM's `tiko_env` carries the branch's
-    /// own identity, so the caller must supply `parent_db_id` /
-    /// `parent_project_id` to override the env for the parent lookup.
+    /// `parent_db_id` identifies the parent database the branch is copied
+    /// from; `tiko_branch restore --parent-db-id` resolves the parent's base
+    /// manifest within the shared `TIKO_ORG_ID`/`TIKO_STORAGE_ROOT`. The
+    /// child VM's `tiko_env` carries the branch's own identity for
+    /// `Store::init()` (its db_id/project_id are irrelevant to the seeding,
+    /// which keys off `--parent-db-id`).
     async fn branch_restore(&self, body: &[u8]) -> Response {
         #[derive(serde::Deserialize)]
         struct RestoreBody {
             pack: PathBuf,
             /// The NEW branch database id (`--db-id`). Required.
             db_id: u64,
+            /// The PARENT's database id — passed as `--parent-db-id` so
+            /// `tiko_branch restore` resolves the parent's base manifest.
+            /// Required.
+            parent_db_id: u64,
             /// The NEW branch project id (`--project-id`). Defaults to `db_id`.
             project_id: Option<u64>,
-            /// The PARENT's database id — overrides `TIKO_DB_ID` in the spawned
-            /// env so `Store::init()` finds the parent's base manifest.
-            /// Defaults to the child's `tiko_env` `TIKO_DB_ID`.
-            parent_db_id: Option<u64>,
-            /// The PARENT's project id — overrides `TIKO_PROJECT_ID` in the
-            /// spawned env. Defaults to the child's `tiko_env` value.
-            parent_project_id: Option<u64>,
             /// Port the branch PostgreSQL listens on. Defaults to 5432.
             branch_port: Option<u16>,
         }
         let body: RestoreBody = if body.is_empty() {
-            return bad_request("branch restore requires 'pack' and 'db_id'");
+            return bad_request("branch restore requires 'pack', 'db_id', and 'parent_db_id'");
         } else {
             match serde_json::from_slice(body) {
                 Ok(b) => b,
@@ -428,6 +426,8 @@ impl PgServer {
         cmd.arg("restore")
             .arg("--pack")
             .arg(&body.pack)
+            .arg("--parent-db-id")
+            .arg(body.parent_db_id.to_string())
             .arg("--db-id")
             .arg(body.db_id.to_string())
             .arg("--pgdata")
@@ -441,18 +441,12 @@ impl PgServer {
             cmd.arg("--branch-port").arg(port.to_string());
         }
 
-        // Override TIKO_DB_ID / TIKO_PROJECT_ID with the parent's identity so
-        // Store::init() resolves the parent's namespace (where the base manifest
-        // lives). TIKO_ORG_ID / TIKO_STORAGE_ROOT are shared and pass through
-        // unchanged from the child's tiko_env.
-        let mut env = self.ctl.tiko_env.clone();
-        if let Some(parent_db) = body.parent_db_id {
-            env.insert("TIKO_DB_ID".into(), parent_db.to_string());
-        }
-        if let Some(parent_proj) = body.parent_project_id {
-            env.insert("TIKO_PROJECT_ID".into(), parent_proj.to_string());
-        }
-        cmd.envs(&env);
+        // The child's tiko_env carries the shared TIKO_ORG_ID /
+        // TIKO_STORAGE_ROOT and the branch's own TIKO_DB_ID /
+        // TIKO_PROJECT_ID (used by Store::init() to satisfy its env
+        // requirements; their values are irrelevant to the parent lookup,
+        // which keys off --parent-db-id).
+        cmd.envs(&self.ctl.tiko_env);
 
         run_external(cmd, "branch_error").await
     }

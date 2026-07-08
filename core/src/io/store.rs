@@ -1367,8 +1367,13 @@ impl Store {
         Ok(())
     }
 
-    /// Seed a branch namespace by copying this (parent) database's newest base
+    /// Seed a branch namespace by copying the parent database's newest base
     /// manifest at or before `ckpt` into the `branch_ns` namespace.
+    ///
+    /// `parent_db_id` identifies the parent database within this store's org
+    /// (`self.ns.org_id`); the branch shares the org, so only `db_id` differs.
+    /// (`project_id` is not part of the storage path — `Locator` keys on
+    /// `{org}/{db}`.)
     ///
     /// The manifest bytes are copied as-is, so the branch's manifest carries
     /// `ChunkRef.db_id = parent_db_id` — which is exactly the copy-on-write
@@ -1382,10 +1387,13 @@ impl Store {
     /// — which represents the same state).
     pub fn seed_branch_base_manifest(
         &self,
+        parent_db_id: u64,
         branch_ns: DbNamespace,
         ckpt: Checkpoint,
     ) -> Result<()> {
-        let prefix = self.lctr.bases_dir();
+        let parent_ns = DbNamespace::new(self.ns.org_id, parent_db_id, parent_db_id);
+        let parent_lctr = Locator::new(parent_ns);
+        let prefix = parent_lctr.bases_dir();
         let keys = self.storage_list_prefix(&prefix)?;
         let target_base = keys
             .iter()
@@ -1394,11 +1402,11 @@ impl Store {
             .max_by_key(|c| *c)
             .ok_or_else(|| {
                 Error::other(format!(
-                    "no base manifest at or before {ckpt} in the parent namespace to seed the branch"
+                    "no base manifest at or before {ckpt} in parent db_id={parent_db_id} to seed the branch"
                 ))
             })?;
 
-        let parent_key = self.lctr.base_manifest(&target_base);
+        let parent_key = parent_lctr.base_manifest(&target_base);
         let bytes = self.storage_get(&parent_key)?;
         let branch_lctr = Locator::new(branch_ns);
         let branch_key = branch_lctr.base_manifest(&target_base);

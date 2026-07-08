@@ -40,6 +40,11 @@ use core::{DbNamespace, storage_root_path};
 // the PG symbols that `core` transitively references. See `tiko_restore`.
 extern crate cli;
 
+/// On-disk filename of the live base-manifest cache under `TIKO_LOCAL_PATH`
+/// (mirror of the private constant in `core::manifest`). `Store::init()` reads
+/// this as a fast path, so a stale leftover would shadow the seeded manifest.
+const BASE_MANIFEST_FILE_NAME: &str = "base_manifest.tikm";
+
 #[derive(Parser)]
 #[command(
     name = "tiko_branch",
@@ -94,6 +99,12 @@ struct RestoreArgs {
     /// Path to the compressed `tar.zst` pack file (produced by `backup`).
     #[arg(long)]
     pack: PathBuf,
+    /// The PARENT database id to branch from. The branch copy-on-write reads
+    /// the parent's chunks through the shared `TIKO_STORAGE_ROOT`, so the
+    /// branch namespace is seeded from the parent's base manifest at the backup
+    /// checkpoint LSN.
+    #[arg(long)]
+    parent_db_id: u64,
     /// The NEW database id for the branch (`TIKO_DB_ID`). Required.
     #[arg(long)]
     db_id: u64,
@@ -107,9 +118,11 @@ struct RestoreArgs {
     /// Port the branch PostgreSQL listens on. MUST differ from the parent.
     #[arg(long, default_value_t = 5432)]
     branch_port: u16,
-    /// Per-branch local cache path (`TIKO_LOCAL_PATH`: `base_manifest.tikm`,
-    /// `draft.spill`, `chunk_cache`). Defaults to `<pgdata>/tiko`.
-    #[arg(long)]
+    /// Per-branch local cache path (`base_manifest.tikm`, `draft.spill`,
+    /// `chunk_cache`). Defaults to the `TIKO_LOCAL_PATH` env var if set, else
+    /// `<pgdata>/tiko`. Resolved by clap at parse time (before the tool
+    /// process overrides its own `TIKO_LOCAL_PATH` for `Store::init`).
+    #[arg(long, env = "TIKO_LOCAL_PATH")]
     local_path: Option<PathBuf>,
     /// Path to `pg_ctl`. Defaults to `pg_ctl` on PATH.
     #[arg(long, default_value = "pg_ctl")]
@@ -163,6 +176,12 @@ fn main() {
             // cache to a temp dir. (The branch PG is spawned with its own
             // explicit `TIKO_LOCAL_PATH`, so this only affects the tool
             // process.)
+            //
+            // NB: `args.local_path` (the BRANCH's local path) was already
+            // resolved by clap at `Cli::parse()` above, from the original
+            // `TIKO_LOCAL_PATH` env — so overriding the env below does NOT
+            // change it. Reading `TIKO_LOCAL_PATH` here in `main()` instead
+            // would wrongly capture this temp dir.
             let local_temp = tempfile::tempdir().unwrap_or_else(|e| {
                 eprintln!("tiko_branch: failed to create temp dir: {e}");
                 exit(1);
@@ -172,9 +191,11 @@ fn main() {
                 std::env::set_var(env::ENV_TIKO_LOCAL_PATH, local_temp.path());
             }
 
-            // `Store::init` reads the PARENT's TIKO_ORG_ID/DB_ID/PROJECT_ID
-            // (shared org) to seed the branch namespace from the parent's base
-            // manifest.
+            // `Store::init` reads the shared `TIKO_ORG_ID`/`TIKO_STORAGE_ROOT`
+            // (and requires `TIKO_DB_ID`/`TIKO_PROJECT_ID` to be set, though
+            // their values are irrelevant here — the parent's db_id comes from
+            // `--parent-db-id`). `TIKO_ORG_ID` identifies the shared org the
+            // parent and branch live in.
             let store = match Store::init() {
                 Ok(s) => s,
                 Err(e) => {
@@ -262,11 +283,12 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| branch.pgdata.join("tiko"));
     eprintln!(
-        "tiko_branch: restoring branch db_id={} project_id={} (port {}) from pack {}",
+        "tiko_branch: restoring branch db_id={} project_id={} (port {}) from pack {} (parent db_id={})",
         branch.db_id,
         project_id,
         branch.branch_port,
-        branch.pack.display()
+        branch.pack.display(),
+        branch.parent_db_id,
     );
 
     // 1. Read the pack file and unpack it into the branch PGDATA. Then drop
@@ -302,10 +324,25 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
     // 3. Seed the branch namespace with the parent's base manifest at the
     //    backup LSN. ChunkRef.db_id = parent is preserved, so the branch
     //    copy-on-write reads shared chunks from the parent's namespace.
-    store.seed_branch_base_manifest(branch_ns.clone(), ckpt)?;
+    store.seed_branch_base_manifest(branch.parent_db_id, branch_ns.clone(), ckpt)?;
     eprintln!("tiko_branch: seeded branch namespace {branch_ns} from {ckpt}");
 
-    // 4. Start the branch PostgreSQL to drive archive recovery to the backup's
+    // 4. Clear any stale local base-manifest cache so the branch PostgreSQL
+    //    re-derives it from the freshly-seeded shared-storage namespace.
+    //    `Store::init()` prefers the on-disk `base_manifest.tikm` fast path; a
+    //    leftover from a previous run (or the tool's temp store) would shadow
+    //    the seeded manifest and pollute the branch's view.
+    let manifest_path = branch_local.join(BASE_MANIFEST_FILE_NAME);
+    if manifest_path.exists() {
+        std::fs::remove_file(&manifest_path)
+            .map_err(|e| Error::other(format!("remove {}: {e}", manifest_path.display())))?;
+        eprintln!(
+            "tiko_branch: cleared stale local base manifest at {}",
+            manifest_path.display()
+        );
+    }
+
+    // 5. Start the branch PostgreSQL to drive archive recovery to the backup's
     //    consistency point, then it promotes — no recovery.signal or
     //    recovery_target needed. The branch runs under its own db_id/project
     //    with the parent's shared storage root and its own local cache path.
@@ -318,7 +355,7 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         &branch_local,
     )?;
 
-    // 5. Wait for the branch to reach consistency and promote.
+    // 6. Wait for the branch to reach consistency and promote.
     let psql = branch
         .psql
         .clone()
@@ -329,7 +366,7 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         branch.db_id
     );
 
-    // 6. Stop the branch PostgreSQL — leave it quiesced for `restart`. Splitting
+    // 7. Stop the branch PostgreSQL — leave it quiesced for `restart`. Splitting
     //    restore/restart lets the caller bring the branch online only when ready
     //    (and keeps `restore` from leaving a running primary the caller may not
     //    be ready to serve).
