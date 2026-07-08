@@ -24,11 +24,18 @@
 //! running parent for `pg_basebackup`). The `restore` and `restart` subcommands
 //! run in the CHILD/branch's context. The split lets the caller bring the
 //! branch online only when ready (e.g. after wiring up the API endpoint).
+//!
+//! **Output model:** every subcommand emits a single JSON object on stdout
+//! (pretty-printed) so HTTP consumers (tikoguest's `/branch/*` routes) can
+//! parse the result directly instead of screen-scraping. Human-readable
+//! progress and diagnostics go to stderr. On any failure the stdout object is
+//! `{"error":{"message":"..."}}` and the process exits non-zero.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 use core::env;
 use core::error::{Error, Result};
@@ -160,59 +167,122 @@ struct RestartArgs {
     pg_ctl: PathBuf,
 }
 
+// ── JSON output DTOs ─────────────────────────────────────────────────────────
+//
+// Each subcommand emits one of these on stdout. Fields use the human-readable
+// PostgreSQL forms (`X/Y` LSNs, hex timeline ids) so HTTP consumers can display
+// them without reformatting.
+
+/// `backup` response: the pack file just written and the backup checkpoint it
+/// was taken at.
+#[derive(Serialize)]
+struct BackupOutput {
+    /// Always `"backed_up"` (only emitted on success).
+    status: String,
+    /// Absolute path to the written `tar.zst` pack file.
+    pack: String,
+    /// Fixed-width hex timeline id (e.g. `"00000001"`).
+    timeline: String,
+    /// PostgreSQL `X/Y` checkpoint LSN the backup was taken at.
+    checkpoint_lsn: String,
+    /// PostgreSQL `X/Y` REDO LSN (where WAL replay starts).
+    redo_lsn: String,
+    /// Compressed pack size in bytes.
+    bytes_compressed: usize,
+}
+
+/// `restore` response: the branch was seeded and promoted (then stopped).
+#[derive(Serialize)]
+struct RestoreOutput {
+    /// Always `"restored"` (only emitted on success).
+    status: String,
+    /// The NEW branch database id.
+    db_id: u64,
+    /// The branch project id.
+    project_id: u64,
+    /// The PARENT database id the branch was copied from.
+    parent_db_id: u64,
+    /// Fixed-width hex timeline id (e.g. `"00000001"`).
+    timeline: String,
+    /// PostgreSQL `X/Y` checkpoint LSN the branch was seeded at (the parent's
+    /// backup checkpoint == base manifest key).
+    checkpoint_lsn: String,
+}
+
+/// `restart` response: the branch PostgreSQL was started.
+#[derive(Serialize)]
+struct RestartOutput {
+    /// Always `"started"` (only emitted on success).
+    status: String,
+    /// The branch database id.
+    db_id: u64,
+    /// Port the branch PostgreSQL listens on.
+    branch_port: u16,
+}
+
+/// Pretty-print a DTO as JSON on stdout.
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    let s = serde_json::to_string_pretty(value)
+        .map_err(|e| Error::other(format!("json serialize failed: {e}")))?;
+    println!("{s}");
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Cmd::Backup(args) => run_backup(&args),
-        // `restart` is just `pg_ctl start` on the already-recovered branch
-        // PGDATA; it doesn't touch Tiko storage, so don't require `Store::init`
-        // (or the TIKO_* env) to succeed for it.
-        Cmd::Restart(args) => run_restart(&args),
-        Cmd::Restore(args) => {
-            // This is an ephemeral standalone CLI process (no real PG
-            // `DataDir`), so `local_path()` would default to a relative
-            // "tiko/" in the CWD — polluting the working directory and
-            // clobbering any existing sample. Redirect the tool's own local
-            // cache to a temp dir. (The branch PG is spawned with its own
-            // explicit `TIKO_LOCAL_PATH`, so this only affects the tool
-            // process.)
-            //
-            // NB: `args.local_path` (the BRANCH's local path) was already
-            // resolved by clap at `Cli::parse()` above, from the original
-            // `TIKO_LOCAL_PATH` env — so overriding the env below does NOT
-            // change it. Reading `TIKO_LOCAL_PATH` here in `main()` instead
-            // would wrongly capture this temp dir.
-            let local_temp = tempfile::tempdir().unwrap_or_else(|e| {
-                eprintln!("tiko_branch: failed to create temp dir: {e}");
-                exit(1);
-            });
-            // SAFETY: single-threaded CLI before any other thread reads the env.
-            unsafe {
-                std::env::set_var(env::ENV_TIKO_LOCAL_PATH, local_temp.path());
-            }
 
-            // `Store::init` reads the shared `TIKO_ORG_ID`/`TIKO_STORAGE_ROOT`
-            // (and requires `TIKO_DB_ID`/`TIKO_PROJECT_ID` to be set, though
-            // their values are irrelevant here — the parent's db_id comes from
-            // `--parent-db-id`). `TIKO_ORG_ID` identifies the shared org the
-            // parent and branch live in.
-            let store = match Store::init() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("tiko_branch: parent store init failed: {e}");
-                    exit(1);
+    let result = (|| -> Result<()> {
+        match cli.command {
+            Cmd::Backup(args) => run_backup(&args),
+            // `restart` is just `pg_ctl start` on the already-recovered branch
+            // PGDATA; it doesn't touch Tiko storage, so don't require `Store::init`
+            // (or the TIKO_* env) to succeed for it.
+            Cmd::Restart(args) => run_restart(&args),
+            Cmd::Restore(args) => {
+                // This is an ephemeral standalone CLI process (no real PG
+                // `DataDir`), so `local_path()` would default to a relative
+                // "tiko/" in the CWD — polluting the working directory and
+                // clobbering any existing sample. Redirect the tool's own local
+                // cache to a temp dir. (The branch PG is spawned with its own
+                // explicit `TIKO_LOCAL_PATH`, so this only affects the tool
+                // process.)
+                //
+                // NB: `args.local_path` (the BRANCH's local path) was already
+                // resolved by clap at `Cli::parse()` above, from the original
+                // `TIKO_LOCAL_PATH` env — so overriding the env below does NOT
+                // change it. Reading `TIKO_LOCAL_PATH` here in `main()` instead
+                // would wrongly capture this temp dir.
+                let local_temp = tempfile::tempdir()
+                    .map_err(|e| Error::other(format!("tiko_branch: failed to create temp dir: {e}")))?;
+                // SAFETY: single-threaded CLI before any other thread reads the env.
+                unsafe {
+                    std::env::set_var(env::ENV_TIKO_LOCAL_PATH, local_temp.path());
                 }
-            };
-            let res = run_restore(store, &args);
 
-            // Clean up the tool's temp cache (the branch PG has its own
-            // TIKO_LOCAL_PATH).
-            drop(local_temp);
-            res
+                // `Store::init` reads the shared `TIKO_ORG_ID`/`TIKO_STORAGE_ROOT`
+                // (and requires `TIKO_DB_ID`/`TIKO_PROJECT_ID` to be set, though
+                // their values are irrelevant here — the parent's db_id comes from
+                // `--parent-db-id`). `TIKO_ORG_ID` identifies the shared org the
+                // parent and branch live in.
+                let store = Store::init()?;
+                let res = run_restore(&store, &args);
+
+                // Clean up the tool's temp cache (the branch PG has its own
+                // TIKO_LOCAL_PATH).
+                drop(local_temp);
+                res
+            }
         }
-    };
+    })();
 
     if let Err(e) = result {
+        // Emit a structured JSON error on stdout (so HTTP consumers can parse
+        // the reason directly) and a human-readable line on stderr. Exit
+        // non-zero so tikoguest's run_external maps this to a 5xx.
+        let body = serde_json::json!({ "error": { "message": e.to_string() } });
+        let stdout = serde_json::to_string(&body)
+            .unwrap_or_else(|_| r#"{"error":{"message":"unknown error"}}"#.to_string());
+        println!("{stdout}");
         eprintln!("tiko_branch: {e}");
         exit(1);
     }
@@ -245,8 +315,9 @@ fn run_backup(args: &BackupArgs) -> Result<()> {
     let label_path = backup_dir.join("backup_label");
     let label = std::fs::read_to_string(&label_path)
         .map_err(|e| Error::other(format!("read {}: {e}", label_path.display())))?;
-    let (checkpoint_lsn, _redo_lsn, timeline) = cli::pgops::parse_backup_label(&label)?;
+    let (checkpoint_lsn, redo_lsn, timeline) = cli::pgops::parse_backup_label(&label)?;
     let ckpt = Checkpoint::new(timeline, checkpoint_lsn);
+    let redo_ckpt = Checkpoint::new(timeline, redo_lsn);
     eprintln!("tiko_branch: parent backup checkpoint {ckpt}");
 
     // 3. Pack the backup directory (tar + zstd) and write it to --pack.
@@ -264,7 +335,15 @@ fn run_backup(args: &BackupArgs) -> Result<()> {
         args.pack.display(),
         tar_zst.len()
     );
-    Ok(())
+
+    print_json(&BackupOutput {
+        status: "backed_up".to_string(),
+        pack: args.pack.to_string_lossy().to_string(),
+        timeline: ckpt.timeline_id.to_hex(),
+        checkpoint_lsn: ckpt.lsn.to_pg_string(),
+        redo_lsn: redo_ckpt.lsn.to_pg_string(),
+        bytes_compressed: tar_zst.len(),
+    })
 }
 
 /// `restore` subcommand: read a pack file, unpack it into the branch PGDATA,
@@ -371,7 +450,14 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
     //    (and keeps `restore` from leaving a running primary the caller may not
     //    be ready to serve).
     cli::pgops::stop_pg(&branch.pg_ctl, &branch.pgdata)?;
-    Ok(())
+    print_json(&RestoreOutput {
+        status: "restored".to_string(),
+        db_id: branch.db_id,
+        project_id,
+        parent_db_id: branch.parent_db_id,
+        timeline: ckpt.timeline_id.to_hex(),
+        checkpoint_lsn: ckpt.lsn.to_pg_string(),
+    })
 }
 
 /// `restart` subcommand: start the branch PostgreSQL left stopped by a
@@ -396,7 +482,11 @@ fn run_restart(args: &RestartArgs) -> Result<()> {
         "tiko_branch: branch db_id={} is up on port {} (copy-on-write on parent storage)",
         args.db_id, args.branch_port
     );
-    Ok(())
+    print_json(&RestartOutput {
+        status: "started".to_string(),
+        db_id: args.db_id,
+        branch_port: args.branch_port,
+    })
 }
 
 /// Start the branch PostgreSQL via `pg_ctl start` with the branch's Tiko

@@ -23,8 +23,9 @@
 //! | `POST` | `/pitr/backup` | take backup  | 200  `tiko_pitr backup` JSON passed through |
 //! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` (db left stopped) |
 //! | `POST` | `/pitr/restart`| start db     | 200  starts the db left stopped by `recover` |
-//! | `PUT`  | `/branch/backup` | pack parent | 200  no body; saves pack to `TIKO_STORAGE_ROOT`, returns `{"pack":"..."}` |
-//! | `POST` | `/branch/restore`| setup branch| 200  body: `{"pack":"...","db_id":N,"parent_db_id":N,...}` (db left stopped) |
+//! | `PUT`  | `/branch/backup` | pack parent | 200  no body; saves pack to `TIKO_STORAGE_ROOT`; passes through `tiko_branch backup` JSON (incl. `pack`) |
+//! | `POST` | `/branch/restore`| setup branch| 200  body: `{"pack":"...","db_id":N,"parent_db_id":N,...}` (db left stopped); `tiko_branch restore` JSON |
+//! | `POST` | `/branch/restart`| start branch| 200  optional body: `{"db_id":N,"project_id":N,"branch_port":N}`; passes through `tiko_branch restart` JSON |
 //!
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
 //! (`TIKO_ORG_ID` / `TIKO_DB_ID` / `TIKO_PROJECT_ID` / `TIKO_STORAGE_ROOT` /
@@ -200,6 +201,7 @@ impl PgServer {
 
             ("PUT", ["branch", "backup"]) => self.branch_backup().await,
             ("POST", ["branch", "restore"]) => self.branch_restore(&req.body).await,
+            ("POST", ["branch", "restart"]) => self.branch_restart(&req.body).await,
 
             _ => not_found(method, path),
         }
@@ -320,8 +322,9 @@ impl PgServer {
     /// `PUT /branch/backup` — spawn `tiko_branch backup` against the local
     /// (parent) PostgreSQL to produce a compressed `tar.zst` pack file in the
     /// shared `TIKO_STORAGE_ROOT` (an S3 mount visible to all VMs, so the child
-    /// can read it from its own VM). Returns the pack file path as JSON so
-    /// tikod can pass it to the child VM's `/branch/restore`. No request body.
+    /// can read it from its own VM). Returns the CLI's JSON output (including
+    /// `pack`, `timeline`, `checkpoint_lsn`, ...) so tikod can pass the pack
+    /// path to the child VM's `/branch/restore`. No request body.
     async fn branch_backup(&self) -> Response {
         // Derive the pack path from TIKO_STORAGE_ROOT + the parent's db_id.
         let Some(storage_root) = self.ctl.tiko_env.get("TIKO_STORAGE_ROOT")
@@ -354,37 +357,9 @@ impl PgServer {
             .arg(&pg_basebackup)
             .envs(&self.ctl.tiko_env);
 
-        match cmd.output().await {
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if out.status.success() {
-                    ok_json(serde_json::json!({
-                        "pack": pack_path.to_string_lossy(),
-                    }))
-                } else {
-                    Response {
-                        status: 500,
-                        body: serde_json::json!({
-                            "error": {
-                                "kind": "branch_error",
-                                "exit_code": out.status.code(),
-                                "stderr": stderr,
-                            }
-                        })
-                        .to_string()
-                        .into_bytes(),
-                    }
-                }
-            }
-            Err(e) => Response {
-                status: 500,
-                body: serde_json::json!({
-                    "error": {"kind": "spawn_error", "message": e.to_string()}
-                })
-                .to_string()
-                .into_bytes(),
-            },
-        }
+        // `tiko_branch backup` now emits a JSON object on stdout (including the
+        // `pack` path); run_external passes it straight through.
+        run_external(cmd, "branch_error").await
     }
 
     /// `POST /branch/restore` — spawn `tiko_branch restore` to unpack a pack
@@ -451,6 +426,59 @@ impl PgServer {
         run_external(cmd, "branch_error").await
     }
 
+    /// `POST /branch/restart` — spawn `tiko_branch restart` to start the branch
+    /// PostgreSQL left stopped by a successful `restore`. Runs on the
+    /// CHILD/branch VM. Optional body `{"db_id":N,"project_id":N,"branch_port":N}`;
+    /// `db_id`/`project_id` default to the VM's Tiko identity (`tiko_env`),
+    /// `branch_port` defaults to 5432. Returns the CLI's JSON output.
+    async fn branch_restart(&self, body: &[u8]) -> Response {
+        #[derive(serde::Deserialize, Default)]
+        struct RestartBody {
+            db_id: Option<u64>,
+            project_id: Option<u64>,
+            branch_port: Option<u16>,
+        }
+        let body: RestartBody = if body.is_empty() {
+            RestartBody::default()
+        } else {
+            match serde_json::from_slice(body) {
+                Ok(b) => b,
+                Err(e) => return bad_request(&format!("invalid branch restart body: {e}")),
+            }
+        };
+
+        // Default db_id / project_id to the VM's branch identity.
+        let db_id = body.db_id.unwrap_or_else(|| {
+            self.ctl
+                .tiko_env
+                .get("TIKO_DB_ID")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+
+        let mut cmd = Command::new(&self.tiko_branch);
+        cmd.arg("restart")
+            .arg("--db-id")
+            .arg(db_id.to_string())
+            .arg("--pgdata")
+            .arg(&self.ctl.data_dir)
+            .arg("--pg-ctl")
+            .arg(&self.ctl.pg_ctl);
+        if let Some(pid) = body.project_id {
+            cmd.arg("--project-id").arg(pid.to_string());
+        }
+        if let Some(port) = body.branch_port {
+            cmd.arg("--branch-port").arg(port.to_string());
+        }
+
+        // The branch VM's tiko_env carries the shared TIKO_ORG_ID /
+        // TIKO_STORAGE_ROOT and the branch's TIKO_DB_ID / TIKO_PROJECT_ID /
+        // TIKO_LOCAL_PATH used by `start_branch_pg`.
+        cmd.envs(&self.ctl.tiko_env);
+
+        run_external(cmd, "branch_error").await
+    }
+
     fn parse_config_body(&self, body: &[u8]) -> Result<BTreeMap<String, String>, Response> {
         #[derive(serde::Deserialize)]
         struct ConfigBody {
@@ -506,15 +534,14 @@ pub type ServerResult<T> = PgCtlResult<T>;
 /// Run a `tiko_pitr` / `tiko_branch` subcommand and format the result as an
 /// HTTP [`Response`].
 ///
-/// Both CLIs may emit a JSON object on stdout (`tiko_pitr` always does;
-/// `tiko_branch` does not — its output is stderr-only). To keep the HTTP
-/// response as clean JSON, we parse stdout JSON and pass it through directly:
+/// Both CLIs emit a JSON object on stdout. To keep the HTTP response as clean
+/// JSON, we parse stdout JSON and pass it through directly:
 ///
 /// - Exit 0 + valid JSON → `200 <parsed json>`
 /// - Exit non-0 + valid JSON → `500 <parsed json>` (already an `{"error":...}`
 ///   object; the CLI's progress/diagnostics on stderr is folded in under
 ///   `"stderr"` for debugging when present).
-/// - Non-JSON stdout (older CLI, `tiko_branch`, panic, etc.) → fall back to the
+/// - Non-JSON stdout (older CLI, panic, etc.) → fall back to the
 ///   legacy `{stdout, stderr}` envelope.
 /// - Spawn failure → `500 {"error":{"kind":"spawn_error",...}}`.
 ///
