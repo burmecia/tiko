@@ -83,6 +83,8 @@ impl Vmm for MockVmm {
 struct FakeAgent {
     listen: SocketAddr,
     config_put: Arc<std::sync::Mutex<Option<BTreeMap<String, String>>>>,
+    /// Last request body received on any route (for body-forwarding asserts).
+    last_body: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl FakeAgent {
@@ -91,12 +93,15 @@ impl FakeAgent {
     /// - `GET /pg/config` → a fixed setting
     /// - `POST /pg/{start,stop,restart,reload}` / `PUT /pg/config` → 204
     /// - `GET /health` → ok
+    /// - `/pitr/*` and `/branch/*` → canned CLI-style JSON (200)
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = listener.local_addr().unwrap();
         let config_put = Arc::new(std::sync::Mutex::new(None));
+        let last_body = Arc::new(std::sync::Mutex::new(None));
 
         let config_put_task = config_put.clone();
+        let last_body_task = last_body.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -104,22 +109,32 @@ impl FakeAgent {
                     Err(_) => continue,
                 };
                 let cfg = config_put_task.clone();
+                let lb = last_body_task.clone();
                 tokio::spawn(async move {
-                    let _ = handle(&mut stream, cfg).await;
+                    let _ = handle(&mut stream, cfg, lb).await;
                 });
             }
         });
 
-        Self { listen, config_put }
+        Self { listen, config_put, last_body }
     }
 
     /// The last `PUT /pg/config` body the agent received.
     fn last_config_put(&self) -> Option<BTreeMap<String, String>> {
         self.config_put.lock().unwrap().clone()
     }
+
+    /// The last request body the agent received on any route.
+    fn last_body(&self) -> Option<String> {
+        self.last_body.lock().unwrap().clone()
+    }
 }
 
-async fn handle(stream: &mut TcpStream, config_put: Arc<std::sync::Mutex<Option<BTreeMap<String, String>>>>) -> std::io::Result<()> {
+async fn handle(
+    stream: &mut TcpStream,
+    config_put: Arc<std::sync::Mutex<Option<BTreeMap<String, String>>>>,
+    last_body: Arc<std::sync::Mutex<Option<String>>>,
+) -> std::io::Result<()> {
     let mut buf = vec![0u8; 8192];
     let n = stream.read(&mut buf).await?;
     let text = String::from_utf8_lossy(&buf[..n]);
@@ -127,6 +142,13 @@ async fn handle(stream: &mut TcpStream, config_put: Arc<std::sync::Mutex<Option<
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+
+    // Record the request body (after the blank line) for forwarding asserts.
+    let req_body = text
+        .find("\r\n\r\n")
+        .map(|i| text[i + 4..].trim().to_string())
+        .filter(|s| !s.is_empty());
+    *last_body.lock().unwrap() = req_body;
 
     // Each route returns an explicit (status, body). Action endpoints are 204;
     // reads are 200 JSON; unknown is 404.
@@ -160,6 +182,27 @@ async fn handle(stream: &mut TcpStream, config_put: Arc<std::sync::Mutex<Option<
             }
             (204, "")
         }
+        // PITR CLI-passthrough routes (canned tiko_pitr JSON).
+        ("GET", "/pitr/list") => (200, r#"{"backups":[],"window":null}"#),
+        ("POST", "/pitr/backup") => (
+            200,
+            r#"{"status":"backed_up","timeline":"00000001","checkpoint_lsn":"0/3000000","bytes_compressed":42}"#,
+        ),
+        ("POST", "/pitr/recover") => (
+            200,
+            r#"{"status":"recovered","target_kind":"time","target_value":"2026-01-01T00:00:00Z","timeline":"00000001"}"#,
+        ),
+        ("POST", "/pitr/restart") => (200, r#"{"status":"started"}"#),
+        // Branch CLI-passthrough routes (canned tiko_branch JSON).
+        ("PUT", "/branch/backup") => (
+            200,
+            r#"{"status":"backed_up","pack":"/data/branch_packs/1.tar.zst","timeline":"00000001","checkpoint_lsn":"0/3000000"}"#,
+        ),
+        ("POST", "/branch/restore") => (
+            200,
+            r#"{"status":"restored","db_id":2,"project_id":2,"parent_db_id":1,"timeline":"00000001","checkpoint_lsn":"0/3000000"}"#,
+        ),
+        ("POST", "/branch/restart") => (200, r#"{"status":"started","db_id":2,"branch_port":5432}"#),
         _ => (
             404,
             r#"{"error":{"kind":"not_found","message":"fake agent has no such route"}}"#,
@@ -405,6 +448,102 @@ async fn all_db_routes_are_forwarded() {
     // An unknown db sub-route must still 404 (not silently fall through).
     let (status, body) = api_request(api, "GET", "/vms/vm-1/db/nonsense", None).await;
     assert_eq!(status, 404, "{body}");
+}
+
+/// Contract guard: every `/vms/{id}/pitr/*` and `/vms/{id}/branch/*` route is
+/// forwarded to the agent (2xx), not 404 at the tikod layer. Adding a guest
+/// `/pitr` or `/branch` endpoint without a tikod mirror route fails here.
+#[tokio::test]
+async fn pitr_and_branch_routes_are_forwarded() {
+    let (api, _agent) = harness().await;
+    let routes: &[(&str, &str, Option<&str>)] = &[
+        ("GET", "/vms/vm-1/pitr/list", None),
+        ("POST", "/vms/vm-1/pitr/backup", None),
+        ("POST", "/vms/vm-1/pitr/recover", Some(r#"{"time":"2026-01-01 00:00:00"}"#)),
+        ("POST", "/vms/vm-1/pitr/restart", None),
+        ("PUT", "/vms/vm-1/branch/backup", None),
+        ("POST", "/vms/vm-1/branch/restore", Some(r#"{"pack":"/p","db_id":2,"parent_db_id":1}"#)),
+        ("POST", "/vms/vm-1/branch/restart", None),
+    ];
+    for (method, path, body) in routes {
+        let (status, resp_body) = api_request(api, method, path, *body).await;
+        assert!(
+            (200..300).contains(&status),
+            "{method} {path} not forwarded: status {status}, body: {resp_body}"
+        );
+    }
+
+    // Unknown pitr/branch sub-routes must 404 at the tikod layer (not fall
+    // through to the per-VM router, which would misinterpret them).
+    let (status, body) = api_request(api, "GET", "/vms/vm-1/pitr/nonsense", None).await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = api_request(api, "POST", "/vms/vm-1/branch/nonsense", None).await;
+    assert_eq!(status, 404, "{body}");
+}
+
+/// The mirror routes forward the request body unchanged to the agent (e.g. the
+/// `/branch/restore` `{pack,db_id,parent_db_id,...}` payload).
+#[tokio::test]
+async fn branch_restore_forwards_request_body() {
+    let (api, agent) = harness().await;
+    let payload = r#"{"pack":"/data/branch_packs/1.tar.zst","db_id":2,"parent_db_id":1}"#;
+    let (status, body) =
+        api_request(api, "POST", "/vms/vm-1/branch/restore", Some(payload)).await;
+    assert_eq!(status, 200, "{body}");
+
+    // The agent observed the exact body tikod forwarded.
+    let forwarded = agent.last_body().expect("agent never received a body");
+    assert_eq!(forwarded, payload, "forwarded body mismatch");
+}
+
+/// The `/pitr/*` and `/branch/*` routes proxy the agent's response verbatim —
+/// including rich error bodies (CLI `stderr`/`exit_code`) that the typed
+/// `send()` path would strip down to `{kind,message}`. This is the whole
+/// reason `forward_raw` exists.
+#[tokio::test]
+async fn agent_error_body_passes_through_verbatim() {
+    // Custom agent that always returns a 500 with stderr/exit_code in the body.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let agent_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"error":{"kind":"branch_error","exit_code":1,"stderr":"boom"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let vmm: Arc<dyn Vmm> = Arc::new(MockVmm {
+        guest_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        known: ["vm-1".to_string()].into_iter().collect(),
+    });
+    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-branch-err-test")));
+    let control = Arc::new(Control::new());
+    let server = Arc::new(ApiServer::new(node, control).with_agent_port(agent_addr.port()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+
+    let (status, body) = api_request(api_addr, "PUT", "/vms/vm-1/branch/backup", None).await;
+    assert_eq!(status, 500, "{body}");
+    // The rich fields survive the gateway intact (forward_raw, not send()).
+    assert!(body.contains(r#""kind":"branch_error""#), "{body}");
+    assert!(body.contains(r#""exit_code":1"#), "{body}");
+    assert!(body.contains(r#""stderr":"boom""#), "{body}");
 }
 
 /// `GET /vms` is the authoritative swarm inventory: union of live VMs (from the

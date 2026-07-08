@@ -170,6 +170,67 @@ impl GuestClient {
         Ok(())
     }
 
+    /// Forward an arbitrary request to the agent and return the raw
+    /// `(status, body_bytes)` so a gateway can mirror the agent's response
+    /// verbatim — status code and full body, including rich error bodies
+    /// (`stderr`/`exit_code`) from the `/pitr/*` and `/branch/*`
+    /// CLI-passthrough routes. Only transport-level failures
+    /// (connect/read/parse) surface as errors; an agent 4xx/5xx is returned as
+    /// a normal `(status, body)` so the caller can pass it through unchanged.
+    pub async fn forward_raw(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> GuestResult<(u16, Vec<u8>)> {
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            host = self.agent,
+            len = body.len(),
+        );
+
+        let mut stream = TcpStream::connect(self.agent)
+            .await
+            .map_err(|e| GuestClientError::Transport(format!("connect to agent: {e}")))?;
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .map_err(|e| GuestClientError::Transport(format!("write to agent: {e}")))?;
+        if !body.is_empty() {
+            stream
+                .write_all(body)
+                .await
+                .map_err(|e| GuestClientError::Transport(format!("write to agent: {e}")))?;
+        }
+
+        let mut buf = Vec::new();
+        stream
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| GuestClientError::Transport(format!("read agent response: {e}")))?;
+
+        // Split headers/body on the first blank line, operating on raw bytes so
+        // the body is preserved exactly (the agent always returns JSON).
+        let sep = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| GuestClientError::Transport("malformed HTTP response".into()))?;
+        let header_str = std::str::from_utf8(&buf[..sep])
+            .map_err(|e| GuestClientError::Transport(format!("malformed HTTP headers: {e}")))?;
+        let status = header_str
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| GuestClientError::Transport("malformed HTTP status line".into()))?;
+        Ok((status, buf[sep + 4..].to_vec()))
+    }
+
     /// Core HTTP/1.1 request. Returns the parsed JSON body for 2xx, or an
     /// [`GuestClientError::Agent`] carrying the agent's `kind`/`message`.
     async fn send(
@@ -178,36 +239,13 @@ impl GuestClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> GuestResult<serde_json::Value> {
-        let body_bytes = body.map(|b| b.to_string()).unwrap_or_default();
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\n\
-             Host: {host}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {len}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {body}",
-            host = self.agent,
-            len = body_bytes.len(),
-            body = body_bytes,
-        );
-
-        let mut stream = TcpStream::connect(self.agent).await.map_err(|e| {
-            GuestClientError::Transport(format!("connect to agent: {e}"))
-        })?;
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| GuestClientError::Transport(format!("write to agent: {e}")))?;
-
-        let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| GuestClientError::Transport(format!("read agent response: {e}")))?;
-
-        let text = String::from_utf8_lossy(&buf);
-        let (status, body_str) = split_response(&text)?;
+        let body_bytes = match body {
+            Some(b) => b.to_string().into_bytes(),
+            None => Vec::new(),
+        };
+        let (status, body_bytes) = self.forward_raw(method, path, &body_bytes).await?;
+        let body_str = std::str::from_utf8(&body_bytes)
+            .map_err(|e| GuestClientError::Transport(format!("non-utf8 agent body: {e}")))?;
 
         if (200..300).contains(&status) {
             if body_str.is_empty() {
@@ -226,22 +264,6 @@ impl GuestClient {
             message,
         })
     }
-}
-
-/// Split an HTTP response into `(status, body_str)`.
-fn split_response(text: &str) -> GuestResult<(u16, &str)> {
-    let header_end = text
-        .find("\r\n\r\n")
-        .ok_or_else(|| GuestClientError::Transport("malformed HTTP response".into()))?;
-    let header_str = &text[..header_end];
-    let body_str = &text[header_end + 4..];
-    let status = header_str
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| GuestClientError::Transport("malformed HTTP status line".into()))?;
-    Ok((status, body_str))
 }
 
 /// Extract `(kind, message)` from an agent error body

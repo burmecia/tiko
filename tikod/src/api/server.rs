@@ -50,6 +50,32 @@
 //! | `GET`  | `/vms/{vm_id}/db/config`        | `/pg/config`   | `{"settings":{name:value,...}}`                           |
 //! | `PUT`  | `/vms/{vm_id}/db/config`        | `/pg/config`   | 204  body: `{"settings":{name:value}}` (then reloads)     |
 //!
+//! # PITR routes (forwarded to the guest `tikoguest` agent)
+//!
+//! `/vms/{vm_id}/pitr/*` proxy to the guest's `/pitr/*` endpoints, which spawn
+//! the in-guest `tiko_pitr` CLI. The request body is forwarded unchanged and
+//! the agent's status code + JSON body (the CLI's stdout, including rich error
+//! bodies with `stderr`/`exit_code`) are returned verbatim.
+//!
+//! | Method | Path                            | Agent endpoint | Returns / Body                                            |
+//! |--------|---------------------------------|----------------|-----------------------------------------------------------|
+//! | `GET`  | `/vms/{vm_id}/pitr/list`        | `/pitr/list`   | `tiko_pitr list` JSON (backups + recoverable window)      |
+//! | `POST` | `/vms/{vm_id}/pitr/backup`      | `/pitr/backup` | `tiko_pitr backup` JSON                                   |
+//! | `POST` | `/vms/{vm_id}/pitr/recover`     | `/pitr/recover`| 200  body: `{"time":"..."}` or `{"lsn":"..."}` (db stopped) |
+//! | `POST` | `/vms/{vm_id}/pitr/restart`     | `/pitr/restart`| 200  starts the db left stopped by `recover`              |
+//!
+//! # Branch routes (forwarded to the guest `tikoguest` agent)
+//!
+//! `/vms/{vm_id}/branch/*` proxy to the guest's `/branch/*` endpoints, which
+//! spawn the in-guest `tiko_branch` CLI. The request body is forwarded
+//! unchanged and the agent's status code + JSON body are returned verbatim.
+//!
+//! | Method | Path                              | Agent endpoint   | Returns / Body                                       |
+//! |--------|-----------------------------------|------------------|------------------------------------------------------|
+//! | `PUT`  | `/vms/{vm_id}/branch/backup`      | `/branch/backup` | `tiko_branch backup` JSON (incl. `pack`)             |
+//! | `POST` | `/vms/{vm_id}/branch/restore`     | `/branch/restore`| body: `{"pack","db_id","parent_db_id",...}` (stopped)|
+//! | `POST` | `/vms/{vm_id}/branch/restart`     | `/branch/restart`| optional body: `{"db_id","project_id",...}`          |
+//!
 //! # Agent-inbound routes (pushed by the guest `tikoguest` agent)
 //!
 //! | Method | Path                            | From            | Returns / Body                              |
@@ -281,6 +307,18 @@ impl ApiServer {
             // DB control routes: /vms/{vm_id}/db/{...} → in-guest tikoguest agent.
             (_, ["vms", vm_id, "db", rest @ ..]) => {
                 self.route_db(method, &VmId::from(*vm_id), rest, req)
+                    .await
+            }
+
+            // PITR routes: /vms/{vm_id}/pitr/{...} → in-guest tikoguest /pitr/*.
+            (_, ["vms", vm_id, "pitr", rest @ ..]) => {
+                self.route_pitr(method, &VmId::from(*vm_id), rest, req)
+                    .await
+            }
+
+            // Branch routes: /vms/{vm_id}/branch/{...} → in-guest tikoguest /branch/*.
+            (_, ["vms", vm_id, "branch", rest @ ..]) => {
+                self.route_branch(method, &VmId::from(*vm_id), rest, req)
                     .await
             }
 
@@ -614,24 +652,10 @@ impl ApiServer {
     /// Resolves the guest IP first; VM-not-found / no-IP surface as errors
     /// before any agent call is attempted.
     async fn route_db(&self, method: &str, vm_id: &VmId, rest: &[&str], req: &Request) -> Response {
-        let guest_ip = match self.node.guest_ip(vm_id).await {
-            Ok(Some(ip)) => ip,
-            Ok(None) => {
-                return Response {
-                    status: 502,
-                    body: serde_json::json!({
-                        "error": {
-                            "kind": "agent_unreachable",
-                            "message": format!("no guest IP discovered for VM {vm_id}"),
-                        }
-                    })
-                    .to_string()
-                    .into_bytes(),
-                };
-            }
-            Err(e) => return err_resp(&e),
+        let db = match self.guest_client(vm_id).await {
+            Ok(c) => c,
+            Err(r) => return r,
         };
-        let db = GuestClient::for_guest(guest_ip, self.agent_port);
 
         let path = format!("/vms/{vm_id}/db/{}", rest.join("/"));
         match (method, rest) {
@@ -660,6 +684,96 @@ impl ApiServer {
                 Err(r) => r,
             },
             _ => not_found(method, &path),
+        }
+    }
+
+    /// Dispatch `/vms/{vm_id}/pitr/{...}` routes to the in-guest `tikoguest`
+    /// agent's `/pitr/*` endpoints (which spawn the `tiko_pitr` CLI). The
+    /// request body is forwarded unchanged; the agent's `(status, body)` is
+    /// returned verbatim so the CLI's JSON (and rich error bodies) survive.
+    async fn route_pitr(
+        &self,
+        method: &str,
+        vm_id: &VmId,
+        rest: &[&str],
+        req: &Request,
+    ) -> Response {
+        let path = format!("/vms/{vm_id}/pitr/{}", rest.join("/"));
+        let agent_path = match (method, rest) {
+            ("GET", ["list"]) => "/pitr/list",
+            ("POST", ["backup"]) => "/pitr/backup",
+            ("POST", ["recover"]) => "/pitr/recover",
+            ("POST", ["restart"]) => "/pitr/restart",
+            _ => return not_found(method, &path),
+        };
+        self.forward_agent(vm_id, agent_path, method, &req.body).await
+    }
+
+    /// Dispatch `/vms/{vm_id}/branch/{...}` routes to the in-guest `tikoguest`
+    /// agent's `/branch/*` endpoints (which spawn the `tiko_branch` CLI). The
+    /// request body is forwarded unchanged (e.g. `/branch/restore`'s
+    /// `{pack,db_id,parent_db_id,...}`); the agent's `(status, body)` is
+    /// returned verbatim so the CLI's JSON (and rich error bodies) survive.
+    async fn route_branch(
+        &self,
+        method: &str,
+        vm_id: &VmId,
+        rest: &[&str],
+        req: &Request,
+    ) -> Response {
+        let path = format!("/vms/{vm_id}/branch/{}", rest.join("/"));
+        let agent_path = match (method, rest) {
+            ("PUT", ["backup"]) => "/branch/backup",
+            ("POST", ["restore"]) => "/branch/restore",
+            ("POST", ["restart"]) => "/branch/restart",
+            _ => return not_found(method, &path),
+        };
+        self.forward_agent(vm_id, agent_path, method, &req.body).await
+    }
+
+    /// Resolve a VM's guest IP and build a [`GuestClient`] for it. Returns an
+    /// error [`Response`] (502 when no guest IP is known; mapped [`VmmError`]
+    /// otherwise) so DB/PITR/branch dispatchers can short-circuit before any
+    /// agent call.
+    async fn guest_client(&self, vm_id: &VmId) -> Result<GuestClient, Response> {
+        let guest_ip = match self.node.guest_ip(vm_id).await {
+            Ok(Some(ip)) => ip,
+            Ok(None) => {
+                return Err(Response {
+                    status: 502,
+                    body: serde_json::json!({
+                        "error": {
+                            "kind": "agent_unreachable",
+                            "message": format!("no guest IP discovered for VM {vm_id}"),
+                        }
+                    })
+                    .to_string()
+                    .into_bytes(),
+                });
+            }
+            Err(e) => return Err(err_resp(&e)),
+        };
+        Ok(GuestClient::for_guest(guest_ip, self.agent_port))
+    }
+
+    /// Resolve the VM's guest IP, then forward `method agent_path body` to its
+    /// `tikoguest` agent and return the agent's `(status, body)` verbatim. Used
+    /// by the `/pitr/*` and `/branch/*` mirror routes, whose responses are
+    /// arbitrary JSON passed through from the in-guest CLI.
+    async fn forward_agent(
+        &self,
+        vm_id: &VmId,
+        agent_path: &str,
+        method: &str,
+        body: &[u8],
+    ) -> Response {
+        let client = match self.guest_client(vm_id).await {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        match client.forward_raw(method, agent_path, body).await {
+            Ok((status, body)) => Response { status, body },
+            Err(e) => guest_err_resp(e),
         }
     }
 }
