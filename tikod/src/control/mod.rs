@@ -297,9 +297,16 @@ impl Control {
     /// Mark `vm_id` as warm-paused. Notifies all subscribers (proxied
     /// connections) so they can disable TCP keepalive before the kernel's
     /// keepalive probe would kill the frozen connection.
+    ///
+    /// Uses `send_replace` (not `send`): `watch::Sender::send` is a silent
+    /// no-op when the channel has no live receivers, so it would fail to store
+    /// `true` when the proxied connection that created the watch has since
+    /// closed — leaving `is_warm_paused` reading a stale `false` and causing
+    /// the warm timer to skip cold-freeze. `send_replace` always updates the
+    /// stored value and notifies any live receivers.
     pub fn mark_warm_paused(&self, vm_id: &VmId) {
         if let Some(tx) = self.warm.get(vm_id) {
-            let _ = tx.send(true);
+            tx.send_replace(true);
         } else {
             let (tx, _rx) = watch::channel(true);
             self.warm.insert(vm_id.clone(), tx);
@@ -311,7 +318,8 @@ impl Control {
     /// wake (resume). Notifies subscribers to re-enable keepalive.
     pub fn clear_warm_paused(&self, vm_id: &VmId) {
         if let Some(tx) = self.warm.get(vm_id) {
-            let _ = tx.send(false);
+            tx.send_replace(false);
+            debug!(vm_id = %vm_id, "cleared warm-paused");
         }
     }
 
@@ -376,5 +384,41 @@ mod tests {
         // Bumping an unknown VM is a no-op (not a panic).
         ctrl.bump_pause_epoch(&"vm-ghost".into());
         assert_eq!(ctrl.pause_epoch(&"vm-ghost".into()), None);
+    }
+
+    /// Regression: `mark_warm_paused` must store `true` even when the proxied
+    /// connection that created the watch has closed (no live receivers). The
+    /// naive `watch::Sender::send` is a silent no-op when the channel is
+    /// closed, which left `is_warm_paused` reading a stale `false` and caused
+    /// the warm timer to skip cold-freeze for VMs with no active connection.
+    #[test]
+    fn warm_paused_stored_without_subscribers() {
+        let ctrl = Control::new();
+        ctrl.register("vm-1".into(), "acme".into(), "main".into(), 5432);
+
+        // A proxied connection subscribed, then closed (receiver dropped).
+        let rx = ctrl.subscribe_warm(&"vm-1".into());
+        drop(rx);
+        assert!(!ctrl.is_warm_paused(&"vm-1".into())); // still false
+
+        // Marking warm-paused must take effect despite no live receiver.
+        ctrl.mark_warm_paused(&"vm-1".into());
+        assert!(ctrl.is_warm_paused(&"vm-1".into()));
+
+        // Clearing must likewise take effect without a live receiver.
+        ctrl.clear_warm_paused(&"vm-1".into());
+        assert!(!ctrl.is_warm_paused(&"vm-1".into()));
+    }
+
+    /// `mark_warm_paused` on a VM with no prior watch entry (no connection was
+    /// ever proxied) must still store `true` for `is_warm_paused`.
+    #[test]
+    fn warm_paused_marked_with_no_prior_entry() {
+        let ctrl = Control::new();
+        ctrl.register("vm-1".into(), "acme".into(), "main".into(), 5432);
+
+        assert!(!ctrl.is_warm_paused(&"vm-1".into()));
+        ctrl.mark_warm_paused(&"vm-1".into());
+        assert!(ctrl.is_warm_paused(&"vm-1".into()));
     }
 }

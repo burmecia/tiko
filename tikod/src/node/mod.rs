@@ -154,6 +154,7 @@ impl Node {
         match self.vmm.vm_state(vm_id).await {
             Ok(VmState::Running) => return Ok(()),
             Ok(VmState::Paused) => {
+                info!(vm_id = %vm_id, "wake: resuming warm-paused VM");
                 self.vmm.resume_vm(vm_id).await?;
                 // Fresh cancel signal: a prior freeze attempt (if any)
                 // is now stale — new connections should not be cancelled.

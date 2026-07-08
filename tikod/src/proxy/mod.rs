@@ -311,29 +311,35 @@ async fn handle_connection(
                 loop {
                     let paused = *thermal.borrow();
                     // Toggle keepalive on thermal transitions: enabled when
-                    // Running, disabled when WarmPaused.
+                    // Running, disabled when WarmPaused (so a frozen VM isn't
+                    // declared dead by the kernel's keepalive probe).
                     #[cfg(unix)]
                     if keepalive_on == paused {
                         keepalive_on = !paused;
                         set_keepalive_enabled(backend_fd, keepalive_on);
                     }
-                    // Wake-on-stale: resume the VM before forwarding data.
-                    if paused {
-                        debug!(client = %client_addr, vm_id = %vm_id, "backend warm-paused — resuming");
-                        if let Err(e) = node.wake(vm_id, control).await {
-                            return Err(io::Error::other(format!(
-                                "wake-on-stale failed for {vm_id}: {e}"
-                            )));
-                        }
-                    }
                     // Read from client, racing against thermal changes so we
-                    // react to warm-pause promptly even while idle.
+                    // toggle keepalive promptly on warm-pause even while idle.
+                    // The wake is deliberately data-triggered (below): an idle
+                    // connection must NOT resume the VM, or the warm-pause →
+                    // cold-freeze transition is defeated and idle VMs never
+                    // scale down.
                     tokio::select! {
                         biased;
                         _ = thermal.changed() => continue,
                         r = client_read.read(&mut buf) => {
                             let n = r?;
                             if n == 0 { break; }
+                            // Wake-on-stale: resume the VM only now that the
+                            // client has actual data to forward.
+                            if *thermal.borrow() {
+                                debug!(client = %client_addr, vm_id = %vm_id, "backend warm-paused — resuming on data");
+                                if let Err(e) = node.wake(vm_id, control).await {
+                                    return Err(io::Error::other(format!(
+                                        "wake-on-stale failed for {vm_id}: {e}"
+                                    )));
+                                }
+                            }
                             backend_write.write_all(&buf[..n]).await?;
                         }
                     }
