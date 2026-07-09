@@ -33,6 +33,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
+use core::env;
 use core::error::{Error, Result};
 use core::io::store::Store;
 use core::io::timeline::Checkpoint;
@@ -586,13 +587,32 @@ fn main() {
             // PGDATA; it doesn't touch Tiko storage, so don't require
             // `Store::init()` (or the TIKO_* env) to succeed for it.
             Cmd::Restart(args) => run_restart(args)?,
-            Cmd::List => {
+            // `list` and `backup` only touch shared storage (backup/ objects),
+            // never the live per-DB local manifest cache. But `Store::init()`
+            // eagerly opens/creates `$TIKO_LOCAL_PATH/base_manifest.tikm` — the
+            // SAME path the running postgres uses. When this CLI runs as a
+            // standalone process (e.g. tikoguest's periodic backup_loop),
+            // `Store::init` would create/overwrite the live `tiko_local` folder
+            // and race the running instance's manifest. Redirect the tool's own
+            // local cache to a throwaway temp dir so the live path is untouched.
+            // (`recover` intentionally keeps the real path: it installs the base
+            // manifest there.)
+            Cmd::List | Cmd::Backup(_) => {
+                let local_temp = tempfile::tempdir().map_err(|e| {
+                    Error::other(format!("tiko_pitr: failed to create temp dir: {e}"))
+                })?;
+                // SAFETY: single-threaded CLI before any other thread reads the env.
+                unsafe {
+                    std::env::set_var(env::ENV_TIKO_LOCAL_PATH, local_temp.path());
+                }
                 let store = Store::init()?;
-                run_list(&store)?;
-            }
-            Cmd::Backup(args) => {
-                let store = Store::init()?;
-                run_backup(&store, args)?;
+                let res = match &cli.command {
+                    Cmd::List => run_list(&store),
+                    Cmd::Backup(args) => run_backup(&store, args),
+                    _ => unreachable!(),
+                };
+                drop(local_temp);
+                res?;
             }
             Cmd::Recover(args) => {
                 let store = Store::init()?;
