@@ -85,6 +85,9 @@ struct FakeAgent {
     config_put: Arc<std::sync::Mutex<Option<BTreeMap<String, String>>>>,
     /// Last request body received on any route (for body-forwarding asserts).
     last_body: Arc<std::sync::Mutex<Option<String>>>,
+    /// Last body received on `POST /branch/restore` (captured separately so a
+    /// later `/pg/start` with an empty body doesn't clobber it).
+    last_restore_body: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl FakeAgent {
@@ -99,9 +102,11 @@ impl FakeAgent {
         let listen = listener.local_addr().unwrap();
         let config_put = Arc::new(std::sync::Mutex::new(None));
         let last_body = Arc::new(std::sync::Mutex::new(None));
+        let last_restore_body = Arc::new(std::sync::Mutex::new(None));
 
         let config_put_task = config_put.clone();
         let last_body_task = last_body.clone();
+        let last_restore_body_task = last_restore_body.clone();
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = match listener.accept().await {
@@ -110,13 +115,14 @@ impl FakeAgent {
                 };
                 let cfg = config_put_task.clone();
                 let lb = last_body_task.clone();
+                let lrb = last_restore_body_task.clone();
                 tokio::spawn(async move {
-                    let _ = handle(&mut stream, cfg, lb).await;
+                    let _ = handle(&mut stream, cfg, lb, lrb).await;
                 });
             }
         });
 
-        Self { listen, config_put, last_body }
+        Self { listen, config_put, last_body, last_restore_body }
     }
 
     /// The last `PUT /pg/config` body the agent received.
@@ -128,12 +134,18 @@ impl FakeAgent {
     fn last_body(&self) -> Option<String> {
         self.last_body.lock().unwrap().clone()
     }
+
+    /// The last `POST /branch/restore` request body the agent received.
+    fn last_restore_body(&self) -> Option<String> {
+        self.last_restore_body.lock().unwrap().clone()
+    }
 }
 
 async fn handle(
     stream: &mut TcpStream,
     config_put: Arc<std::sync::Mutex<Option<BTreeMap<String, String>>>>,
     last_body: Arc<std::sync::Mutex<Option<String>>>,
+    last_restore_body: Arc<std::sync::Mutex<Option<String>>>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; 8192];
     let n = stream.read(&mut buf).await?;
@@ -153,7 +165,7 @@ async fn handle(
     // Each route returns an explicit (status, body). Action endpoints are 204;
     // reads are 200 JSON; unknown is 404.
     let (status, body): (u16, &str) = match (method, path) {
-        ("GET", "/health") => (200, r#"{"status":"ok","initialized":true,"running":true}"#),
+        ("GET", "/health") => (200, r#"{"status":"ok","initialized":true,"running":true,"storage_ready":true}"#),
         ("GET", "/pg/status") => (
             200,
             r#"{"initialized":true,"running":true,"ready":true,"pid":4242,"version":"17.0","data_dir":"/var/lib/postgresql/tt","config_file":"/var/lib/postgresql/tt/postgresql.tiko.conf"}"#,
@@ -198,10 +210,20 @@ async fn handle(
             200,
             r#"{"status":"backed_up","pack":"/data/branch_packs/1.tar.zst","timeline":"00000001","checkpoint_lsn":"0/3000000"}"#,
         ),
-        ("POST", "/branch/restore") => (
-            200,
-            r#"{"status":"restored","db_id":2,"project_id":2,"parent_db_id":1,"timeline":"00000001","checkpoint_lsn":"0/3000000"}"#,
-        ),
+        ("POST", "/branch/restore") => {
+            // Capture the restore body separately (a later /pg/start with an
+            // empty body would otherwise clobber last_body).
+            if let Some(body_start) = text.find("\r\n\r\n") {
+                let rb = text[body_start + 4..].trim();
+                if !rb.is_empty() {
+                    *last_restore_body.lock().unwrap() = Some(rb.to_string());
+                }
+            }
+            (
+                200,
+                r#"{"status":"restored","db_id":2,"project_id":2,"parent_db_id":1,"timeline":"00000001","checkpoint_lsn":"0/3000000"}"#,
+            )
+        }
         ("POST", "/branch/restart") => (200, r#"{"status":"started","db_id":2,"branch_port":5432}"#),
         _ => (
             404,
@@ -699,4 +721,230 @@ async fn post_pause_request_acks_202() {
     // Invalid JSON → 400.
     let (status, _) = api_request(api_addr, "POST", "/vms/vm-1/pause-request", Some("not json")).await;
     assert_eq!(status, 400);
+}
+
+// ── Stateful mock: tracks created VMs so create_db can resolve guest IPs ────
+
+/// A stateful `Vmm` mock: VMs added via `create_vm` become resolvable for
+/// `vm_guest_ip` / `vm_state` / `list_vms`. Used by the `POST /dbs` test,
+/// which provisions a brand-new VM and then talks to its guest agent.
+struct StatefulMockVmm {
+    guest_ip: IpAddr,
+    known: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+#[async_trait]
+impl Vmm for StatefulMockVmm {
+    async fn create_vm(&self, config: VmConfig) -> Result<VmId, VmmError> {
+        self.known.lock().unwrap().insert(config.vm_id.clone());
+        Ok(config.vm_id)
+    }
+    async fn start_vm(&self, _: &VmId) -> Result<(), VmmError> {
+        Ok(())
+    }
+    async fn pause_vm(&self, _: &VmId) -> Result<(), VmmError> {
+        Ok(())
+    }
+    async fn resume_vm(&self, _: &VmId) -> Result<(), VmmError> {
+        Ok(())
+    }
+    async fn snapshot_vm(&self, _: &VmId) -> Result<Snapshot, VmmError> {
+        Err(VmmError::Backend("not implemented in mock".into()))
+    }
+    async fn restore_vm(&self, snap: &Snapshot) -> Result<VmId, VmmError> {
+        Ok(snap.vm_id.clone())
+    }
+    async fn destroy_vm(&self, id: &VmId) -> Result<(), VmmError> {
+        self.known.lock().unwrap().remove(id);
+        Ok(())
+    }
+    async fn vm_state(&self, id: &VmId) -> Result<VmState, VmmError> {
+        if self.known.lock().unwrap().contains(id) {
+            Ok(VmState::Running)
+        } else {
+            Err(VmmError::VmNotFound(id.clone()))
+        }
+    }
+    async fn vm_guest_ip(&self, id: &VmId) -> Result<Option<IpAddr>, VmmError> {
+        if !self.known.lock().unwrap().contains(id) {
+            return Err(VmmError::VmNotFound(id.clone()));
+        }
+        Ok(Some(self.guest_ip))
+    }
+    async fn list_vms(&self) -> Result<Vec<VmInfo>, VmmError> {
+        let known = self.known.lock().unwrap().clone();
+        Ok(known
+            .iter()
+            .map(|vm_id| VmInfo {
+                vm_id: vm_id.clone(),
+                state: VmState::Running,
+                guest_ip: Some(self.guest_ip),
+            })
+            .collect())
+    }
+}
+
+/// `POST /dbs` provisions a VM, restores the org bootstrap pack, and starts
+/// Postgres. With an empty swarm, the auto-generated id is `vm-0` (db_id 0).
+#[tokio::test]
+async fn post_dbs_creates_and_starts_db() {
+    let agent = FakeAgent::start().await;
+    let guest_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let known = Arc::new(std::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
+    let vmm: Arc<dyn Vmm> = Arc::new(StatefulMockVmm { guest_ip, known });
+    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-create-db-test")));
+    let control = Arc::new(Control::new());
+    let server = Arc::new(
+        ApiServer::new(node, control)
+            .with_assets_dir(std::env::temp_dir().join("tikod-create-db-assets"))
+            .with_agent_port(agent.listen.port()),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+
+    // No body → auto vm_id + db_id, project_id defaults to db_id.
+    let (status, body) = api_request(api_addr, "POST", "/dbs", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""vm_id":"vm-0""#), "{body}");
+    assert!(body.contains(r#""db_id":0"#), "{body}");
+
+    // The agent received /branch/restore with db_id (and project_id defaulting
+    // to it). parent_db_id / pack were left absent so the agent applies its
+    // defaults (parent 0, org bootstrap pack).
+    let restore_body = agent
+        .last_restore_body()
+        .expect("agent never received /branch/restore");
+    assert!(restore_body.contains(r#""db_id":0"#), "{restore_body}");
+    assert!(restore_body.contains(r#""project_id":0"#), "{restore_body}");
+    assert!(
+        !restore_body.contains("parent_db_id"),
+        "parent_db_id should be absent so the agent defaults it: {restore_body}"
+    );
+    assert!(
+        !restore_body.contains("pack"),
+        "pack should be absent so the agent defaults it: {restore_body}"
+    );
+
+    // A second call auto-increments to vm-1 / db_id 1.
+    let (status, body) = api_request(api_addr, "POST", "/dbs", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""vm_id":"vm-1""#), "{body}");
+    assert!(body.contains(r#""db_id":1"#), "{body}");
+
+    // An explicit project_id is forwarded to the restore.
+    let (status, body) =
+        api_request(api_addr, "POST", "/dbs", Some(r#"{"project_id":77}"#)).await;
+    assert_eq!(status, 200, "{body}");
+    let restore_body = agent.last_restore_body().expect("agent never received /branch/restore");
+    assert!(restore_body.contains(r#""project_id":77"#), "{restore_body}");
+
+    // Invalid body → 400.
+    let (status, body) = api_request(api_addr, "POST", "/dbs", Some("not json")).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+/// `POST /dbs` waits for the agent's `storage_ready` flag (not just liveness)
+/// before restoring: a freshly-booted guest's `/mnt/s3files` network mount may
+/// still be coming up when the agent is already serving. Here a custom agent
+/// reports `storage_ready:false` for the first few `/health` probes, then
+/// `true`; tikod must keep polling until the mount is "ready" and only then
+/// call `/branch/restore`.
+#[tokio::test]
+async fn post_dbs_waits_for_storage_ready() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    // `/health` flips to storage_ready=true after `READY_AFTER` probes.
+    const READY_AFTER: u32 = 3;
+    let health_calls = Arc::new(AtomicU32::new(0));
+    let restore_called = Arc::new(AtomicBool::new(false));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let agent_addr = listener.local_addr().unwrap();
+    let hc = health_calls.clone();
+    let rc = restore_called.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let hc = hc.clone();
+            let rc = rc.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let text = String::from_utf8_lossy(&buf);
+                let req_line = text.lines().next().unwrap_or("");
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+
+                let (status, body): (u16, String) = match (method, path) {
+                    ("GET", "/health") => {
+                        let n = hc.fetch_add(1, Ordering::Relaxed);
+                        let ready = n >= READY_AFTER;
+                        (
+                            200,
+                            format!(
+                                r#"{{"status":"ok","storage_ready":{ready}}}"#,
+                                ready = ready
+                            ),
+                        )
+                    }
+                    ("POST", "/branch/restore") => {
+                        rc.store(true, Ordering::Relaxed);
+                        (200, r#"{"status":"restored"}"#.to_string())
+                    }
+                    ("POST", "/pg/start") => (204, String::new()),
+                    _ => (
+                        404,
+                        r#"{"error":{"kind":"not_found"}}"#.to_string(),
+                    ),
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_text(status),
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let guest_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let known = Arc::new(std::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
+    let vmm: Arc<dyn Vmm> = Arc::new(StatefulMockVmm { guest_ip, known });
+    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-storage-ready-test")));
+    let control = Arc::new(Control::new());
+    let server = Arc::new(
+        ApiServer::new(node, control)
+            .with_assets_dir(std::env::temp_dir().join("tikod-storage-ready-assets"))
+            .with_agent_port(agent_addr.port()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+
+    let (status, body) = api_request(api_addr, "POST", "/dbs", None).await;
+    assert_eq!(status, 200, "{body}");
+
+    // tikod polled /health more than once (it kept polling while storage was
+    // reported not-ready) and only proceeded once ready flipped true.
+    let probes = health_calls.load(Ordering::Relaxed);
+    assert!(
+        probes >= READY_AFTER,
+        "expected tikod to keep polling until storage_ready (>= {READY_AFTER} probes), got {probes}"
+    );
+    assert!(restore_called.load(Ordering::Relaxed), "restore was never called");
 }

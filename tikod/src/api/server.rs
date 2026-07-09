@@ -20,6 +20,7 @@
 //! | `GET`  | `/vms`                      | list VMs          | `{"vms":[{vm_id,...},...]}`              |
 //! | `PUT`  | `/vms`                      | create_vm         | `{"vm_id":"..."}`  body optional (auto-generates id) |
 //! | `POST` | `/vms/provision`            | create + start    | `{"vm_id":"..."}`  body optional (auto-generates id) |
+//! | `POST` | `/dbs`                      | create + start db | `{"vm_id":"...","db_id":N}`  body optional `{"project_id":N}` (provisions a VM, restores the org bootstrap pack, starts PG) |
 //! | `GET`  | `/vms/{vm_id}`              | vm_state          | `{"vm_id":"...","state":"running"}`      |
 //! | `DELETE`| `/vms/{vm_id}`             | destroy_vm        | 204                                      |
 //! | `GET`  | `/vms/{vm_id}/ip`           | vm_guest_ip       | `{"vm_id":"...","ip":"1.2.3.4"\|null}`   |
@@ -297,6 +298,12 @@ impl ApiServer {
                     Err(e) => err_resp(&e),
                 }
             }
+
+            // Create + start a new database: provision a VM, restore the org's
+            // bootstrap pack onto it, and start Postgres. The vm_id and db_id
+            // are both auto-generated (and equal: the VM bakes
+            // `TIKO_DB_ID = vm_index`).
+            ("POST", ["dbs"]) => self.create_db(req).await,
             // Legacy `POST /vms/restore` / `POST /vms/thaw` (full
             // `Snapshot` in the body) were replaced by path-keyed,
             // body-less `PUT /vms/{vm_id}/restore` and
@@ -646,6 +653,134 @@ impl ApiServer {
                 .cmp(b.get("vm_id").and_then(|v| v.as_str()).unwrap_or(""))
         });
         ok_json(serde_json::json!({"vms": vms}))
+    }
+
+    /// `POST /dbs` — create and start a new database.
+    ///
+    /// Orchestrates the full bring-up of a fresh database end-to-end:
+    /// 1. **Provision** a new VM (create + start). The vm_id is auto-generated
+    ///    (`"vm-{N}"`); the db_id is `N` — the same integer the VM bakes into
+    ///    its `tiko.env` as `TIKO_DB_ID`, so the in-guest identity matches the
+    ///    namespace the restore seeds.
+    /// 2. **Wait** for the in-guest `tikoguest` agent to come up (polled with
+    ///    retries — the guest needs a moment to boot).
+    /// 3. **Restore** the org's bootstrap pack onto the VM via the agent's
+    ///    `/branch/restore` (`parent_db_id` and `pack` both default inside the
+    ///    agent — the org's single bootstrap pack).
+    /// 4. **Start** Postgres (`/pg/start`), leaving a ready-to-serve database.
+    ///
+    /// Optional body: `{"project_id": N}` (defaults to the db_id).
+    ///
+    /// Returns `{"vm_id":"vm-N","db_id":N}`. On any failure the error from the
+    /// failing step is returned verbatim; the provisioned VM is left in place
+    /// (the caller may `DELETE /vms/{vm_id}` to clean up).
+    async fn create_db(&self, req: &Request) -> Response {
+        #[derive(serde::Deserialize, Default)]
+        struct CreateDbBody {
+            project_id: Option<u64>,
+        }
+        let body: CreateDbBody = if req.body.is_empty() {
+            CreateDbBody::default()
+        } else {
+            match serde_json::from_slice(&req.body) {
+                Ok(b) => b,
+                Err(e) => {
+                    return bad_request(&format!(
+                        "invalid body; expected {{\"project_id\":N}}: {e}"
+                    ))
+                }
+            }
+        };
+
+        // 1. Provision a fresh VM. The db_id is the vm_index baked into the
+        //    VM's tiko.env (TIKO_DB_ID = vm_index), i.e. the trailing integer
+        //    of the auto-generated "vm-{N}" id.
+        let vm_id = self.auto_vm_id().await;
+        let db_id = vm_index_of(&vm_id);
+        let config = self.default_vm_config(vm_id.clone());
+        let vm_id = match self.node.provision(config).await {
+            Ok(id) => id,
+            Err(e) => return err_resp(&e),
+        };
+        self.control
+            .register(vm_id.clone(), String::new(), String::new(), 5432);
+
+        // 2. Wait for the in-guest agent to boot.
+        if let Err(resp) = self.wait_for_agent(&vm_id).await {
+            return resp;
+        }
+
+        let client = match self.guest_client(&vm_id).await {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+
+        // 3. Restore the org's bootstrap pack (parent_db_id and pack default
+        //    inside the agent). project_id defaults to the db_id.
+        let restore_body = serde_json::json!({
+            "db_id": db_id,
+            "project_id": body.project_id.unwrap_or(db_id),
+        });
+        match client
+            .forward_raw("POST", "/branch/restore", restore_body.to_string().as_bytes())
+            .await
+        {
+            Ok((status, _)) if (200..300).contains(&status) => {}
+            Ok((status, body)) => return Response { status, body },
+            Err(e) => return guest_err_resp(e),
+        }
+
+        // 4. Start Postgres (left stopped by the restore).
+        match client.forward_raw("POST", "/pg/start", &[]).await {
+            Ok((status, _)) if (200..300).contains(&status) => {}
+            Ok((status, body)) => return Response { status, body },
+            Err(e) => return guest_err_resp(e),
+        }
+
+        ok_json(serde_json::json!({"vm_id": vm_id, "db_id": db_id}))
+    }
+
+    /// Poll the guest agent's `/health` endpoint until the agent is live AND
+    /// its S3-backed storage is mounted, or the retry budget is exhausted.
+    ///
+    /// Waiting on `storage_ready` (not just liveness) is essential: the agent
+    /// boots before the `/mnt/s3files` network mount finishes, so the very next
+    /// step (branch restore) would read the bootstrap pack from a half-mounted
+    /// filesystem and fail. The budget is sized for a cold NFS/efs-proxy mount.
+    /// Returns `Err(502)` if the agent/storage never become ready.
+    async fn wait_for_agent(&self, vm_id: &VmId) -> Result<(), Response> {
+        let client = self.guest_client(vm_id).await?;
+        const ATTEMPTS: u32 = 240;
+        const INTERVAL: Duration = Duration::from_millis(500);
+        let window_secs = ATTEMPTS * INTERVAL.as_millis() as u32 / 1000;
+        for _ in 0..ATTEMPTS {
+            match client.forward_raw("GET", "/health", &[]).await {
+                // Agent live AND storage mounted → ready. (A 2xx with
+                // storage_ready=false means the network mount is still in
+                // progress; fall through to retry.)
+                Ok((status, body))
+                    if (200..300).contains(&status) && storage_ready_from_health(&body) =>
+                {
+                    return Ok(())
+                }
+                // Agent not up yet (connection refused) or storage not ready — retry.
+                _ => {}
+            }
+            tokio::time::sleep(INTERVAL).await;
+        }
+        Err(Response {
+            status: 502,
+            body: serde_json::json!({
+                "error": {
+                    "kind": "agent_unreachable",
+                    "message": format!(
+                        "agent/storage for VM {vm_id} did not become ready within {window_secs}s"
+                    ),
+                }
+            })
+            .to_string()
+            .into_bytes(),
+        })
     }
 
     /// Dispatch `/vms/{vm_id}/db/{...}` routes to the in-guest `tikoguest` agent.
@@ -1166,4 +1301,26 @@ fn percent_decode_seg(seg: &str) -> &str {
     // decoding isn't required. We expose the raw segment so callers see the
     // exact characters. Reserved chars in vm_ids are not supported.
     seg
+}
+
+/// Extract the trailing integer of an auto-generated `"vm-{N}"` id. This is
+/// the vm_index the backend bakes into the guest's `tiko.env` as
+/// `TIKO_DB_ID`, so it doubles as the database id for `POST /dbs`. Falls back
+/// to 0 for any id that doesn't match the `vm-<digits>` shape.
+fn vm_index_of(vm_id: &VmId) -> u64 {
+    vm_id
+        .strip_prefix("vm-")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Parse a guest `/health` body and return its `storage_ready` flag. Defaults
+/// to `false` for older agents that don't report the field (so `wait_for_agent`
+/// keeps waiting rather than proceeding against an unready mount). Used to gate
+/// `create_db`'s restore/start calls until the S3 mount is up.
+fn storage_ready_from_health(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("storage_ready").and_then(|x| x.as_bool()))
+        .unwrap_or(false)
 }
