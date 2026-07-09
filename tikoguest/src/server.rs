@@ -24,7 +24,7 @@
 //! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` (db left stopped) |
 //! | `POST` | `/pitr/restart`| start db     | 200  starts the db left stopped by `recover` |
 //! | `PUT`  | `/branch/backup` | pack parent | 200  no body; saves pack to `TIKO_STORAGE_ROOT`; passes through `tiko_branch backup` JSON (incl. `pack`) |
-//! | `POST` | `/branch/restore`| setup branch| 200  body: `{"pack":"...","db_id":N,"parent_db_id":N,...}` (db left stopped); `tiko_branch restore` JSON |
+//! | `POST` | `/branch/restore`| setup branch| 200  body: `{"db_id":N,"parent_db_id":N,"pack":"..."?}` (`pack` defaults to the org bootstrap pack; db left stopped); `tiko_branch restore` JSON |
 //! | `POST` | `/branch/restart`| start branch| 200  optional body: `{"db_id":N,"project_id":N,"branch_port":N}`; passes through `tiko_branch restart` JSON |
 //!
 //! Every spawned `pg_ctl` / `initdb` inherits the per-VM Tiko identity
@@ -209,14 +209,38 @@ impl PgServer {
 
     /// `GET /health` — cheap liveness + coarse PG state (no pg_ctl spawn for
     /// the running flag; we infer from postmaster.pid presence).
+    ///
+    /// `storage_ready` reports whether the S3-backed `TIKO_STORAGE_ROOT` is
+    /// mounted and accessible. The agent boots before the network mount
+    /// (`/mnt/s3files`) finishes, so a live `/health` does NOT imply storage is
+    /// ready; callers that touch storage (branch restore/backup, PITR) must
+    /// wait for `storage_ready == true`.
     async fn health(&self) -> Response {
         let initialized = self.ctl.is_initialized();
         let running = self.ctl.pid().is_some();
+        let storage_ready = self.storage_ready();
         ok_json(serde_json::json!({
             "status": "ok",
             "initialized": initialized,
             "running": running,
+            "storage_ready": storage_ready,
         }))
+    }
+
+    /// Whether the S3-backed `TIKO_STORAGE_ROOT` is mounted and accessible.
+    /// See [`storage_mounted`] for the detection rationale (network mount may
+    /// still be in progress when the agent is already live).
+    fn storage_ready(&self) -> bool {
+        let Some(root) = self
+            .ctl
+            .tiko_env
+            .get("TIKO_STORAGE_ROOT")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        else {
+            return false;
+        };
+        storage_mounted(&root)
     }
 
     /// `GET /services` — list registered services and their status.
@@ -325,12 +349,13 @@ impl PgServer {
     /// can read it from its own VM). Returns the CLI's JSON output (including
     /// `pack`, `timeline`, `checkpoint_lsn`, ...) so tikod can pass the pack
     /// path to the child VM's `/branch/restore`. No request body.
+    ///
+    /// The pack is keyed by **org** (`branch_packs/{org_id}/bootstrap.tar.zst`),
+    /// not per database: each org keeps a single bootstrap pack that any new
+    /// db/project created under that org restores from. Taking a new backup
+    /// overwrites the previous bootstrap pack in place.
     async fn branch_backup(&self) -> Response {
-        // Derive the pack path from TIKO_STORAGE_ROOT + the parent's db_id.
-        let Some(storage_root) = self.ctl.tiko_env.get("TIKO_STORAGE_ROOT")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-        else {
+        let Some(pack_path) = self.bootstrap_pack_path() else {
             return Response {
                 status: 500,
                 body: serde_json::json!({
@@ -340,13 +365,6 @@ impl PgServer {
                 .into_bytes(),
             };
         };
-        let db_id = self
-            .ctl
-            .tiko_env
-            .get("TIKO_DB_ID")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        let pack_path = storage_root.join("branch_packs").join(format!("{db_id}.tar.zst"));
 
         let pg_basebackup = sibling_binary(&self.ctl.pg_ctl, "pg_basebackup");
         let mut cmd = Command::new(&self.tiko_branch);
@@ -362,6 +380,33 @@ impl PgServer {
         run_external(cmd, "branch_error").await
     }
 
+    /// The org-wide bootstrap pack path:
+    /// `{TIKO_STORAGE_ROOT}/branch_packs/{org_id}/bootstrap.tar.zst`.
+    ///
+    /// Each org keeps exactly one bootstrap pack, shared by every db/project
+    /// created under it. Returns `None` only when `TIKO_STORAGE_ROOT` is unset
+    /// (an explicit `org_id` of 0 still yields a valid path).
+    fn bootstrap_pack_path(&self) -> Option<PathBuf> {
+        let storage_root = self
+            .ctl
+            .tiko_env
+            .get("TIKO_STORAGE_ROOT")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)?;
+        let org_id = self
+            .ctl
+            .tiko_env
+            .get("TIKO_ORG_ID")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        Some(
+            storage_root
+                .join("branch_packs")
+                .join(org_id.to_string())
+                .join("bootstrap.tar.zst"),
+        )
+    }
+
     /// `POST /branch/restore` — spawn `tiko_branch restore` to unpack a pack
     /// file into the branch PGDATA, seed the branch namespace from the parent's
     /// base manifest, and run recovery. The branch promotes and is left
@@ -373,23 +418,30 @@ impl PgServer {
     /// child VM's `tiko_env` carries the branch's own identity for
     /// `Store::init()` (its db_id/project_id are irrelevant to the seeding,
     /// which keys off `--parent-db-id`).
+    ///
+    /// `pack` is optional: when omitted, it defaults to the org's bootstrap
+    /// pack (`{TIKO_STORAGE_ROOT}/branch_packs/{org_id}/bootstrap.tar.zst`),
+    /// i.e. the pack produced by `PUT /branch/backup` on the parent VM.
     async fn branch_restore(&self, body: &[u8]) -> Response {
         #[derive(serde::Deserialize)]
         struct RestoreBody {
-            pack: PathBuf,
+            /// Pack file to restore from. Optional — defaults to the org's
+            /// bootstrap pack when omitted.
+            pack: Option<PathBuf>,
             /// The NEW branch database id (`--db-id`). Required.
             db_id: u64,
             /// The PARENT's database id — passed as `--parent-db-id` so
             /// `tiko_branch restore` resolves the parent's base manifest.
-            /// Required.
-            parent_db_id: u64,
+            /// Optional — defaults to 0 (no parent: a fresh bootstrap from
+            /// the pack, rather than copy-on-write from an existing db).
+            parent_db_id: Option<u64>,
             /// The NEW branch project id (`--project-id`). Defaults to `db_id`.
             project_id: Option<u64>,
             /// Port the branch PostgreSQL listens on. Defaults to 5432.
             branch_port: Option<u16>,
         }
         let body: RestoreBody = if body.is_empty() {
-            return bad_request("branch restore requires 'pack', 'db_id', and 'parent_db_id'");
+            return bad_request("branch restore requires 'db_id'");
         } else {
             match serde_json::from_slice(body) {
                 Ok(b) => b,
@@ -397,12 +449,34 @@ impl PgServer {
             }
         };
 
+        // Resolve the pack: an explicit body value, else the org's bootstrap
+        // pack (the one `PUT /branch/backup` writes on the parent VM).
+        let pack = match body.pack {
+            Some(p) => p,
+            None => match self.bootstrap_pack_path() {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        status: 500,
+                        body: serde_json::json!({
+                            "error": {
+                                "kind": "config_error",
+                                "message": "pack not provided and TIKO_STORAGE_ROOT is not set"
+                            }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    };
+                }
+            },
+        };
+
         let mut cmd = Command::new(&self.tiko_branch);
         cmd.arg("restore")
             .arg("--pack")
-            .arg(&body.pack)
+            .arg(&pack)
             .arg("--parent-db-id")
-            .arg(body.parent_db_id.to_string())
+            .arg(body.parent_db_id.unwrap_or(0).to_string())
             .arg("--db-id")
             .arg(body.db_id.to_string())
             .arg("--pgdata")
@@ -618,5 +692,38 @@ fn sibling_binary(pg_ctl: &Path, name: &str) -> PathBuf {
     match pg_ctl.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
         _ => PathBuf::from(name),
+    }
+}
+
+/// True if `root` is stat-able AND sits on a mounted filesystem distinct from
+/// the root fs.
+///
+/// The agent boots before the `/mnt/s3files` network mount (NFSv4.2 via a local
+/// efs-proxy) finishes. Before `mount(2)` completes, the placeholder directory
+/// (if any) lives on the root filesystem, so its device id matches `/`'s and
+/// this returns `false`. Once the mount lands, the device id changes and this
+/// returns `true` — a reliable, spawn-free readiness signal that the network
+/// storage is actually serving.
+///
+/// Detection walks up from `root` to the filesystem boundary: the deepest
+/// ancestor whose device differs from its parent is the mountpoint. If `root`
+/// is on the root fs (no boundary before `/`), this returns `false`.
+fn storage_mounted(root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let dev = match std::fs::metadata(root) {
+        Ok(m) => m.dev(),
+        Err(_) => return false,
+    };
+    let mut p = PathBuf::from(root);
+    loop {
+        let Some(parent) = p.parent().map(Path::to_path_buf) else {
+            return false; // reached "/" with no device boundary
+        };
+        match std::fs::metadata(&parent) {
+            // Parent on a different device → `p` is (on) a mounted filesystem.
+            Ok(m) if m.dev() != dev => return true,
+            Ok(_) => p = parent, // same device; keep ascending
+            Err(_) => return false,
+        }
     }
 }
