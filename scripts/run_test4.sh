@@ -12,27 +12,28 @@ export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${BASE_DIR}/target"
 POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 PG_BIN_DIR="${POSTGRES_INSTALL}/bin"
 PG_LIB_DIR="${POSTGRES_INSTALL}/lib/postgresql"
 
 echo "Building Tiko smgr..."
-if ! (cargo build -p smgr) >/dev/null; then
+if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr) >/dev/null; then
   echo "Tiko smgr build failed" >&2
   exit 1
 fi
 
 echo "Building PostgreSQL..."
-rm -f postgres/src/backend/postgres
-if ! (cd postgres && make -j4 && make install) >/dev/null; then
+rm -f "${BASE_DIR}/postgres/src/backend/postgres"
+if ! (cd "${BASE_DIR}/postgres" && make -j4 && make install) >/dev/null; then
   echo "Postgres build/install failed" >&2
   exit 1
 fi
 
 echo "Building Tiko Worker..."
-if ! (cargo build -p worker) >/dev/null; then
+if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p worker) >/dev/null; then
   echo "Tiko Worker build failed" >&2
   exit 1
 fi
@@ -47,14 +48,15 @@ if [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
     cp "${TARGET_DIR}/debug/libtikoworker.so" "${PG_LIB_DIR}"
 fi
 
-rm -rf tt log.log
-$PG_BIN_DIR/initdb -D tt
-cp ./postgresql.conf.sample tt/postgresql.conf
+TEST_DIR="${BASE_DIR}/tt"
+rm -rf "${TEST_DIR}" "${BASE_DIR}/log.log"
+$PG_BIN_DIR/initdb -D "${TEST_DIR}"
+cp "${BASE_DIR}/postgresql.conf.sample" "${TEST_DIR}/postgresql.conf"
 
-$PG_BIN_DIR/pg_ctl -D tt -l log.log start
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" start
 
 $PG_BIN_DIR/psql -d postgres -c "create temp table tt(a int);create index idx_tt on tt(a);insert into tt values(123);select * from tt;"
 
 sleep 2
 
-$PG_BIN_DIR/pg_ctl -D tt -l log.log stop
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" stop

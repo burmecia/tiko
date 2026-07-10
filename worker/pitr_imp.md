@@ -890,7 +890,7 @@ All tests run with `cargo test` only. No LocalStack, no Docker, no network.
 
 ### Full regression test
 ```bash
-./run_test.sh
+./scripts/run_test.sh
 # Runs postgres/src/test/modules/test_tiko/ via pg_regress
 ```
 

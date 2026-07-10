@@ -12,7 +12,7 @@ Requires Rust 1.88+ (edition 2024). PostgreSQL is a git submodule under `postgre
 
 ```bash
 # Build everything and run tests
-./run_test.sh
+./scripts/run_test.sh
 
 # Build individual crates
 cd s3smgr && cargo build --release    # produces target/release/libs3smgr.a (staticlib)

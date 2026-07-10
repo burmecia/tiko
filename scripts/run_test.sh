@@ -15,14 +15,15 @@ export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
 export TIKO_PITR_INTERVAL_SECS="300"
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${BASE_DIR}/target"
 TEST_DIR="${BASE_DIR}/postgres/src/test/modules/test_tiko"
 POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 EXTENSION_DIR="${POSTGRES_INSTALL}/share/postgresql/extension"
 
 echo "Building Tiko smgr..."
-if ! (cargo build -p smgr) >/dev/null; then
+if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr) >/dev/null; then
   echo "Tiko smgr build failed" >&2
   exit 1
 fi
@@ -34,14 +35,14 @@ if [ ! -f "${TARGET_DIR}/debug/libtikosmgr.a" ]; then
 fi
 
 echo "Building PostgreSQL..."
-rm -f postgres/src/backend/postgres
-if ! (cd postgres && make -j4 && make install) >/dev/null; then
+rm -f "${BASE_DIR}/postgres/src/backend/postgres"
+if ! (cd "${BASE_DIR}/postgres" && make -j4 && make install) >/dev/null; then
   echo "Postgres build/install failed" >&2
   exit 1
 fi
 
 echo "Building Tiko Worker..."
-if ! (cargo build -p worker) >/dev/null; then
+if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p worker) >/dev/null; then
   echo "Tiko Worker build failed" >&2
   exit 1
 fi
@@ -59,7 +60,7 @@ if [ -f "${TARGET_DIR}/debug/${WORKER_LIB}" ]; then
 fi
 
 echo "Running tests..."
-if ! (cd postgres/src/test/modules/test_tiko && make check PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libtikoworker -c shared_buffers=256kB') >/dev/null; then
+if ! (cd "${BASE_DIR}/postgres/src/test/modules/test_tiko" && make check PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libtikoworker -c shared_buffers=256kB') >/dev/null; then
   echo "Test Tiko failed" >&2
   exit 1
 fi

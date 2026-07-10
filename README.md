@@ -121,7 +121,7 @@ git submodule update --init postgres
 ### Build & run the storage tests
 
 ```bash
-./run_test.sh
+./scripts/run_test.sh
 ```
 
 This builds the Rust crates, compiles the patched PostgreSQL, and runs the
