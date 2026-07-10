@@ -118,13 +118,19 @@ Install Rust 1.88
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.88.0
 ```
 
+Clone Tiko repo
+
 ```bash
 git clone https://github.com/burmecia/tiko.git
-git submodule update --init postgres
+cd tiko
 ```
 
 Build Postgres:
+
 ```bash
+git submodule update --init postgres
+cd postgres
+
 sudo apt-get install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config
 
 ./configure --prefix $(realpath ../)/target/pg-install \
@@ -178,24 +184,6 @@ Update S3 Files config in `scripts/mount_s3files_vm.sh`.
 
 
 ### Build & run the storage tests
-
-Build postgres:
-
-```bash
-cd postgres
-
-./configure --prefix $(realpath ../)/target/pg-install \
-    --enable-debug \
-    --enable-cassert \
-    --without-openssl \
-    --without-systemd \
-    --without-libxml \
-    --without-libxslt \
-    --without-llvm \
-    --without-selinux
-
-make -j$(nproc)
-```
 
 ```bash
 ./scripts/run_test.sh
