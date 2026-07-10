@@ -23,9 +23,12 @@
 
 set -euo pipefail
 
+# Modify below accoding to your S3 Files config
 FILE_SYSTEM_ID=fs-02b6905b6653757b6
 MOUNT_TARGET_IP=172.31.38.90        # apse2-az3, same subnet as the host
 AWS_REGION=ap-southeast-2
+
+
 MOUNT_POINT=/mnt/s3files
 
 # Optional access point (root dir "/lambda", uid/gid 1000). Leave empty to mount

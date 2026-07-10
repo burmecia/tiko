@@ -121,6 +121,11 @@ Tiko runs each PostgreSQL database inside a Firecracker microVM. The
   `scripts/download_kernel.sh`, `scripts/create_rootfs.sh`, and
   `scripts/build_initramfs.sh`).
 
+```bash
+cd firecracker
+export FIRECRACKER_BIN=$(realpath ./build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker)
+```
+
 ### AWS S3 Files
 
 Tiko uses [AWS S3 Files] as its object-storage backend. The guest VM mounts
@@ -132,6 +137,8 @@ an S3 Files file system via NFSv4.2 (TLS + IAM), requiring:
 - The `amazon-efs-utils` package installed in the guest rootfs.
 
 See `tikod/docs/s3-files-setup.md` for the full setup runbook.
+
+Update S3 Files config in `scripts/mount_s3files_vm.sh`.
 
 [AWS S3 Files]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.html
 
@@ -147,14 +154,27 @@ Install Rust 1.88
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.88.0
 ```
 
-Install Postgres build requirements:
-```bash
-sudo apt-get install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config
-```
-
 ```bash
 git clone https://github.com/burmecia/tiko.git
 git submodule update --init postgres
+```
+
+Build Postgres:
+```bash
+sudo apt-get install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config
+
+./configure --prefix $(realpath ../)/target/pg-install \
+    --enable-debug \
+    --enable-cassert \
+    --without-openssl \
+    --without-systemd \
+    --without-libxml \
+    --without-libxslt \
+    --without-llvm \
+    --without-icu \
+    --without-selinux
+
+make -j$(nproc) && make install
 ```
 
 ### Build & run the storage tests
@@ -179,6 +199,24 @@ make -j$(nproc)
 
 ```bash
 ./scripts/run_test.sh
+```
+
+Copy S3 Files creds file and fill in your AWS access credentials:
+
+```bash
+cp ./scripts/s3files-creds.env.sample ./tikod/assets/s3files-creds.env
+```
+
+Prepare tikod and VM
+
+```bash
+./scripts/download_kernel.sh
+./scripts/build_initramfs.sh
+./scripts/create_rootfs.sh
+```
+
+```bash
+RUST_LOG=tikod=debug cargo run -p tikod
 ```
 
 This builds the Rust crates, compiles the patched PostgreSQL, and runs the
