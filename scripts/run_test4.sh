@@ -51,7 +51,8 @@ fi
 TEST_DIR="${BASE_DIR}/tt"
 rm -rf "${TEST_DIR}" "${BASE_DIR}/log.log"
 $PG_BIN_DIR/initdb -D "${TEST_DIR}"
-cp "${BASE_DIR}/postgresql.conf.sample" "${TEST_DIR}/postgresql.conf"
+cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
+echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
 $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" start
 

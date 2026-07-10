@@ -48,7 +48,7 @@ fi
 # Fresh cluster + fresh Tiko storage root.
 rm -rf tt "${TIKO_STORAGE_ROOT}" log.log recovery.out
 $PG_BIN_DIR/initdb -D tt --auth=trust --no-instructions
-cp ./postgresql.conf.sample tt/postgresql.conf
+cp ./scripts/postgresql.conf.sample tt/postgresql.conf
 
 # Stop any postgres that might still own port 5432 / the tt data dir.
 $PG_BIN_DIR/pg_ctl -D tt -l log.log stop -m fast -w 2>/dev/null || true

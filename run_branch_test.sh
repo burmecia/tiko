@@ -45,7 +45,7 @@ fi
 TIKO_PACK="${PWD}/tt_branch_pack.tar.zst"
 rm -rf tt tt_branch "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" parent.log
 $PG_BIN_DIR/initdb -D tt --auth=trust --no-instructions
-cp ./postgresql.conf.sample tt/postgresql.conf
+cp ./scripts/postgresql.conf.sample tt/postgresql.conf
 
 $PG_BIN_DIR/pg_ctl -D tt -l parent.log start -w
 

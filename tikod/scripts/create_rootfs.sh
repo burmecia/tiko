@@ -191,7 +191,7 @@ echo ">>> Installing Postgres..."
 sudo cp -r $PG_INSTALL_DIR/* "$PG_TGT_DIR/"
 sudo cp "$SCRIPT_DIR/start_pg.sh" "$SCRIPT_DIR/init_pg.sh" "$SCRIPT_DIR/tiko_env.sh" "$PG_HOME_DIR"
 sudo chmod +x "$PG_HOME_DIR/start_pg.sh" "$PG_HOME_DIR/init_pg.sh" "$PG_HOME_DIR/tiko_env.sh"
-sudo cp "$SCRIPT_DIR/../../postgresql.tiko.conf" "$PG_HOME_DIR"
+sudo cp "$SCRIPT_DIR/../../scripts/postgresql.tiko.conf" "$PG_HOME_DIR"
 
 echo ">>> Installing tikoguest guest agent..."
 # Build the control agent (release) and bake it into the image. tikod reaches
