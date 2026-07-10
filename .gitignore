@@ -1,5 +1,7 @@
 /target
 /tt
+/tiko
+/tt_branch
 /tiko_root
 /tikod/assets/*
 !/tikod/assets/.gitkeep

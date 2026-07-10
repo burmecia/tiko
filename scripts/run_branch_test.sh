@@ -16,24 +16,26 @@ unset TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
-# Shared storage root OUTSIDE both PGDATAs so parent + branch share one tree
-# (required for copy-on-write: the branch reads the parent's chunks in place).
-export TIKO_STORAGE_ROOT="${PWD}/tiko_root"
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${BASE_DIR}/target"
 PG_BIN_DIR="${TARGET_DIR}/pg-install/bin"
 PG_LIB_DIR="${TARGET_DIR}/pg-install/lib/postgresql"
 TIKO_BIN_DIR="${TARGET_DIR}/debug"
 
+# Shared storage root OUTSIDE both PGDATAs so parent + branch share one tree
+# (required for copy-on-write: the branch reads the parent's chunks in place).
+export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"
+
 echo "Building Tiko smgr + worker + cli..."
-if ! (cargo build -p smgr -p worker -p cli) >/dev/null; then
+if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr -p worker -p cli) >/dev/null; then
   echo "Build failed" >&2; exit 1
 fi
 
 echo "Building PostgreSQL..."
-rm -f postgres/src/backend/postgres
-if ! (cd postgres && make -j4 && make install) >/dev/null; then
+rm -f "${BASE_DIR}/postgres/src/backend/postgres"
+if ! (cd "${BASE_DIR}/postgres" && make -j4 && make install) >/dev/null; then
   echo "Postgres build/install failed" >&2; exit 1
 fi
 
@@ -42,12 +44,12 @@ if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
 fi
 
 # Fresh parent cluster + shared storage root.
-TIKO_PACK="${PWD}/tt_branch_pack.tar.zst"
-rm -rf tt tt_branch "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" parent.log
-$PG_BIN_DIR/initdb -D tt --auth=trust --no-instructions
-cp ./scripts/postgresql.conf.sample tt/postgresql.conf
+TIKO_PACK="${BASE_DIR}/tt_branch_pack.tar.zst"
+rm -rf "${BASE_DIR}/tt" "${BASE_DIR}/tt_branch" "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" "${BASE_DIR}/parent.log"
+$PG_BIN_DIR/initdb -D "${BASE_DIR}/tt" --auth=trust --no-instructions
+cp "${SCRIPT_DIR}/postgresql.conf.sample" "${BASE_DIR}/tt/postgresql.conf"
 
-$PG_BIN_DIR/pg_ctl -D tt -l parent.log start -w
+$PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt" -l "${BASE_DIR}/parent.log" start -w
 
 # 1. Seed the parent with data spanning several pages, then checkpoint.
 $PG_BIN_DIR/psql -p 5432 -d postgres -c \
@@ -73,13 +75,13 @@ echo "--- tiko_branch restore ---"
   --pack "${TIKO_PACK}" \
   --parent-db-id 34 \
   --db-id 35 \
-  --pgdata tt_branch --branch-port 5433 \
+  --pgdata "${BASE_DIR}/tt_branch" --branch-port 5433 \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"
 
 echo "--- tiko_branch restart ---"
 "${TIKO_BIN_DIR}/tiko_branch" restart \
   --db-id 35 \
-  --pgdata tt_branch --branch-port 5433 \
+  --pgdata "${BASE_DIR}/tt_branch" --branch-port 5433 \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"
 
 # 3. Verify the branch reads the parent's data via copy-on-write.
@@ -108,7 +110,7 @@ if [ "${BRANCH_COUNT2}" != "201" ]; then
 fi
 
 # Cleanup.
-$PG_BIN_DIR/pg_ctl -D tt_branch stop -m fast -w
-$PG_BIN_DIR/pg_ctl -D tt stop -m fast -w
+$PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt_branch" stop -m fast -w
+$PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt" stop -m fast -w
 rm -f "${TIKO_PACK}"
 echo "Branch test passed. ✅"
