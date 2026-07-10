@@ -140,11 +140,41 @@ See `tikod/docs/s3-files-setup.md` for the full setup runbook.
 
 Requires **Rust 1.88+** (edition 2024) and the PostgreSQL submodule initialized:
 
+Install Rust 1.88
+
 ```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.88.0
+```
+
+Install Postgres build requirements:
+```bash
+sudo apt-get install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config
+```
+
+```bash
+git clone https://github.com/burmecia/tiko.git
 git submodule update --init postgres
 ```
 
 ### Build & run the storage tests
+
+Build postgres:
+
+```bash
+cd postgres
+
+./configure --prefix $(realpath ../)/target/pg-install \
+    --enable-debug \
+    --enable-cassert \
+    --without-openssl \
+    --without-systemd \
+    --without-libxml \
+    --without-libxslt \
+    --without-llvm \
+    --without-selinux
+
+make -j$(nproc)
+```
 
 ```bash
 ./scripts/run_test.sh
