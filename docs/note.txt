@@ -1,0 +1,23 @@
+# build for testing Tiko S3Smgr extension
+./configure --prefix $(realpath ../)/target/pg-install \
+    --enable-debug \
+    --enable-cassert \
+    --without-openssl \
+    --without-systemd \
+    --without-libxml \
+    --without-libxslt \
+    --without-llvm \
+    --without-selinux
+
+
+make -j$(nproc)
+make install-strip
+
+# check WAL archive status
+SELECT * FROM pg_stat_archiver;
+
+# check WAL archive settings
+SELECT name, setting, unit
+FROM pg_settings
+WHERE name IN ('archive_mode', 'archive_command', 'archive_timeout');
+

@@ -24,6 +24,3 @@ clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 async-trait = "0.1"
 libc = { workspace = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-arcbox-vz = { version = "0.4", features = ["macos-14"] }

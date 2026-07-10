@@ -1,23 +1,19 @@
 //! VMM abstraction layer.
 //!
 //! Defines the [`Vmm`] trait that abstracts the hypervisor backend, allowing
-//! `tikod` to run on macOS (Apple Virtualization Framework) for development
-//! and on Linux (Firecracker) for production.
+//! `tikod` to run on Linux (Firecracker) for production.
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────┐
 //! │ node/ module  ─── uses ──→  trait Vmm            │
-//! │                               ▲         ▲        │
-//! │                   ┌───────────┘         │        │
-//! │              AppleVzVmm            FirecrackerVmm│
-//! │              (macOS dev)           (Linux prod)  │
+//! │                               ▲                  │
+//! │                               │                  │
+//! │                          FirecrackerVmm          │
+//! │                          (Linux prod)            │
 //! └─────────────────────────────────────────────────┘
 //! ```
 
 pub mod firecracker;
-
-#[cfg(target_os = "macos")]
-pub mod apple_vz;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -148,7 +144,6 @@ pub type VmmResult<T> = Result<T, VmmError>;
 /// Abstract hypervisor backend.
 ///
 /// Each implementation wraps a specific VMM:
-/// - [`apple_vz::AppleVzVmm`] — Apple Virtualization Framework (macOS dev)
 /// - [`firecracker::FirecrackerVmm`] — Firecracker microVM (Linux prod)
 ///
 /// The backend owns the VM state internally, keyed by [`VmId`]. All methods
@@ -189,12 +184,6 @@ pub trait Vmm: Send + Sync {
     /// inventory — tikod merges it with its control registry to produce the
     /// swarm-wide `GET /vms` view.
     async fn list_vms(&self) -> VmmResult<Vec<VmInfo>>;
-}
-
-/// Returns the platform-default VMM backend.
-#[cfg(target_os = "macos")]
-pub fn default_vmm(snapshot_dir: std::path::PathBuf) -> Box<dyn Vmm> {
-    Box::new(apple_vz::AppleVzVmm::new(snapshot_dir))
 }
 
 /// Returns the platform-default VMM backend.

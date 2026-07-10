@@ -42,7 +42,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ASSETS_DIR="$SCRIPT_DIR/../assets"
-FC_DIR="$SCRIPT_DIR/../../firecracker/build/cargo_target/x86_64-unknown-linux-musl/debug"
+FC_DIR="${FIRECRACKER_DIR:-$(dirname "$(command -v firecracker 2>/dev/null || echo /usr/local/bin/firecracker)")}"
 BASE_IMAGE="$ASSETS_DIR/ubuntu-24.04-rootfs.ext4"
 INITRAMFS="$ASSETS_DIR/tiko-initramfs.cpio.gz"
 

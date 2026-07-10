@@ -848,8 +848,7 @@ impl FirecrackerVmm {
         ensure_kvm_access();
 
         let fc_bin = std::env::var("FIRECRACKER_BIN").unwrap_or_else(|_| {
-            "/home/ubuntu/tiko/firecracker/build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker"
-                .into()
+            "firecracker".into()
         });
 
         Self {

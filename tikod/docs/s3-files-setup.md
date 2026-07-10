@@ -60,8 +60,8 @@ an instance profile. A least-privilege IAM user feeds it static credentials.
   `arn:aws:s3:::s3fs-test-3872/*`, `s3:ListBucket` on the bucket, and
   read-only control-plane on the file system (so the helper can call
   `s3files:GetMountTarget`/`ListMountTargets` even with `mounttargetip`).
-- Access key id: `AKIAS7BNIVLMLNKO2KUS` (secret is in
-  `tikod/assets/s3files-creds.env`, which is gitignored — never commit it).
+- Access key id + secret: stored in `tikod/assets/s3files-creds.env`
+  (gitignored — never commit it).
 
 To recreate the access key:
 ```bash

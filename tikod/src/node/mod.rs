@@ -25,7 +25,7 @@ use crate::vmm::{Snapshot, VmConfig, VmId, VmInfo, VmState, Vmm};
 /// Owns the VMM backend and adds orchestration logic for freeze,
 /// snapshot caching, and endpoint discovery.
 pub struct Node {
-    /// The VMM backend (AppleVzVmm on macOS, FirecrackerVmm on Linux).
+    /// The VMM backend (FirecrackerVmm on Linux).
     vmm: Arc<dyn Vmm>,
     /// Directory for snapshot files.
     snapshot_dir: PathBuf,

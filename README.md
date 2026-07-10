@@ -41,8 +41,7 @@ PG18's asynchronous I/O subsystem.
 
 ### Compute control plane (`tikod`)
 - **microVM lifecycle**: provision / start / pause / resume / snapshot / destroy,
-  backed by Firecracker on Linux (production) and Apple Virtualization Framework on
-  macOS (development).
+  backed by Firecracker on Linux (production).
 - **PG wire-protocol proxy** with **wake-on-connect**: a frozen VM is transparently
   restored on the first client connection, so databases can scale to zero without
   dropping clients.
@@ -86,7 +85,6 @@ PG18's asynchronous I/O subsystem.
 ```
 tiko/
 ├── postgres/        # vendored PostgreSQL (git submodule) + Tiko patches
-├── firecracker/     # vendored Firecracker microVMM (git submodule)
 ├── pgsys/           # hand-written PostgreSQL FFI bindings (extern "C")
 ├── core/            # storage layer: chunks, manifests, store, I/O engine
 ├── smgr/            # tikosmgr — PostgreSQL storage manager (s3_* functions)
@@ -107,6 +105,34 @@ pgsys ──→ core ──→ smgr (tikosmgr) ──→ postgres
 `tikod` and `tikoguest` are standalone binaries with no internal Rust deps: they
 orchestrate Postgres and the storage layer by spawning CLIs / `pg_ctl` and over
 HTTP, not by linking the storage crates.
+
+---
+
+## Prerequisites
+
+### Firecracker
+
+Tiko runs each PostgreSQL database inside a Firecracker microVM. The
+`firecracker` binary must be available on the host (in `$PATH` or via the
+`FIRECRACKER_BIN` / `FIRECRACKER_DIR` environment variables).
+
+- A KVM-enabled Linux host is required (`/dev/kvm`).
+- Guest kernel and rootfs images must be built separately (see
+  `tikod/scripts/download_kernel.sh` and `tikod/scripts/create_rootfs.sh`).
+
+### AWS S3 Files
+
+Tiko uses [AWS S3 Files] as its object-storage backend. The guest VM mounts
+an S3 Files file system via NFSv4.2 (TLS + IAM), requiring:
+
+- An S3 Files file system and mount target in the host's AZ.
+- Static IAM credentials for the guest (the guest has no instance metadata
+  service). Store them in `tikod/assets/s3files-creds.env` (gitignored).
+- The `amazon-efs-utils` package installed in the guest rootfs.
+
+See `tikod/docs/s3-files-setup.md` for the full setup runbook.
+
+[AWS S3 Files]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.html
 
 ---
 

@@ -21,7 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ASSETS_DIR="$SCRIPT_DIR/../assets"
-FC_DIR="$SCRIPT_DIR/../../firecracker/build/cargo_target/x86_64-unknown-linux-musl/debug"
+FC_DIR="${FIRECRACKER_DIR:-$(dirname "$(command -v firecracker 2>/dev/null || echo /usr/local/bin/firecracker)")}"
 
 VM_ID="${VM_ID:-0}"
 [ $# -ge 1 ] && [ "$1" != "--" ] && VM_ID="$1"

@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-# stress_cleanup.sh — tear down everything left behind by a stress test run.
+# cleanup.sh — tear down everything left behind by a stress test run.
 #
 #   1. Kill the tikod server process
 #   2. Remove the tikod tmp directory
 #   3. Delete all leftover tiko tap interfaces
 #
 # Usage:
-#   ./stress_cleanup.sh
+#   ./cleanup.sh
 #
 # Env:
 #   TIKOD_PID   kill a specific PID instead of pkill    (default: empty)
