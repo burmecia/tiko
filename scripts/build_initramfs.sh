@@ -18,7 +18,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ASSETS_DIR="$SCRIPT_DIR/../assets"
+ASSETS_DIR="$SCRIPT_DIR/../tikod/assets"
 INITRAMFS="$ASSETS_DIR/tiko-initramfs.cpio.gz"
 INIT_SRC="$SCRIPT_DIR/initramfs_init.sh"
 

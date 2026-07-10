@@ -3,10 +3,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ASSETS_DIR="$SCRIPT_DIR/../assets"
+ASSETS_DIR="$SCRIPT_DIR/../tikod/assets"
 IMAGE="$ASSETS_DIR/ubuntu-24.04-rootfs.ext4"
 ROOTFS=/tmp/rootfs
-PG_INSTALL_DIR="$SCRIPT_DIR/../../target/pg-install"
+PG_INSTALL_DIR="$SCRIPT_DIR/../target/pg-install"
 PG_TGT_DIR="$ROOTFS/usr/local"
 PG_HOME_DIR="$ROOTFS/var/lib/postgresql"
 
@@ -191,13 +191,13 @@ echo ">>> Installing Postgres..."
 sudo cp -r $PG_INSTALL_DIR/* "$PG_TGT_DIR/"
 sudo cp "$SCRIPT_DIR/start_pg.sh" "$SCRIPT_DIR/init_pg.sh" "$SCRIPT_DIR/tiko_env.sh" "$PG_HOME_DIR"
 sudo chmod +x "$PG_HOME_DIR/start_pg.sh" "$PG_HOME_DIR/init_pg.sh" "$PG_HOME_DIR/tiko_env.sh"
-sudo cp "$SCRIPT_DIR/../../scripts/postgresql.tiko.conf" "$PG_HOME_DIR"
+sudo cp "$SCRIPT_DIR/postgresql.tiko.conf" "$PG_HOME_DIR"
 
 echo ">>> Installing tikoguest guest agent..."
 # Build the control agent (release) and bake it into the image. tikod reaches
 # it over the guest IP at :9000 (see tikod/src/guestcontrol.rs).
-( cd "$SCRIPT_DIR/../.." && cargo build --release -p tikoguest )
-sudo install -m755 "$SCRIPT_DIR/../../target/release/tikoguest" "$ROOTFS/usr/local/bin/tikoguest"
+( cd "$SCRIPT_DIR/.." && cargo build --release -p tikoguest )
+sudo install -m755 "$SCRIPT_DIR/../target/release/tikoguest" "$ROOTFS/usr/local/bin/tikoguest"
 sudo install -m644 "$SCRIPT_DIR/tikoguest.service" "$ROOTFS/etc/systemd/system/tikoguest.service"
 # Enable at boot by creating the wants symlink (equivalent to `systemctl enable`
 # from inside the chroot, done host-side since the chroot phase already ran).
@@ -206,16 +206,16 @@ sudo ln -sf /etc/systemd/system/tikoguest.service \
     "$ROOTFS/etc/systemd/system/multi-user.target.wants/tikoguest.service"
 
 echo ">>> Installing CLI tools..."
-( cd "$SCRIPT_DIR/../.." && cargo build --release -p cli )
+( cd "$SCRIPT_DIR/.." && cargo build --release -p cli )
 sudo mkdir -p "$ROOTFS/usr/local/libexec"
 for bin in tiko_tlseg_viewer; do
-    sudo install -m755 "$SCRIPT_DIR/../../target/release/$bin" "$ROOTFS/usr/local/bin/$bin"
+    sudo install -m755 "$SCRIPT_DIR/../target/release/$bin" "$ROOTFS/usr/local/bin/$bin"
 done
 # tiko_pitr / tiko_branch / tiko_restore: real binary in libexec, wrapper at
 # /usr/local/bin sources tiko_env.sh so identity/storage/PGDATA are set up
 # automatically.
 for bin in tiko_pitr tiko_branch tiko_restore; do
-    sudo install -m755 "$SCRIPT_DIR/../../target/release/$bin" "$ROOTFS/usr/local/libexec/$bin"
+    sudo install -m755 "$SCRIPT_DIR/../target/release/$bin" "$ROOTFS/usr/local/libexec/$bin"
     sudo install -m755 "$SCRIPT_DIR/$bin.sh" "$ROOTFS/usr/local/bin/$bin"
 done
 

@@ -72,8 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !path.exists() {
             eprintln!("{name} not found at {}", path.display());
             eprintln!(
-                "Run: tikod/scripts/download_kernel.sh && tikod/scripts/create_rootfs.sh \
-                 && tikod/scripts/build_initramfs.sh"
+                "Run: scripts/download_kernel.sh && scripts/create_rootfs.sh \
+                 && scripts/build_initramfs.sh"
             );
             std::process::exit(1);
         }

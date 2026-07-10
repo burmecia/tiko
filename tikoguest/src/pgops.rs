@@ -310,7 +310,7 @@ impl PgCtl {
 
     /// `initdb` — initialize a fresh cluster in the data directory.
     ///
-    /// Mirrors `tikod/scripts/init_pg.sh`:
+    /// Mirrors `scripts/init_pg.sh`:
     ///   1. refuse if postgres is still running (caller must stop first)
     ///   2. refuse if already initialized unless `force` wipes it first
     ///   3. `initdb -D <data_dir> --auth=trust`

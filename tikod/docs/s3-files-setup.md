@@ -80,7 +80,7 @@ aws s3files list-mount-targets \
 
 ## What is baked into the rootfs
 
-`tikod/scripts/create_rootfs.sh` now does the following when building the image
+`scripts/create_rootfs.sh` now does the following when building the image
 (so a freshly built VM auto-mounts on boot):
 
 1. Installs `amazon-efs-utils` (>= 3.0.0) + `botocore` (already there).
@@ -113,7 +113,7 @@ fs-02b6905b6653757b6:/ /mnt/s3files s3files _netdev,nofail,mounttargetip=172.31.
 So building with creds present:
 ```bash
 S3FILES_AWS_ACCESS_KEY_ID=AKIA... S3FILES_AWS_SECRET_ACCESS_KEY=... \
-  ./tikod/scripts/create_rootfs.sh
+  ./scripts/create_rootfs.sh
 ```
 
 ---

@@ -118,7 +118,8 @@ Tiko runs each PostgreSQL database inside a Firecracker microVM. The
 
 - A KVM-enabled Linux host is required (`/dev/kvm`).
 - Guest kernel and rootfs images must be built separately (see
-  `tikod/scripts/download_kernel.sh` and `tikod/scripts/create_rootfs.sh`).
+  `scripts/download_kernel.sh`, `scripts/create_rootfs.sh`, and
+  `scripts/build_initramfs.sh`).
 
 ### AWS S3 Files
 

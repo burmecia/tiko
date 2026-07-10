@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ASSETS_DIR="$SCRIPT_DIR/../assets"
+ASSETS_DIR="$SCRIPT_DIR/../tikod/assets"
 
 ARCH="$(uname -m)"
 S3="https://s3.amazonaws.com/spec.ccfc.min"

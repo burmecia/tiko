@@ -13,7 +13,7 @@ storage manager, before any storage-layer optimization.
   - `shared_buffers` ≈ 128 MB (default 25% of RAM) — note this is smaller than
     the test table, so scans are cache-thrashing, not truly warm.
 - **Rootfs**: 5 GB sparse ext4 image (`tikod/assets/ubuntu-24.04-rootfs.ext4`),
-  built by `tikod/scripts/create_rootfs.sh`.
+  built by `scripts/create_rootfs.sh`.
 - **Postgres**: Tiko build, `s3smgr` storage manager registered.
 - **Tiko I/O unit**: **chunk = 256 KB** (32 × 8 KB blocks). All throughput
   numbers below can be read as chunks/s by dividing MB/s by 0.256.
