@@ -20,7 +20,7 @@
 //! | `GET`  | `/vms`                      | list VMs          | `{"vms":[{vm_id,...},...]}`              |
 //! | `PUT`  | `/vms`                      | create_vm         | `{"vm_id":"..."}`  body optional (auto-generates id) |
 //! | `POST` | `/vms/provision`            | create + start    | `{"vm_id":"..."}`  body optional (auto-generates id) |
-//! | `POST` | `/dbs`                      | create + start db | `{"vm_id":"...","db_id":N}`  body optional `{"project_id":N}` (provisions a VM, restores the org bootstrap pack, starts PG) |
+//! | `POST` | `/dbs`                      | create + start db | `{"vm_id":"...","db_id":N}`  body optional `{"vm_id":"vm-N"}` (provisions a VM, restores the org bootstrap pack, starts PG) |
 //! | `GET`  | `/vms/{vm_id}`              | vm_state          | `{"vm_id":"...","state":"running"}`      |
 //! | `DELETE`| `/vms/{vm_id}`             | destroy_vm        | 204                                      |
 //! | `GET`  | `/vms/{vm_id}/ip`           | vm_guest_ip       | `{"vm_id":"...","ip":"1.2.3.4"\|null}`   |
@@ -669,7 +669,7 @@ impl ApiServer {
     ///    agent — the org's single bootstrap pack).
     /// 4. **Start** Postgres (`/pg/start`), leaving a ready-to-serve database.
     ///
-    /// Optional body: `{"project_id": N}` (defaults to the db_id).
+    /// Optional body: `{"vm_id":"vm-N"}` (defaults to the next free auto id).
     ///
     /// Returns `{"vm_id":"vm-N","db_id":N}`. On any failure the error from the
     /// failing step is returned verbatim; the provisioned VM is left in place
@@ -677,7 +677,7 @@ impl ApiServer {
     async fn create_db(&self, req: &Request) -> Response {
         #[derive(serde::Deserialize, Default)]
         struct CreateDbBody {
-            project_id: Option<u64>,
+            vm_id: Option<VmId>,
         }
         let body: CreateDbBody = if req.body.is_empty() {
             CreateDbBody::default()
@@ -686,16 +686,20 @@ impl ApiServer {
                 Ok(b) => b,
                 Err(e) => {
                     return bad_request(&format!(
-                        "invalid body; expected {{\"project_id\":N}}: {e}"
+                        "invalid body; expected {{\"vm_id\":\"vm-N\"}}: {e}"
                     ))
                 }
             }
         };
 
-        // 1. Provision a fresh VM. The db_id is the vm_index baked into the
-        //    VM's tiko.env (TIKO_DB_ID = vm_index), i.e. the trailing integer
-        //    of the auto-generated "vm-{N}" id.
-        let vm_id = self.auto_vm_id().await;
+        // 1. Provision a fresh VM. The caller may pin the id with `vm_id`;
+        //    otherwise the next free auto id is used. The db_id is the
+        //    vm_index baked into the VM's tiko.env (TIKO_DB_ID = vm_index),
+        //    i.e. the trailing integer of the "vm-{N}" id.
+        let vm_id = match body.vm_id {
+            Some(id) => id,
+            None => self.auto_vm_id().await,
+        };
         let db_id = vm_index_of(&vm_id);
         let config = self.default_vm_config(vm_id.clone());
         let vm_id = match self.node.provision(config).await {
@@ -719,7 +723,7 @@ impl ApiServer {
         //    inside the agent). project_id defaults to the db_id.
         let restore_body = serde_json::json!({
             "db_id": db_id,
-            "project_id": body.project_id.unwrap_or(db_id),
+            "project_id": db_id,
         });
         match client
             .forward_raw("POST", "/branch/restore", restore_body.to_string().as_bytes())

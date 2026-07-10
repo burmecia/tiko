@@ -837,11 +837,14 @@ async fn post_dbs_creates_and_starts_db() {
     assert!(body.contains(r#""vm_id":"vm-1""#), "{body}");
     assert!(body.contains(r#""db_id":1"#), "{body}");
 
-    // An explicit project_id is forwarded to the restore.
+    // An explicit vm_id pins the id (and db_id/project_id follow it).
     let (status, body) =
-        api_request(api_addr, "POST", "/dbs", Some(r#"{"project_id":77}"#)).await;
+        api_request(api_addr, "POST", "/dbs", Some(r#"{"vm_id":"vm-77"}"#)).await;
     assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""vm_id":"vm-77""#), "{body}");
+    assert!(body.contains(r#""db_id":77"#), "{body}");
     let restore_body = agent.last_restore_body().expect("agent never received /branch/restore");
+    assert!(restore_body.contains(r#""db_id":77"#), "{restore_body}");
     assert!(restore_body.contains(r#""project_id":77"#), "{restore_body}");
 
     // Invalid body → 400.
