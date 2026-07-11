@@ -69,8 +69,8 @@ flowchart TB
   Client -->|PG wire| Tikod
   Tikod <-->|HTTP :9000| Guest1
   Tikod <-->|HTTP :9000| Guest2
-  PG1 ==>|chunks · WAL · manifests| S3
-  PG2 ==>|chunks · WAL · manifests| S3
+  PG1 ==>|chunks · WAL · manifests · NFS| S3
+  PG2 ==>|chunks · WAL · manifests · NFS| S3
 
   classDef client fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#9a3412
   classDef control fill:#eff6ff,stroke:#3b82f6,stroke-width:2px,color:#1e40af
