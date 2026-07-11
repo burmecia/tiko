@@ -24,6 +24,8 @@ PG_LIB_DIR="${POSTGRES_INSTALL}/lib/postgresql"
 TIKO_BIN_DIR="${TARGET_DIR}/debug"
 TEST_DIR="${BASE_DIR}/tt"
 
+export PATH="${PG_BIN_DIR}":$PATH
+
 # Keep the Tiko storage root OUTSIDE PGDATA so it survives PGDATA wipe/restore.
 # Per-db local cache (base_manifest.tikm etc.) defaults to $PGDATA/tiko.
 export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"

@@ -24,6 +24,8 @@ PG_BIN_DIR="${TARGET_DIR}/pg-install/bin"
 PG_LIB_DIR="${TARGET_DIR}/pg-install/lib/postgresql"
 TIKO_BIN_DIR="${TARGET_DIR}/debug"
 
+export PATH="${PG_BIN_DIR}":$PATH
+
 # Shared storage root OUTSIDE both PGDATAs so parent + branch share one tree
 # (required for copy-on-write: the branch reads the parent's chunks in place).
 export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"
