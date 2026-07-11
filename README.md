@@ -30,8 +30,10 @@ a small patch set to vendored PostgreSQL 18.
 - 🪣 **Storage is just S3.** A custom `smgr` routes block I/O to chunk-level
   object ops; async reads plug into PostgreSQL 18's AIO subsystem so backends
   never block.
-- 🌿 **Copy-on-write (COW) branching.** Fork a database in one call — branches
-  share immutable chunks, so a fork costs only its new blocks.
+- 🌿 **Copy-on-write (COW) branching.** Every new database is itself a branch of a
+  seed database — so provisioning is instant and a fresh DB costs almost nothing.
+  Fork any database in one call; branches share immutable chunks, so a fork costs
+  only its new blocks.
 - ⏪ **Point-in-time recovery.** WAL streams to S3 in near-realtime;
   `tiko_pitr recover` replays to any target time or LSN and promotes
   automatically.
