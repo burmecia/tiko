@@ -38,17 +38,17 @@ flowchart LR
 
   subgraph Host ["🖥️ Host (KVM)"]
     direction TB
-    Tikod["<b>tikod</b><br/><small>control plane</small>"]
+    Tikod["<b>tikod</b><br/><small>control plane · proxy · VMM backend</small>"]
   end
 
-  subgraph VM1 ["🔥 Firecracker microVM — db vm-1"]
+  subgraph VM1 ["🔥 Firecracker microVM — database vm-1"]
     direction TB
     Guest1["<b>tikoguest</b><br/><small>pg_ctl · scaler</small>"]
     PG1["<b>PostgreSQL + Tiko</b><br/><small>tikosmgr · tikoworker<br/>async I/O · WAL · local cache</small>"]
     Guest1 --> PG1
   end
 
-  subgraph VM2 ["🔥 Firecracker microVM — db vm-2"]
+  subgraph VM2 ["🔥 Firecracker microVM — database vm-2"]
     direction TB
     Guest2["<b>tikoguest</b><br/><small>pg_ctl · scaler</small>"]
     PG2["<b>PostgreSQL + Tiko</b><br/><small>tikosmgr · tikoworker<br/>async I/O · WAL · local cache</small>"]
