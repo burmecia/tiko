@@ -32,38 +32,58 @@ a small patch set to vendored PostgreSQL 18.
 ## How it works
 
 ```mermaid
-flowchart TD
-    Client([SQL Client])
+%%{init: {"themeVariables": {"titleColor": "#1e293b", "clusterBkg": "#f8fafc", "clusterBorder": "#94a3b8"}}}%%
+flowchart LR
+  Client(["<b>SQL Client</b>"])
 
-    subgraph Host [Host]
-        Tikod["<b>tikod</b><br/>control plane · proxy · VMM backend"]
-    end
+  subgraph Host ["🖥️ Host"]
+    direction TB
+    Tikod["<b>tikod</b><br/><small>control plane · proxy · VMM backend</small>"]
+  end
 
-    subgraph VM [Firecracker microVM]
-        Guest["<b>tikoguest</b><br/>pg_ctl · scaler"]
-        PG["<b>PostgreSQL + Tiko</b><br/>tikosmgr (smgr) · tikoworker (async I/O, WAL)"]
-    end
+  subgraph VM1 ["🔥 Firecracker microVM — database vm-1"]
+    direction TB
+    Guest1["<b>tikoguest</b><br/><small>pg_ctl · scaler</small>"]
+    PG1["<b>PostgreSQL + Tiko</b><br/><small>tikosmgr · tikoworker<br/>async I/O · WAL · local cache</small>"]
+    Guest1 --> PG1
+  end
 
-    S3[("S3-compatible storage<br/>local cache in front")]
+  subgraph VM2 ["🔥 Firecracker microVM — database vm-2"]
+    direction TB
+    Guest2["<b>tikoguest</b><br/><small>pg_ctl · scaler</small>"]
+    PG2["<b>PostgreSQL + Tiko</b><br/><small>tikosmgr · tikoworker<br/>async I/O · WAL · local cache</small>"]
+    Guest2 --> PG2
+  end
 
-    Client -->|PG wire| Tikod
-    Tikod -->|HTTP :9000| Guest
-    Guest -->|shared_preload_libraries| PG
-    PG ===>|chunks · WAL · manifests| S3
+  S3[("🪣<br/><b>S3-compatible storage</b><br/>(S3 Files)<br/><small>immutable chunks · WAL · manifests</small>")]
 
-    classDef client fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    classDef control fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
-    classDef vm fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
-    classDef storage fill:#fce7f3,stroke:#db2777,stroke-width:2px,color:#831843
+  Client -->|PG wire| Tikod
+  Tikod -->|HTTP :9000| Guest1
+  Tikod -->|HTTP :9000| Guest2
+  PG1 ==>|chunks · WAL · manifests| S3
+  PG2 ==>|chunks · WAL · manifests| S3
 
-    class Client client
-    class Tikod control
-    class Guest,PG vm
-    class S3 storage
+  classDef client fill:#fff7ed,stroke:#f97316,stroke-width:2px,color:#9a3412
+  classDef control fill:#eff6ff,stroke:#3b82f6,stroke-width:2px,color:#1e40af
+  classDef vm fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,color:#166534
+  classDef storage fill:#fdf2f8,stroke:#ec4899,stroke-width:2px,color:#9d174d
 
-    style Host fill:#f8fafc,stroke:#94a3b8,stroke-dasharray:5 5
-    style VM fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,stroke-dasharray:5 5
-    style S3 fill:#fdf2f8,stroke:#db2777,stroke-width:2px
+  class Client client
+  class Tikod control
+  class Guest1,PG1,Guest2,PG2 vm
+  class S3 storage
+
+  style Host fill:#f8fafc,stroke:#94a3b8,stroke-width:2px,stroke-dasharray:5 5
+  style VM1 fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,stroke-dasharray:5 5
+  style VM2 fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,stroke-dasharray:5 5
+  style S3 fill:#fdf2f8,stroke:#ec4899,stroke-width:2px
+  linkStyle 0 stroke:#64748b,stroke-width:2px
+  linkStyle 1 stroke:#64748b,stroke-width:2px
+  linkStyle 2 stroke:#64748b,stroke-width:2px
+  linkStyle 3 stroke:#3b82f6,stroke-width:2px
+  linkStyle 4 stroke:#3b82f6,stroke-width:2px
+  linkStyle 5 stroke:#ec4899,stroke-width:3px
+  linkStyle 6 stroke:#ec4899,stroke-width:3px
 ```
 
 - **tikosmgr** — the storage manager. Turns block reads/writes into chunk-level
