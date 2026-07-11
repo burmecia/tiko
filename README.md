@@ -53,14 +53,14 @@ flowchart TB
   subgraph VM1 ["🔥 Firecracker microVM — database vm-1"]
     direction TB
     Guest1["<b>tikoguest</b><br/><small>pg_ctl · scaler&nbsp;&nbsp;&nbsp;&nbsp;</small>"]
-    PG1["<b>PostgreSQL + Tiko&nbsp;&nbsp;</b><br/><small>tikosmgr · tikoworker · async I/O · WAL · local cache</small>"]
+    PG1["<b>PostgreSQL + Tiko&nbsp;&nbsp;</b><br/><small>tikosmgr · tikoworker · async I/O · WAL · cache</small>"]
     Guest1 --> PG1
   end
 
   subgraph VM2 ["🔥 Firecracker microVM — database vm-2"]
     direction TB
     Guest2["<b>tikoguest</b><br/><small>pg_ctl · scaler&nbsp;&nbsp;&nbsp;&nbsp;</small>"]
-    PG2["<b>PostgreSQL + Tiko&nbsp;&nbsp;</b><br/><small>tikosmgr · tikoworker · async I/O · WAL · local cache</small>"]
+    PG2["<b>PostgreSQL + Tiko&nbsp;&nbsp;</b><br/><small>tikosmgr · tikoworker · async I/O · WAL · cache</small>"]
     Guest2 --> PG2
   end
 
