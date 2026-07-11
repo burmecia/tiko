@@ -108,16 +108,6 @@ HTTP, not by linking the storage crates.
 
 ---
 
-## Prerequisites
-
-Requires **Rust** and the PostgreSQL submodule initialized:
-
-Install Rust
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
 ## Getting started
 
 Clone Tiko repo
@@ -141,11 +131,33 @@ Run smoke test
 ./scripts/run_test.sh
 ```
 
+Run large data test
+
 ```bash
-./scripts/run_test4.sh
+./scripts/run_test2.sh
 ```
 
-### Firecracker
+Run Postgres regression test
+
+```bash
+./scripts/run_pg_test.sh
+```
+
+Run PITR test
+
+```bash
+./scripts/run_pitr_test.sh
+```
+
+Run branching test
+
+```bash
+./scripts/run_branch_test.sh
+```
+
+### MicroVM orchestration
+
+#### Firecracker
 
 Tiko runs each PostgreSQL database inside a Firecracker microVM. The
 `firecracker` binary must be available on the host (in `$PATH` or via the
@@ -157,11 +169,14 @@ Tiko runs each PostgreSQL database inside a Firecracker microVM. The
   `scripts/build_initramfs.sh`).
 
 ```bash
+git clone https://github.com/firecracker-microvm/firecracker
 cd firecracker
+tools/devtool build
+
 export FIRECRACKER_BIN=$(realpath ./build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker)
 ```
 
-### AWS S3 Files
+#### AWS S3 Files
 
 Tiko uses [AWS S3 Files] as its object-storage backend. The guest VM mounts
 an S3 Files file system via NFSv4.2 (TLS + IAM), requiring:
