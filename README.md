@@ -110,12 +110,12 @@ HTTP, not by linking the storage crates.
 
 ## Prerequisites
 
-Requires **Rust 1.88+** (edition 2024) and the PostgreSQL submodule initialized:
+Requires **Rust** and the PostgreSQL submodule initialized:
 
-Install Rust 1.88
+Install Rust
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.88.0
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 ## Getting started

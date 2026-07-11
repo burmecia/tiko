@@ -58,4 +58,6 @@ if ! (cd "${BASE_DIR}/postgres" && EXTRA_INSTALL=src/test/modules/test_tiko/work
   exit 1
 fi
 
+echo
 echo "All PG tests passed. 🎉"
+echo

@@ -147,4 +147,7 @@ fi
 
 # Cleanup.
 $PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt" -l "${BASE_DIR}/log.log" stop -m fast -w
+
+echo
 echo "PITR test passed. ✅"
+echo

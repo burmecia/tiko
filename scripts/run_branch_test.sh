@@ -113,4 +113,7 @@ fi
 $PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt_branch" stop -m fast -w
 $PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt" stop -m fast -w
 rm -f "${TIKO_PACK}"
+
+echo
 echo "Branch test passed. ✅"
+echo
