@@ -25,6 +25,8 @@ PG_LIB_DIR="${TARGET_DIR}/pg-install/lib/postgresql"
 TIKO_BIN_DIR="${TARGET_DIR}/debug"
 TEST_DIR="${BASE_DIR}/tt"
 BRANCH_DIR="${BASE_DIR}/tt_branch"
+PARENT_LOCAL_DIR="${BASE_DIR}/tt_local"
+BRANCH_LOCAL_DIR="${BASE_DIR}/tt_branch_local"
 
 export PATH="${PG_BIN_DIR}":$PATH
 
@@ -46,15 +48,18 @@ fi
 if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
     cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${PG_LIB_DIR}"
 fi
+if [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
+    cp "${TARGET_DIR}/debug/libtikoworker.so" "${PG_LIB_DIR}"
+fi
 
 # Fresh parent cluster + shared storage root.
 TIKO_PACK="${BASE_DIR}/tt_branch_pack.tar.zst"
-rm -rf "${TEST_DIR}" "${BRANCH_DIR}" "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" "${BASE_DIR}/parent.log"
-$PG_BIN_DIR/initdb -D "${TEST_DIR}" --auth=trust --no-instructions
+rm -rf "${TEST_DIR}" "${BRANCH_DIR}" "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" "${BASE_DIR}/parent.log" "${PARENT_LOCAL_DIR}" "${BRANCH_LOCAL_DIR}"
+TIKO_LOCAL_PATH="${PARENT_LOCAL_DIR}" $PG_BIN_DIR/initdb -D "${TEST_DIR}" --auth=trust --no-instructions
 cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
 echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/parent.log" start -w
+TIKO_LOCAL_PATH="${PARENT_LOCAL_DIR}" $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/parent.log" start -w
 
 # 1. Seed the parent with data spanning several pages, then checkpoint.
 $PG_BIN_DIR/psql -p 5432 -d postgres -c \
@@ -71,12 +76,12 @@ sleep 2
 #         promote, then STOP the branch (run `restart` to bring it back up).
 #      c) `restart` — start the stopped branch PostgreSQL (final step).
 echo "--- tiko_branch backup ---"
-"${TIKO_BIN_DIR}/tiko_branch" backup \
+TIKO_LOCAL_PATH="${PARENT_LOCAL_DIR}" "${TIKO_BIN_DIR}/tiko_branch" backup \
   --pack "${TIKO_PACK}" \
   --pg-basebackup "${PG_BIN_DIR}/pg_basebackup"
 
 echo "--- tiko_branch restore ---"
-"${TIKO_BIN_DIR}/tiko_branch" restore \
+TIKO_LOCAL_PATH="${BRANCH_LOCAL_DIR}" "${TIKO_BIN_DIR}/tiko_branch" restore \
   --pack "${TIKO_PACK}" \
   --parent-db-id 34 \
   --db-id 35 \
@@ -84,7 +89,7 @@ echo "--- tiko_branch restore ---"
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"
 
 echo "--- tiko_branch restart ---"
-"${TIKO_BIN_DIR}/tiko_branch" restart \
+TIKO_LOCAL_PATH="${BRANCH_LOCAL_DIR}" "${TIKO_BIN_DIR}/tiko_branch" restart \
   --db-id 35 \
   --pgdata "${BRANCH_DIR}" --branch-port 5433 \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"

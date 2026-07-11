@@ -19,7 +19,22 @@
       "Bash(mkfs.ext4 -q /home/ubuntu/tiko/tikod/assets/ubuntu-24.04-rootfs.ext4)",
       "Bash(apt-cache depends *)",
       "Bash(debootstrap --print-debs --variant=minbase noble /tmp/nonexistent http://archive.ubuntu.com/ubuntu)",
-      "Bash(aws sts *)"
+      "Bash(aws sts *)",
+      "Bash(python3 -c \"import zstandard, msgpack; print\\('ok'\\)\")",
+      "Bash(pip install *)",
+      "Bash(cargo build *)",
+      "Bash(./target/debug/tiko_mdump tiko_root/s3sim/12/34/bases/00000001/0000000001F0AE78.manifest)",
+      "Bash(xxd tt_branch_local/base_manifest.tikm)",
+      "Bash(git -C postgres log --oneline -5)",
+      "Bash(git -C postgres diff --stat)",
+      "Bash(timeout 600 ./scripts/run_branch_test.sh)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(./target/debug/tiko_mdump tiko_root/s3sim/12/35/bases/00000001/0000000001F0AE78.manifest)",
+      "Bash(./target/debug/tiko_mdump tiko_root/s3sim/12/35/bases/00000001/0000000003000028.manifest)",
+      "Bash(echo \"wrote: $?\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(grep -qE 'could not read blocks|Branch test passed|BRANCH FAILED|Build failed|Postgres build' __TRACKED_VAR__/run6.log)",
+      "Bash(grep -qE 'could not read blocks|Branch test passed|BRANCH FAILED|Build failed' __TRACKED_VAR__/run8.log)"
     ]
   }
 }

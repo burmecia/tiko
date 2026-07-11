@@ -77,6 +77,9 @@ use crate::relfork::{REL_FORK_SIZE, RelForkMeta};
 
 const TIKM_MAGIC: [u8; 4] = *b"TIKM";
 const TIKM_VERSION: u32 = 1;
+/// Per-call sequence for unique TIKM tmp paths (see `write_tikm`). Combined
+/// with the PID it disambiguates concurrent writers within one process.
+static TIKM_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Filename of the local TIKM cache file under the tiko root path.
 const BASE_MANIFEST_FILE_NAME: &str = "base_manifest.tikm";
 /// Header size in bytes.
@@ -231,7 +234,14 @@ fn write_tikm(
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension(format!("tikm.{}.tmp", std::process::id()));
+    // Tmp path must be unique per *call*, not just per process: the s3worker
+    // writes TIKM files from multiple Tokio threads concurrently (each
+    // `base_manifest()` reload can call `write_tikm`). A per-PID-only tmp path
+    // would let sibling threads truncate/clobber each other's in-progress tmp,
+    // publishing a torn `base_manifest.tikm`. The atomic sequence makes each
+    // writer own a private tmp file.
+    let seq = TIKM_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("tikm.{}.{}.tmp", std::process::id(), seq));
     let mut f = OpenOptions::new()
         .write(true)
         .create(true)
@@ -278,10 +288,18 @@ fn write_tikm(
     f.flush()?;
     drop(f);
 
+    // Open the read handle on the *tmp* file before the rename. This guarantees
+    // the returned FD points at exactly the bytes just written — if a concurrent
+    // writer renames a different manifest over `path` right after, our handle
+    // (and the `Manifest` metadata built around it) stay mutually consistent.
+    // Reopening `path` after the rename would risk attaching to another writer's
+    // file while carrying this manifest's checkpoint/entry_count, corrupting
+    // lookups. The renamed inode stays alive via this FD after `tmp_path` is
+    // unlinked by the rename.
+    let file = File::open(&tmp_path)?;
+
     fs::rename(&tmp_path, path)?;
 
-    // Reopen read-only for the handle stored in ManifestInner.
-    let file = File::open(path)?;
     Ok(file)
 }
 
