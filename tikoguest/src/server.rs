@@ -23,7 +23,7 @@
 //! | `POST` | `/pitr/backup` | take backup  | 200  `tiko_pitr backup` JSON passed through |
 //! | `POST` | `/pitr/recover`| recover PITR | 200  body: `{"time":"..."}` or `{"lsn":"..."}` (db left stopped) |
 //! | `POST` | `/pitr/restart`| start db     | 200  starts the db left stopped by `recover` |
-//! | `PUT`  | `/branch/backup` | pack parent | 200  no body; saves pack to `TIKO_STORAGE_ROOT`; passes through `tiko_branch backup` JSON (incl. `pack`) |
+//! | `PUT`  | `/branch/backup` | pack parent | 200  optional body: `{"pack":"..."?}` (`pack` defaults to the org bootstrap pack); saves pack to `TIKO_STORAGE_ROOT`; passes through `tiko_branch backup` JSON (incl. `pack`) |
 //! | `POST` | `/branch/restore`| setup branch| 200  body: `{"db_id":N,"parent_db_id":N,"pack":"..."?}` (`pack` defaults to the org bootstrap pack; db left stopped); `tiko_branch restore` JSON |
 //! | `POST` | `/branch/restart`| start branch| 200  optional body: `{"db_id":N,"project_id":N,"branch_port":N}`; passes through `tiko_branch restart` JSON |
 //!
@@ -199,7 +199,7 @@ impl PgServer {
             ("POST", ["pitr", "recover"]) => self.pitr_recover(&req.body).await,
             ("POST", ["pitr", "restart"]) => self.pitr_restart().await,
 
-            ("PUT", ["branch", "backup"]) => self.branch_backup().await,
+            ("PUT", ["branch", "backup"]) => self.branch_backup(&req.body).await,
             ("POST", ["branch", "restore"]) => self.branch_restore(&req.body).await,
             ("POST", ["branch", "restart"]) => self.branch_restart(&req.body).await,
 
@@ -348,22 +348,50 @@ impl PgServer {
     /// shared `TIKO_STORAGE_ROOT` (an S3 mount visible to all VMs, so the child
     /// can read it from its own VM). Returns the CLI's JSON output (including
     /// `pack`, `timeline`, `checkpoint_lsn`, ...) so tikod can pass the pack
-    /// path to the child VM's `/branch/restore`. No request body.
+    /// path to the child VM's `/branch/restore`.
     ///
-    /// The pack is keyed by **org** (`branch_packs/{org_id}/bootstrap.tar.zst`),
-    /// not per database: each org keeps a single bootstrap pack that any new
-    /// db/project created under that org restores from. Taking a new backup
-    /// overwrites the previous bootstrap pack in place.
-    async fn branch_backup(&self) -> Response {
-        let Some(pack_path) = self.bootstrap_pack_path() else {
-            return Response {
-                status: 500,
-                body: serde_json::json!({
-                    "error": {"kind": "config_error", "message": "TIKO_STORAGE_ROOT is not set"}
-                })
-                .to_string()
-                .into_bytes(),
-            };
+    /// `pack` is optional: when omitted (empty body or no `pack` field), it
+    /// defaults to the org's bootstrap pack
+    /// (`{TIKO_STORAGE_ROOT}/branch_packs/{org_id}/bootstrap.tar.zst`). The
+    /// pack is keyed by **org**, not per database: each org keeps a single
+    /// bootstrap pack that any new db/project created under that org restores
+    /// from. Taking a new backup overwrites the target pack in place.
+    async fn branch_backup(&self, body: &[u8]) -> Response {
+        #[derive(serde::Deserialize, Default)]
+        struct BackupBody {
+            /// Destination pack file. Optional — defaults to the org's
+            /// bootstrap pack when omitted.
+            pack: Option<PathBuf>,
+        }
+        let body: BackupBody = if body.is_empty() {
+            BackupBody::default()
+        } else {
+            match serde_json::from_slice(body) {
+                Ok(b) => b,
+                Err(e) => return bad_request(&format!("invalid branch backup body: {e}")),
+            }
+        };
+
+        // Resolve the destination pack: an explicit body value, else the org's
+        // bootstrap pack.
+        let pack_path = match body.pack {
+            Some(p) => p,
+            None => match self.bootstrap_pack_path() {
+                Some(p) => p,
+                None => {
+                    return Response {
+                        status: 500,
+                        body: serde_json::json!({
+                            "error": {
+                                "kind": "config_error",
+                                "message": "pack not provided and TIKO_STORAGE_ROOT is not set"
+                            }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    };
+                }
+            },
         };
 
         let pg_basebackup = sibling_binary(&self.ctl.pg_ctl, "pg_basebackup");

@@ -73,8 +73,8 @@
 //!
 //! | Method | Path                              | Agent endpoint   | Returns / Body                                       |
 //! |--------|-----------------------------------|------------------|------------------------------------------------------|
-//! | `PUT`  | `/vms/{vm_id}/branch/backup`      | `/branch/backup` | `tiko_branch backup` JSON (incl. `pack`)             |
-//! | `POST` | `/vms/{vm_id}/branch/restore`     | `/branch/restore`| body: `{"pack","db_id","parent_db_id",...}` (stopped)|
+//! | `PUT`  | `/vms/{vm_id}/branch/backup`      | `/branch/backup` | optional body: `{"pack"?}` (`pack` defaults to the org bootstrap pack); `tiko_branch backup` JSON (incl. `pack`) |
+//! | `POST` | `/vms/{vm_id}/branch/restore`     | `/branch/restore`| body: `{"db_id","parent_db_id",...}`, optional `pack` (defaults to the org bootstrap pack); db left stopped |
 //! | `POST` | `/vms/{vm_id}/branch/restart`     | `/branch/restart`| optional body: `{"db_id","project_id",...}`          |
 //!
 //! # Agent-inbound routes (pushed by the guest `tikoguest` agent)
@@ -850,9 +850,13 @@ impl ApiServer {
 
     /// Dispatch `/vms/{vm_id}/branch/{...}` routes to the in-guest `tikoguest`
     /// agent's `/branch/*` endpoints (which spawn the `tiko_branch` CLI). The
-    /// request body is forwarded unchanged (e.g. `/branch/restore`'s
-    /// `{pack,db_id,parent_db_id,...}`); the agent's `(status, body)` is
+    /// request body is forwarded unchanged; the agent's `(status, body)` is
     /// returned verbatim so the CLI's JSON (and rich error bodies) survive.
+    ///
+    /// Both `/branch/backup` and `/branch/restore` accept an optional `pack`
+    /// field naming the pack file path; when omitted the agent defaults it to
+    /// the org's bootstrap pack (`branch_packs/{org_id}/bootstrap.tar.zst`).
+    /// `/branch/restore` additionally carries `{db_id,parent_db_id,...}`.
     async fn route_branch(
         &self,
         method: &str,
