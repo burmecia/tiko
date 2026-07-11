@@ -33,7 +33,7 @@ a small patch set to vendored PostgreSQL 18.
 
 ```mermaid
 %%{init: {"themeVariables": {"titleColor": "#1e293b", "clusterBkg": "#f8fafc", "clusterBorder": "#94a3b8"}}}%%
-flowchart LR
+flowchart TB
   Client(["<b>SQL Client</b>"])
 
   subgraph Host ["🖥️ Host (KVM)"]
@@ -51,7 +51,7 @@ flowchart LR
   subgraph VM2 ["🔥 Firecracker microVM — database vm-2"]
     direction TB
     Guest2["<b>tikoguest</b><br/><small>pg_ctl · scaler</small>"]
-    PG2["<b>PostgreSQL + Tiko&nbsp;&nbsp;</b><br/><small>tikosmgr · tikoworker<br/>async I/O · WAL<br/>local cache</small>"]
+    PG2["<b>PostgreSQL + Tiko</b><br/><small>tikosmgr · tikoworker<br/>async I/O · WAL<br/>local cache</small>"]
     Guest2 --> PG2
   end
 
