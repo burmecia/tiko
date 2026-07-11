@@ -1,82 +1,77 @@
 # Tiko
 
-**Serverless PostgreSQL on S3-backed storage, orchestrated by microVMs.**
+**Serverless Postgres — S3 storage, Firecracker microVM compute.**
 
-Tiko runs each PostgreSQL database inside its own Firecracker microVM and stores
-its data on S3-compatible object storage. A local file cache sits in front of S3
-as the source of truth for hot blocks, while a custom storage manager replaces
-PostgreSQL's magnetic-disk (`md`) layer entirely. The result is a database that
-scales to zero (freeze a VM to a snapshot, restore on first connection), supports
-point-in-time recovery and copy-on-write branching, and keeps per-database cost
-close to raw object storage.
+Tiko replaces PostgreSQL's magnetic-disk storage manager with an S3-backed block
+store. Each database lives in its own microVM, freezes to a snapshot when idle,
+and wakes on the first client connection. The result: databases that scale to
+zero, fork like git branches, and recover to any point in time — with per-DB cost
+that falls to near-zero when nobody is connected.
 
-The project is written in Rust and compiled as PostgreSQL shared libraries
-(extensions) plus standalone binaries. PostgreSQL is vendored as a git submodule
-under `postgres/`, with a small patch set integrating Tiko's storage manager and
-PG18's asynchronous I/O subsystem.
+Built in Rust as a set of PostgreSQL extensions + standalone binaries, on top of
+a small patch set to vendored PostgreSQL 18.
 
 ---
 
-## Most important features
+## Why Tiko?
 
-### S3-backed block storage with a local cache
-- A custom storage manager (`smgr`) implements PostgreSQL's `smgr` interface with
-  `s3_*` functions (`s3_readv`, `s3_writev`, `s3_open`, …), so the database never
-  touches a local magnetic disk for relation files.
-- Relation data is split into **256 KB chunks** (32 × 8 KB blocks). Chunks are
-  content-addressed, versioned per checkpoint LSN, and stored under
-  `{storage_root}/s3sim/{org}/{db}/chunks/`.
-- A **shared-memory block cache** fronts S3: hot blocks are served from a
-  per-database local cache, dirty chunks are flushed at checkpoint time, and a
-  background worker reconciles cache-dirty pages with object storage.
+- **Compute-storage separation.** Postgres runs in isolated Firecracker microVMs;
+  data lives on S3 as immutable chunks — compute can move, restart, or scale
+  independently of storage.
+- **Scales to zero.** Idle VMs warm-pause (TCP survives), then snapshot-and-destroy
+  after an idle window. The next connection restores the VM in sub-second time.
+- **Storage is just S3.** A custom `smgr` routes block I/O to chunk-level object ops;
+  async reads plug into PostgreSQL 18's AIO subsystem so backends never block.
+- **Copy-on-write (COW) branching.** Fork a database in one call — branches share
+  immutable chunks, so a fork costs only its new blocks.
+- **Point-in-time recovery.** WAL streams to S3 in near-realtime; `tiko_pitr recover`
+  replays to any target time or LSN and promotes automatically.
 
-### Asynchronous I/O pipeline
-- Sync smgr paths call block I/O directly in the backend process (safe for
-  backend-local memory).
-- Async reads go through a **shared-memory pipeline** to a Tokio-powered
-  background worker that handles cache hits (`pread`), S3 fetches on misses, and
-  writes — completing backends via `SetLatch` with zero contention slot pools.
-- Integrates with **PostgreSQL 18's AIO subsystem** via a custom `PGAIO_OP_S3_READV`
-  op, keeping the backend non-blocking.
+---
 
-### Compute control plane (`tikod`)
-- **microVM lifecycle**: provision / start / pause / resume / snapshot / destroy,
-  backed by Firecracker on Linux (production).
-- **PG wire-protocol proxy** with **wake-on-connect**: a frozen VM is transparently
-  restored on the first client connection, so databases can scale to zero without
-  dropping clients.
-- **Warm-pause + cold-freeze**: idle VMs are warm-paused (TCP connections survive),
-  then snapshot-and-destroyed after an idle window to reclaim RAM/CPU.
-- A single HTTP control API fans every operation out to the right guest agent.
+## How it works
 
-### Point-in-time recovery (PITR)
-- WAL is streamed to object storage in near-realtime via the PostgreSQL physical
-  streaming-replication protocol, uploaded as 256 KB chunk objects and sealed
-  segment objects.
-- Periodic **base backups** (`pg_basebackup`) are uploaded alongside base manifests
-  (chunk-reference maps), bounding WAL replay during recovery.
-- `tiko_pitr recover` restores the latest usable backup, replays WAL to a target
-  time or LSN, and promotes — all automated.
+```mermaid
+flowchart TD
+    Client([SQL Client])
 
-### Copy-on-write database branching
-- A new database can be created from an **org-level bootstrap pack** in a single
-  call (`POST /dbs`): provision a VM, restore the pack, start Postgres.
-- Branches share chunks with their parent through copy-on-write `ChunkRef`s, so a
-  fork costs only the new/modified blocks.
-- `tiko_branch` provides `backup` / `restore` / `restart` for branch lifecycle.
+    subgraph Host [Host]
+        Tikod["<b>tikod</b><br/>control plane · proxy · VMM backend"]
+    end
 
-### Compaction & retention (GC)
-- A **compactor** periodically folds timeline segments into a new base manifest,
-  advancing the base checkpoint and deleting covered segment files.
-- Retention is **checkpoint-count-based** (not time-based): inactive projects keep
-  their full history, while busy ones age out old manifests, WAL, and orphan
-  chunks past a configurable window.
+    subgraph VM [Firecracker microVM]
+        Guest["<b>tikoguest</b><br/>pg_ctl · scaler"]
+        PG["<b>PostgreSQL + Tiko</b><br/>tikosmgr (smgr) · tikoworker (async I/O, WAL)"]
+    end
 
-### Observability & guest agent (`tikoguest`)
-- An in-guest agent exposes HTTP routes for Postgres control (`/pg/*`), PITR
-  (`/pitr/*`), branching (`/branch/*`), and health.
-- A scaler loop pushes metrics to `tikod`, evaluates idle policy, and requests
-  pause when a database goes quiet — driving the scale-to-zero behavior.
+    S3[("S3-compatible storage<br/>local cache in front")]
+
+    Client -->|PG wire| Tikod
+    Tikod -->|HTTP :9000| Guest
+    Guest -->|shared_preload_libraries| PG
+    PG ===>|chunks · WAL · manifests| S3
+
+    classDef client fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    classDef control fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef vm fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef storage fill:#fce7f3,stroke:#db2777,stroke-width:2px,color:#831843
+
+    class Client client
+    class Tikod control
+    class Guest,PG vm
+    class S3 storage
+
+    style Host fill:#f8fafc,stroke:#94a3b8,stroke-dasharray:5 5
+    style VM fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,stroke-dasharray:5 5
+    style S3 fill:#fdf2f8,stroke:#db2777,stroke-width:2px
+```
+
+- **tikosmgr** — the storage manager. Turns block reads/writes into chunk-level
+  object operations, transparent to SQL.
+- **tikoworker** — the background worker. Owns the async I/O pipeline, streams WAL,
+  and runs compaction.
+- **tikod** — the control plane. Owns VM lifecycle and proxies client traffic,
+  freezing/restoring VMs so idle databases cost nothing.
 
 ---
 
@@ -84,38 +79,30 @@ PG18's asynchronous I/O subsystem.
 
 ```
 tiko/
-├── postgres/        # vendored PostgreSQL (git submodule) + Tiko patches
-├── pgsys/           # hand-written PostgreSQL FFI bindings (extern "C")
-├── core/            # storage layer: chunks, manifests, store, I/O engine
-├── smgr/            # tikosmgr — PostgreSQL storage manager (s3_* functions)
-├── worker/          # tikoworker — background worker (AIO, WAL receiver, compactor)
-├── cli/             # operator CLIs: tiko_pitr, tiko_branch, tiko_restore, tiko_tlseg_viewer
-├── tikod/           # control plane: proxy, node/VMM lifecycle, HTTP API
-└── tikoguest/       # in-VM agent: pg control, observability, scaler, freeze
+├── postgres/     # vendored PostgreSQL 18 (git submodule) + Tiko patches
+├── pgsys/        # hand-written PostgreSQL FFI bindings (extern "C")
+├── core/         # storage layer: chunks, manifests, store, I/O engine
+├── smgr/         # tikosmgr — PostgreSQL storage manager (s3_* functions)
+├── worker/       # tikoworker — background worker (AIO, WAL receiver, compactor)
+├── cli/          # operator CLIs: tiko_pitr, tiko_branch, tiko_restore, ...
+├── tikod/        # control plane: proxy, node/VMM lifecycle, HTTP API
+└── tikoguest/    # in-VM agent: pg control, observability, scaler, freeze
 ```
 
-### Dependency chain
-
 ```
-pgsys ──→ core ──→ smgr (tikosmgr) ──→ postgres
-              └────→ worker (tikoworker) ──→ postgres
-                  └→ cli (tiko_pitr, tiko_branch, …)
+pgsys ──→ core ──→ smgr (tikosmgr)  ──→ postgres
+              └───→ worker (tikoworker) ──→ postgres
+                └──→ cli (tiko_pitr, tiko_branch, …)
 ```
 
-`tikod` and `tikoguest` are standalone binaries with no internal Rust deps: they
-orchestrate Postgres and the storage layer by spawning CLIs / `pg_ctl` and over
-HTTP, not by linking the storage crates.
+`tikod` and `tikoguest` are standalone binaries that orchestrate Postgres and the
+storage layer by spawning CLIs / `pg_ctl` and over HTTP — no internal Rust deps.
 
 ---
 
 ## Getting started
 
-Clone Tiko repo
-
-```bash
-git clone https://github.com/burmecia/tiko.git
-cd tiko
-```
+### Storage layer (compute-storage separation)
 
 Build Postgres:
 
@@ -123,221 +110,129 @@ Build Postgres:
 ./scripts/build_postgres.sh
 ```
 
-## Postgres compute-storage separation
-
-Run the smoke test
+Run the smoke test:
 
 ```bash
 ./scripts/run_test.sh
 ```
 
-Other test scripts you can try run:
+Other test scripts:
 
-- `./scripts/run_test2.sh` -- Large data test
-- `./scripts/run_pg_test.sh` -- Postgres regression test
-- `./scripts/run_pitr_test.sh` -- PITR test
-- `./scripts/run_branch_test.sh` -- Branching test
+- `./scripts/run_test2.sh` — large data test
+- `./scripts/run_pg_test.sh` — PostgreSQL regression test
+- `./scripts/run_pitr_test.sh` — PITR test
+- `./scripts/run_branch_test.sh` — branching test
 
-## MicroVM orchestration
+### MicroVM orchestration (full stack)
 
-### Build Firecracker
+Requires a KVM-enabled Linux host and the `firecracker` binary on `FIRECRACKER_BIN`.
 
-Tiko runs each PostgreSQL database inside a Firecracker microVM. The `firecracker` binary must be available on the host (via the `FIRECRACKER_BIN` environment variables).
-
-- A KVM-enabled Linux host is required (`/dev/kvm`).
-- Build Firecracker needs Docker to be installed (https://docs.docker.com/engine/install/ubuntu/)
+**1. Build Firecracker** (Docker required):
 
 ```bash
 git clone https://github.com/firecracker-microvm/firecracker
-cd firecracker
-tools/devtool build
-
+cd firecracker && tools/devtool build
 export FIRECRACKER_BIN=$(realpath ./build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker)
 ```
 
-### Set up AWS S3 Files
-
-Tiko uses [AWS S3 Files](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.html) as its object-storage backend. The guest VM mounts an S3 Files file system via NFSv4.2 (TLS + IAM), requiring:
-
-- An S3 Files file system and mount target in the host's AZ.
-- Static IAM credentials for the guest (the guest has no instance metadata
-  service). Store them in `tikod/assets/s3files-creds.env` (gitignored).
-
-See `tikod/docs/s3-files-setup.md` for the full setup runbook.
-
-Once the S3 Files is ready, update S3 Files config in `scripts/mount_s3files_vm.sh` to let guest know where to access the S3 Files.
-
-Copy S3 Files creds file and fill in with your AWS access credentials:
+**2. Set up S3 Files** (the object-storage backend). The guest VM mounts an
+[S3 Files](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.html)
+file system via NFSv4.2. See `tikod/docs/s3-files-setup.md` for the full runbook,
+then copy the creds template:
 
 ```bash
 cp ./scripts/s3files-creds.env.sample ./tikod/assets/s3files-creds.env
+# edit tikod/assets/s3files-creds.env with your AWS credentials
+# update S3 Files config in scripts/mount_s3files_vm.sh
 ```
 
-### Prepare MicroVM, tikod and initialise seed db
-
-Prepare kernel and rootfs:
+**3. Prepare the VM image, start tikod, seed a database:**
 
 ```bash
 ./scripts/download_kernel.sh
 ./scripts/build_initramfs.sh
 ./scripts/create_rootfs.sh
+
+RUST_LOG=tikod=debug cargo run -p tikod   # start the control plane
 ```
 
-Start tikod server:
-
-```bash
-RUST_LOG=tikod=debug cargo run -p tikod
-```
-
-Open another terminal and run `vmtop` to monitor the VM swarm:
+In another terminal, watch the VM swarm:
 
 ```bash
 ./scripts/vmtop.py
 ```
 
-Open another terminal again to create seed db:
+In a third terminal, create the seed database:
 
 ```bash
-# create an initial vm
 curl -X POST localhost:9000/vms/provision
-
-# create the seed db (this will take couple of minutes, be patient)
-curl -X POST localhost:9000/vms/vm-0/db/init
-
-# start the seed db
+curl -X POST localhost:9000/vms/vm-0/db/init      # takes a couple minutes
 curl -X POST localhost:9000/vms/vm-0/db/start
 
-# add some seed data
 psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-0'" \
     -c 'create table tt(a int); insert into tt values(123);'
 
-# take a base backup of the seed db
-curl -X PUT localhost:9000/vms/vm-0/branch/backup
+curl -X PUT localhost:9000/vms/vm-0/branch/backup   # base backup
 ```
 
-Ok now, all the preparation works are done.
+---
+
+## Try it
 
 ### Scale to zero
 
-Let's create 5 databases:
+Spin up 5 databases and watch `vmtop`:
 
 ```bash
 ./scripts/stress_create_dbs.sh 5
 ```
 
-Now go back to `vmtop` terminal and watch each db's status change.
+Each database transitions through:
 
-- `running` - normal status
-- `paused` - db is paused but still in memory, 2 minutes without activities from `running`
-- `frozen` - db is destroyed after snapshot, 2 minutes without new connection from `paused`
+| Status  | Meaning                                                  |
+|---------|----------------------------------------------------------|
+| running | normal operation                                         |
+| paused  | idle ~2 min — still in memory, TCP connections survive   |
+| frozen  | idle ~2 min more — snapshotted and destroyed, zero cost  |
 
-When a db is in `paused` or `frozen`, open a new psql connection will bring it back to `running`.
+Open a psql connection to any paused/frozen DB and it wakes back to `running`:
 
 ```bash
-# wake up vm-2
-psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
-
-# wake up vm-5
-psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-5'" -c 'select * from tt'
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" \
+    -c 'select * from tt'
 ```
 
-Notes:
+The `tiko.endpoint=vm-N` option selects which database to wake.
 
-- we use connection options, like `tiko.endpoint=vm-2`, to distiguish which db to wake up.
-- for demo purpose, we currently use fixed-time inactivity checking policy, that is, it will always be treated inactive after 2 minutes regardless having active connection or not.
-- when the vm is in `running` status, you can ssh in it directly, e.g., `ssh root@172.16.2.2`, password is `root`.
-
-### Copy-on-write(COW) database branching
-
-Let's make some data changes on `vm-2` and then make a base backup:
+### Copy-on-write branching
 
 ```bash
-# add data to vm-2
-psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'insert into tt values(234)'
+# modify vm-2, then back it up
+psql -d "...options='-c tiko.endpoint=vm-2'" -c 'insert into tt values(234)'
+curl -X PUT localhost:9000/vms/vm-2/branch/backup \
+    -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst"}'
 
-# make base backup on vm-2
-curl -X PUT localhost:9000/vms/vm-2/branch/backup -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst"}'
-```
-
-Now restore it to a new VM and start the new db:
-
-```bash
-# create a new empty vm 'vm-9'
+# restore into a new VM and start it
 curl -X POST localhost:9000/vms/provision -d '{"vm_id":"vm-9"}'
-
-# restore from vm-2 branch
-curl -X POST localhost:9000/vms/vm-9/branch/restore -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst","db_id":9,"parent_db_id":2}'
-
-# start vm-9 db
+curl -X POST localhost:9000/vms/vm-9/branch/restore \
+    -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst","db_id":9,"parent_db_id":2}'
 curl -X POST localhost:9000/vms/vm-9/db/start
 
-# check if the data is copied into vm-9 db
-psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-9'" -c 'select * from tt'
+psql -d "...options='-c tiko.endpoint=vm-9'" -c 'select * from tt'   # data is copied
 ```
 
 ### PITR
 
-Let's add some new data to 'vm-2':
-
 ```bash
-# check current data and add new data
-psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'select * from tt; insert into tt values(999)'
-```
-Now check what are the available PITR restore points:
-
-```bash
+# add data, then list available restore points
+psql -d "...options='-c tiko.endpoint=vm-2'" -c 'insert into tt values(999)'
 curl -X GET localhost:9000/vms/vm-2/pitr/list
-```
 
-Choose an earlier timestamp and restore to it:
-
-```bash
-# PITR recover
+# recover to a chosen timestamp and restart
 curl -X POST localhost:9000/vms/vm-2/pitr/recover -d '{"time":"2026-07-11 08:35:00"}'
-```
-
-Start the db and check result:
-
-```bash
-# start db
 curl -X POST localhost:9000/vms/vm-2/db/start
-
-# check the recovered data
-psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
+psql -d "...options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
 ```
-
----
-
-## Architecture
-
-```
-                              ┌──────────────────────────────────────────┐
-   SQL client ──PG wire──→    │  tikod (control plane)                    │
-                              │   proxy ─→ control ─→ node ─→ Vmm backend │
-                              └───────────────┬──────────────────────────┘
-                                              │ HTTP (guest IP:9000)
-                                  ┌───────────▼───────────┐
-                                  │  tikoguest (in-VM)     │
-                                  │   pg_ctl / scaler      │
-                                  └───────────┬───────────┘
-                                              │ shared_preload_libraries
-                                  ┌───────────▼───────────┐
-                                  │  PostgreSQL + Tiko ext │
-                                  │  smgr (tikosmgr)       │
-                                  │  worker (tikoworker)   │
-                                  └───────────┬───────────┘
-                                              │ chunks / WAL / manifests
-                                  ┌───────────▼───────────┐
-                                  │  S3-compatible storage │
-                                  │  (local cache in front)│
-                                  └───────────────────────┘
-```
-
-- The **storage manager** turns every block read/write into chunk-level object
-  operations, transparent to SQL.
-- The **worker** owns the async pipeline, streams WAL, and runs compaction.
-- **tikod** owns VM lifecycle and proxies client traffic, freezing/restoring VMs
-  on demand so idle databases cost nothing.
 
 ---
 
