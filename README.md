@@ -123,50 +123,29 @@ Build Postgres:
 ./scripts/build_postgres.sh
 ```
 
-### Postgres compute-storage separation
+## Postgres compute-storage separation
 
-Run smoke test
+Run the smoke test
 
 ```bash
 ./scripts/run_test.sh
 ```
 
-Run large data test
+Other test scripts you can try run:
 
-```bash
-./scripts/run_test2.sh
-```
+- `./scripts/run_test2.sh` -- Large data test
+- `./scripts/run_pg_test.sh` -- Postgres regression test
+- `./scripts/run_pitr_test.sh` -- PITR test
+- `./scripts/run_branch_test.sh` -- Branching test
 
-Run Postgres regression test
+## MicroVM orchestration
 
-```bash
-./scripts/run_pg_test.sh
-```
+### Build Firecracker
 
-Run PITR test
-
-```bash
-./scripts/run_pitr_test.sh
-```
-
-Run branching test
-
-```bash
-./scripts/run_branch_test.sh
-```
-
-### MicroVM orchestration
-
-#### Firecracker
-
-Tiko runs each PostgreSQL database inside a Firecracker microVM. The
-`firecracker` binary must be available on the host (in `$PATH` or via the
-`FIRECRACKER_BIN` / `FIRECRACKER_DIR` environment variables).
+Tiko runs each PostgreSQL database inside a Firecracker microVM. The `firecracker` binary must be available on the host (via the `FIRECRACKER_BIN` environment variables).
 
 - A KVM-enabled Linux host is required (`/dev/kvm`).
-- Guest kernel and rootfs images must be built separately (see
-  `scripts/download_kernel.sh`, `scripts/create_rootfs.sh`, and
-  `scripts/build_initramfs.sh`).
+- Build Firecracker needs Docker to be installed (https://docs.docker.com/engine/install/ubuntu/)
 
 ```bash
 git clone https://github.com/firecracker-microvm/firecracker
@@ -176,34 +155,27 @@ tools/devtool build
 export FIRECRACKER_BIN=$(realpath ./build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker)
 ```
 
-#### AWS S3 Files
+### Set up AWS S3 Files
 
-Tiko uses [AWS S3 Files] as its object-storage backend. The guest VM mounts
-an S3 Files file system via NFSv4.2 (TLS + IAM), requiring:
+Tiko uses [AWS S3 Files](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.html) as its object-storage backend. The guest VM mounts an S3 Files file system via NFSv4.2 (TLS + IAM), requiring:
 
 - An S3 Files file system and mount target in the host's AZ.
 - Static IAM credentials for the guest (the guest has no instance metadata
   service). Store them in `tikod/assets/s3files-creds.env` (gitignored).
-- The `amazon-efs-utils` package installed in the guest rootfs.
 
 See `tikod/docs/s3-files-setup.md` for the full setup runbook.
 
-Update S3 Files config in `scripts/mount_s3files_vm.sh`.
+Once the S3 Files is ready, update S3 Files config in `scripts/mount_s3files_vm.sh` to let guest know where to access the S3 Files.
 
-[AWS S3 Files]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.html
-
----
-
-
-### Build & run the storage tests
-
-Copy S3 Files creds file and fill in your AWS access credentials:
+Copy S3 Files creds file and fill in with your AWS access credentials:
 
 ```bash
 cp ./scripts/s3files-creds.env.sample ./tikod/assets/s3files-creds.env
 ```
 
-Prepare tikod and VM
+### Prepare MicroVM, tikod and initialise seed db
+
+Prepare kernel and rootfs:
 
 ```bash
 ./scripts/download_kernel.sh
@@ -211,35 +183,72 @@ Prepare tikod and VM
 ./scripts/create_rootfs.sh
 ```
 
+Start tikod server:
+
 ```bash
 RUST_LOG=tikod=debug cargo run -p tikod
 ```
 
-This builds the Rust crates, compiles the patched PostgreSQL, and runs the
-`test_pico` regression module:
+Open another terminal and run `vmtop` to monitor the VM swarm:
 
 ```bash
-cd postgres/src/test/modules/test_pico && make check \
-  PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libs3worker'
+./scripts/vmtop.py
 ```
 
-### Build individual crates
+Open another terminal again to create seed db:
 
 ```bash
-cargo build -p smgr      # storage manager (loaded into postgres)
-cargo build -p worker    # background worker (cdylib, shared_preload_libraries)
-cargo build -p tikod     # control plane binary
-cargo build -p tikoguest # guest agent binary
-cargo build -p cli       # operator CLIs (tiko_pitr, tiko_branch, …)
+# create an initial vm
+curl -X POST localhost:9000/vms/provision
+
+# create the seed db (this will take several minutes, be patient)
+curl -X POST localhost:9000/vms/vm-0/db/init
+
+# start the seed db
+curl -X POST localhost:9000/vms/vm-0/db/start
+
+# add some seed data
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-0'" \
+    -c 'create table tt(a int); insert into tt values(123);'
+
+# take a base backup of the seed db
+curl -X PUT localhost:9000/vms/vm-0/branch/backup
 ```
 
-### Run the control-plane tests
+Ok now, all the preparation works are done.
+
+### Scale to zero
+
+Let's create 8 databases:
 
 ```bash
-cargo test -p tikod
-cargo test -p tikoguest
-cargo test -p core
+./scripts/stress_create_dbs.sh 8
 ```
+
+Now go back to `vmtop` terminal and watch each db's status change.
+
+- `running` - normal status
+- `paused` - db is paused but still in memory, 2 minutes without activities from `running`
+- `frozen` - db is destroyed after snapshot, 2 minutes without new connection from `paused`
+
+When a db is in `paused` or `frozen`, open a new psql connection will bring it back to `running`.
+
+```bash
+# wake up vm-2
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
+
+# wake up vm-5
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-5'" -c 'select * from tt'
+```
+
+Notes:
+
+- we use connection options, like `tiko.endpoint=vm-2`, to distiguish which db to wake up.
+- for demo purpose, we currently use fixed-time inactivity checking policy, that is, it will always be treated inactive after 2 minutes regardless having active connection or not.
+
+### Copy-on-write(COW) database branching
+
+### PITR
 
 ---
 
