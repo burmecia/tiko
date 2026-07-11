@@ -245,8 +245,20 @@ Notes:
 
 - we use connection options, like `tiko.endpoint=vm-2`, to distiguish which db to wake up.
 - for demo purpose, we currently use fixed-time inactivity checking policy, that is, it will always be treated inactive after 2 minutes regardless having active connection or not.
+- when the vm is in `running` status, you can ssh in it directly, e.g., `ssh root@172.16.2.2`, password is `root`.
 
 ### Copy-on-write(COW) database branching
+
+```bash
+# make a base backup for vm-2
+curl -X PUT localhost:9000/vms/vm-2/branch/backup -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst"}'
+
+# create a new empty vm 'vm-9'
+curl -X POST localhost:9000/vms/provision -d '{"vm_id":"vm-9"}'
+
+# restore from vm-2 branch
+curl -X POST localhost:9000/vms/vm-9/branch/restore -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst","db_id":"vm-9","parent_db_id":"vm-2"}'
+```
 
 ### PITR
 
