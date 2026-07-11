@@ -201,7 +201,7 @@ Open another terminal again to create seed db:
 # create an initial vm
 curl -X POST localhost:9000/vms/provision
 
-# create the seed db (this will take several minutes, be patient)
+# create the seed db (this will take couple of minutes, be patient)
 curl -X POST localhost:9000/vms/vm-0/db/init
 
 # start the seed db
@@ -219,10 +219,10 @@ Ok now, all the preparation works are done.
 
 ### Scale to zero
 
-Let's create 8 databases:
+Let's create 5 databases:
 
 ```bash
-./scripts/stress_create_dbs.sh 8
+./scripts/stress_create_dbs.sh 5
 ```
 
 Now go back to `vmtop` terminal and watch each db's status change.
@@ -249,18 +249,62 @@ Notes:
 
 ### Copy-on-write(COW) database branching
 
-```bash
-# make a base backup for vm-2
-curl -X PUT localhost:9000/vms/vm-2/branch/backup -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst"}'
+Let's make some data changes on `vm-2` and then make a base backup:
 
+```bash
+# add data to vm-2
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'insert into tt values(234)'
+
+# make base backup on vm-2
+curl -X PUT localhost:9000/vms/vm-2/branch/backup -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst"}'
+```
+
+Now restore it to a new VM and start the new db:
+
+```bash
 # create a new empty vm 'vm-9'
 curl -X POST localhost:9000/vms/provision -d '{"vm_id":"vm-9"}'
 
 # restore from vm-2 branch
-curl -X POST localhost:9000/vms/vm-9/branch/restore -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst","db_id":"vm-9","parent_db_id":"vm-2"}'
+curl -X POST localhost:9000/vms/vm-9/branch/restore -d '{"pack":"/mnt/s3files/tiko_root/branch_packs/12/2.tar.zst","db_id":9,"parent_db_id":2}'
+
+# start vm-9 db
+curl -X POST localhost:9000/vms/vm-9/db/start
+
+# check if the data is copied into vm-9 db
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-9'" -c 'select * from tt'
 ```
 
 ### PITR
+
+Let's add some new data to 'vm-2':
+
+```bash
+# check current data and add new data
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'select * from tt; insert into tt values(999)'
+```
+Now check what are the available PITR restore points:
+
+```bash
+curl -X GET localhost:9000/vms/vm-2/pitr/list
+```
+
+Choose an earlier timestamp and restore to it:
+
+```bash
+# PITR recover
+curl -X POST localhost:9000/vms/vm-2/pitr/recover -d '{"time":"2026-07-11 08:35:00"}'
+```
+
+Start the db and check result:
+
+```bash
+# start db
+curl -X POST localhost:9000/vms/vm-2/db/start
+
+# check the recovered data
+psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
+```
 
 ---
 
