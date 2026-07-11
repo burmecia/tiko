@@ -23,6 +23,8 @@ TARGET_DIR="${BASE_DIR}/target"
 PG_BIN_DIR="${TARGET_DIR}/pg-install/bin"
 PG_LIB_DIR="${TARGET_DIR}/pg-install/lib/postgresql"
 TIKO_BIN_DIR="${TARGET_DIR}/debug"
+TEST_DIR="${BASE_DIR}/tt"
+BRANCH_DIR="${BASE_DIR}/tt_branch"
 
 export PATH="${PG_BIN_DIR}":$PATH
 
@@ -47,11 +49,12 @@ fi
 
 # Fresh parent cluster + shared storage root.
 TIKO_PACK="${BASE_DIR}/tt_branch_pack.tar.zst"
-rm -rf "${BASE_DIR}/tt" "${BASE_DIR}/tt_branch" "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" "${BASE_DIR}/parent.log"
-$PG_BIN_DIR/initdb -D "${BASE_DIR}/tt" --auth=trust --no-instructions
-cp "${SCRIPT_DIR}/postgresql.conf.sample" "${BASE_DIR}/tt/postgresql.conf"
+rm -rf "${TEST_DIR}" "${BRANCH_DIR}" "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" "${BASE_DIR}/parent.log"
+$PG_BIN_DIR/initdb -D "${TEST_DIR}" --auth=trust --no-instructions
+cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
+echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
-$PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt" -l "${BASE_DIR}/parent.log" start -w
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/parent.log" start -w
 
 # 1. Seed the parent with data spanning several pages, then checkpoint.
 $PG_BIN_DIR/psql -p 5432 -d postgres -c \
@@ -77,13 +80,13 @@ echo "--- tiko_branch restore ---"
   --pack "${TIKO_PACK}" \
   --parent-db-id 34 \
   --db-id 35 \
-  --pgdata "${BASE_DIR}/tt_branch" --branch-port 5433 \
+  --pgdata "${BRANCH_DIR}" --branch-port 5433 \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"
 
 echo "--- tiko_branch restart ---"
 "${TIKO_BIN_DIR}/tiko_branch" restart \
   --db-id 35 \
-  --pgdata "${BASE_DIR}/tt_branch" --branch-port 5433 \
+  --pgdata "${BRANCH_DIR}" --branch-port 5433 \
   --pg-ctl "${PG_BIN_DIR}/pg_ctl"
 
 # 3. Verify the branch reads the parent's data via copy-on-write.
@@ -112,8 +115,8 @@ if [ "${BRANCH_COUNT2}" != "201" ]; then
 fi
 
 # Cleanup.
-$PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt_branch" stop -m fast -w
-$PG_BIN_DIR/pg_ctl -D "${BASE_DIR}/tt" stop -m fast -w
+$PG_BIN_DIR/pg_ctl -D "${BRANCH_DIR}" stop -m fast -w
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" stop -m fast -w
 rm -f "${TIKO_PACK}"
 
 echo
