@@ -3,6 +3,7 @@
 /tiko
 /tt_branch
 /tiko_root
+/tiko_local
 /tikod/assets/*
 !/tikod/assets/.gitkeep
 *.log

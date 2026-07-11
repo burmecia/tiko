@@ -65,4 +65,6 @@ if ! (cd "${BASE_DIR}/postgres/src/test/modules/test_tiko" && make check PG_TEST
   exit 1
 fi
 
+echo
 echo "All tests passed. 🎉"
+echo

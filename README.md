@@ -118,6 +118,8 @@ Install Rust 1.88
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.88.0
 ```
 
+## Getting started
+
 Clone Tiko repo
 
 ```bash
@@ -128,24 +130,21 @@ cd tiko
 Build Postgres:
 
 ```bash
-git submodule update --init postgres
-cd postgres
-
-sudo apt-get install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config
-
-./configure --prefix $(realpath ../)/target/pg-install \
-    --enable-debug \
-    --enable-cassert \
-    --without-openssl \
-    --without-systemd \
-    --without-libxml \
-    --without-libxslt \
-    --without-llvm \
-    --without-icu \
-    --without-selinux
-
-make -j$(nproc) && make install
+./scripts/build_postgres.sh
 ```
+
+### Postgres compute-storage separation
+
+Run smoke test
+
+```bash
+./scripts/run_test.sh
+```
+
+```bash
+./scripts/run_test4.sh
+```
+
 ### Firecracker
 
 Tiko runs each PostgreSQL database inside a Firecracker microVM. The
@@ -180,14 +179,8 @@ Update S3 Files config in `scripts/mount_s3files_vm.sh`.
 
 ---
 
-## Getting started
-
 
 ### Build & run the storage tests
-
-```bash
-./scripts/run_test.sh
-```
 
 Copy S3 Files creds file and fill in your AWS access credentials:
 

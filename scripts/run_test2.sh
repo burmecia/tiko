@@ -7,11 +7,9 @@ set -e  # Exit on any error
 ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 
 # Set environment variables for Tiko configuration
-unset TIKO_STORAGE_ROOT TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
-#export TIKO_PITR_INTERVAL_SECS="300"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -20,9 +18,12 @@ POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 PG_BIN_DIR="${POSTGRES_INSTALL}/bin"
 TEST_DIR="${BASE_DIR}/tt"
 
+export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"
+export TIKO_LOCAL_PATH="${BASE_DIR}/tiko_local"
+
 # How many times to duplicate the sample dataset (199 rows each).
-# Default: 50x = ~9950 rows. Override with TIKO_TEST_DATA_DUPLICATES env var.
-DUPLICATES="${TIKO_TEST_DATA_DUPLICATES:-50}"
+# Default: 500x = ~99500 rows. Override with TIKO_TEST_DATA_DUPLICATES env var.
+DUPLICATES="${TIKO_TEST_DATA_DUPLICATES:-500}"
 
 # Build a large CSV from the committed small sample by duplicating data rows.
 # The sample file has a header + data rows; we keep one header and repeat the
@@ -42,13 +43,17 @@ done
 ROW_COUNT=$(($(wc -l < "${LARGE_CSV}") - 1))
 echo "Generated ${LARGE_CSV} with ${ROW_COUNT} data rows"
 
-rm -rf "${TEST_DIR}" "${BASE_DIR}/log.log"
+rm -rf "${TEST_DIR}" "${BASE_DIR}/log.log" "${TIKO_STORAGE_ROOT}" "${TIKO_LOCAL_PATH}"
 $PG_BIN_DIR/initdb -D "${TEST_DIR}"
 cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
 echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" start
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" -w start
 
 $PG_BIN_DIR/psql -d postgres -v csvfile="'${LARGE_CSV}'" -f "${SCRIPT_DIR}/load_data.sql"
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" stop
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" -w stop
+
+echo
+echo "Test run completed. 🎉"
+echo
