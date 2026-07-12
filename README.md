@@ -133,16 +133,11 @@ storage layer by spawning CLIs / `pg_ctl` and over HTTP — no internal Rust dep
 
 ## Getting started
 
-Clone the repository with submodules.
+Clone the repository with submodules and make sure [Rust 1.88+ (edition 2024)](https://rust-lang.org/tools/install/) is installed.
 
 ```bash
 git clone --recurse-submodules https://github.com/burmecia/tiko.git
 cd tiko
-```
-
-Make sure [Rust 1.88+ (edition 2024)](https://rust-lang.org/tools/install/) is installed.
-
-```bash
 rustup show
 ```
 
@@ -160,9 +155,19 @@ Run the smoke test:
 ./scripts/run_test.sh
 ```
 
+Run the large-data test to see compute-storage separation in action:
+
+```bash
+./scripts/run_large_data_test.sh
+
+# After the run, three directories appear under the repo root:
+# - `tt/`         — the Postgres PGDATA directory (compute)
+# - `tiko_root/`  — simulated S3-compatible remote storage (storage)
+# - `tiko_local/` — local cache, base manifest, and other per-DB state
+```
+
 Other test scripts:
 
-- `./scripts/run_large_data_test.sh` — large data test
 - `./scripts/run_pg_test.sh` — PostgreSQL regression test
 - `./scripts/run_pitr_test.sh` — PITR test
 - `./scripts/run_branch_test.sh` — branching test

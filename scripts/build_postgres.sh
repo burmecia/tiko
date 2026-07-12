@@ -19,12 +19,32 @@ if [ ! -f "${POSTGRES_DIR}/configure" ]; then
 fi
 
 # 2. Install build dependencies.
-echo "Installing build dependencies..."
-sudo apt-get update
-sudo apt-get install -y \
-    build-essential libreadline-dev zlib1g-dev flex bison \
-    libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc \
-    ccache pkg-config
+OS="$(uname)"
+if [ "${OS}" = "Darwin" ]; then
+    if ! command -v brew &>/dev/null; then
+        echo "ERROR: Homebrew is not installed. Install from https://brew.sh" >&2
+        exit 1
+    fi
+    if ! xcode-select -p &>/dev/null; then
+        echo "ERROR: Xcode Command Line Tools are not installed. Run: xcode-select --install" >&2
+        exit 1
+    fi
+    echo "Installing build dependencies (macOS)..."
+    brew install flex bison readline zlib pkg-config ccache
+    # macOS ships outdated flex/bison; prefer Homebrew's.
+    export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:${PATH}"
+    export PKG_CONFIG_PATH="$(brew --prefix readline)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+elif [ "${OS}" = "Linux" ]; then
+    echo "Installing build dependencies (Linux)..."
+    sudo apt-get update
+    sudo apt-get install -y \
+        build-essential libreadline-dev zlib1g-dev flex bison \
+        libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc \
+        ccache pkg-config
+else
+    echo "ERROR: Unsupported OS: ${OS}" >&2
+    exit 1
+fi
 
 # 3. Configure.
 echo "Configuring PostgreSQL..."
@@ -53,6 +73,13 @@ fi
 
 # 5. Build and install.
 echo "Building and installing PostgreSQL..."
-make -j"$(nproc)" && make install
+if [ "${OS}" = "Darwin" ]; then
+    JOBS="$(sysctl -n hw.ncpu)"
+else
+    JOBS="$(nproc)"
+fi
+make -j"${JOBS}" && make install
 
-echo "PostgreSQL installed to ${PG_INSTALL}"
+echo
+echo "PostgreSQL installed to ${PG_INSTALL} 🎉"
+echo

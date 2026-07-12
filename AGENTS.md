@@ -34,8 +34,8 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
   CLAUDE.md mention of an Apple Virtualization Framework macOS backend is stale;
   `tikod/src/vmm/` contains only `firecracker.rs`. On macOS you can build/test
   `core`, `pgsys`, `smgr`, `worker`, `cli`, `tikoguest`, but not `tikod`.
-- **`build_postgres.sh` is Linux-only** (`sudo apt-get`). On macOS, configure
-  `postgres/` manually once before running `run_test.sh`.
+- **`build_postgres.sh`** installs deps via `apt-get` on Linux and `brew` on
+  macOS (auto-detected). On macOS it also checks for Xcode Command Line Tools.
 - **Required env vars**: `run_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/
   `TIKO_PROJECT_ID`/`TIKO_PITR_INTERVAL_SECS`. It also `unset`s
   `TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH` (the smoke test uses defaults). In a VM
