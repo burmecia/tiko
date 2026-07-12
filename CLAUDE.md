@@ -4,641 +4,230 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tiko replaces PostgreSQL's magnetic disk (`md`) storage manager with S3-backed block storage. A local file cache sits in front of S3 as the source of truth. The project is written in Rust and compiled as PostgreSQL shared libraries (extensions).
+Tiko is a serverless Postgres proof-of-concept: S3-backed storage + Firecracker microVM compute.
+It replaces PostgreSQL's magnetic-disk (`md`) storage manager with an S3-backed block store, runs
+each database in its own microVM that scales to zero when idle, supports copy-on-write branching,
+and streams WAL to S3 for point-in-time recovery. Written in Rust, compiled as PostgreSQL shared
+libraries (extensions) plus standalone control-plane/CLI binaries. This is experimental, not
+production software.
 
 ## Build & Test
 
-Requires Rust 1.88+ (edition 2024). PostgreSQL is a git submodule under `postgres/`.
+Requires Rust 1.88+ (edition 2024). PostgreSQL 18 is a git submodule under `postgres/`, patched
+for Tiko's custom AIO opcodes.
 
 ```bash
-# Build everything and run tests
-./scripts/run_test.sh
+./scripts/build_postgres.sh   # build vendored/patched Postgres
+./scripts/run_test.sh         # build smgr+worker, build Postgres, run the smoke test (make check)
+
+# Other test scripts
+./scripts/run_test2.sh        # large-data test
+./scripts/run_pg_test.sh      # PostgreSQL regression test
+./scripts/run_pitr_test.sh    # PITR test
+./scripts/run_branch_test.sh  # COW branching test
 
 # Build individual crates
-cd s3smgr && cargo build --release    # produces target/release/libs3smgr.a (staticlib)
-cd s3worker && cargo build --release  # produces target/release/libs3worker.dylib (cdylib)
-
-# Run the PostgreSQL regression test
-cd postgres/src/test/modules/test_pico && make check \
-  PG_TEST_INITDB_EXTRA_OPTS='-c log_min_messages=debug1 -c shared_preload_libraries=libs3worker'
+cargo build -p smgr    # produces target/{debug,release}/libtikosmgr.a (staticlib+rlib)
+cargo build -p worker  # produces target/{debug,release}/libtikoworker.{dylib,so} (cdylib+rlib)
 ```
 
-PostgreSQL configure (from `note.txt`) — minimal debug build:
-```bash
-cd postgres && ./configure --prefix $(realpath ../)/target/pg-install \
-    --enable-debug --enable-cassert --without-openssl --without-systemd \
-    --without-libxml --without-libxslt --without-llvm --without-selinux
-```
+`run_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/`TIKO_PROJECT_ID`/`TIKO_PITR_INTERVAL_SECS`, builds
+`smgr`, builds Postgres, builds `worker`, copies `libtikoworker` into
+`postgres/src/test/modules/test_tiko/`, then runs `make check` there with
+`shared_preload_libraries=libtikoworker`.
+
+Clippy note: `cargo clippy` run against `core`/`cli` aborts on pre-existing lint errors in `pgsys`
+(FFI bindings) — verify changes with `cargo build`/`cargo test` instead of clippy.
 
 ## Architecture
 
-Three workspace crates with a clear dependency chain:
+### Workspace layout
 
 ```
-s3smgr ──→ s3worker ──→ pgsys
-  │                       │
-  └───────────────────────┘
+tiko/
+├── postgres/     # vendored PostgreSQL 18 (git submodule) + Tiko patches
+├── pgsys/        # hand-written PostgreSQL FFI bindings
+├── core/         # storage layer: chunks, manifests, store, I/O engine
+├── smgr/         # tikosmgr — PostgreSQL storage manager
+├── worker/       # tikoworker — background worker (AIO, WAL receiver, compactor)
+├── cli/          # operator CLIs: tiko_pitr, tiko_branch, tiko_restore, tiko_tlseg_viewer
+├── tikod/        # control plane: proxy, node/VMM lifecycle, HTTP API
+└── tikoguest/    # in-VM agent: pg control, observability, scaler, freeze
 ```
+
+```
+pgsys ──→ core ──→ smgr (tikosmgr)  ──→ postgres
+              └───→ worker (tikoworker) ──→ postgres
+                └──→ cli (tiko_pitr, tiko_branch, tiko_restore, ...)
+```
+
+`tikod` and `tikoguest` are standalone binaries with no internal Rust dependency on
+`core`/`smgr`/`worker` — they orchestrate everything by spawning CLI binaries / `pg_ctl` and
+talking HTTP.
 
 ### `pgsys` — PostgreSQL FFI bindings
-Raw `extern "C"` declarations for PG internals: smgr (md* functions), background workers, shared memory, LWLocks, latches, condition variables, logging. No build.rs/bindgen — bindings are hand-written `#[repr(C)]` structs matching PG's C layout. Symbols resolve at load time against the running postgres process.
+Raw `extern "C"` declarations for PG internals: smgr, background workers, shared memory, LWLocks,
+latches, condition variables, logging, PG18 AIO (`aio.rs`). No build.rs/bindgen — bindings are
+hand-written `#[repr(C)]` structs matching PG's C layout. Symbols resolve at load time against the
+running postgres process.
 
-### `s3smgr` — Storage manager interface (staticlib)
-Implements the PG `smgr` interface with `s3_*` functions (`s3_readv`, `s3_writev`, `s3_open`, etc.) that are registered as the storage manager. Two I/O paths:
+### `core` — storage layer (library, no PG dependency)
+Chunks, manifests, the object-store abstraction, and the shared-memory I/O/cache engine. Key
+modules:
+- `org.rs` / `db.rs` — `OrgMeta` (org lifecycle, soft-delete) and `DbNamespace { org_id, db_id,
+  project_id }`, built from `TIKO_ORG_ID`/`TIKO_DB_ID`/`TIKO_PROJECT_ID` env vars. Only
+  `org_id`/`db_id` currently appear in storage keys.
+- `io/locator.rs` — `Locator`: builds S3 object keys, e.g. `{org}/{db}/chunks/{ckpt}/{relfork}/{chunk_id}`,
+  `{org}/{db}/bases/{tl}/{lsn}.manifest`, `{org}/{db}/backup/{tl}/{lsn}.tar.zst`,
+  `{org}/{db}/timeline/{segment}`, `{org}/{db}/wal/{tl}/{segment}[.chunks/{offset}]`,
+  `{org}/{db}/db_meta.json`. `chunk_in_db()` addresses another `db_id` in the same org — this is
+  the COW mechanism (see below).
+- `manifest.rs` — `ChunkRef { db_id, timeline_id, lsn, ... }`. A chunk reference can point at a
+  *parent* database's namespace, so a branch's base manifest resolves shared chunks straight from
+  the parent's storage without copying.
+- `io/storage/` — `trait ObjectStorage { put, get, delete, list_prefix }`. `storage.rs` wraps a
+  `Box<dyn ObjectStorage>`; `s3.rs` is a stub (`todo!()`) for a real networked S3 client; `s3_sim.rs`
+  (`S3Sim`) is the **active backend today** — a local-filesystem simulation of S3 rooted at
+  `{root_path}/s3sim`, zstd-compressing everything except `.json`/`.zst` objects. In production this
+  filesystem root is itself an NFSv4.2-mounted S3 Files share, so despite the name, `S3Sim` is the
+  real production storage path, not just a test double.
+- `io/cache/` — shared-memory write-back `ChunkCache`/`MetaCache` (256 KB chunks, per-fork nblocks
+  and deletion state). There is **no local backing-file cache** anymore — reads/writes flow PG
+  buffer → shmem cache → `Store` → `Storage` (S3Sim) directly on eviction/flush.
+- `io/store.rs` — `Store` ties cache + locator + storage together (`get_chunk`, `patch_chunk`,
+  `run_compaction`).
+- `pitr.rs` — recovery-config helpers (`postgresql.auto.conf` recovery block), crash-safe PGDATA
+  snapshot/restore excluding the bulk `tiko/` dir.
+- `env.rs` — env var parsing, incl. `TIKO_LOCAL_PATH` for the small local state dir (base-manifest
+  cache file, draft spill file — not block data).
 
-- **Sync path** (all smgr functions except `s3_startreadv` and `s3_prefetch`): Calls `store_ops` directly in the backend process (`pread`/`pwrite` on local cache files). This is correct because sync smgr callers may pass backend-local memory pointers (`PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local `PGIOAlignedBlock`) that s3worker cannot access cross-process.
-- **Async path** (`s3_startreadv` → `s3_io_perform_read`/`s3_io_perform_write`): Uses the shared-memory pipeline to s3worker. Buffers are always in shared memory (`BufferBlocks`), so cross-process access is safe. Also used by `s3_prefetch` for local cache warming (no `buffer_ptr`).
+### `smgr` (crate `smgr`, lib `tikosmgr`) — storage manager interface (staticlib+rlib)
+Implements the PG `smgr` interface (`smgr_impl/*.rs`: open, close, create, exists, extend, nblocks,
+prefetch, readv, writev, truncate, unlink, zeroextend, startreadv, ...). Two I/O paths:
+- **Sync path**: calls `core::ops` (read/write blocks) directly in the backend process. Correct
+  because sync smgr callers may pass backend-local memory (palloc'd pages, local buffers,
+  stack-local aligned blocks) that the worker process cannot access cross-process.
+- **Async path** (`tiko_startreadv` → `aio.rs::perform_io`): uses the shared-memory pipeline to
+  `tikoworker`. Falls back to direct `core::ops` calls when the worker/pipeline is unavailable
+  (initdb, shutdown checkpoint, worker crash).
+- `checkpoint.rs` — `tiko_perform_checkpoint()`: normal checkpoints flush dirty cache chunks;
+  `CHECKPOINT_CAUSE_BASEBACKUP` additionally materializes a base manifest at that LSN (paired with
+  `tiko_pitr backup`); shutdown checkpoints fold everything into the base manifest inline.
 
-The `use_pipeline()` helper (combines `is_under_postmaster()` + `is_s3worker_alive()`) guards the async path in `aio.rs` and `prefetch.rs`, falling back to direct `store_ops` when unavailable (initdb, shutdown checkpoint, s3worker crash).
+### `worker` (crate `worker`, lib `tikoworker`) — background worker process (cdylib+rlib)
+Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker running
+`main_loop`. Structure:
+- **`main_loop`** — PG-process main thread: polls submit queue, dispatches to Tokio, sleeps via
+  `WaitLatch`.
+- **`thread_pool`** — Tokio runtime init.
+- **`dispatcher`** / **`io_handler`** — shared-memory submit queue from backends to Tokio, async
+  S3 GET/PUT + local cache I/O, completion via `SetLatch` on the backend's latch.
+- **`shmem`** — `shmem_request_hook`/`shmem_startup_hook` for PG shared memory init.
+- **`tasks/wal_receiver.rs`** — streams WAL from the local postmaster via the PG physical
+  streaming-replication protocol over a Unix socket (hand-rolled wire protocol; `tokio-postgres`
+  lacks `CopyBoth`), uploading 256 KiB WAL chunk objects near-realtime and sealing full segments on
+  switch.
+- **`tasks/compactor.rs`** — folds superseded timeline segments into a new base manifest and
+  deletes the now-redundant segment objects (the only GC-like behavior currently implemented; see
+  Roadmap below — full chunk/retention GC is not yet built).
 
-### `s3worker` — Background worker process (cdylib)
-Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker that calls `s3worker_main`. Internal structure:
-- **`main_loop`** — the PG-process main thread: polls submit queue, dispatches to Tokio, sleeps via `WaitLatch`
-- **`thread_pool`** — initializes Tokio runtime (4 async workers + 8 blocking threads)
-- **`dispatcher`** — bounded `sync_channel` for work requests from main thread to Tokio (no completion channel — Tokio notifies backends directly via SetLatch)
-- **`io_handler`** — async S3 GET/PUT and local cache read/write with SetLatch completion path
-- **`io_control`** (pub) — the shared memory data structures, also used by `s3smgr`
-- **`store_ops`** (pub) — synchronous block-level file I/O (`read_blocks`, `write_blocks`, `create_file`, etc.). Called directly by s3smgr sync functions and by s3worker's `io_handler`. Uses S3-style path layout: `{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`
-- **`shmem`** — hooks into `shmem_request_hook`/`shmem_startup_hook` for PG shared memory init
+### Shared Memory IPC & Slot State Machine
+`S3IoControl`-style shared struct lives in PG shared memory. Per-backend slot pools (small fixed
+slots per backend, bitmask claiming — no CAS races on claim), an MPSC submit queue backends push
+into and the worker pops from, and direct `SetLatch` completion (no harvest step, no main-thread
+scan).
 
-### Shared Memory IPC
-
-`S3IoControl` lives in PG shared memory (allocated via `ShmemInitStruct`). Layout:
-
-- **Per-backend slot pools** (`BackendSlotPool`): Each backend owns 4 `S3IoSlot`s (64 bytes each). Slot claiming uses a local bitmask — zero contention, no CAS races. Pools are dynamically sized to `MaxBackends` and follow `S3IoControl` in shared memory via pointer arithmetic.
-- **MPSC submit queue** (`SubmitQueue`): Backends push `(backend_id, slot_idx)` entries via `fetch_add`. s3worker pops and dispatches. Strict ordering, no advisory hints. 1024 entries, power-of-2 ring buffer. Zero sentinel handles producer write delays.
-- **SetLatch completion**: Tokio workers call `SetLatch(owner_latch)` directly on the backend's latch after marking a slot Completed. No harvest step, no main-thread scan.
-
-### Slot State Machine
-
-`Free → Filling → Submitted → InProgress → Completed → Free`
-
-| Transition | Who | Mechanism |
-|---|---|---|
-| Free → Filling | Backend | Claim from own pool (bit clear) |
-| Filling → Submitted | Backend | `slot.publish()` (Release store) |
-| Submitted → InProgress | s3worker | `slot.try_start_processing()` (CAS) |
-| InProgress → Completed | Tokio | `slot.mark_completed()` + `SetLatch(owner_latch)` |
-| Completed → Free | Backend | `slot.release()` + `pool.release()` |
-
-### Shutdown & Non-Normal Mode Handling
-
-PostgreSQL kills all `B_BG_WORKER` processes (including s3worker) in `PM_STOP_BACKENDS`, **before** the checkpointer performs the shutdown checkpoint in `PM_WAIT_XLOG_SHUTDOWN`. There is no `bgw_flags` value to keep a bgworker alive past this phase.
-
-**`use_pipeline()` guard** (used in `aio.rs` and `prefetch.rs`):
-- `is_under_postmaster()` — false during initdb (both `--boot` and `--single` phases). Checked via PG's `IsUnderPostmaster` global (process-local, no shared memory).
-- `is_s3worker_alive()` — uses `kill(pid, 0)` on PID stored in shared memory. Returns false if s3worker is dead (shutdown, crash).
-- When `use_pipeline()` returns false, the AIO path falls back to direct `store_ops` calls (same as the sync smgr functions).
-
-All sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, `s3_create`, etc.) always call `store_ops` directly — no pipeline, no fallback needed. This handles initdb, shutdown checkpoint, and s3worker crash. Pages land in the local cache (persistent), WAL guarantees recoverability, and on next startup s3worker reconciles cache-dirty pages with S3.
+Slot lifecycle: `Free → Filling → Submitted → InProgress → Completed → Free` — backend claims and
+fills, backend publishes (release store), worker claims for processing (CAS), Tokio marks complete
+and sets the backend's latch, backend releases back to its pool.
 
 ### PG18 AIO Integration
+The vendored `postgres/` submodule is patched with custom AIO opcodes `PGAIO_OP_TIKO_READV` /
+`PGAIO_OP_TIKO_WRITEV` (`postgres/src/include/storage/aio.h`, `.../tiko.h`), wired into
+`aio_io.c`/`aio_funcs.c`/`smgr.c`'s core dispatch switches. This is a small, contained patch — no
+I/O method replacement, no custom completion callbacks beyond the normal bufmgr chain.
 
-PG18 introduces an asynchronous I/O subsystem built around `PgAioHandle` — a shared-memory object tracking each I/O operation through a state machine: `IDLE → HANDED_OUT → DEFINED → STAGED → SUBMITTED → COMPLETED_IO → COMPLETED_SHARED → COMPLETED_LOCAL → IDLE`. The smgr interface adds `startreadv` alongside the existing synchronous `readv`.
+Flow: `smgr::startreadv::tiko_startreadv` sets up iovecs, registers callbacks, calls
+`pgaio_io_start_tiko_readv` (no `PGAIO_HF_SYNCHRONOUS` flag, so PG's IO worker pool picks it up,
+keeping the backend non-blocking). The IO worker calls `pgaio_io_perform_synchronously()`, which
+hits `smgr::aio::perform_io()` — this submits into the Tiko shared-memory pipeline to `tikoworker`
+(or falls back to direct `core::ops` calls when the pipeline isn't available) and waits on the
+latch. Normal PG AIO completion callbacks (md validation, `BM_VALID`, checksums) run unmodified.
 
-**Design: Custom `PgAioOp` for S3 reads**
+Thread safety: Tokio threads **can** read/write shared memory atomics, `memcpy` into buffers, do
+file/network I/O, and `SetLatch`. They **cannot** call `ConditionVariable*`, `LWLock*`,
+`ereport`/`elog`, or `palloc`/`pfree` — those require PG process-local state and must only run on
+the main thread.
 
-Add `PGAIO_OP_S3_READV` to the `PgAioOp` enum and handle it in `pgaio_io_perform_synchronously()`. This plugs into PG18 AIO with a small, contained patch — no I/O method replacement, no custom callbacks needed.
+### Shutdown & Non-Normal Mode Handling
+PostgreSQL kills all `B_BG_WORKER` processes (including `tikoworker`) in `PM_STOP_BACKENDS`,
+**before** the checkpointer's shutdown checkpoint. A `use_pipeline()`-style guard (checks
+`IsUnderPostmaster` and whether the worker PID in shared memory is alive) falls back to direct
+`core::ops` calls when the async path isn't available — initdb, shutdown checkpoint, worker crash.
+Sync smgr functions always call `core::ops` directly regardless, so pages land in the shmem cache /
+get flushed to storage, WAL guarantees recoverability, and on restart the worker reconciles any
+cache-dirty state.
 
-**Data flow:**
+### `cli` — operator CLI binaries
+- `tiko_pitr` — `list` (available recovery points), `backup` (runs `pg_basebackup`, uploads
+  tarball under the `backup/` key prefix), `recover --time|--lsn [--timeline]` (installs the
+  backup's base manifest, replays WAL, promotes, leaves the instance stopped), `restart`.
+- `tiko_branch` — `backup` (runs `pg_basebackup -X stream` against the running parent, forming a
+  base manifest at that LSN via `CHECKPOINT_CAUSE_BASEBACKUP`, packs into `tar.zst`), `restore`
+  (unpacks into a fresh branch PGDATA and seeds the branch's namespace with the parent's base
+  manifest — `ChunkRef.db_id = parent`, so shared chunks resolve from the parent's storage — then
+  starts the branch's Postgres to replay to consistency and stops it), `restart`.
+- `tiko_restore` — implements PostgreSQL's `restore_command` contract (`tiko_restore %f %p`),
+  reading sealed-segment or in-flight `.chunks/` WAL objects written by `wal_receiver`.
+- `tiko_tlseg_viewer` — inspects timeline/segment objects.
+- `pg_stubs.rs` — standalone binaries statically link `core`/`pgsys`, which declare `extern "C"`
+  symbols normally resolved by the running postmaster (e.g. `DataDir`, `rust_pg_log`). `pg_stubs.rs`
+  provides no-op definitions so these binaries link outside of a running Postgres process.
+- `cli/legacy/` exists in the tree (`tiko_ctl`, old `tiko_restore`/`tiko_archive`/manifest viewer)
+  but is commented out of `Cargo.toml`'s `[[bin]]` list — dead code from a prior CLI shape, not
+  part of the build.
 
-```
-Backend              PG IO Worker              s3worker (Tokio)          S3
-═══════              ════════════              ════════════════          ══
-s3_startreadv()
-  set up iovec
-  pgaio_io_stage(PGAIO_OP_S3_READV)
-  submit to IO worker queue
-  return immediately ✓
-                     wakes up
-(doing other work)   pgaio_io_perform_synchronously()
-                       case PGAIO_OP_S3_READV:
-                       submit_and_wait() ────→  claim slot, fill, publish
-                       WaitLatch                dispatch to Tokio
-                                                  cache hit → pread
-                                                  cache miss ──────→ GET
-                                                              ◄───── data
-                                                              write cache
-                                                memcpy to buffer_ptr
-                                                mark_completed + SetLatch
-                     WaitLatch returns ◄────────┘
-                     result = nblocks * BLCKSZ
-                     pgaio_io_process_completion()
-                       callbacks (md_readv_complete, buffer_readv_complete)
-                       ConditionVariableBroadcast
-wref_wait returns ◄──┘
-```
+### `tikod` — compute control plane
+HTTP control API + PG wire-protocol proxy + VM orchestration. Not a GC/retention service (see
+Roadmap). Modules: `proxy/` (wire-protocol proxy with wake-on-connect/freeze, startup/cancel/error
+handling), `control/` (VM registry, idle policy, auto-pause enforcement), `node/` (VM lifecycle via
+the `Vmm` trait — Firecracker on Linux, Apple Virtualization Framework on macOS dev — plus snapshot
+cache), `api/` (HTTP server/client: `/vms/provision`, `/vms/{id}/db/*`, `/vms/{id}/branch/*`,
+`/vms/{id}/pitr/*`), `guestcontrol.rs` (talks to `tikoguest` over HTTP).
 
-**Key design decisions:**
+### `tikoguest` — in-VM agent
+Runs inside each microVM: `pg_ctl` lifecycle, observability (`pgmetrics.rs`), autoscaling
+(`scaler.rs`), freeze/backup coordination (`backup.rs`), and an HTTP server (`server.rs`) that
+`tikod` talks to.
 
-- **No `PGAIO_HF_SYNCHRONOUS` flag**: Without this flag, `pgaio_io_stage` submits the handle to PG's IO worker pool (not the backend). The IO worker calls `pgaio_io_perform_synchronously()` which hits our `PGAIO_OP_S3_READV` switch case. The backend remains non-blocking — true async from its perspective.
-- **IO worker reuses `submit_and_wait()`**: The IO worker is a regular PG process with a valid `MyProcNumber` and `MyLatch`, counted in `MaxBackends`. It gets its own `BackendSlotPool` in `S3IoControl`. From Tiko's perspective, it's just another backend — claims slots, publishes requests, waits on latch. No Tokio runtime needed in the IO worker.
-- **s3worker handles all S3 I/O**: The IO worker never touches S3 directly. It submits to the Tiko shared-memory pipeline; s3worker's Tokio runtime handles cache checks, S3 fetches, and writes data to the shared-memory buffer pages.
-- **Bufmgr callbacks work unmodified**: `pgaio_io_process_completion` runs the normal callback chain (md byte validation, bufmgr `BM_VALID` flag setting, checksum checks) — no custom AIO callbacks needed.
+### Copy-on-write branching
+Every database is a branch of a seed database. A chunk's `ChunkRef` can reference the *parent*
+database's `db_id`, so a freshly restored branch shares all inherited chunks without copying —
+only newly written/modified blocks land under the branch's own `db_id`. Driven end-to-end by
+`tiko_branch backup`/`restore` and `tikod`'s `/vms/{id}/branch/backup|restore` HTTP endpoints (see
+README for a full worked example).
 
-**PG patch scope** (~6 switch cases + 1 function + enum update):
-
-| File | Change |
-|------|--------|
-| `include/storage/aio.h` | Add `PGAIO_OP_S3_READV` to `PgAioOp`, update `PGAIO_OP_COUNT` |
-| `aio_io.c` `pgaio_io_perform_synchronously` | Add case calling `s3_io_perform_read()` |
-| `aio_io.c` `pgaio_io_get_op_name` | Add `"s3_readv"` |
-| `aio_io.c` `pgaio_io_uses_fd` | Return `false` (no fd to track) |
-| `aio_io.c` `pgaio_io_get_iovec_length` | Return from `op_data.read.iov_length` |
-| `aio_io.c` | Add `pgaio_io_start_s3_readv()` (sets up op_data, calls `pgaio_io_stage`) |
-| `aio_funcs.c` `pg_get_aios` | Display offset/length for debug view |
-| `method_io_uring.c` | Not needed — IO worker path handles it via `pgaio_io_perform_synchronously` |
-
-**Rust side** (`s3smgr`):
-
-- `s3_startreadv`: Set up iovec from buffers, register md callbacks, set smgr target, call `pgaio_io_start_s3_readv()`
-- `s3_io_perform_read` (`extern "C"`): Decode relation info from `target_data`, call `submit_and_wait()` with iov buffer addresses, return `nblocks * BLCKSZ` or `-errno`
-
-### Future Improvements
-
-- **Local cache hit short-circuit**: Cache hits bypass the shared memory queue entirely — `s3_readv` checks the cache index and does a direct `pread()`. Only cache misses go through the async pipeline.
-- **S3 request coalescing**: Batch adjacent block reads into single S3 range GET requests to amortize per-request latency.
-
-### Thread Safety Rules
-
-Tokio threads **CAN**: read/write shared memory atomics, `memcpy` to `buffer_ptr`, file/network I/O, `SetLatch`.
-Tokio threads **CANNOT**: call `ConditionVariable*`, `LWLock*`, `ereport`/`elog`, `palloc`/`pfree` — these require PG process-local state and must only run on the main thread.
+### Point-in-time recovery
+WAL streams to S3 in near-real-time via `worker::tasks::wal_receiver`. `tiko_pitr recover
+--time|--lsn` replays to a target point and promotes. `tiko_restore` implements the
+`restore_command` contract PG calls during recovery.
 
 ## Key Conventions
 
-- `s3worker/build.rs` uses `-undefined dynamic_lookup` (macOS) so PG symbols resolve at extension load time
-- All PG-facing functions use `extern "C-unwind"` and `#[unsafe(no_mangle)]`
-- Shared memory pointers stored in `OnceLock<*mut T>` with Send/Sync wrapper types
-- PG hook chaining: always save and call `prev_*_hook` before installing custom hooks
-
-## PITR Support Design
-
-### High-Level Architecture
-
-Since Tiko already uses S3-backed storage for data files, PITR primarily requires:
-1. **WAL archiving to S3** with lifecycle policies
-2. **Metadata tracking** for recovery points
-3. **Restore coordination** using PostgreSQL's built-in recovery
-
-### Implementation Plan
-
-#### Phase 1: WAL Archiving to S3
-
-**1.1 Add WAL Archiver Module** (`s3worker/src/wal_archiver.rs`):
-
-```rust
-//! WAL archiver - uploads completed WAL segments to S3
-//!
-//! Integrates with PostgreSQL's archive_command to upload WAL files to S3
-//! with automatic lifecycle management (7-day retention).
-
-use std::path::Path;
-use tokio::fs;
-use aws_sdk_s3::Client as S3Client;
-
-pub struct WalArchiver {
-    s3_client: S3Client,
-    bucket: String,
-    prefix: String,  // e.g., "wal/{cluster_id}/"
-    retention_days: u32,
-}
-
-impl WalArchiver {
-    /// Archive a WAL segment to S3
-    pub async fn archive_segment(&self, wal_path: &Path) -> Result<(), String> {
-        let wal_filename = wal_path.file_name()
-            .ok_or("Invalid WAL path")?
-            .to_str()
-            .ok_or("Invalid filename")?;
-        
-        // S3 key: wal/{cluster_id}/{timeline}/{segment}
-        let s3_key = format!("{}{}", self.prefix, wal_filename);
-        
-        let body = fs::read(wal_path).await
-            .map_err(|e| format!("Failed to read WAL: {}", e))?;
-        
-        // Upload to S3 with lifecycle tag
-        self.s3_client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&s3_key)
-            .body(body.into())
-            .tagging(&format!("retention-days={}", self.retention_days))
-            .send()
-            .await
-            .map_err(|e| format!("S3 upload failed: {}", e))?;
-        
-        Ok(())
-    }
-    
-    /// Restore a WAL segment from S3
-    pub async fn restore_segment(&self, wal_filename: &str, dest_path: &Path) -> Result<(), String> {
-        let s3_key = format!("{}{}", self.prefix, wal_filename);
-        
-        let response = self.s3_client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&s3_key)
-            .send()
-            .await
-            .map_err(|e| format!("S3 download failed: {}", e))?;
-        
-        let body = response.body.collect().await
-            .map_err(|e| format!("Failed to read S3 body: {}", e))?
-            .into_bytes();
-        
-        fs::write(dest_path, &body).await
-            .map_err(|e| format!("Failed to write WAL: {}", e))?;
-        
-        Ok(())
-    }
-}
-```
-
-**1.2 PostgreSQL Configuration** (`postgresql.conf`):
-
-```ini
-# Enable WAL archiving
-wal_level = replica
-archive_mode = on
-archive_timeout = 300  # Force archive every 5 minutes
-
-# Archive command - calls Tiko's WAL archiver
-archive_command = '/path/to/pico_archive %p %f'
-
-# For 7-day PITR, keep enough WAL locally too
-max_wal_size = 10GB
-min_wal_size = 1GB
-wal_keep_size = 1GB
-```
-
-**1.3 Archive Command Helper** (`pico_archive` binary):
-
-```rust
-// s3worker/src/bin/pico_archive.rs
-//! Archive command wrapper
-//! Usage: pico_archive <wal_path> <wal_filename>
-
-use tokio::runtime::Runtime;
-use s3worker::wal_archiver::WalArchiver;
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: pico_archive <wal_path> <wal_filename>");
-        std::process::exit(1);
-    }
-    
-    let wal_path = &args[1];
-    let wal_filename = &args[2];
-    
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async {
-        let archiver = WalArchiver::from_env();
-        match archiver.archive_segment(wal_path.as_ref()).await {
-            Ok(_) => {
-                // PostgreSQL expects exit code 0 on success
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("Archive failed: {}", e);
-                std::process::exit(1);
-            }
-        }
-    });
-}
-```
-
-#### Phase 2: Continuous Base Backup Tracking
-
-**2.1 Add Snapshot Metadata Tracker** (`s3worker/src/snapshot.rs`):
-
-```rust
-//! Snapshot metadata for PITR
-//!
-//! Since Tiko data files are already in S3-style local cache, we track
-//! "recovery points" rather than full backups.
-
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct RecoveryPoint {
-    pub timestamp: i64,  // Unix timestamp
-    pub wal_lsn: String,  // LSN at snapshot time (e.g., "0/3000000")
-    pub checkpoint_lsn: String,  // Last checkpoint LSN
-    pub timeline_id: u32,
-    pub cache_generation: u64,  // Cache generation number
-}
-
-pub struct SnapshotTracker {
-    s3_client: aws_sdk_s3::Client,
-    bucket: String,
-    prefix: String,  // e.g., "snapshots/{cluster_id}/"
-}
-
-impl SnapshotTracker {
-    /// Record a recovery point (called periodically, e.g., every hour)
-    pub async fn record_recovery_point(&self, point: &RecoveryPoint) -> Result<(), String> {
-        let key = format!("{}recovery_point_{}.json", self.prefix, point.timestamp);
-        
-        let json = serde_json::to_string_pretty(point)
-            .map_err(|e| format!("JSON error: {}", e))?;
-        
-        self.s3_client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(json.into_bytes().into())
-            .send()
-            .await
-            .map_err(|e| format!("S3 upload failed: {}", e))?;
-        
-        Ok(())
-    }
-    
-    /// List available recovery points within retention window
-    pub async fn list_recovery_points(&self, since: i64) -> Result<Vec<RecoveryPoint>, String> {
-        // List S3 objects with prefix, filter by timestamp
-        // Parse JSON and return sorted list
-        todo!()
-    }
-}
-```
-
-**2.2 Background Snapshot Task** (add to `s3worker`):
-
-```rust
-// In s3worker/src/main_loop.rs or new file
-
-use tokio::time::{interval, Duration};
-
-/// Periodic task to record recovery points
-pub async fn snapshot_task(tracker: Arc<SnapshotTracker>) {
-    let mut interval = interval(Duration::from_secs(3600)); // Every hour
-    
-    loop {
-        interval.tick().await;
-        
-        // Get current checkpoint LSN from PostgreSQL
-        let recovery_point = unsafe {
-            let lsn = pgsys::xlog::GetInsertRecPtr();
-            let checkpoint_lsn = pgsys::xlog::GetLastCheckpointRecPtr();
-            
-            RecoveryPoint {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64,
-                wal_lsn: format!("{:X}/{:X}", 
-                    (lsn >> 32) as u32, 
-                    (lsn & 0xFFFFFFFF) as u32),
-                checkpoint_lsn: format!("{:X}/{:X}",
-                    (checkpoint_lsn >> 32) as u32,
-                    (checkpoint_lsn & 0xFFFFFFFF) as u32),
-                timeline_id: pgsys::xlog::GetRecoveryTargetTLI(),
-                cache_generation: CacheControl::global().generation(),
-            }
-        };
-        
-        if let Err(e) = tracker.record_recovery_point(&recovery_point).await {
-            eprintln!("Failed to record recovery point: {}", e);
-        }
-    }
-}
-```
-
-#### Phase 3: Cache Sync to S3
-
-**Status: checkpoint flush is implemented; real S3 client is future work.**
-
-The cache currently uses local S3-sim files as the backing store
-(`{DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}`). Dirty cache
-blocks are flushed to these files at checkpoint time. When a real S3 client
-is added, `store_ops::write_blocks` and `read_blocks` will be replaced with
-S3 PUT/GET calls.
-
-**3.1 Checkpoint Flush** (`s3smgr/src/checkpoint.rs`) — **already implemented**:
-
-```rust
-/// Called from CheckPointGuts() in xlog.c after CheckPointBuffers().
-/// Flushes all dirty cache chunks to the S3-sim backing files before
-/// the checkpoint WAL record is written.
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn s3_checkpoint_flush() {
-    if !S3IoControl::is_initialized() {
-        return;
-    }
-    S3IoControl::get().cache.flush_all_dirty_chunks();
-}
-```
-
-`flush_all_dirty_chunks` scans every cache slot, spins to pin each dirty
-slot exclusively, calls `flush_dirty_chunk` (which reads each dirty block
-from the cache file and writes it to the backing relation file via
-`store_ops::write_blocks`), clears `dirty_blocks`, then unpins. This is a
-synchronous, blocking flush — it runs on the checkpointer process main thread
-before the checkpoint WAL record is written.
-
-`s3_shutdown` (smgr shutdown hook) is **intentionally empty**: by the time it
-fires, the shutdown checkpoint has already flushed all dirty chunks.
-
-**3.2 Future: Replace S3-sim with real S3** (modify `core/src/store_ops.rs`):
-
-Chunk granularity is 256 KB (32 blocks). The S3 key layout mirrors the local
-path structure but uses `chunk_id` as the object key suffix:
-
-```
-S3 key:   {spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}
-Local:    {DataDir}/pico/{spc_oid}/{db_oid}/{rel_number}.{fork}
-```
-
-`read_blocks` becomes a S3 GET for the chunk containing the requested block;
-`write_blocks` (called from `flush_dirty_chunk` on eviction or checkpoint)
-becomes a S3 PUT. The cache layer above is unchanged — it operates in terms
-of `read_blocks`/`write_blocks` regardless of the backing store.
-
-#### Phase 4: Recovery (Restore) Process
-
-**4.1 Restore Command Helper** (`pico_restore` binary):
-
-```rust
-// s3worker/src/bin/pico_restore.rs
-//! Restore command for archive recovery
-//! Usage: pico_restore %f %p
-
-use tokio::runtime::Runtime;
-use s3worker::wal_archiver::WalArchiver;
-use std::path::PathBuf;
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: pico_restore <wal_filename> <dest_path>");
-        std::process::exit(1);
-    }
-    
-    let wal_filename = &args[1];
-    let dest_path = PathBuf::from(&args[2]);
-    
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async {
-        let archiver = WalArchiver::from_env();
-        match archiver.restore_segment(wal_filename, &dest_path).await {
-            Ok(_) => std::process::exit(0),
-            Err(e) => {
-                eprintln!("Restore failed: {}", e);
-                std::process::exit(1);
-            }
-        }
-    });
-}
-```
-
-**4.2 Recovery Configuration**:
-
-To restore to a point in time (within last 7 days):
-
-```bash
-# 1. Stop the database
-pg_ctl stop
-
-# 2. Clear local cache (will be rebuilt from S3)
-rm -rf $PGDATA/pico/cache*
-
-# 3. Configure recovery
-cat >> $PGDATA/postgresql.conf <<EOF
-restore_command = '/path/to/pico_restore %f %p'
-recovery_target_time = '2026-02-20 10:00:00'
-recovery_target_action = 'promote'
-EOF
-
-touch $PGDATA/recovery.signal
-
-# 4. Start recovery
-pg_ctl start
-
-# PostgreSQL will:
-# - Read checkpoint from pg_control
-# - Download WAL from S3 via restore_command
-# - Replay WAL until target time
-# - On cache miss, s3worker downloads blocks from S3
-```
-
-### S3 Lifecycle Policy (7-Day Retention)
-
-Configure S3 bucket lifecycle rules:
-
-```json
-{
-  "Rules": [
-    {
-      "Id": "ExpireOldWAL",
-      "Status": "Enabled",
-      "Filter": {
-        "Prefix": "wal/"
-      },
-      "Expiration": {
-        "Days": 7
-      }
-    },
-    {
-      "Id": "ExpireOldSnapshots",
-      "Status": "Enabled",
-      "Filter": {
-        "Prefix": "snapshots/"
-      },
-      "Expiration": {
-        "Days": 7
-      }
-    }
-  ]
-}
-```
-
-### Implementation Checklist
-
-```rust
-// Add to Cargo.toml dependencies:
-// [dependencies]
-// aws-config = "1.0"
-// aws-sdk-s3 = "1.0"
-// serde = { version = "1.0", features = ["derive"] }
-// serde_json = "1.0"
-```
-
-**Files to create:**
-- [ ] `s3worker/src/wal_archiver.rs` - WAL upload/download
-- [ ] `s3worker/src/snapshot.rs` - Recovery point tracking
-- [ ] `s3worker/src/s3_client.rs` - S3 client initialization
-- [ ] `s3worker/src/bin/pico_archive.rs` - Archive command binary
-- [ ] `s3worker/src/bin/pico_restore.rs` - Restore command binary
-
-**Files to modify:**
-- [ ] `s3worker/src/lib.rs` - Export new modules
-- [ ] `s3worker/src/main_loop.rs` - Add snapshot task
-- [ ] `core/src/store_ops.rs` - Add S3 sync functions
-- [ ] `postgres/src/test/modules/test_pico/test_pico.c` - Add PITR tests
-
-### Testing Plan
-
-```sql
--- 1. Setup test database
-CREATE TABLE test_pitr (id int, data text, ts timestamp default now());
-INSERT INTO test_pitr VALUES (1, 'before', now());
-
--- 2. Create restore point
-SELECT pg_create_restore_point('before_delete');
-
--- 3. Make changes to recover from
-INSERT INTO test_pitr VALUES (2, 'deleted', now());
-DELETE FROM test_pitr WHERE id = 1;
-
--- 4. Perform PITR to before_delete
--- (follow recovery steps above)
-
--- 5. Verify recovery
-SELECT * FROM test_pitr;  -- Should show id=1, not id=2
-```
-
-### Advantages of This Design
-
-1. **Minimal PostgreSQL patches** - Uses standard `archive_command`/`restore_command`
-2. **Leverages existing infra** - s3worker Tokio runtime handles S3 I/O
-3. **Checkpoint-count retention** - Retention is activity-based, not time-based (see GC Policy below)
-4. **No full backups needed** - Tiko's block-level S3 storage + WAL = complete PITR
-5. **Fast recovery** - Only download blocks accessed during WAL replay
-
-### GC Policy (Retention Enforcement)
-
-GC is run by `tikod` (control plane), not by `s3worker`. The entry point is
-`enforce_retention_org(org_id, max_checkpoints)` in `tikod/src/gc.rs`.
-
-**Retention is checkpoint-count-based, not time-based.**
-A time-based cutoff would delete data from inactive projects (a paused project
-still has a valid current state). Counting checkpoints ties retention to database
-activity: a busy project fills the window quickly; an idle one keeps all its history
-indefinitely until it generates enough new checkpoints to trigger cleanup.
-
-Policy: keep the last `max_checkpoints` (default 500) delta manifests per project.
-
-**Cutoff derivation:**
-```
-all_delta_lsns = sorted ascending list of delta manifest LSNs for the project
-if len > max_checkpoints:
-    cutoff_lsn = all_delta_lsns[len - max_checkpoints]
-else:
-    skip (nothing to GC)
-```
-
-**Four GC phases (run in order):**
-
-| Phase | What is deleted |
-|---|---|
-| Delta manifest GC | Manifests + `pg_state.tar.zst` with LSN < `cutoff_lsn` |
-| Base manifest GC | All bases with `base_lsn < cutoff_lsn`, except the newest one (needed as recovery anchor) |
-| WAL GC | Segments whose end LSN is entirely before `cutoff_lsn` |
-| Chunk GC | Versioned `{lsn_hex}` objects not referenced by any retained base or delta manifest; zero branch is permanent |
-
-In a multi-server cluster, GC acquires a per-org GC lease (`{org}/gc_lease.json`)
-before running — only one server runs GC for a given org at a time.
+- `worker/build.rs` uses `-undefined dynamic_lookup` (macOS) so PG symbols resolve at extension
+  load time.
+- All PG-facing functions use `extern "C-unwind"` and `#[unsafe(no_mangle)]`.
+- Shared memory pointers stored in `OnceLock<*mut T>` with Send/Sync wrapper types.
+- PG hook chaining: always save and call `prev_*_hook` before installing custom hooks.
+
+## Roadmap / Not Yet Implemented
+
+Per the README's own roadmap and verified absent from the code:
+- **Garbage collection**: no chunk/retention GC exists. `worker::tasks::compactor` only deletes
+  timeline segments once folded into a new base manifest — there is no delta-manifest GC,
+  base-manifest GC, WAL GC, or orphaned-chunk GC. Org soft-delete (`OrgMeta.deleted_at`) is tracked
+  but nothing physically reclaims deleted orgs' data yet.
+- **Real S3 backend**: `core::io::storage::s3::S3` is a stub (`todo!()`); `S3Sim` (local
+  filesystem, potentially NFS-mounted) is the only working backend today.
+- Baking more services (PostgREST, Auth) into the guest rootfs.
+- Externalizing scheduled jobs (`pg_cron`) into `tikod`.
