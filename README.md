@@ -133,6 +133,19 @@ storage layer by spawning CLIs / `pg_ctl` and over HTTP — no internal Rust dep
 
 ## Getting started
 
+Clone the repository with submodules.
+
+```bash
+git clone --recurse-submodules https://github.com/burmecia/tiko.git
+cd tiko
+```
+
+Make sure [Rust 1.88+ (edition 2024)](https://rust-lang.org/tools/install/) is installed.
+
+```bash
+rustup show
+```
+
 ### Storage layer (compute-storage separation)
 
 Build Postgres:
@@ -149,7 +162,7 @@ Run the smoke test:
 
 Other test scripts:
 
-- `./scripts/run_test2.sh` — large data test
+- `./scripts/run_large_data_test.sh` — large data test
 - `./scripts/run_pg_test.sh` — PostgreSQL regression test
 - `./scripts/run_pitr_test.sh` — PITR test
 - `./scripts/run_branch_test.sh` — branching test
@@ -274,6 +287,7 @@ psql -d "...options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
 - [ ] Garbage collector (GC) to recycle unreferenced chunks
 - [ ] Bake more services such as PostgREST and Auth into the root filesystem
 - [ ] Externalize scheduled jobs such as `pg_cron` into `tikod`
+- [ ] Add AWS FSx integration as an optional storage backend
 - [ ] Code cleanup and hardening
 
 ---

@@ -12,7 +12,7 @@ wrong without being told.
 ./scripts/run_test.sh         # primary smoke test: builds smgr + PG + worker, runs make check
 ```
 
-Other suites: `run_test2.sh` (large data), `run_test4.sh`, `run_pg_test.sh`
+Other suites: `run_large_data_test.sh` (large data), `run_test4.sh`, `run_pg_test.sh`
 (PG regression), `run_pitr_test.sh` (PITR), `run_branch_test.sh` (COW branching).
 
 `run_test.sh` is the **integration test** and encodes a required build order:

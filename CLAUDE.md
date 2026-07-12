@@ -21,7 +21,7 @@ for Tiko's custom AIO opcodes.
 ./scripts/run_test.sh         # build smgr+worker, build Postgres, run the smoke test (make check)
 
 # Other test scripts
-./scripts/run_test2.sh        # large-data test
+./scripts/run_large_data_test.sh  # large-data test
 ./scripts/run_pg_test.sh      # PostgreSQL regression test
 ./scripts/run_pitr_test.sh    # PITR test
 ./scripts/run_branch_test.sh  # COW branching test
