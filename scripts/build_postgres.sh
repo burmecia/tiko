@@ -40,7 +40,18 @@ cd "${POSTGRES_DIR}"
     --without-icu \
     --without-selinux
 
-# 4. Build and install.
+# 4. Build Tiko smgr (staticlib linked into postgres at make time).
+echo "Building Tiko smgr..."
+if ! cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr; then
+    echo "ERROR: Tiko smgr build failed" >&2
+    exit 1
+fi
+if [ ! -f "${BASE_DIR}/target/debug/libtikosmgr.a" ]; then
+    echo "ERROR: Rust library libtikosmgr.a not found!" >&2
+    exit 1
+fi
+
+# 5. Build and install.
 echo "Building and installing PostgreSQL..."
 make -j"$(nproc)" && make install
 
