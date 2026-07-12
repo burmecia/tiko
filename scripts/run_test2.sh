@@ -16,10 +16,38 @@ BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${BASE_DIR}/target"
 POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 PG_BIN_DIR="${POSTGRES_INSTALL}/bin"
+PG_LIB_DIR="${POSTGRES_INSTALL}/lib/postgresql"
 TEST_DIR="${BASE_DIR}/tt"
 
 export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"
 export TIKO_LOCAL_PATH="${BASE_DIR}/tiko_local"
+
+echo "Building Tiko smgr..."
+if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr) >/dev/null; then
+  echo "Tiko smgr build failed" >&2
+  exit 1
+fi
+
+echo "Building PostgreSQL..."
+rm -f "${BASE_DIR}/postgres/src/backend/postgres"
+if ! (cd "${BASE_DIR}/postgres" && make -j4 && make install) >/dev/null; then
+  echo "Postgres build/install failed" >&2
+  exit 1
+fi
+
+echo "Building Tiko Worker..."
+if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p worker) >/dev/null; then
+  echo "Tiko Worker build failed" >&2
+  exit 1
+fi
+
+# Copy the compiled worker library to the PG lib dir so shared_preload_libraries can find it.
+if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
+    cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${PG_LIB_DIR}"
+fi
+if [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
+    cp "${TARGET_DIR}/debug/libtikoworker.so" "${PG_LIB_DIR}"
+fi
 
 # How many times to duplicate the sample dataset (199 rows each).
 # Default: 500x = ~99500 rows. Override with TIKO_TEST_DATA_DUPLICATES env var.
