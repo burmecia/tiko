@@ -255,6 +255,8 @@ psql -d "host=localhost user=postgres dbname=postgres options='-c tiko.endpoint=
 
 The `tiko.endpoint=vm-N` option selects which database to wake.
 
+[![Tiko - Scale to zero](https://img.youtube.com/vi/JjNWI3vEfMY/0.jpg)](https://www.youtube.com/watch?v=JjNWI3vEfMY)
+
 ### Copy-on-write branching
 
 ```bash
@@ -272,6 +274,8 @@ curl -X POST localhost:9000/vms/vm-9/db/start
 psql -d "...options='-c tiko.endpoint=vm-9'" -c 'select * from tt'   # data is copied
 ```
 
+[![Tiko - COW branching](https://img.youtube.com/vi/lfcMQTTG800/0.jpg)](https://www.youtube.com/watch?v=lfcMQTTG800)
+
 ### PITR
 
 ```bash
@@ -284,6 +288,8 @@ curl -X POST localhost:9000/vms/vm-2/pitr/recover -d '{"time":"2026-07-11 08:35:
 curl -X POST localhost:9000/vms/vm-2/db/start
 psql -d "...options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
 ```
+
+[![Tiko - PITR](https://img.youtube.com/vi/eANvTIp-GQ8/0.jpg)](https://www.youtube.com/watch?v=eANvTIp-GQ8)
 
 ### Cleanup
 
