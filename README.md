@@ -5,17 +5,17 @@
 Tiko replaces PostgreSQL's magnetic-disk storage manager with an S3-backed block
 store. Each database lives in its own microVM, freezes to a snapshot when idle,
 and springs back to life on the first client connection. The result: databases
-that scale to zero, fork like git branches, and recover to any point in time —
+that scale to zero, copy-on-write branching, and recover to any point in time —
 with per-DB cost that falls to near-zero when nobody is connected.
 
 Built in Rust as a set of PostgreSQL extensions + standalone binaries, on top of
 a small patch set to vendored PostgreSQL 18.
 
 > [!WARNING]
-> **This is a proof-of-concept.** Tiko is an experiment, not production software.
-> The code is rough, known to be buggy, and APIs/config will change without notice.
-> Expect missing pieces, rough edges, and data-loss scenarios. **Do not use it for
-> anything you care about.** That said, ideas, issues, and contributions are welcome.
+> **This is a proof-of-concept.** The code is rough, known to be buggy, and
+> APIs/config will change without notice. Expect missing pieces, rough edges,
+> and data-loss scenarios. **Do not use it for anything you care about.**
+> That said, ideas, issues, and contributions are welcome.
 
 ---
 
@@ -133,7 +133,8 @@ storage layer by spawning CLIs / `pg_ctl` and over HTTP — no internal Rust dep
 
 ## Getting started
 
-Clone the repository with submodules and make sure [Rust 1.88+ (edition 2024)](https://rust-lang.org/tools/install/) is installed.
+Clone this repository with submodules and make sure [Rust 1.88+ (edition 2024)]
+(https://rust-lang.org/tools/install/) is installed.
 
 ```bash
 git clone --recurse-submodules https://github.com/burmecia/tiko.git
@@ -174,9 +175,9 @@ Other test scripts:
 
 ### MicroVM orchestration (full stack)
 
-Requires a KVM-enabled Linux host and the `firecracker` binary on `FIRECRACKER_BIN`.
-This means EC2 (e.g. `c8i`/`m8i`) or any metal instance with nested virtualization
-works out of the box.
+Requires a KVM-enabled Linux host (Ubuntu 24.04 x86 recommended) and the
+`firecracker` binary on `FIRECRACKER_BIN`. AWS EC2 instances (e.g. `c8i`/`m8i`)
+or any metal instance with nested virtualization works out of the box.
 
 **1. Build Firecracker** (Docker required):
 
@@ -213,7 +214,7 @@ In another terminal, watch the VM swarm:
 ./scripts/vmtop.py
 ```
 
-In a third terminal, create the seed database:
+In a third terminal, create the seed database `vm-0`:
 
 ```bash
 curl -X POST localhost:9000/vms/provision
@@ -277,7 +278,7 @@ psql -d "...options='-c tiko.endpoint=vm-9'" -c 'select * from tt'   # data is c
 ```bash
 # add data, then list available restore points
 psql -d "...options='-c tiko.endpoint=vm-2'" -c 'insert into tt values(999)'
-curl -X GET localhost:9000/vms/vm-2/pitr/list
+curl -X GET localhost:9000/vms/vm-2/pitr/list | jq
 
 # recover to a chosen timestamp and restart
 curl -X POST localhost:9000/vms/vm-2/pitr/recover -d '{"time":"2026-07-11 08:35:00"}'
@@ -290,7 +291,7 @@ psql -d "...options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
 ## Roadmap
 
 - [ ] Garbage collector (GC) to recycle unreferenced chunks
-- [ ] Bake more services such as PostgREST and Auth into the root filesystem
+- [ ] Bake more services, such as PostgREST and Auth, into the root filesystem
 - [ ] Externalize scheduled jobs such as `pg_cron` into `tikod`
 - [ ] Add AWS FSx integration as an optional storage backend
 - [ ] Code cleanup and hardening
