@@ -133,8 +133,7 @@ storage layer by spawning CLIs / `pg_ctl` and over HTTP — no internal Rust dep
 
 ## Getting started
 
-Clone this repository with submodules and make sure [Rust 1.88+ (edition 2024)]
-(https://rust-lang.org/tools/install/) is installed.
+Clone this repository with submodules and make sure [Rust 1.88+ (edition 2024)](https://rust-lang.org/tools/install/) is installed.
 
 ```bash
 git clone --recurse-submodules https://github.com/burmecia/tiko.git
