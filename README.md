@@ -285,6 +285,14 @@ curl -X POST localhost:9000/vms/vm-2/db/start
 psql -d "...options='-c tiko.endpoint=vm-2'" -c 'select * from tt'
 ```
 
+### Cleanup
+
+Tear down all VMs, kill tikod, and remove leftover tap interfaces:
+
+```bash
+./scripts/cleanup.sh
+```
+
 ---
 
 ## Roadmap
