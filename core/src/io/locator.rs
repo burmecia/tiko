@@ -1,5 +1,5 @@
 use super::timeline::{Checkpoint, SegmentId};
-use crate::{chunk::ChunkTag, db::DbNamespace, manifest::ChunkRef};
+use crate::{chunk::ChunkTag, db::DbNamespace, manifest::ChunkRef, relfork::RelFork};
 use pgsys::timeline_id::TimelineId;
 
 pub struct Locator {
@@ -20,7 +20,7 @@ impl Locator {
     // ── Chunk keys ────────────────────────────
 
     pub(super) fn chunk(&self, tag: &ChunkTag, ckpt: &Checkpoint) -> String {
-        let rf = tag.relfork();
+        let rf = RelFork::from(tag);
         format!(
             "{ns}/chunks/{ckpt}/{rf}/{chunk_id}",
             ns = self.ns,
@@ -35,7 +35,7 @@ impl Locator {
     /// copy-on-write reads of chunks owned by another database (e.g. a branch
     /// reading its parent's chunks via `ChunkRef.db_id`).
     fn chunk_in_db(&self, tag: &ChunkTag, ckpt: &Checkpoint, db_id: u64) -> String {
-        let rf = tag.relfork();
+        let rf = RelFork::from(tag);
         format!(
             "{org}/{db}/chunks/{ckpt}/{rf}/{chunk_id}",
             org = self.ns.org_id,

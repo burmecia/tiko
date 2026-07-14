@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{Snapshot, VmConfig, VmId, VmInfo, VmState, Vmm, VmmError, VmmResult};
 
@@ -110,7 +110,9 @@ impl FcApiClient {
         let mut header_buf = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            let n = stream.read(&mut byte).await
+            let n = stream
+                .read(&mut byte)
+                .await
                 .map_err(|e| VmmError::Backend(format!("read header: {e}")))?;
             if n == 0 {
                 break; // EOF
@@ -149,7 +151,9 @@ impl FcApiClient {
         // Read the body (if any).
         let mut body_buf = vec![0u8; content_length];
         if content_length > 0 {
-            stream.read_exact(&mut body_buf).await
+            stream
+                .read_exact(&mut body_buf)
+                .await
                 .map_err(|e| VmmError::Backend(format!("read body: {e}")))?;
         }
 
@@ -316,7 +320,16 @@ fn create_tap(tap_name: &str, gateway_ip: &str, subnet: &str) -> VmmResult<()> {
     if !nat_present {
         run_cmd(
             "iptables",
-            &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
+            &[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                subnet,
+                "-j",
+                "MASQUERADE",
+            ],
         )?;
     }
     // FORWARD rules: let the guest reach external hosts (e.g. the S3 Files
@@ -338,7 +351,16 @@ fn destroy_tap(tap_name: &str, subnet: &str) {
     remove_forward_rules(tap_name);
     let _ = run_cmd(
         "iptables",
-        &["-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
+        &[
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "-j",
+            "MASQUERADE",
+        ],
     );
     let _ = run_cmd("ip", &["link", "set", tap_name, "down"]);
     let _ = run_cmd("ip", &["tuntap", "del", tap_name, "mode", "tap"]);
@@ -559,7 +581,9 @@ fn inject_guest_net(rootfs: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
     let mnt = mnt.trim_end_matches('\n');
     // Ensure the mountpoint is cleaned up no matter how we exit.
     let cleanup = |mnt: &str| {
-        let _ = run_shell(&format!("umount {mnt} 2>/dev/null; rmdir {mnt} 2>/dev/null"));
+        let _ = run_shell(&format!(
+            "umount {mnt} 2>/dev/null; rmdir {mnt} 2>/dev/null"
+        ));
     };
 
     let guest_cidr = match net.guest_ip {
@@ -590,9 +614,7 @@ fn inject_guest_net(rootfs: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
         run_shell(&format!(
             "tee {mnt}/etc/systemd/network/20-eth0.network >/dev/null <<'NETUNIT'\n{net_unit}NETUNIT"
         ))?;
-        run_shell(&format!(
-            "echo {hostname} > {mnt}/etc/hostname"
-        ))?;
+        run_shell(&format!("echo {hostname} > {mnt}/etc/hostname"))?;
         Ok::<(), VmmError>(())
     })();
     cleanup(mnt);
@@ -847,9 +869,7 @@ impl FirecrackerVmm {
 
         ensure_kvm_access();
 
-        let fc_bin = std::env::var("FIRECRACKER_BIN").unwrap_or_else(|_| {
-            "firecracker".into()
-        });
+        let fc_bin = std::env::var("FIRECRACKER_BIN").unwrap_or_else(|_| "firecracker".into());
 
         Self {
             snapshot_dir,
@@ -1147,7 +1167,9 @@ impl Vmm for FirecrackerVmm {
     async fn start_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let sock_path = {
             let vms = self.vms.lock().unwrap();
-            let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
             entry.api_sock.clone()
         };
 
@@ -1167,14 +1189,14 @@ impl Vmm for FirecrackerVmm {
     async fn pause_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let sock_path = {
             let vms = self.vms.lock().unwrap();
-            let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
             entry.api_sock.clone()
         };
 
         let client = FcApiClient::new(&sock_path);
-        client
-            .patch("/vm", &json!({"state": "Paused"}))
-            .await?;
+        client.patch("/vm", &json!({"state": "Paused"})).await?;
 
         let mut vms = self.vms.lock().unwrap();
         if let Some(entry) = vms.get_mut(vm_id) {
@@ -1187,14 +1209,14 @@ impl Vmm for FirecrackerVmm {
     async fn resume_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let sock_path = {
             let vms = self.vms.lock().unwrap();
-            let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
             entry.api_sock.clone()
         };
 
         let client = FcApiClient::new(&sock_path);
-        client
-            .patch("/vm", &json!({"state": "Resumed"}))
-            .await?;
+        client.patch("/vm", &json!({"state": "Resumed"})).await?;
 
         let mut vms = self.vms.lock().unwrap();
         if let Some(entry) = vms.get_mut(vm_id) {
@@ -1207,7 +1229,9 @@ impl Vmm for FirecrackerVmm {
     async fn snapshot_vm(&self, vm_id: &VmId) -> VmmResult<Snapshot> {
         let (sock_path, config, snap_paths) = {
             let vms = self.vms.lock().unwrap();
-            let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
             if entry.state != VmState::Paused {
                 return Err(VmmError::InvalidState {
                     vm_id: vm_id.clone(),
@@ -1215,7 +1239,11 @@ impl Vmm for FirecrackerVmm {
                     expected: VmState::Paused,
                 });
             }
-            (entry.api_sock.clone(), entry.config.clone(), self.snapshot_paths(vm_id))
+            (
+                entry.api_sock.clone(),
+                entry.config.clone(),
+                self.snapshot_paths(vm_id),
+            )
         };
 
         let (snap_path, mem_path) = snap_paths;
@@ -1350,11 +1378,7 @@ impl Vmm for FirecrackerVmm {
 
         // Wait up to 3s for graceful exit.
         if let Some(child) = entry.child.as_mut() {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                child.wait(),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
 
             // Force kill if still alive.
             let _ = child.start_kill();
@@ -1372,7 +1396,9 @@ impl Vmm for FirecrackerVmm {
     async fn vm_state(&self, vm_id: &VmId) -> VmmResult<VmState> {
         let (sock_path, cached_state) = {
             let vms = self.vms.lock().unwrap();
-            let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
             (entry.api_sock.clone(), entry.state)
         };
 
@@ -1397,7 +1423,9 @@ impl Vmm for FirecrackerVmm {
 
     async fn vm_guest_ip(&self, vm_id: &VmId) -> VmmResult<Option<IpAddr>> {
         let vms = self.vms.lock().unwrap();
-        let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+        let entry = vms
+            .get(vm_id)
+            .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
         Ok(Some(entry.guest_ip))
     }
 

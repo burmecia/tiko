@@ -47,7 +47,9 @@ pub async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Requ
             if buf.is_empty() {
                 return Ok(None);
             }
-            return Err(std::io::Error::other("client closed before sending full headers"));
+            return Err(std::io::Error::other(
+                "client closed before sending full headers",
+            ));
         }
         buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, watch};
 use tracing::{debug, info};
 
 use crate::vmm::{Snapshot, VmId};
@@ -108,13 +108,7 @@ impl Control {
     }
 
     /// Register a new VM in the control plane.
-    pub fn register(
-        &self,
-        vm_id: VmId,
-        tenant_id: String,
-        branch_id: String,
-        pg_port: u16,
-    ) {
+    pub fn register(&self, vm_id: VmId, tenant_id: String, branch_id: String, pg_port: u16) {
         info!(vm_id = %vm_id, tenant = %tenant_id, "registering VM");
         self.vms.insert(
             vm_id,
@@ -281,7 +275,8 @@ impl Control {
     /// reusing) the `Notify` means stale waiters from the cancelled generation
     /// are never spuriously woken by later activity.
     pub fn reset_cancellers(&self, vm_id: &VmId) {
-        self.cancellers.insert(vm_id.clone(), Arc::new(Notify::new()));
+        self.cancellers
+            .insert(vm_id.clone(), Arc::new(Notify::new()));
     }
 
     /// Subscribe to `vm_id`'s thermal-state signal. Returns a `watch::Receiver`
@@ -344,23 +339,14 @@ mod tests {
         assert!(ctrl.try_mark_pause_requested(&"vm-ghost".into()).is_none());
 
         // First request → Some(false) (new).
-        assert_eq!(
-            ctrl.try_mark_pause_requested(&"vm-1".into()),
-            Some(false)
-        );
+        assert_eq!(ctrl.try_mark_pause_requested(&"vm-1".into()), Some(false));
 
         // Second request → Some(true) (already requested — idempotent).
-        assert_eq!(
-            ctrl.try_mark_pause_requested(&"vm-1".into()),
-            Some(true)
-        );
+        assert_eq!(ctrl.try_mark_pause_requested(&"vm-1".into()), Some(true));
 
         // After clearing, next request is new again.
         ctrl.clear_pause_requested(&"vm-1".into());
-        assert_eq!(
-            ctrl.try_mark_pause_requested(&"vm-1".into()),
-            Some(false)
-        );
+        assert_eq!(ctrl.try_mark_pause_requested(&"vm-1".into()), Some(false));
     }
 
     #[test]

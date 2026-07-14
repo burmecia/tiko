@@ -24,7 +24,7 @@ use tikod::config::TikodConfig;
 use tikod::control::Control;
 use tikod::node::Node;
 use tikod::proxy::{Proxy, ProxyConfig};
-use tikod::vmm::{default_vmm, Vmm};
+use tikod::vmm::{Vmm, default_vmm};
 
 /// Tiko compute control plane.
 #[derive(Parser, Debug)]

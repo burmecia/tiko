@@ -38,12 +38,11 @@ use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
-use cancel::{copy_until_ready, forward_cancel, CancelTable};
+use cancel::{CancelTable, copy_until_ready, forward_cancel};
 use error::{
-    error_packet, fatal_missing_endpoint, fatal_unknown_vm, fatal_wake_timeout,
-    wake_error_packet,
+    error_packet, fatal_missing_endpoint, fatal_unknown_vm, fatal_wake_timeout, wake_error_packet,
 };
-use startup::{read_first_message, FirstMessage, StartupMessage};
+use startup::{FirstMessage, StartupMessage, read_first_message};
 
 use crate::control::Control;
 use crate::node::Node;
@@ -291,13 +290,19 @@ async fn handle_connection(
     // The whole splice races against the per-VM cancel signal (cold
     // freeze): when fired, the splice is dropped and both sockets
     // close, prompting the client to reconnect through wake.
-    let thermal_rx = connected_vm_id.as_ref().map(|id| control.subscribe_warm(id));
+    let thermal_rx = connected_vm_id
+        .as_ref()
+        .map(|id| control.subscribe_warm(id));
 
     let splice = async {
         let backend_to_client = async {
-            let key =
-                copy_until_ready(&mut backend_read, &mut client_write, backend_addr, cancel_table)
-                    .await?;
+            let key = copy_until_ready(
+                &mut backend_read,
+                &mut client_write,
+                backend_addr,
+                cancel_table,
+            )
+            .await?;
             io::copy(&mut backend_read, &mut client_write).await?;
             client_write.shutdown().await?;
             Ok::<_, io::Error>(key)
@@ -357,7 +362,10 @@ async fn handle_connection(
 
     debug!(client = %client_addr, "proxying established");
 
-    if let Some(cancel_signal) = connected_vm_id.as_ref().map(|id| control.subscribe_cancel(id)) {
+    if let Some(cancel_signal) = connected_vm_id
+        .as_ref()
+        .map(|id| control.subscribe_cancel(id))
+    {
         // VM-routed: race the splice against the cancel signal.
         tokio::select! {
             biased;
@@ -409,7 +417,7 @@ async fn resolve_vm(
         Ok(Ok(())) => {}
         Ok(Err(e)) => return RouteOutcome::Reject(wake_error_packet(vm_id, &e)),
         Err(_) => {
-            return RouteOutcome::Reject(fatal_wake_timeout(vm_id, config.resume_timeout_secs))
+            return RouteOutcome::Reject(fatal_wake_timeout(vm_id, config.resume_timeout_secs));
         }
     }
 
@@ -420,7 +428,7 @@ async fn resolve_vm(
                 FATAL,
                 "08006",
                 &format!("cannot get guest IP for VM {vm_id}: {e}"),
-            ))
+            ));
         }
     };
 
@@ -447,16 +455,14 @@ fn set_backend_keepalive(stream: &TcpStream) {
     let fd = stream.as_raw_fd();
 
     // Helper: set an integer socket option.
-    let setopt = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| {
-        unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                opt,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+    let setopt = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     };
 
     // Enable keepalive.

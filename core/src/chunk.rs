@@ -49,9 +49,9 @@ impl ChunkTag {
     }
 
     /// Return the [`RelFork`] this chunk belongs to.
-    pub fn relfork(&self) -> RelFork {
-        RelFork::from(*self)
-    }
+    // pub fn relfork(&self) -> RelFork {
+    //     RelFork::from(*self)
+    // }
 
     pub fn start_block(&self) -> BlockNumber {
         self.chunk_id * BLOCKS_PER_CHUNK
@@ -94,7 +94,7 @@ impl ChunkTag {
     /// Format this chunk tag as a storage path segment:
     /// `{spc_oid}/{db_oid}/{rel_number}.{fork}/{chunk_id}`.
     pub fn to_path(&self) -> String {
-        let rf = self.relfork();
+        let rf = RelFork::from(self);
         format!("{rf}/{}", self.chunk_id)
     }
 
@@ -207,17 +207,6 @@ impl ChunkTag {
             blkno: start_block,
             start_block,
             end_block,
-        }
-    }
-}
-
-impl From<ChunkTag> for RelFork {
-    fn from(tag: ChunkTag) -> Self {
-        RelFork {
-            spc_oid: tag.spc_oid,
-            db_oid: tag.db_oid,
-            rel_number: tag.rel_number,
-            fork_number: tag.fork_number,
         }
     }
 }

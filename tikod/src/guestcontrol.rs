@@ -147,9 +147,8 @@ impl GuestClient {
             .get("settings")
             .ok_or_else(|| GuestClientError::Transport("missing settings in response".into()))?
             .clone();
-        serde_json::from_value(settings).map_err(|e| {
-            GuestClientError::Transport(format!("failed to decode settings: {e}"))
-        })
+        serde_json::from_value(settings)
+            .map_err(|e| GuestClientError::Transport(format!("failed to decode settings: {e}")))
     }
 
     /// `PUT /pg/config` — merge `settings` into the override file and reload.
@@ -251,9 +250,8 @@ impl GuestClient {
             if body_str.is_empty() {
                 return Ok(serde_json::Value::Null);
             }
-            return serde_json::from_str(body_str).map_err(|e| {
-                GuestClientError::Transport(format!("JSON parse error: {e}"))
-            });
+            return serde_json::from_str(body_str)
+                .map_err(|e| GuestClientError::Transport(format!("JSON parse error: {e}")));
         }
 
         // Forward the agent's structured error verbatim.

@@ -119,6 +119,17 @@ impl std::fmt::Display for RelFork {
     }
 }
 
+impl From<&ChunkTag> for RelFork {
+    fn from(tag: &ChunkTag) -> Self {
+        RelFork {
+            spc_oid: tag.spc_oid,
+            db_oid: tag.db_oid,
+            rel_number: tag.rel_number,
+            fork_number: tag.fork_number,
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct RelForkMeta {
     pub nblocks: u32,

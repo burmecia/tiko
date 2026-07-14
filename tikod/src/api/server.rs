@@ -108,7 +108,7 @@ use tracing::{debug, error, info, warn};
 const WARM_PAUSE_SECS: u64 = 120;
 
 use crate::control::Control;
-use crate::guestcontrol::{GuestClient, GuestClientError, DEFAULT_AGENT_PORT};
+use crate::guestcontrol::{DEFAULT_AGENT_PORT, GuestClient, GuestClientError};
 use crate::node::Node;
 use crate::vmm::{VmConfig, VmId, VmmError};
 
@@ -180,7 +180,9 @@ impl ApiServer {
             vm_id: Option<VmId>,
         }
         let parsed: CreateVmRequest = serde_json::from_slice(&req.body).map_err(|e| {
-            bad_request(&format!("invalid body; expected {{\"vm_id\":\"...\"}}: {e}"))
+            bad_request(&format!(
+                "invalid body; expected {{\"vm_id\":\"...\"}}: {e}"
+            ))
         })?;
         match parsed.vm_id {
             Some(id) => Ok(id),
@@ -313,8 +315,7 @@ impl ApiServer {
 
             // DB control routes: /vms/{vm_id}/db/{...} → in-guest tikoguest agent.
             (_, ["vms", vm_id, "db", rest @ ..]) => {
-                self.route_db(method, &VmId::from(*vm_id), rest, req)
-                    .await
+                self.route_db(method, &VmId::from(*vm_id), rest, req).await
             }
 
             // PITR routes: /vms/{vm_id}/pitr/{...} → in-guest tikoguest /pitr/*.
@@ -339,13 +340,7 @@ impl ApiServer {
     }
 
     /// Dispatch `/vms/{vm_id}/...` routes.
-    async fn route_vm(
-        &self,
-        method: &str,
-        vm_id: &VmId,
-        rest: &[&str],
-        req: &Request,
-    ) -> Response {
+    async fn route_vm(&self, method: &str, vm_id: &VmId, rest: &[&str], req: &Request) -> Response {
         let vmm = self.node.vmm();
         match (method, rest) {
             ("GET", []) => match vmm.vm_state(vm_id).await {
@@ -429,7 +424,11 @@ impl ApiServer {
                     pg_port: Option<u16>,
                 }
                 let body: RegisterBody = if req.body.is_empty() {
-                    RegisterBody { tenant_id: None, branch_id: None, pg_port: None }
+                    RegisterBody {
+                        tenant_id: None,
+                        branch_id: None,
+                        pg_port: None,
+                    }
                 } else {
                     match serde_json::from_slice(&req.body) {
                         Ok(b) => b,
@@ -596,10 +595,11 @@ impl ApiServer {
     /// metadata come from the registry where available.
     async fn list_vms(&self) -> Response {
         // Live VMs from the backend (authoritative for state + guest IP).
-        let live: std::collections::HashMap<VmId, crate::vmm::VmInfo> = match self.node.list_vms().await {
-            Ok(list) => list.into_iter().map(|i| (i.vm_id.clone(), i)).collect(),
-            Err(e) => return err_resp(&e),
-        };
+        let live: std::collections::HashMap<VmId, crate::vmm::VmInfo> =
+            match self.node.list_vms().await {
+                Ok(list) => list.into_iter().map(|i| (i.vm_id.clone(), i)).collect(),
+                Err(e) => return err_resp(&e),
+            };
         let registry = self.control.list();
 
         // Merge: every live VM, then every registered VM not currently live
@@ -687,7 +687,7 @@ impl ApiServer {
                 Err(e) => {
                     return bad_request(&format!(
                         "invalid body; expected {{\"vm_id\":\"vm-N\"}}: {e}"
-                    ))
+                    ));
                 }
             }
         };
@@ -726,7 +726,11 @@ impl ApiServer {
             "project_id": db_id,
         });
         match client
-            .forward_raw("POST", "/branch/restore", restore_body.to_string().as_bytes())
+            .forward_raw(
+                "POST",
+                "/branch/restore",
+                restore_body.to_string().as_bytes(),
+            )
             .await
         {
             Ok((status, _)) if (200..300).contains(&status) => {}
@@ -765,7 +769,7 @@ impl ApiServer {
                 Ok((status, body))
                     if (200..300).contains(&status) && storage_ready_from_health(&body) =>
                 {
-                    return Ok(())
+                    return Ok(());
                 }
                 // Agent not up yet (connection refused) or storage not ready — retry.
                 _ => {}
@@ -845,7 +849,8 @@ impl ApiServer {
             ("POST", ["restart"]) => "/pitr/restart",
             _ => return not_found(method, &path),
         };
-        self.forward_agent(vm_id, agent_path, method, &req.body).await
+        self.forward_agent(vm_id, agent_path, method, &req.body)
+            .await
     }
 
     /// Dispatch `/vms/{vm_id}/branch/{...}` routes to the in-guest `tikoguest`
@@ -871,7 +876,8 @@ impl ApiServer {
             ("POST", ["restart"]) => "/branch/restart",
             _ => return not_found(method, &path),
         };
-        self.forward_agent(vm_id, agent_path, method, &req.body).await
+        self.forward_agent(vm_id, agent_path, method, &req.body)
+            .await
     }
 
     /// Resolve a VM's guest IP and build a [`GuestClient`] for it. Returns an
@@ -1011,7 +1017,9 @@ fn parse_stop_mode(req: &Request) -> Result<crate::guestcontrol::StopMode, Respo
 }
 
 /// Parse `{"settings":{...}}` from a `/pg/config` PUT.
-fn parse_config_settings(req: &Request) -> Result<std::collections::BTreeMap<String, String>, Response> {
+fn parse_config_settings(
+    req: &Request,
+) -> Result<std::collections::BTreeMap<String, String>, Response> {
     #[derive(serde::Deserialize)]
     struct Body {
         settings: std::collections::BTreeMap<String, String>,
@@ -1059,7 +1067,9 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
             if buf.is_empty() {
                 return Ok(None);
             }
-            return Err(std::io::Error::other("client closed before sending full headers"));
+            return Err(std::io::Error::other(
+                "client closed before sending full headers",
+            ));
         }
         buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {
@@ -1110,11 +1120,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>
 }
 
 /// Write an HTTP/1.1 response with a JSON body and `Connection: close`.
-async fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    body: &[u8],
-) -> std::io::Result<()> {
+async fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> std::io::Result<()> {
     let status_text = status_text(status);
     let head = format!(
         "HTTP/1.1 {status} {status_text}\r\n\

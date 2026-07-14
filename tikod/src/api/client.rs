@@ -64,9 +64,8 @@ impl ApiClient {
     /// `PUT /vms/{id}/snapshot` — snapshot a paused VM.
     pub async fn snapshot_vm(&self, vm_id: &VmId) -> VmmResult<Snapshot> {
         let resp = self.request("PUT", &path(vm_id, "snapshot"), None).await?;
-        serde_json::from_value(resp).map_err(|e| {
-            VmmError::Backend(format!("failed to decode snapshot response: {e}"))
-        })
+        serde_json::from_value(resp)
+            .map_err(|e| VmmError::Backend(format!("failed to decode snapshot response: {e}")))
     }
 
     /// `PUT /vms/{id}/restore` — restore a VM from the snapshot stored in the
@@ -81,7 +80,8 @@ impl ApiClient {
 
     /// `DELETE /vms/{id}` — destroy a VM and release its resources.
     pub async fn destroy_vm(&self, vm_id: &VmId) -> VmmResult<()> {
-        self.request("DELETE", &format!("/vms/{vm_id}"), None).await?;
+        self.request("DELETE", &format!("/vms/{vm_id}"), None)
+            .await?;
         Ok(())
     }
 
@@ -120,21 +120,16 @@ impl ApiClient {
 
     /// `PUT /vms/{id}/freeze` — pause → snapshot → destroy.
     pub async fn freeze(&self, vm_id: &VmId) -> VmmResult<Snapshot> {
-        let resp = self
-            .request("PUT", &path(vm_id, "freeze"), None)
-            .await?;
-        serde_json::from_value(resp).map_err(|e| {
-            VmmError::Backend(format!("failed to decode snapshot response: {e}"))
-        })
+        let resp = self.request("PUT", &path(vm_id, "freeze"), None).await?;
+        serde_json::from_value(resp)
+            .map_err(|e| VmmError::Backend(format!("failed to decode snapshot response: {e}")))
     }
 
     /// `PUT /vms/{id}/thaw` — restore from the registry-stored
     /// snapshot, then resume. Snapshot is resolved server-side from the vm_id
     /// (in the path), so the client supplies no body.
     pub async fn thaw(&self, vm_id: &VmId) -> VmmResult<VmId> {
-        let resp = self
-            .request("PUT", &path(vm_id, "thaw"), None)
-            .await?;
+        let resp = self.request("PUT", &path(vm_id, "thaw"), None).await?;
         resp.get("vm_id")
             .and_then(|v| v.as_str().map(String::from))
             .ok_or_else(|| VmmError::Backend("response missing vm_id".into()))
@@ -150,9 +145,7 @@ impl ApiClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> VmmResult<serde_json::Value> {
-        let body_bytes = body
-            .map(|b| b.to_string())
-            .unwrap_or_default();
+        let body_bytes = body.map(|b| b.to_string()).unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\n\
              Host: {host}\r\n\
@@ -166,10 +159,9 @@ impl ApiClient {
             body = body_bytes,
         );
 
-        let mut stream =
-            TcpStream::connect(self.addr)
-                .await
-                .map_err(|e| VmmError::Backend(format!("connect to API: {e}")))?;
+        let mut stream = TcpStream::connect(self.addr)
+            .await
+            .map_err(|e| VmmError::Backend(format!("connect to API: {e}")))?;
         stream
             .write_all(request.as_bytes())
             .await
@@ -188,9 +180,8 @@ impl ApiClient {
             if body_str.is_empty() {
                 return Ok(serde_json::Value::Null);
             }
-            return serde_json::from_str(body_str).map_err(|e| {
-                VmmError::Backend(format!("JSON parse error: {e}"))
-            });
+            return serde_json::from_str(body_str)
+                .map_err(|e| VmmError::Backend(format!("JSON parse error: {e}")));
         }
 
         Err(decode_error(status, body_str))
@@ -236,28 +227,18 @@ fn decode_error(status: u16, body_str: &str) -> VmmError {
         None => return VmmError::Backend(format!("HTTP {status}: {body_str}")),
     };
 
-    let kind = err_obj
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let kind = err_obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let message = err_obj
         .get("message")
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_else(|| format!("HTTP {status}"));
 
-    let str_field = |key: &str| {
-        err_obj
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    };
+    let str_field = |key: &str| err_obj.get(key).and_then(|v| v.as_str()).map(String::from);
 
     match kind {
         "vm_not_found" => VmmError::VmNotFound(str_field("vm_id").unwrap_or_default()),
-        "snapshot_not_found" => {
-            VmmError::SnapshotNotFound(str_field("vm_id").unwrap_or_default())
-        }
+        "snapshot_not_found" => VmmError::SnapshotNotFound(str_field("vm_id").unwrap_or_default()),
         "invalid_state" => {
             let vm_id = str_field("vm_id").unwrap_or_default();
             let current = err_obj

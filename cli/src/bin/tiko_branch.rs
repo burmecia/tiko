@@ -252,8 +252,9 @@ fn main() {
                 // `TIKO_LOCAL_PATH` env — so overriding the env below does NOT
                 // change it. Reading `TIKO_LOCAL_PATH` here in `main()` instead
                 // would wrongly capture this temp dir.
-                let local_temp = tempfile::tempdir()
-                    .map_err(|e| Error::other(format!("tiko_branch: failed to create temp dir: {e}")))?;
+                let local_temp = tempfile::tempdir().map_err(|e| {
+                    Error::other(format!("tiko_branch: failed to create temp dir: {e}"))
+                })?;
                 // SAFETY: single-threaded CLI before any other thread reads the env.
                 unsafe {
                     std::env::set_var(env::ENV_TIKO_LOCAL_PATH, local_temp.path());

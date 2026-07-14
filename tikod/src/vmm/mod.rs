@@ -10,8 +10,15 @@
 //! │                               │                  │
 //! │                          FirecrackerVmm          │
 //! │                          (Linux prod)            │
+//! │                               │                  │
+//! │                          UnsupportedVmm          │
+//! │                          (non-Linux stub)        │
 //! └─────────────────────────────────────────────────┘
 //! ```
+//!
+//! On non-Linux platforms (e.g. macOS, for local development) [`default_vmm`]
+//! returns an `UnsupportedVmm` stub whose every operation fails: `tikod`
+//! compiles and starts, but cannot actually create or run VMs.
 
 pub mod firecracker;
 
@@ -145,6 +152,7 @@ pub type VmmResult<T> = Result<T, VmmError>;
 ///
 /// Each implementation wraps a specific VMM:
 /// - [`firecracker::FirecrackerVmm`] — Firecracker microVM (Linux prod)
+/// - `UnsupportedVmm` — no-op stub (non-Linux; compiles but cannot run VMs)
 ///
 /// The backend owns the VM state internally, keyed by [`VmId`]. All methods
 /// are idempotent where reasonable and safe.
@@ -190,4 +198,77 @@ pub trait Vmm: Send + Sync {
 #[cfg(target_os = "linux")]
 pub fn default_vmm(snapshot_dir: std::path::PathBuf) -> Box<dyn Vmm> {
     Box::new(firecracker::FirecrackerVmm::new(snapshot_dir))
+}
+
+// ============================================================================
+// UnsupportedVmm — non-Linux stub
+// ============================================================================
+
+/// No-op VMM backend for platforms without a real hypervisor (e.g. macOS).
+///
+/// Every [`Vmm`] operation returns [`VmmError::Backend`]; no VM can ever be
+/// created, started, or listed. This exists purely so `tikod` links on
+/// non-Linux hosts — letting the rest of the binary (config parsing, HTTP API,
+/// proxy) compile and be exercised locally — while making it impossible to
+/// actually run a guest VM.
+#[derive(Default)]
+struct UnsupportedVmm;
+
+/// Shared error returned by every `UnsupportedVmm` method.
+fn unsupported() -> VmmError {
+    VmmError::Backend(
+        "no VMM backend available on this platform (Firecracker requires Linux/KVM)".into(),
+    )
+}
+
+#[async_trait]
+impl Vmm for UnsupportedVmm {
+    async fn create_vm(&self, _config: VmConfig) -> VmmResult<VmId> {
+        Err(unsupported())
+    }
+
+    async fn start_vm(&self, _vm_id: &VmId) -> VmmResult<()> {
+        Err(unsupported())
+    }
+
+    async fn pause_vm(&self, _vm_id: &VmId) -> VmmResult<()> {
+        Err(unsupported())
+    }
+
+    async fn resume_vm(&self, _vm_id: &VmId) -> VmmResult<()> {
+        Err(unsupported())
+    }
+
+    async fn snapshot_vm(&self, _vm_id: &VmId) -> VmmResult<Snapshot> {
+        Err(unsupported())
+    }
+
+    async fn restore_vm(&self, _snapshot: &Snapshot) -> VmmResult<VmId> {
+        Err(unsupported())
+    }
+
+    async fn destroy_vm(&self, _vm_id: &VmId) -> VmmResult<()> {
+        Err(unsupported())
+    }
+
+    async fn vm_state(&self, _vm_id: &VmId) -> VmmResult<VmState> {
+        Err(unsupported())
+    }
+
+    async fn vm_guest_ip(&self, _vm_id: &VmId) -> VmmResult<Option<IpAddr>> {
+        Err(unsupported())
+    }
+
+    async fn list_vms(&self) -> VmmResult<Vec<VmInfo>> {
+        Err(unsupported())
+    }
+}
+
+/// Returns the platform-default VMM backend.
+///
+/// On non-Linux platforms there is no hypervisor backend, so this returns an
+/// `UnsupportedVmm` stub. See [`default_vmm`] (Linux) for the real backend.
+#[cfg(not(target_os = "linux"))]
+pub fn default_vmm(_snapshot_dir: std::path::PathBuf) -> Box<dyn Vmm> {
+    Box::new(UnsupportedVmm)
 }

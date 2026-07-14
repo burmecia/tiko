@@ -819,7 +819,7 @@ impl ChunkCache {
             if let Some(rf) = for_relfork {
                 // Safety: slot is pinned (pin_count > 0), which prevents eviction
                 // from changing the tag.
-                if slot.read_tag().relfork() != *rf {
+                if RelFork::from(&slot.read_tag()) != *rf {
                     self.unpin(slot_index);
                     continue;
                 }
@@ -847,7 +847,7 @@ impl ChunkCache {
             // from different writer generations; we re-verify under the bucket
             // write lock below before acting.
             let tag = slot.read_tag();
-            if tag.relfork() != *rf {
+            if RelFork::from(&tag) != *rf {
                 continue;
             }
 

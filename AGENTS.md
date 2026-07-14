@@ -29,11 +29,15 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
 - **Do NOT run `cargo clippy`** on `core`/`smgr`/`worker`/`cli`/`pgsys`. Pre-existing
   lint errors in the hand-written FFI bindings (`pgsys`) abort the build. Verify
   changes with `cargo build` / `cargo test` instead.
-- **`tikod` does NOT build on macOS** (it's Linux/Firecracker-only — `default_vmm`
-  is `#[cfg(target_os = "linux")]` but `main.rs` imports it unconditionally). The
-  CLAUDE.md mention of an Apple Virtualization Framework macOS backend is stale;
-  `tikod/src/vmm/` contains only `firecracker.rs`. On macOS you can build/test
-  `core`, `pgsys`, `smgr`, `worker`, `cli`, `tikoguest`, but not `tikod`.
+- **`tikod` builds on macOS but cannot run VMs.** `default_vmm` has a
+  `#[cfg(target_os = "linux")]` Firecracker branch and a `#[cfg(not(target_os = "linux"))]`
+  branch that returns an `UnsupportedVmm` stub (every `Vmm` op errors with
+  `VmmError::Backend`). So on macOS `tikod` compiles/starts (useful for working on
+  config/HTTP API/proxy) but no VM can be created. The CLAUDE.md mention of an Apple
+  Virtualization Framework macOS backend is stale; `tikod/src/vmm/` ships only
+  `firecracker.rs` (Linux prod) plus the in-`mod.rs` `UnsupportedVmm` stub. On macOS you
+  can build/test `core`, `pgsys`, `smgr`, `worker`, `cli`, `tikoguest`, and now `tikod`
+  (VM ops aside).
 - **`build_postgres.sh`** installs deps via `apt-get` on Linux and `brew` on
   macOS (auto-detected). On macOS it also checks for Xcode Command Line Tools.
 - **Required env vars**: `run_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/

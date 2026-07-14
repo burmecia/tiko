@@ -39,13 +39,12 @@ use tikod::api::{ApiClient, ApiServer};
 use tikod::control::Control;
 use tikod::node::Node;
 use tikod::vmm::firecracker::FirecrackerVmm;
-use tikod::vmm::{VmConfig, VmmError, VmState};
+use tikod::vmm::{VmConfig, VmState, VmmError};
 
 /// Kernel cmdline for the two-drive overlay model. No `root=` is needed: the
 /// initramfs (`assets/tiko-initramfs.cpio.gz`) assembles an overlayfs root from
 /// /dev/vda (RO base) + /dev/vdb (RW overlay) before handing off to systemd.
-const BOOT_ARGS: &str =
-    "console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0";
+const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0";
 
 /// TCP connect timeout used for single liveness probes.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -54,8 +53,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
         )
         .init();
 
@@ -387,7 +385,10 @@ async fn stage_concurrency(
         tracing::info!("--- {N} concurrent VM lifecycles all succeeded ---");
         Ok(())
     } else {
-        Err(format!("concurrency failures:\n  - {}", errs.join("\n  - ")))
+        Err(format!(
+            "concurrency failures:\n  - {}",
+            errs.join("\n  - ")
+        ))
     }
 }
 
@@ -477,11 +478,7 @@ fn make_config(vm_id: &str, kernel: &Path, rootfs: &Path, initrd: &Path) -> VmCo
 /// return an error describing the mismatch. State transitions are recorded
 /// synchronously after each successful Firecracker API call, so this usually
 /// succeeds on the first probe.
-async fn assert_state(
-    client: &ApiClient,
-    vm_id: &str,
-    expected: VmState,
-) -> Result<(), String> {
+async fn assert_state(client: &ApiClient, vm_id: &str, expected: VmState) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match client.vm_state(&vm_id.to_string()).await {

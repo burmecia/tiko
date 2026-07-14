@@ -702,7 +702,7 @@ impl Manifest {
             .map(|(rf, _)| *rf)
             .collect();
         if !deleted.is_empty() {
-            output.retain(|(tag, _)| !deleted.contains(&tag.relfork()));
+            output.retain(|(tag, _)| !deleted.contains(&RelFork::from(tag)));
         }
 
         // 6. Sort meta by RelFork (required by on-disk binary search).

@@ -102,7 +102,10 @@ pub async fn scaler_loop(
         // the current pause epoch — a mismatch means the VM was paused (and
         // possibly restored) since our last tick.
         let metrics_body = serde_json::to_value(&metrics).unwrap_or_default();
-        match tikod.send_json("POST", &reports_path, Some(&metrics_body)).await {
+        match tikod
+            .send_json("POST", &reports_path, Some(&metrics_body))
+            .await
+        {
             Ok(resp) if resp.status == 200 => {
                 if let Some(epoch) = parse_pause_epoch(&resp.body)
                     && epoch != last_seen_epoch
@@ -142,11 +145,18 @@ pub async fn scaler_loop(
             && metrics.active_backends <= policy.max_active_backends
             && metrics.long_running_tx <= policy.max_long_running_tx;
 
-        debug!("pg metrics: {:?}, idle_ticks: {}, is_idle: {}", metrics, idle_ticks, is_idle);
+        debug!(
+            "pg metrics: {:?}, idle_ticks: {}, is_idle: {}",
+            metrics, idle_ticks, is_idle
+        );
 
         if is_idle {
             idle_ticks += 1;
-            debug!(idle_ticks, threshold = policy.idle_threshold_ticks, "VM is idle");
+            debug!(
+                idle_ticks,
+                threshold = policy.idle_threshold_ticks,
+                "VM is idle"
+            );
 
             if idle_ticks >= policy.idle_threshold_ticks {
                 let body = PauseRequest {

@@ -123,11 +123,7 @@ where
 /// Cancel connections are write-only: send the packet and close. Returns
 /// `Ok(())` even if no backend is known (the cancel is silently dropped, same
 /// as PostgreSQL's behaviour for a stale cancel key).
-pub async fn forward_cancel(
-    pid: u32,
-    secret: u32,
-    table: &CancelTable,
-) -> io::Result<()> {
+pub async fn forward_cancel(pid: u32, secret: u32, table: &CancelTable) -> io::Result<()> {
     let Some(addr) = table.get(pid, secret) else {
         debug!(pid, secret, "cancel for unknown backend key — dropping");
         return Ok(());

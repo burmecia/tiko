@@ -24,7 +24,12 @@ const FATAL: &str = "FATAL";
 /// Build a complete `'E'` error packet on the wire.
 pub(crate) fn error_packet(severity: &str, sqlstate: &str, message: &str) -> Vec<u8> {
     let mut fields = Vec::with_capacity(64);
-    for (tag, value) in [(b'S', severity), (b'V', severity), (b'C', sqlstate), (b'M', message)] {
+    for (tag, value) in [
+        (b'S', severity),
+        (b'V', severity),
+        (b'C', sqlstate),
+        (b'M', message),
+    ] {
         fields.push(tag);
         fields.extend_from_slice(value.as_bytes());
         fields.push(0);
@@ -49,11 +54,7 @@ pub fn fatal_missing_endpoint() -> Vec<u8> {
 
 /// `tiko.endpoint` referenced a vm_id that is not in the registry.
 pub fn fatal_unknown_vm(vm_id: &str) -> Vec<u8> {
-    error_packet(
-        FATAL,
-        "28000",
-        &format!("unknown VM {vm_id}"),
-    )
+    error_packet(FATAL, "28000", &format!("unknown VM {vm_id}"))
 }
 
 /// VM is in a state that cannot be forwarded to (e.g. `Snapshotting`).

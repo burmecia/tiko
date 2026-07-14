@@ -25,9 +25,7 @@ pub extern "C-unwind" fn tiko_nblocks(
             // Dump env + cache state so failures (often a missing/wrong
             // namespace or an uninitialised cache during early startup /
             // shutdown) are diagnosable from the log alone.
-            let env_val = |name: &str| {
-                std::env::var(name).unwrap_or_else(|_| "<unset>".into())
-            };
+            let env_val = |name: &str| std::env::var(name).unwrap_or_else(|_| "<unset>".into());
             pg_log_error(&format!(
                 "tiko_nblocks: failed for relfork {relfork}: {err} \
                  [cache_available={} \

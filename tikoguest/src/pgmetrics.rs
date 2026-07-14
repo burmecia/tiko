@@ -133,12 +133,8 @@ impl PgMetrics {
 
         match client.query_one(sql, &[&self.config.db_name]).await {
             Ok(row) => {
-                let cache_hit_ratio: Option<f64> = row
-                    .try_get("cache_hit_ratio")
-                    .unwrap_or(None);
-                let wal_lsn: Option<String> = row
-                    .try_get("wal_lsn")
-                    .unwrap_or(None);
+                let cache_hit_ratio: Option<f64> = row.try_get("cache_hit_ratio").unwrap_or(None);
+                let wal_lsn: Option<String> = row.try_get("wal_lsn").unwrap_or(None);
                 Metrics {
                     available: true,
                     connections: row.get("connections"),

@@ -348,7 +348,9 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     //    and select the base backup to recover from — the latest backup at or
     //    before the target (standard PITR: minimises WAL replay). clap
     //    guarantees exactly one of --time / --lsn is set.
-    let (base_ckpt, tar_bytes, target, target_kind, target_value) = if let Some(time_str) = &args.time {
+    let (base_ckpt, tar_bytes, target, target_kind, target_value) = if let Some(time_str) =
+        &args.time
+    {
         let target_ts = pitr::parse_pg_timestamp(time_str)?;
         if target_ts < window.earliest_ts || target_ts > window.latest_ts {
             return Err(Error::other(format!(

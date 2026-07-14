@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tikod::api::ApiServer;
 use tikod::control::Control;
 use tikod::node::Node;
-use tikod::vmm::{Snapshot, VmConfig, VmId, VmInfo, Vmm, VmmError, VmState};
+use tikod::vmm::{Snapshot, VmConfig, VmId, VmInfo, VmState, Vmm, VmmError};
 
 // ── Mock Vmm: lets the test dictate the guest IP per call ──────────────────
 
@@ -122,7 +122,12 @@ impl FakeAgent {
             }
         });
 
-        Self { listen, config_put, last_body, last_restore_body }
+        Self {
+            listen,
+            config_put,
+            last_body,
+            last_restore_body,
+        }
     }
 
     /// The last `PUT /pg/config` body the agent received.
@@ -165,7 +170,10 @@ async fn handle(
     // Each route returns an explicit (status, body). Action endpoints are 204;
     // reads are 200 JSON; unknown is 404.
     let (status, body): (u16, &str) = match (method, path) {
-        ("GET", "/health") => (200, r#"{"status":"ok","initialized":true,"running":true,"storage_ready":true}"#),
+        ("GET", "/health") => (
+            200,
+            r#"{"status":"ok","initialized":true,"running":true,"storage_ready":true}"#,
+        ),
         ("GET", "/pg/status") => (
             200,
             r#"{"initialized":true,"running":true,"ready":true,"pid":4242,"version":"17.0","data_dir":"/var/lib/postgresql/tt","config_file":"/var/lib/postgresql/tt/postgresql.tiko.conf"}"#,
@@ -174,14 +182,16 @@ async fn handle(
             200,
             r#"{"settings":{"max_connections":"100","log_min_messages":"info"}}"#,
         ),
-        ("POST", "/pg/start") | ("POST", "/pg/stop") | ("POST", "/pg/restart") | ("POST", "/pg/reload") => {
-            (204, "")
-        }
+        ("POST", "/pg/start")
+        | ("POST", "/pg/stop")
+        | ("POST", "/pg/restart")
+        | ("POST", "/pg/reload") => (204, ""),
         ("POST", "/pg/init") => (204, ""),
         ("PUT", "/pg/config") => {
             // Capture the request body (after the blank line).
             if let Some(body_start) = text.find("\r\n\r\n") {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text[body_start + 4..])
+                if let Ok(parsed) =
+                    serde_json::from_str::<serde_json::Value>(&text[body_start + 4..])
                 {
                     if let Some(settings) = parsed.get("settings") {
                         if let Ok(map) =
@@ -224,7 +234,9 @@ async fn handle(
                 r#"{"status":"restored","db_id":2,"project_id":2,"parent_db_id":1,"timeline":"00000001","checkpoint_lsn":"0/3000000"}"#,
             )
         }
-        ("POST", "/branch/restart") => (200, r#"{"status":"started","db_id":2,"branch_port":5432}"#),
+        ("POST", "/branch/restart") => {
+            (200, r#"{"status":"started","db_id":2,"branch_port":5432}"#)
+        }
         _ => (
             404,
             r#"{"error":{"kind":"not_found","message":"fake agent has no such route"}}"#,
@@ -253,7 +265,12 @@ fn status_text(code: u16) -> &'static str {
 
 // ── HTTP client helper ─────────────────────────────────────────────────────
 
-async fn api_request(api_addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+async fn api_request(
+    api_addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, String) {
     let body_bytes = body.unwrap_or("").as_bytes();
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -269,7 +286,9 @@ async fn api_request(api_addr: SocketAddr, method: &str, path: &str, body: Optio
         s.read_to_end(&mut r).await.unwrap();
         String::from_utf8_lossy(&r).into_owned()
     };
-    let text = tokio::time::timeout(Duration::from_secs(5), fut).await.unwrap();
+    let text = tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .unwrap();
     let end = text.find("\r\n\r\n").unwrap();
     let status = text[..end]
         .lines()
@@ -328,7 +347,8 @@ async fn db_health_proxies_to_agent() {
 async fn db_start_stop_restart_reload_return_204() {
     let (api, _agent) = harness().await;
     for action in ["start", "stop", "restart", "reload"] {
-        let (status, body) = api_request(api, "POST", &format!("/vms/vm-1/db/{action}"), None).await;
+        let (status, body) =
+            api_request(api, "POST", &format!("/vms/vm-1/db/{action}"), None).await;
         assert_eq!(status, 204, "action {action}: {body}");
     }
 }
@@ -336,8 +356,13 @@ async fn db_start_stop_restart_reload_return_204() {
 #[tokio::test]
 async fn db_stop_invalid_mode_is_400() {
     let (api, _agent) = harness().await;
-    let (status, body) =
-        api_request(api, "POST", "/vms/vm-1/db/stop", Some(r#"{"mode":"explode"}"#)).await;
+    let (status, body) = api_request(
+        api,
+        "POST",
+        "/vms/vm-1/db/stop",
+        Some(r#"{"mode":"explode"}"#),
+    )
+    .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("bad_request"), "{body}");
 }
@@ -383,7 +408,9 @@ async fn db_config_put_forwards_settings_to_agent() {
     assert_eq!(status, 204, "{body}");
 
     // The fake agent recorded the forwarded PUT body.
-    let put = agent.last_config_put().expect("agent never received config PUT");
+    let put = agent
+        .last_config_put()
+        .expect("agent never received config PUT");
     assert_eq!(put.get("work_mem").unwrap(), "8MB");
     assert_eq!(put.get("max_connections").unwrap(), "50");
 }
@@ -403,7 +430,10 @@ async fn db_route_with_no_guest_ip_is_502() {
         guest_ip: None,
         known: ["vm-1".to_string()].into_iter().collect(),
     });
-    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-db-test-noip")));
+    let node = Arc::new(Node::new(
+        vmm,
+        std::env::temp_dir().join("tikod-db-test-noip"),
+    ));
     let control = Arc::new(Control::new());
     let server = Arc::new(ApiServer::new(node, control));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -424,7 +454,10 @@ async fn db_route_unreachable_agent_is_502() {
         guest_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         known: ["vm-1".to_string()].into_iter().collect(),
     });
-    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-db-test-dead")));
+    let node = Arc::new(Node::new(
+        vmm,
+        std::env::temp_dir().join("tikod-db-test-dead"),
+    ));
     let control = Arc::new(Control::new());
     // Use a port almost certainly nothing listens on.
     let server = Arc::new(ApiServer::new(node, control).with_agent_port(9));
@@ -455,7 +488,11 @@ async fn all_db_routes_are_forwarded() {
         ("POST", "/vms/vm-1/db/restart", None),
         ("POST", "/vms/vm-1/db/reload", None),
         ("GET", "/vms/vm-1/db/config", None),
-        ("PUT", "/vms/vm-1/db/config", Some(r#"{"settings":{"work_mem":"4MB"}}"#)),
+        (
+            "PUT",
+            "/vms/vm-1/db/config",
+            Some(r#"{"settings":{"work_mem":"4MB"}}"#),
+        ),
     ];
     for (method, path, body) in routes {
         let (status, resp_body) = api_request(api, method, path, *body).await;
@@ -481,10 +518,18 @@ async fn pitr_and_branch_routes_are_forwarded() {
     let routes: &[(&str, &str, Option<&str>)] = &[
         ("GET", "/vms/vm-1/pitr/list", None),
         ("POST", "/vms/vm-1/pitr/backup", None),
-        ("POST", "/vms/vm-1/pitr/recover", Some(r#"{"time":"2026-01-01 00:00:00"}"#)),
+        (
+            "POST",
+            "/vms/vm-1/pitr/recover",
+            Some(r#"{"time":"2026-01-01 00:00:00"}"#),
+        ),
         ("POST", "/vms/vm-1/pitr/restart", None),
         ("PUT", "/vms/vm-1/branch/backup", None),
-        ("POST", "/vms/vm-1/branch/restore", Some(r#"{"pack":"/p","db_id":2,"parent_db_id":1}"#)),
+        (
+            "POST",
+            "/vms/vm-1/branch/restore",
+            Some(r#"{"pack":"/p","db_id":2,"parent_db_id":1}"#),
+        ),
         ("POST", "/vms/vm-1/branch/restart", None),
     ];
     for (method, path, body) in routes {
@@ -509,8 +554,7 @@ async fn pitr_and_branch_routes_are_forwarded() {
 async fn branch_restore_forwards_request_body() {
     let (api, agent) = harness().await;
     let payload = r#"{"pack":"/data/branch_packs/1.tar.zst","db_id":2,"parent_db_id":1}"#;
-    let (status, body) =
-        api_request(api, "POST", "/vms/vm-1/branch/restore", Some(payload)).await;
+    let (status, body) = api_request(api, "POST", "/vms/vm-1/branch/restore", Some(payload)).await;
     assert_eq!(status, 200, "{body}");
 
     // The agent observed the exact body tikod forwarded.
@@ -551,7 +595,10 @@ async fn agent_error_body_passes_through_verbatim() {
         guest_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         known: ["vm-1".to_string()].into_iter().collect(),
     });
-    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-branch-err-test")));
+    let node = Arc::new(Node::new(
+        vmm,
+        std::env::temp_dir().join("tikod-branch-err-test"),
+    ));
     let control = Arc::new(Control::new());
     let server = Arc::new(ApiServer::new(node, control).with_agent_port(agent_addr.port()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -633,7 +680,10 @@ async fn get_vms_merges_live_and_registry() {
         .find(|e| e["vm_id"] == "vm-paused")
         .expect("vm-paused missing");
     assert!(paused["state"].is_null(), "frozen state should be null");
-    assert!(paused["guest_ip"].is_null(), "frozen guest_ip should be null");
+    assert!(
+        paused["guest_ip"].is_null(),
+        "frozen guest_ip should be null"
+    );
 }
 
 /// `POST /vms/{id}/reports` stores agent-pushed metrics in the control registry.
@@ -644,7 +694,10 @@ async fn post_reports_stores_metrics() {
         guest_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         known: ["vm-1".to_string()].into_iter().collect(),
     });
-    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-report-test")));
+    let node = Arc::new(Node::new(
+        vmm,
+        std::env::temp_dir().join("tikod-report-test"),
+    ));
     let control = Arc::new(Control::new());
     control.register("vm-1".into(), "acme".into(), "main".into(), 5432);
 
@@ -665,7 +718,13 @@ async fn post_reports_stores_metrics() {
         "cache_hit_ratio": 0.99,
         "wal_lsn": "0/3000000"
     });
-    let (status, resp) = api_request(api_addr, "POST", "/vms/vm-1/reports", Some(&body.to_string())).await;
+    let (status, resp) = api_request(
+        api_addr,
+        "POST",
+        "/vms/vm-1/reports",
+        Some(&body.to_string()),
+    )
+    .await;
     assert_eq!(status, 200, "{resp}");
     assert!(resp.contains(r#""pause_epoch":0"#), "{resp}");
 
@@ -673,11 +732,23 @@ async fn post_reports_stores_metrics() {
     let (status, list_body) = api_request(api_addr, "GET", "/vms", None).await;
     assert_eq!(status, 200, "{list_body}");
     assert!(list_body.contains(r#""connections":3"#), "{list_body}");
-    assert!(list_body.contains(r#""wal_lsn":"0/3000000""#), "{list_body}");
-    assert!(list_body.contains(r#""last_report_secs_ago""#), "{list_body}");
+    assert!(
+        list_body.contains(r#""wal_lsn":"0/3000000""#),
+        "{list_body}"
+    );
+    assert!(
+        list_body.contains(r#""last_report_secs_ago""#),
+        "{list_body}"
+    );
 
     // POST to an unregistered VM → 404.
-    let (status, _) = api_request(api_addr, "POST", "/vms/vm-ghost/reports", Some(&body.to_string())).await;
+    let (status, _) = api_request(
+        api_addr,
+        "POST",
+        "/vms/vm-ghost/reports",
+        Some(&body.to_string()),
+    )
+    .await;
     assert_eq!(status, 404);
 
     // POST with invalid JSON → 400.
@@ -710,16 +781,34 @@ async fn post_pause_request_acks_202() {
     let body = serde_json::json!({"reason": "idle", "metrics": {"connections": 0}});
 
     // Request → 202 (accepted).
-    let (status, resp) = api_request(api_addr, "POST", "/vms/vm-1/pause-request", Some(&body.to_string())).await;
+    let (status, resp) = api_request(
+        api_addr,
+        "POST",
+        "/vms/vm-1/pause-request",
+        Some(&body.to_string()),
+    )
+    .await;
     assert_eq!(status, 202, "{resp}");
     assert!(resp.contains("accepted"), "{resp}");
 
     // Unregistered VM → 404.
-    let (status, _) = api_request(api_addr, "POST", "/vms/vm-ghost/pause-request", Some(&body.to_string())).await;
+    let (status, _) = api_request(
+        api_addr,
+        "POST",
+        "/vms/vm-ghost/pause-request",
+        Some(&body.to_string()),
+    )
+    .await;
     assert_eq!(status, 404);
 
     // Invalid JSON → 400.
-    let (status, _) = api_request(api_addr, "POST", "/vms/vm-1/pause-request", Some("not json")).await;
+    let (status, _) = api_request(
+        api_addr,
+        "POST",
+        "/vms/vm-1/pause-request",
+        Some("not json"),
+    )
+    .await;
     assert_eq!(status, 400);
 }
 
@@ -794,7 +883,10 @@ async fn post_dbs_creates_and_starts_db() {
         std::collections::HashSet::<String>::new(),
     ));
     let vmm: Arc<dyn Vmm> = Arc::new(StatefulMockVmm { guest_ip, known });
-    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-create-db-test")));
+    let node = Arc::new(Node::new(
+        vmm,
+        std::env::temp_dir().join("tikod-create-db-test"),
+    ));
     let control = Arc::new(Control::new());
     let server = Arc::new(
         ApiServer::new(node, control)
@@ -838,14 +930,18 @@ async fn post_dbs_creates_and_starts_db() {
     assert!(body.contains(r#""db_id":1"#), "{body}");
 
     // An explicit vm_id pins the id (and db_id/project_id follow it).
-    let (status, body) =
-        api_request(api_addr, "POST", "/dbs", Some(r#"{"vm_id":"vm-77"}"#)).await;
+    let (status, body) = api_request(api_addr, "POST", "/dbs", Some(r#"{"vm_id":"vm-77"}"#)).await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""vm_id":"vm-77""#), "{body}");
     assert!(body.contains(r#""db_id":77"#), "{body}");
-    let restore_body = agent.last_restore_body().expect("agent never received /branch/restore");
+    let restore_body = agent
+        .last_restore_body()
+        .expect("agent never received /branch/restore");
     assert!(restore_body.contains(r#""db_id":77"#), "{restore_body}");
-    assert!(restore_body.contains(r#""project_id":77"#), "{restore_body}");
+    assert!(
+        restore_body.contains(r#""project_id":77"#),
+        "{restore_body}"
+    );
 
     // Invalid body → 400.
     let (status, body) = api_request(api_addr, "POST", "/dbs", Some("not json")).await;
@@ -905,10 +1001,7 @@ async fn post_dbs_waits_for_storage_ready() {
                         (200, r#"{"status":"restored"}"#.to_string())
                     }
                     ("POST", "/pg/start") => (204, String::new()),
-                    _ => (
-                        404,
-                        r#"{"error":{"kind":"not_found"}}"#.to_string(),
-                    ),
+                    _ => (404, r#"{"error":{"kind":"not_found"}}"#.to_string()),
                 };
                 let resp = format!(
                     "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -926,7 +1019,10 @@ async fn post_dbs_waits_for_storage_ready() {
         std::collections::HashSet::<String>::new(),
     ));
     let vmm: Arc<dyn Vmm> = Arc::new(StatefulMockVmm { guest_ip, known });
-    let node = Arc::new(Node::new(vmm, std::env::temp_dir().join("tikod-storage-ready-test")));
+    let node = Arc::new(Node::new(
+        vmm,
+        std::env::temp_dir().join("tikod-storage-ready-test"),
+    ));
     let control = Arc::new(Control::new());
     let server = Arc::new(
         ApiServer::new(node, control)
@@ -949,5 +1045,8 @@ async fn post_dbs_waits_for_storage_ready() {
         probes >= READY_AFTER,
         "expected tikod to keep polling until storage_ready (>= {READY_AFTER} probes), got {probes}"
     );
-    assert!(restore_called.load(Ordering::Relaxed), "restore was never called");
+    assert!(
+        restore_called.load(Ordering::Relaxed),
+        "restore was never called"
+    );
 }

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tikod::api::{ApiClient, ApiServer};
 use tikod::control::Control;
 use tikod::node::Node;
-use tikod::vmm::firecracker::FirecrackerVmm;
 use tikod::vmm::VmmError;
+use tikod::vmm::firecracker::FirecrackerVmm;
 
 /// Bring up an in-process API server on an ephemeral port and return a client
 /// pointed at it. The listener is bound before the serve task is spawned, so the
@@ -22,9 +22,9 @@ async fn spawn_server() -> ApiClient {
         "tikod-api-test-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let vmm = Arc::new(FirecrackerVmm::new(dir.clone()));
     let node = Arc::new(Node::new(vmm, dir.join("snapshots")));
@@ -125,7 +125,10 @@ async fn bad_json_body_is_bad_request() {
         "expected 400, got: {}",
         &resp[..resp.len().min(80)]
     );
-    assert!(resp.contains("bad_request"), "missing bad_request kind: {resp}");
+    assert!(
+        resp.contains("bad_request"),
+        "missing bad_request kind: {resp}"
+    );
 }
 
 #[tokio::test]
@@ -161,7 +164,10 @@ async fn invalid_json_provision_is_bad_request() {
         "expected 400, got: {}",
         &resp[..resp.len().min(80)]
     );
-    assert!(resp.contains("bad_request"), "missing bad_request kind: {resp}");
+    assert!(
+        resp.contains("bad_request"),
+        "missing bad_request kind: {resp}"
+    );
 }
 
 #[tokio::test]
@@ -177,7 +183,10 @@ async fn health_endpoint_reports_ok() {
         "expected 200, got: {}",
         &resp[..resp.len().min(80)]
     );
-    assert!(resp.contains(r#""status":"ok""#), "missing status ok: {resp}");
+    assert!(
+        resp.contains(r#""status":"ok""#),
+        "missing status ok: {resp}"
+    );
 }
 
 #[tokio::test]
@@ -189,5 +198,8 @@ async fn list_vms_is_initially_empty() {
     )
     .await;
     assert!(resp.starts_with("HTTP/1.1 200"));
-    assert!(resp.contains(r#""vms":[]"#), "expected empty vms list: {resp}");
+    assert!(
+        resp.contains(r#""vms":[]"#),
+        "expected empty vms list: {resp}"
+    );
 }

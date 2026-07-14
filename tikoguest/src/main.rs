@@ -59,7 +59,11 @@ struct Args {
     initdb: PathBuf,
 
     /// Log file passed to `pg_ctl -l` for start/restart.
-    #[arg(long, default_value = "/var/lib/postgresql/log.log", env = "TIKOGUEST_LOG")]
+    #[arg(
+        long,
+        default_value = "/var/lib/postgresql/log.log",
+        env = "TIKOGUEST_LOG"
+    )]
     log_path: PathBuf,
 
     /// Override config file (`include_if_exists` target in `postgresql.conf`).
@@ -91,12 +95,20 @@ struct Args {
 
     /// `tiko_pitr` executable (the `/usr/local/bin` wrapper that sources
     /// `tiko_env.sh`). Used by the base-backup loop.
-    #[arg(long, default_value = "/usr/local/bin/tiko_pitr", env = "TIKO_PITR_BIN")]
+    #[arg(
+        long,
+        default_value = "/usr/local/bin/tiko_pitr",
+        env = "TIKO_PITR_BIN"
+    )]
     tiko_pitr: PathBuf,
 
     /// `tiko_branch` executable (the `/usr/local/bin` wrapper that sources
     /// `tiko_env.sh`). Used by the `/branch/*` API endpoints.
-    #[arg(long, default_value = "/usr/local/bin/tiko_branch", env = "TIKO_BRANCH_BIN")]
+    #[arg(
+        long,
+        default_value = "/usr/local/bin/tiko_branch",
+        env = "TIKO_BRANCH_BIN"
+    )]
     tiko_branch: PathBuf,
 
     /// Base-backup loop interval in seconds. 0 disables the loop. Each cycle
@@ -118,8 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .config_file
         .unwrap_or_else(|| args.data_dir.join("postgresql.tiko.conf"));
 
-    let mut ctl_builder = PgCtl::new(args.pg_ctl, args.data_dir, args.log_path, config_file)
-        .with_initdb(args.initdb);
+    let mut ctl_builder =
+        PgCtl::new(args.pg_ctl, args.data_dir, args.log_path, config_file).with_initdb(args.initdb);
     if let Some(tiko_env_path) = args.tiko_env {
         ctl_builder = ctl_builder.with_tiko_env_path(tiko_env_path);
     }

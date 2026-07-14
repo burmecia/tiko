@@ -92,8 +92,13 @@ impl Fixture {
         let config_file = data_dir.join("postgresql.tiko.conf");
         let log_path = root.join("log.log");
 
-        let ctl = PgCtl::new(pg_ctl.clone(), data_dir.clone(), log_path, config_file.clone())
-            .with_initdb(initdb.clone());
+        let ctl = PgCtl::new(
+            pg_ctl.clone(),
+            data_dir.clone(),
+            log_path,
+            config_file.clone(),
+        )
+        .with_initdb(initdb.clone());
         let server = Arc::new(PgServer::new(
             ctl,
             PathBuf::from("tiko_pitr"),
@@ -163,7 +168,9 @@ impl Fixture {
 
         let fut = async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut stream = tokio::net::TcpStream::connect(self.server_addr).await.unwrap();
+            let mut stream = tokio::net::TcpStream::connect(self.server_addr)
+                .await
+                .unwrap();
             stream.write_all(&payload).await.unwrap();
             let mut resp = Vec::new();
             stream.read_to_end(&mut resp).await.unwrap();
@@ -234,7 +241,9 @@ async fn start_then_stop_drives_pg_ctl() {
     assert_eq!(status, 204);
     let calls = f.calls_log();
     assert!(
-        calls.iter().any(|c| c.contains(" -m fast ") && c.ends_with(" stop")),
+        calls
+            .iter()
+            .any(|c| c.contains(" -m fast ") && c.ends_with(" stop")),
         "{calls:?}"
     );
 }
@@ -252,12 +261,16 @@ async fn stop_with_explicit_mode_is_validated() {
     assert_eq!(status, 204);
     let calls = f.calls_log();
     assert!(
-        calls.iter().any(|c| c.contains(" -m immediate ") && c.ends_with(" stop")),
+        calls
+            .iter()
+            .any(|c| c.contains(" -m immediate ") && c.ends_with(" stop")),
         "{calls:?}"
     );
 
     // An invalid mode must be rejected as 400, not passed to pg_ctl.
-    let (status, body) = f.request("POST", "/pg/stop", Some(r#"{"mode":"explode"}"#)).await;
+    let (status, body) = f
+        .request("POST", "/pg/stop", Some(r#"{"mode":"explode"}"#))
+        .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("bad_request"), "{body}");
 }
@@ -342,14 +355,25 @@ async fn init_creates_cluster_and_wires_config() {
 
     // initdb was invoked.
     let calls = f.initdb_calls_log();
-    assert!(calls.iter().any(|c| c.contains("-D") && c.contains("--auth=trust")), "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("-D") && c.contains("--auth=trust")),
+        "{calls:?}"
+    );
 
     // PG_VERSION is now present (written by the fake initdb).
-    assert!(f.data_dir.join("PG_VERSION").exists(), "PG_VERSION missing after init");
+    assert!(
+        f.data_dir.join("PG_VERSION").exists(),
+        "PG_VERSION missing after init"
+    );
 
     // The override config was copied from the PGHOME template into the data dir.
     let override_conf = std::fs::read_to_string(&f.config_file).unwrap();
-    assert!(override_conf.contains("log_min_messages=info"), "{override_conf}");
+    assert!(
+        override_conf.contains("log_min_messages=info"),
+        "{override_conf}"
+    );
 
     // postgresql.conf has the include_if_exists hook.
     let pg_conf = std::fs::read_to_string(f.data_dir.join("postgresql.conf")).unwrap();
@@ -374,7 +398,10 @@ async fn init_when_data_dir_does_not_exist_is_not_500() {
     assert!(!f.data_dir.exists());
 
     let (status, body) = f.request("POST", "/pg/init", None).await;
-    assert_eq!(status, 204, "init on a missing data dir returned {status}: {body}");
+    assert_eq!(
+        status, 204,
+        "init on a missing data dir returned {status}: {body}"
+    );
     // initdb ran and re-created the data dir.
     assert!(f.data_dir.join("PG_VERSION").exists());
     assert!(!f.initdb_calls_log().is_empty());
@@ -421,7 +448,9 @@ async fn init_refuses_while_running() {
     // StillRunning guard is what triggers.
     f.set_running(999);
 
-    let (status, body) = f.request("POST", "/pg/init", Some(r#"{"force":true}"#)).await;
+    let (status, body) = f
+        .request("POST", "/pg/init", Some(r#"{"force":true}"#))
+        .await;
     assert_eq!(status, 409, "{body}");
     assert!(body.contains("still_running"), "{body}");
 }
@@ -429,7 +458,9 @@ async fn init_refuses_while_running() {
 #[tokio::test]
 async fn init_invalid_body_is_bad_request() {
     let f = Fixture::start().await;
-    let (status, body) = f.request("POST", "/pg/init", Some(r#"{"force":"not-a-bool"}"#)).await;
+    let (status, body) = f
+        .request("POST", "/pg/init", Some(r#"{"force":"not-a-bool"}"#))
+        .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("bad_request"), "{body}");
 }
@@ -443,9 +474,15 @@ async fn start_passes_tiko_identity_to_pg_ctl() {
     assert_eq!(status, 204, "{body}");
 
     let env = f.pg_ctl_env_log();
-    assert!(env.contains("TIKO_ORG_ID=77"), "missing TIKO_ORG_ID:\n{env}");
+    assert!(
+        env.contains("TIKO_ORG_ID=77"),
+        "missing TIKO_ORG_ID:\n{env}"
+    );
     assert!(env.contains("TIKO_DB_ID=88"), "missing TIKO_DB_ID:\n{env}");
-    assert!(env.contains("TIKO_PROJECT_ID=99"), "missing TIKO_PROJECT_ID:\n{env}");
+    assert!(
+        env.contains("TIKO_PROJECT_ID=99"),
+        "missing TIKO_PROJECT_ID:\n{env}"
+    );
     assert!(
         env.contains("TIKO_STORAGE_ROOT=/mnt/s3files/tiko_root"),
         "missing TIKO_STORAGE_ROOT:\n{env}"
@@ -461,7 +498,10 @@ async fn init_passes_tiko_identity_to_initdb() {
 
     let env = f.initdb_env_log();
     assert!(env.contains("TIKO_DB_ID=88"), "missing TIKO_DB_ID:\n{env}");
-    assert!(env.contains("TIKO_PROJECT_ID=99"), "missing TIKO_PROJECT_ID:\n{env}");
+    assert!(
+        env.contains("TIKO_PROJECT_ID=99"),
+        "missing TIKO_PROJECT_ID:\n{env}"
+    );
 }
 
 #[tokio::test]

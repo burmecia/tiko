@@ -32,10 +32,7 @@ pub async fn backup_loop(tiko_pitr: PathBuf, interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
 
-        let result = Command::new(&tiko_pitr)
-            .arg("backup")
-            .output()
-            .await;
+        let result = Command::new(&tiko_pitr).arg("backup").output().await;
 
         match result {
             Ok(output) if output.status.success() => {

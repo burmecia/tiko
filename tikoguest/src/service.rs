@@ -83,13 +83,7 @@ impl ServiceRegistry {
 
     /// Dispatch a request to the named service. Returns `None` if the service
     /// is not registered (caller should return 404).
-    pub fn route(
-        &self,
-        name: &str,
-        method: &str,
-        rest: &[&str],
-        body: &[u8],
-    ) -> Option<Response> {
+    pub fn route(&self, name: &str, method: &str, rest: &[&str], body: &[u8]) -> Option<Response> {
         self.services
             .get(name)
             .map(|svc| svc.handle_request(method, rest, body))
@@ -105,7 +99,7 @@ impl Default for ServiceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{ok_json, no_content, not_found};
+    use crate::http::{no_content, not_found, ok_json};
 
     /// A minimal service for testing the registry + dispatch.
     struct FakeService {
@@ -129,11 +123,13 @@ mod tests {
             match (method, rest) {
                 ("GET", []) => ok_json(serde_json::json!({"status": "ok"})),
                 ("POST", ["start"]) => {
-                    self.running.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.running
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     no_content()
                 }
                 ("POST", ["stop"]) => {
-                    self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+                    self.running
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     no_content()
                 }
                 _ => not_found(method, &format!("/services/fake/{}", rest.join("/"))),

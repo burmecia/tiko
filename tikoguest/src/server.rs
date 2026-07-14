@@ -41,7 +41,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
-use crate::http::{read_request, write_response, ok_json, no_content, bad_request, not_found, Request, Response};
+use crate::http::{
+    Request, Response, bad_request, no_content, not_found, ok_json, read_request, write_response,
+};
 use crate::pgops::{PgCtl, PgCtlError, PgCtlResult, StopMode};
 use crate::service::ServiceRegistry;
 
@@ -662,7 +664,8 @@ async fn run_external(mut cmd: Command, error_kind: &str) -> Response {
                     // error object so clients can see why it failed. Success
                     // responses pass through unmodified — stderr there is just
                     // progress noise.
-                    if !out.status.success() && !stderr.is_empty()
+                    if !out.status.success()
+                        && !stderr.is_empty()
                         && let Some(obj) = value.as_object_mut()
                     {
                         obj.entry("stderr")
@@ -680,7 +683,10 @@ async fn run_external(mut cmd: Command, error_kind: &str) -> Response {
                         .to_string()
                         .into_bytes()
                     });
-                    Response { status: http_status, body }
+                    Response {
+                        status: http_status,
+                        body,
+                    }
                 }
                 Err(_) => {
                     // Not JSON — fall back to wrapping stdout/stderr verbatim.

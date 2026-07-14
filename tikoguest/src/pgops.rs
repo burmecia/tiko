@@ -98,7 +98,12 @@ pub struct PgCtl {
 }
 
 impl PgCtl {
-    pub fn new(pg_ctl: PathBuf, data_dir: PathBuf, log_path: PathBuf, config_file: PathBuf) -> Self {
+    pub fn new(
+        pg_ctl: PathBuf,
+        data_dir: PathBuf,
+        log_path: PathBuf,
+        config_file: PathBuf,
+    ) -> Self {
         // The override template ships in PGDATA's parent (PGHOME) per
         // create_rootfs.sh; fall back to the config file path if there's no
         // parent (e.g. a relative data dir in tests).
@@ -216,7 +221,10 @@ impl PgCtl {
         if !self.is_initialized() {
             return Ok(false);
         }
-        match self.run(&["-D", &arg_path(&self.data_dir), "status"], "status").await {
+        match self
+            .run(&["-D", &arg_path(&self.data_dir), "status"], "status")
+            .await
+        {
             Ok(_) => Ok(true),
             Err(PgCtlError::CommandFailed { code: Some(_), .. }) => Ok(false),
             Err(e) => Err(e),
@@ -339,11 +347,7 @@ impl PgCtl {
 
         // 3. initdb.
         let output = Command::new(&self.initdb)
-            .args([
-                "-D",
-                &arg_path(&self.data_dir),
-                "--auth=trust",
-            ])
+            .args(["-D", &arg_path(&self.data_dir), "--auth=trust"])
             .envs(&self.tiko_env)
             .output()
             .await
@@ -481,7 +485,9 @@ fn render_pg_config(settings: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
     out.push_str("# Managed by tikoguest (tikod). Hand-edits will be overwritten.\n");
     for (name, value) in settings {
-        let needs_quote = !value.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-');
+        let needs_quote = !value
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-');
         if needs_quote {
             let escaped = value.replace('\'', "''");
             out.push_str(&format!("{name} = '{escaped}'\n"));
