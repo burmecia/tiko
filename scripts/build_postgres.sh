@@ -34,6 +34,10 @@ if [ "${OS}" = "Darwin" ]; then
     # macOS ships outdated flex/bison; prefer Homebrew's.
     export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:${PATH}"
     export PKG_CONFIG_PATH="$(brew --prefix readline)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+    # Pin deployment target to the SDK's major version so C deps built by the
+    # Rust `cc` crate (zstd-sys in libtikosmgr.a) match clang's default floor —
+    # otherwise ld warns "built for newer macOS version ... than being linked".
+    export MACOSX_DEPLOYMENT_TARGET="$(xcrun --show-sdk-version | cut -d. -f1).0"
 elif [ "${OS}" = "Linux" ]; then
     echo "Installing build dependencies (Linux)..."
     sudo apt-get update

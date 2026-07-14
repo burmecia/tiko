@@ -15,6 +15,16 @@ export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
 export TIKO_PROJECT_ID="56"
 
+# Pin the macOS deployment target to the SDK's major version (e.g. "26.0").
+# Without this, the Rust `cc` crate (zstd-sys and other C deps compiled into
+# libtikosmgr.a) defaults to the full SDK version (e.g. 26.5) while clang
+# floors to the major (26.0), triggering ld warnings like "object file ... was
+# built for newer 'macOS' version (26.5) than being linked (26.0)" when
+# libtikosmgr.a is linked into postgres.
+if [ "$(uname)" = "Darwin" ]; then
+    export MACOSX_DEPLOYMENT_TARGET="$(xcrun --show-sdk-version | cut -d. -f1).0"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET_DIR="${BASE_DIR}/target"

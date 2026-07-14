@@ -48,17 +48,12 @@ impl ChunkTag {
         }
     }
 
-    /// Return the [`RelFork`] this chunk belongs to.
-    // pub fn relfork(&self) -> RelFork {
-    //     RelFork::from(*self)
-    // }
-
     pub fn start_block(&self) -> BlockNumber {
         self.chunk_id * BLOCKS_PER_CHUNK
     }
 
     pub fn end_block(&self) -> BlockNumber {
-        (self.chunk_id + 1) * BLOCKS_PER_CHUNK - 1
+        self.end_block_exclusive() - 1
     }
 
     pub fn end_block_exclusive(&self) -> BlockNumber {
