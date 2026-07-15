@@ -668,6 +668,10 @@ impl ApiServer {
     ///    `/branch/restore` (`parent_db_id` and `pack` both default inside the
     ///    agent — the org's single bootstrap pack).
     /// 4. **Start** Postgres (`/pg/start`), leaving a ready-to-serve database.
+    /// 5. **Start** PostgREST (`/services/postgrest/start`) so the in-guest REST
+    ///    API is serving before `create_db` returns. PostgREST then rides along
+    ///    with every freeze/thaw (Firecracker snapshots full VM memory), so this
+    ///    explicit start happens once per database lifetime.
     ///
     /// Optional body: `{"vm_id":"vm-N"}` (defaults to the next free auto id).
     ///
@@ -740,6 +744,18 @@ impl ApiServer {
 
         // 4. Start Postgres (left stopped by the restore).
         match client.forward_raw("POST", "/pg/start", &[]).await {
+            Ok((status, _)) if (200..300).contains(&status) => {}
+            Ok((status, body)) => return Response { status, body },
+            Err(e) => return guest_err_resp(e),
+        }
+
+        // 5. Start PostgREST. The service provisions its roles + spawns
+        //    postgrest after PG is ready. A non-2xx here fails the whole
+        //    bring-up so the caller isn't left with a half-serving VM.
+        match client
+            .forward_raw("POST", "/services/postgrest/start", &[])
+            .await
+        {
             Ok((status, _)) if (200..300).contains(&status) => {}
             Ok((status, body)) => return Response { status, body },
             Err(e) => return guest_err_resp(e),

@@ -13,6 +13,7 @@ name = "tikoguest"
 path = "src/main.rs"
 
 [dependencies]
+libc = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = "0.7"
 tracing = { workspace = true }

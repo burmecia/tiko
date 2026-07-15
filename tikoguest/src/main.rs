@@ -34,6 +34,7 @@ use tikoguest::env;
 use tikoguest::http::HttpClient;
 use tikoguest::pgmetrics::{PgMetrics, PgMetricsConfig};
 use tikoguest::pgops::PgCtl;
+use tikoguest::postgrest::PostgRest;
 use tikoguest::scaler::{self, ScalerPolicy};
 use tikoguest::server::PgServer;
 
@@ -170,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pg_config = match &args.pg_conn {
                     Some(conn) => PgMetricsConfig {
                         connection_string: conn.clone(),
-                        db_name: "tt".into(),
+                        db_name: "postgres".into(),
                     },
                     None => PgMetricsConfig::default(),
                 };
@@ -231,7 +232,13 @@ async fn start_server(
     tiko_pitr: PathBuf,
     tiko_branch: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server = Arc::new(PgServer::new(ctl, tiko_pitr, tiko_branch));
+    // Register the in-guest PostgREST service under /services/postgrest/*. It
+    // shares the Postgres handle (same pg_ctl / data dir / tiko identity) and
+    // spawns postgrest against the rootfs-baked conf after PG is ready.
+    let postgrest = Arc::new(PostgRest::new(ctl.clone()));
+    let server = Arc::new(
+        PgServer::new(ctl, tiko_pitr, tiko_branch).with_service(postgrest),
+    );
     server.run(listen_addr).await?;
     Ok(())
 }

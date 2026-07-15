@@ -187,6 +187,14 @@ async fn handle(
         | ("POST", "/pg/restart")
         | ("POST", "/pg/reload") => (204, ""),
         ("POST", "/pg/init") => (204, ""),
+        // PostgREST service control (forwarded to the in-guest tikoguest agent).
+        ("POST", "/services/postgrest/start")
+        | ("POST", "/services/postgrest/stop")
+        | ("POST", "/services/postgrest/reload") => (204, ""),
+        ("GET", "/services/postgrest") | ("GET", "/services/postgrest/status") => (
+            200,
+            r#"{"status":"running","pid":1234}"#,
+        ),
         ("PUT", "/pg/config") => {
             // Capture the request body (after the blank line).
             if let Some(body_start) = text.find("\r\n\r\n") {
@@ -1001,6 +1009,7 @@ async fn post_dbs_waits_for_storage_ready() {
                         (200, r#"{"status":"restored"}"#.to_string())
                     }
                     ("POST", "/pg/start") => (204, String::new()),
+                    ("POST", "/services/postgrest/start") => (204, String::new()),
                     _ => (404, r#"{"error":{"kind":"not_found"}}"#.to_string()),
                 };
                 let resp = format!(

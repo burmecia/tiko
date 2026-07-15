@@ -6,6 +6,7 @@
 //! Options:
 //!   --data-dir <PATH>      Directory for snapshots and runtime artifacts
 //!   --listen <ADDR>        Address for the PG proxy to listen on (default: 127.0.0.1:5432)
+//!   --http-listen <ADDR>   Address for the PostgREST HTTP proxy (default: 0.0.0.0:3000)
 //!   --api-listen <ADDR>    Address for the HTTP control API (default: 127.0.0.1:9000)
 //!   --agent-port <PORT>    Guest tikoguest agent port for /vms/{id}/db/* (default: 9000)
 //!   --assets-dir <PATH>    Kernel/rootfs/initramfs for preset VmConfig (default: tikod/assets)
@@ -22,6 +23,7 @@ use tracing_subscriber::EnvFilter;
 use tikod::api::ApiServer;
 use tikod::config::TikodConfig;
 use tikod::control::Control;
+use tikod::http_proxy::HttpProxy;
 use tikod::node::Node;
 use tikod::proxy::{Proxy, ProxyConfig};
 use tikod::vmm::{Vmm, default_vmm};
@@ -37,6 +39,11 @@ struct Args {
     /// Address for the PG proxy to listen on.
     #[arg(long, default_value = "127.0.0.1:5432")]
     listen: String,
+
+    /// Address for the PostgREST HTTP reverse proxy (fans out by
+    /// `X-Tiko-Endpoint` header to each VM's in-guest PostgREST).
+    #[arg(long, default_value = "0.0.0.0:3000")]
+    http_listen: String,
 
     /// Address for the HTTP control API (VM lifecycle).
     #[arg(long, default_value = "0.0.0.0:9000")]
@@ -63,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build configuration.
     let listen_addr: SocketAddr = args.listen.parse()?;
+    let http_listen_addr: SocketAddr = args.http_listen.parse()?;
     let api_listen_addr: SocketAddr = args.api_listen.parse()?;
     let data_dir = PathBuf::from(&args.data_dir);
     std::fs::create_dir_all(&data_dir)?;
@@ -75,9 +83,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
+    // HTTP proxy reuses the PG proxy's wake/dev settings with its own listen
+    // address (default 0.0.0.0:3000).
+    let http_config = ProxyConfig {
+        listen_addr: http_listen_addr,
+        ..Default::default()
+    };
+
     tracing::info!(
         data_dir = %config.data_dir.display(),
         listen = %config.proxy.listen_addr,
+        http_listen = %http_config.listen_addr,
         api_listen = %api_listen_addr,
         platform = std::env::consts::OS,
         "starting tikod"
@@ -105,14 +121,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create and run proxy.
-    let proxy = Proxy::new(node.clone(), control.clone(), config.proxy.clone());
+    // Create and run the proxies.
+    let pg_proxy = Proxy::new(node.clone(), control.clone(), config.proxy.clone());
+    let http_proxy = HttpProxy::new(node.clone(), control.clone(), http_config);
 
-    // Run the proxy until Ctrl+C / SIGINT.
+    // Run both proxies until Ctrl+C / SIGINT.
     tokio::select! {
-        result = proxy.run() => {
+        result = pg_proxy.run() => {
             if let Err(e) = result {
-                tracing::error!(error = %e, "proxy exited");
+                tracing::error!(error = %e, "PG proxy exited");
+            }
+        }
+        result = http_proxy.run() => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "HTTP proxy exited");
             }
         }
         _ = tokio::signal::ctrl_c() => {

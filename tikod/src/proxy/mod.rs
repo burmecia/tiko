@@ -397,39 +397,54 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Resolve a VM target to a backend socket address. Performs wake-on-connect
-/// (resume / thaw, single-flighted via `Control`) bounded by
-/// `resume_timeout_secs`. Records `on_connect` on success.
-async fn resolve_vm(
+/// Protocol-agnostic error from resolving + waking a VM for forwarding.
+///
+/// Both the PG wire proxy ([`resolve_vm`]) and the HTTP reverse proxy
+/// (`http_proxy`) build on [`resolve_guest`] and map this into their own error
+/// format (PG-wire error packet vs HTTP response).
+#[derive(Debug)]
+pub enum ResolveError {
+    /// VM is not registered in the control plane.
+    UnknownVm(VmId),
+    /// Wake (resume / cold restore) failed.
+    Wake(crate::vmm::VmmError),
+    /// Wake exceeded the resume timeout (seconds).
+    WakeTimeout(VmId, u64),
+    /// Guest IP discovery failed.
+    GuestIp(VmId, crate::vmm::VmmError),
+}
+
+/// Resolve a VM to a reachable guest IP, waking it (resume / cold restore) if
+/// needed, bounded by `resume_timeout_secs`. Records `on_connect` on success so
+/// the connection/idle counters stay accurate.
+///
+/// Protocol-agnostic: callers wrap [`ResolveError`] into their own error format
+/// (PG-wire packet vs HTTP response) and select their own target port (5432 vs
+/// 3000). This is the reusable core factored out of [`resolve_vm`].
+pub async fn resolve_guest(
     vm_id: &VmId,
     node: &Node,
     control: &Control,
-    config: &ProxyConfig,
-) -> RouteOutcome {
+    resume_timeout_secs: u64,
+) -> Result<IpAddr, ResolveError> {
     // Unknown VM — reject hard.
     if control.get(vm_id).is_none() {
-        return RouteOutcome::Reject(fatal_unknown_vm(vm_id));
+        return Err(ResolveError::UnknownVm(vm_id.clone()));
     }
 
     // Wake (Running → noop; Paused → resume; Stopped → restore), bounded.
     let wake = node.wake(vm_id, control);
-    match tokio::time::timeout(Duration::from_secs(config.resume_timeout_secs), wake).await {
+    match tokio::time::timeout(Duration::from_secs(resume_timeout_secs), wake).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return RouteOutcome::Reject(wake_error_packet(vm_id, &e)),
+        Ok(Err(e)) => return Err(ResolveError::Wake(e)),
         Err(_) => {
-            return RouteOutcome::Reject(fatal_wake_timeout(vm_id, config.resume_timeout_secs));
+            return Err(ResolveError::WakeTimeout(vm_id.clone(), resume_timeout_secs));
         }
     }
 
     let guest_ip = match node.guest_ip(vm_id).await {
         Ok(ip) => ip,
-        Err(e) => {
-            return RouteOutcome::Reject(error_packet(
-                FATAL,
-                "08006",
-                &format!("cannot get guest IP for VM {vm_id}: {e}"),
-            ));
-        }
+        Err(e) => return Err(ResolveError::GuestIp(vm_id.clone(), e)),
     };
 
     let ip = guest_ip.unwrap_or_else(|| {
@@ -438,7 +453,31 @@ async fn resolve_vm(
     });
 
     control.on_connect(vm_id);
-    RouteOutcome::Addr(SocketAddr::new(ip, PG_PORT))
+    Ok(ip)
+}
+
+/// Resolve a VM target to a backend socket address. Wraps [`resolve_guest`]
+/// with wake-on-connect (single-flighted via `Control`) and formats failures
+/// as PG-wire error packets for the client.
+async fn resolve_vm(
+    vm_id: &VmId,
+    node: &Node,
+    control: &Control,
+    config: &ProxyConfig,
+) -> RouteOutcome {
+    match resolve_guest(vm_id, node, control, config.resume_timeout_secs).await {
+        Ok(ip) => RouteOutcome::Addr(SocketAddr::new(ip, PG_PORT)),
+        Err(ResolveError::UnknownVm(id)) => RouteOutcome::Reject(fatal_unknown_vm(&id)),
+        Err(ResolveError::Wake(e)) => RouteOutcome::Reject(wake_error_packet(vm_id, &e)),
+        Err(ResolveError::WakeTimeout(id, secs)) => {
+            RouteOutcome::Reject(fatal_wake_timeout(&id, secs))
+        }
+        Err(ResolveError::GuestIp(id, e)) => RouteOutcome::Reject(error_packet(
+            FATAL,
+            "08006",
+            &format!("cannot get guest IP for VM {id}: {e}"),
+        )),
+    }
 }
 
 // ── TCP keepalive (Part A) ──────────────────────────────────────────────────

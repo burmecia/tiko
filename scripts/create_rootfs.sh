@@ -205,6 +205,24 @@ sudo mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 sudo ln -sf /etc/systemd/system/tikoguest.service \
     "$ROOTFS/etc/systemd/system/multi-user.target.wants/tikoguest.service"
 
+echo ">>> Installing PostgREST..."
+# PostgREST is co-located in the guest (one per VM), spawned by the tikoguest
+# `PostgRest` service — same lifecycle model as PG via pg_ctl (no systemd unit,
+# so freeze/thaw snapshots and resumes it with the rest of the VM). v14 is the
+# current line; override the exact version with POSTGREST_VERSION.
+POSTGREST_VERSION="${POSTGREST_VERSION:-14.15}"
+PGR_TARBALL="postgrest-v${POSTGREST_VERSION}-linux-static-x86-64.tar.xz"
+curl -fsSL -o "/tmp/${PGR_TARBALL}" \
+    "https://github.com/PostgREST/postgrest/releases/download/v${POSTGREST_VERSION}/${PGR_TARBALL}"
+mkdir -p /tmp/postgrest-extract
+tar -xf "/tmp/${PGR_TARBALL}" -C /tmp/postgrest-extract
+sudo install -m755 "/tmp/postgrest-extract/postgrest" "$ROOTFS/usr/local/bin/postgrest"
+rm -rf /tmp/postgrest-extract "/tmp/${PGR_TARBALL}"
+# Static base config + role-provisioning SQL. The service templates per-VM
+# overrides (e.g. jwt-secret) via PGRST_* env vars at spawn time.
+sudo install -m644 "$SCRIPT_DIR/postgrest.conf" "$PG_HOME_DIR/postgrest.conf"
+sudo install -m644 "$SCRIPT_DIR/postgrest_setup.sql" "$PG_HOME_DIR/postgrest_setup.sql"
+
 echo ">>> Installing CLI tools..."
 ( cd "$SCRIPT_DIR/.." && cargo build --release -p cli )
 sudo mkdir -p "$ROOTFS/usr/local/libexec"

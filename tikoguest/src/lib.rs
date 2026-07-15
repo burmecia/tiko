@@ -10,6 +10,7 @@ pub mod env;
 pub mod http;
 pub mod pgmetrics;
 pub mod pgops;
+pub mod postgrest;
 pub mod scaler;
 pub mod server;
 pub mod service;

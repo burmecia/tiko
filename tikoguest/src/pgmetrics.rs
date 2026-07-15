@@ -25,13 +25,13 @@ pub struct Metrics {
     /// Whether the collection succeeded. `false` when PG is down or a query
     /// failed.
     pub available: bool,
-    /// Total backends connected to the `tt` database (`pg_stat_activity`).
+    /// Total backends connected to the `postgres` database (`pg_stat_activity`).
     pub connections: i64,
     /// Backends currently executing a query (`state='active'`).
     pub active_backends: i64,
     /// Backends with a transaction started > 60s ago.
     pub long_running_tx: i64,
-    /// `pg_database_size('tt')` in bytes.
+    /// `pg_database_size('postgres')` in bytes.
     pub db_size_bytes: i64,
     /// `blks_hit / (blks_hit + blks_read)` — `None` when no reads yet.
     pub cache_hit_ratio: Option<f64>,
@@ -63,8 +63,8 @@ impl Metrics {
 /// Configuration for [`PgMetrics`].
 #[derive(Clone, Debug)]
 pub struct PgMetricsConfig {
-    /// libpq-style connection string. Defaults to the unix socket as the
-    /// `postgres` user (the agent runs as postgres), database `tt`.
+    /// libpq-style connection string. Defaults to localhost as the
+    /// `postgres` user (the agent runs as postgres), database `postgres`.
     pub connection_string: String,
     /// Database name used in `pg_stat_activity` / `pg_database_size` filters.
     pub db_name: String,
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn config_defaults() {
         let c = PgMetricsConfig::default();
-        assert!(c.connection_string.contains("dbname=tt"));
-        assert_eq!(c.db_name, "tt");
+        assert!(c.connection_string.contains("dbname=postgres"));
+        assert_eq!(c.db_name, "postgres");
     }
 }
