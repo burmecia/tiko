@@ -123,8 +123,12 @@ src/
     stub.rs        StubBackend (non-Linux; compiles on macOS for API/proxy dev)
   node.rs          lifecycle orchestration: create/start/pause/resume/suspend/
                    restore/destroy; enforces the transition table
+  scheduler.rs     long-running tokio task: evaluates due cron schedules and
+                   triggers Node restore/start (see §13)
   control.rs       registry: DashMap<VmId, VmRecord> + single-flight restore
                    locks + cancel Notifys
+  store.rs         StateStore trait + SQLite impl: durable source of truth for
+                   the registry; write-through + crash recovery (see §14)
   network/
     mod.rs         Ipam: alloc/release from a configurable subnet pool
     tap.rs         TAP create/destroy + NAT/iptables (ported)
@@ -217,6 +221,10 @@ post_restore_cmd = "/usr/local/bin/resume.sh"
 policy = "on_failure"                  # always | on_failure | never
 backoff_secs = 2
 
+[schedule]                             # scheduled jobs (host-driven wakeups; optional)
+cron = "*/5 * * * *"                   # or interval_secs = 300
+keep_warm = true                       # suspend between runs (default); false = ephemeral
+
 [expose]                               # workload HTTP exposed externally via guest proxy
 http_port = 8080                       # guest proxy forwards external HTTP here
 control_bin = "/usr/local/bin/workload-control"  # optional /db,/pitr-style control routes
@@ -228,9 +236,10 @@ mount_path = "/mnt/data"
 size_mb = 1024                         # local_fast only
 ```
 
-Everything in the manifest is **guest-internal behavior**. The host reads **only
-the `[[volumes]]` section** (at provision time, to create/attach storage before
-boot). It never reads `idle`, `health`, `process`, `suspend`, or `restart`.
+Everything in the manifest is **guest-internal behavior** except the two sections
+the host must execute. The host reads **only `[[volumes]]` and `[schedule]`** (at
+provision time, to create/attach storage before boot and to drive scheduled
+wakeups). It never reads `idle`, `health`, `process`, `suspend`, or `restart`.
 
 ### 5.2 `VmSpec` (the provision request — host/infra)
 
@@ -243,13 +252,15 @@ struct VmSpec {
     network: NetworkSpec,                // derived or explicit
     routing: Vec<RoutingRule>,           // how external traffic reaches this VM
     env: HashMap<String, String>,        // injected environment
-    manifest: Option<WorkloadManifest>,  // authoritative; host reads only .volumes
+    manifest: Option<WorkloadManifest>,  // authoritative; host reads .volumes + .schedule
+    schedule: Option<SchedulePolicy>,    // overrides manifest [schedule] if set
 }
 ```
 
 Routing, ports, resources, env, and the manifest are host-specified at provision
-time. Lifecycle/idle policy is **not** here — it lives in the manifest and is
-driven by the guest.
+time. The schedule may be overridden here (operators tune cadence without
+rebuilding the rootfs). Idle policy is the one lifecycle concern that is
+**manifest-only and guest-driven** — never host-specified.
 
 ## 6. VM state machine
 
@@ -479,7 +490,81 @@ HTTP-header routing (`X-Tiko-Endpoint: vm-N`) proves the path.
   (ported from `tikod/src/vmm/firecracker.rs`).
 - **Config:** a real `config.toml` (replaces today's CLI-args-only model).
 
-## 13. Demo workload (validates end-to-end)
+## 13. Scheduling (host-driven triggers)
+
+Sibling to idle detection (§8), but **host-driven**: only the host can wake a
+suspended VM on time, so scheduling must be host-owned. Idle is guest-driven
+(the guest knows its own activity); scheduling is clock-driven (the host owns
+the clock). Both end in the same `suspend`/`restore` machinery and guest signals.
+
+**Where the crontab lives.** Declared in the manifest `[schedule]` block; the
+host reads it at provision (same rule as `volumes`) and stores it in `VmRecord`.
+The provision request may **override** it (`schedule` field, §5.2), so operators
+can tune cadence without rebuilding the rootfs.
+
+**Module:** `tikovm-host/scheduler.rs` — a long-running tokio task, wakes on a
+timer, evaluates due schedules (standard cron expressions, or `interval_secs`),
+and invokes `Node`.
+
+**Run modes** (`keep_warm`):
+- `keep_warm = true` (default): provision once → `suspend`; each tick the
+  scheduler `restore`s the VM (wake) → the guest supervisor runs `[process]`
+  fresh (on-wake / `post_restore` semantics) → on completion the guest sends
+  `SuspendRequest` → host `suspend`s until the next tick.
+- `keep_warm = false` (ephemeral): each tick the scheduler provisions a fresh VM
+  → `[process]` runs → `ShutdownRequest` → `destroy`. Lambda-like; pays boot
+  cost per run; simplest state model.
+
+**The trigger *is* the wake** — no separate `Run` RPC. Restoring/starting the VM
+is the trigger; the guest's supervisor treats a wake as a job invocation and
+runs `[process]`. On completion the guest uses the same signals as idle
+(`SuspendRequest` / `ShutdownRequest`). So the only difference from idle-driven
+scale-to-zero is *who pulls the trigger*: the host's clock vs. the guest's idle
+evaluator.
+
+`next_fire_time` is persisted (§14) so the scheduler resumes correctly after a
+hostd crash.
+
+## 14. Persistence & crash recovery
+
+The current `tikod` control registry is in-memory only (`DashMap`), so a hostd
+crash loses all VM records. `tikovm-host` fixes this with a durable store and a
+reconcile-on-boot recovery model.
+
+**Module:** `tikovm-host/store.rs` — a generic `StateStore` trait
+(`upsert_vm`, `get_vm`, `list_vms`, `delete_vm`) with a **SQLite** impl now
+(`rusqlite`/`sqlx`), swappable for Postgres/etcd later (multi-node). DB file at
+`data_dir/tikovm.db`, path in `HostConfig`.
+
+**Model:** the DB is the durable source of truth; the in-memory `DashMap`
+remains the hot read path and is reconstructed from the DB on boot.
+
+**Write-through:** every registry mutation persists — `create`, each state
+transition, `suspend`→snapshot descriptor, schedule, `pause_epoch`.
+`metrics`/`last_activity` persist at low frequency / on state change (not
+per-connection; a slightly-stale `last_activity` on recovery is acceptable).
+
+**Boot reconciliation (controller pattern):** read DB → rebuild registry →
+probe each VM → correct drift → resume scheduler / idle timers / proxy.
+
+| VmRecord state at crash | Reconciliation on restart |
+|---|---|
+| `Suspended` | verify snapshot files exist on disk → keep `Suspended` (restorable). **Trivial — the common case** in a scale-to-zero system. |
+| `Started` / `Paused` | Firecracker child is likely dead (hostd held the `Child` with `kill_on_drop`). **Restore-on-demand:** mark `Suspended` from the last snapshot; the proxy/scheduler lazily `restore`s on next access. |
+| `Created` / `Destroyed` | no live runtime → restore as-is. |
+
+Plus: re-create missing TAPs / iptables, re-establish vsock UDS paths, recompute
+scheduler `next_fire_time` from cron. The **guest is transparent** to hostd
+crashes — it keeps running its supervised process and only sees a vsock reset
+(which it already handles per §7).
+
+**Policy (confirmed): restore-on-demand.** hostd does not try to keep
+Firecracker children alive across its own crash; a crashed running VM is
+restored lazily from its last snapshot on next access. Cost: loss of in-memory
+state since the last snapshot. This is **core scope** (not deferred) and is
+validated by a crash/restart test.
+
+## 15. Demo workload (validates end-to-end)
 
 A trivial **HTTP echo server** rootfs:
 - `workload.toml`: `[process]` = echo-server :8080; `[health]` = `GET /health`;
@@ -494,16 +579,18 @@ routing wired → `curl` reaches echo → idle → `SuspendRequest` → suspend 
 `curl` wakes → restore → `ShutdownRequest`/destroy. Proves the whole generic
 loop with zero workload-specific code in host/guest.
 
-## 14. What's deferred (designed, not built initially)
+## 16. What's deferred (designed, not built initially)
 
 - Migrating the real Tiko Postgres to a rootfs + manifest (validates against the
   real workload; first real user of both storage tiers).
-- Language-runtime (Lambda-style) and cron workloads.
+- Concrete language-runtime (Lambda-style) and cron-job **rootfs workloads** (the
+  scheduling mechanism itself is in-scope — see §13).
 - `vhost-user-block` production scale path for `remote_slow`.
-- Multi-node clustering / distributed registry.
+- Multi-node clustering / distributed registry (the `StateStore` trait is the
+  seam; §14).
 - Garbage collection of snapshots / overlays.
 
-## 15. Relationship to the existing Tiko code
+## 17. Relationship to the existing Tiko code
 
 **Reused (ported as fresh, generalized code):**
 - `Vmm` trait + `FirecrackerVmm` lifecycle → `tikovm-host/vmm/` (+ vsock device, + virtio-block volumes).
@@ -526,7 +613,7 @@ loop with zero workload-specific code in host/guest.
 **Untouched:** `core`, `smgr`, `worker`, `pgsys`, `cli`, and the existing
 `tikod` / `tikoguest` crates are not modified.
 
-## 16. Build & verification
+## 18. Build & verification
 
 - `cargo build` / `cargo test -p tikovm-protocol` / `-p tikovm-host` /
   `-p tikovm-guest` — all must build on macOS (stub backend) and Linux
@@ -536,16 +623,19 @@ loop with zero workload-specific code in host/guest.
 - `clippy` is safe on these crates (no `pgsys` FFI in the dependency set).
 - Echo boot test modeled on `tikod/examples/boot_test.rs` (Linux + KVM only).
 
-## 17. Implementation sequencing
+## 19. Implementation sequencing
 
 1. Scaffold 3 crates + workspace registration + `tikovm-protocol` (types, codec,
    errors, state machine).
 2. `tikovm-host`: `Vmm` trait + stub + port Firecracker (+vsock); `Node`
    (transition enforcement); control registry; config.
-3. `tikovm-host`: networking (TAP/IPAM/vsock); storage (overlay + volume
+3. `tikovm-host`: `store.rs` (StateStore + SQLite, write-through) + boot
+   reconciliation (restore-on-demand).
+4. `tikovm-host`: networking (TAP/IPAM/vsock); storage (overlay + volume
    provisioner).
-4. `tikovm-host`: proxy/router + guest proxy + guestlink + API + metrics.
-5. `tikovm-guest`: manifest + supervisor + health + idle + hostlink/server +
+5. `tikovm-host`: proxy/router + guest proxy + guestlink + API + metrics.
+6. `tikovm-host`: `scheduler.rs` (cron evaluation + keep-warm/ephemeral triggers).
+7. `tikovm-guest`: manifest + supervisor + health + idle + hostlink/server +
    lifecycle + fs.
-6. Echo rootfs + boot test.
-7. Tests across all crates.
+8. Echo rootfs + boot test.
+9. Tests across all crates (incl. a hostd crash/restart recovery test).
