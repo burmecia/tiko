@@ -87,6 +87,11 @@ async fn handle(
         }
         GuestToHost::HealthReport { healthy } => {
             info!(%vm_id, ?healthy, "guest health report");
+            if let Some(rec) = node.control().get(vm_id)
+                && let Ok(mut g) = rec.write()
+            {
+                g.healthy = healthy;
+            }
             HostReply::Ok
         }
     };

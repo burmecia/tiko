@@ -26,6 +26,8 @@ pub struct VmRecord {
     pub last_activity: Option<SystemTime>,
     pub pause_epoch: u64,
     pub last_metrics: Option<serde_json::Value>,
+    /// Latest guest-reported health (transient: in-memory only, not persisted).
+    pub healthy: Option<bool>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
@@ -42,6 +44,7 @@ impl VmRecord {
             last_activity: None,
             pause_epoch: 0,
             last_metrics: None,
+            healthy: None,
             created_at: now,
             updated_at: now,
         }
@@ -57,6 +60,7 @@ impl VmRecord {
             state: self.state,
             guest_ip: self.guest_ip,
             workload: self.workload_label().map(|s| s.to_string()),
+            healthy: self.healthy,
         }
     }
 }

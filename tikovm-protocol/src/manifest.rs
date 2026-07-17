@@ -120,6 +120,23 @@ pub enum HealthProbe {
     None,
 }
 
+impl HealthProbe {
+    /// Probe interval in seconds (0 for `None`).
+    pub fn interval_secs(&self) -> u64 {
+        match self {
+            HealthProbe::Http { interval_secs, .. }
+            | HealthProbe::Tcp { interval_secs, .. }
+            | HealthProbe::Exec { interval_secs, .. } => *interval_secs,
+            HealthProbe::None => 0,
+        }
+    }
+
+    /// Whether this probe actually does anything.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, HealthProbe::None)
+    }
+}
+
 fn default_health_interval() -> u64 {
     5
 }

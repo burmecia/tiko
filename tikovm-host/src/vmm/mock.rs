@@ -151,5 +151,6 @@ pub fn test_drive(id: &str, path: &str) -> DriveConfig {
         drive_id: id.into(),
         path: path.into(),
         read_only: false,
+        size_mb: None,
     }
 }

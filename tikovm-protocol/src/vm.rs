@@ -231,6 +231,9 @@ pub struct VmInfo {
     /// Workload label from the manifest, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload: Option<String>,
+    /// Latest guest-reported health (true = healthy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthy: Option<bool>,
 }
 
 #[cfg(test)]

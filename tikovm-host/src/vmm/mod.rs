@@ -65,6 +65,10 @@ pub struct DriveConfig {
     pub drive_id: String,
     pub path: PathBuf,
     pub read_only: bool,
+    /// For `local_fast` volumes: image size in MiB (host creates the file if
+    /// absent). `None` = path must already exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_mb: Option<u64>,
 }
 
 /// A snapshot of a paused VM — the source for `restore` / the artifact of

@@ -24,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
-use super::{BackendState, Snapshot, VmConfig, VmId, Vmm, VmmError, VmmResult};
+use super::{BackendState, DriveConfig, Snapshot, VmConfig, VmId, Vmm, VmmError, VmmResult};
 
 // ============================================================================
 // FcApiClient — minimal HTTP/1.1 client over Unix socket
@@ -337,6 +337,35 @@ fn inject_guest_net(rootfs: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
 
 fn shell_quote(p: &Path) -> String {
     format!("'{}'", p.display())
+}
+
+// ============================================================================
+// local_fast volume images (ext4, labeled so the guest mounts by LABEL=<name>)
+// ============================================================================
+
+/// For each drive with a `size_mb`, ensure its backing ext4 image exists under
+/// `snapshot_dir/volumes/<vm_id>/<drive_id>.ext4` (formatted with `-L <drive_id>`
+/// so the guest mounts it by label). Rewrites `drive.path` to that real path.
+fn provision_drives(snapshot_dir: &Path, vm_id: &str, drives: &mut [DriveConfig]) -> VmmResult<()> {
+    for d in drives.iter_mut() {
+        let Some(size_mb) = d.size_mb else {
+            // Caller-supplied path (must already exist); nothing to provision.
+            continue;
+        };
+        let dir = snapshot_dir.join("volumes").join(vm_id);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.ext4", d.drive_id));
+        if !path.exists() {
+            let path_str = path.display().to_string();
+            let size_arg = format!("{size_mb}M");
+            info!(drive = %d.drive_id, %path_str, size_mb, "creating local_fast volume image");
+            run_user("truncate", &["-s", &size_arg, &path_str])?;
+            // -L sets the label the guest mounts by; -q quiets mkfs output.
+            run_user("mkfs.ext4", &["-q", "-L", &d.drive_id, &path_str])?;
+        }
+        d.path = path;
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -660,6 +689,9 @@ impl Vmm for FirecrackerVmm {
 
         let mut vm_config = config.clone();
         vm_config.rootfs_path = rootfs_for_attach;
+        // Provision local_fast volume images (ext4, labeled by drive_id so the
+        // guest can mount by LABEL=<name>). Reused across restarts.
+        provision_drives(&self.snapshot_dir, &vm_id, &mut vm_config.drives)?;
         let client = FcApiClient::new(&api_sock);
         if let Err(e) = self
             .configure_vm(&client, &vm_config, &vm_id, &net.tap_name, &net.guest_mac, &serial_log, overlay_path.as_deref())

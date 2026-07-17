@@ -238,11 +238,15 @@ pub fn vm_config_from_spec(spec: &VmSpec) -> VmConfig {
         .map(|m| {
             m.volumes
                 .iter()
-                .enumerate()
-                .map(|(i, v)| DriveConfig {
+                .filter(|v| v.tier == tikovm_protocol::volume::VolumeTier::LocalFast)
+                .map(|v| DriveConfig {
+                    // drive_id doubles as the ext4 label the guest mounts by.
                     drive_id: v.name.clone(),
-                    path: format!("/tmp/tikovm/vol-{}-{i}", v.name).into(),
+                    // path is finalized by the backend (under its snapshot dir);
+                    // a placeholder keeps the field non-empty.
+                    path: format!("/tmp/tikovm/vol-{}", v.name).into(),
                     read_only: v.read_only,
+                    size_mb: v.size_mb,
                 })
                 .collect::<Vec<_>>()
         })

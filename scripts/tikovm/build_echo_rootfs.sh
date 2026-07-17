@@ -41,10 +41,18 @@ args = ["--port", "8080"]
 kind = "http"
 path = "/health"
 port = 8080
-interval_secs = 10
+interval_secs = 5
 
 [expose]
 http_port = 8080
+
+# a local_fast volume: the host creates an ext4 image (labeled "data") and
+# attaches it; the guest mounts it by label at /mnt/data.
+[[volumes]]
+name = "data"
+tier = "local_fast"
+mount_path = "/mnt/data"
+size_mb = 64
 
 # scale-to-zero: after 15s with no connections to :8080, guestd asks the host
 # to suspend this VM. The host proxy wakes it on the next connection.
