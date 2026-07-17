@@ -58,8 +58,8 @@ done
 step "0b. build binaries + echo rootfs"
 ( cd "$REPO" && cargo build -p tikovm-host -p tikovm-guest --example echo-server ) \
   || die "cargo build failed"
-GUESTD="$REPO/target/debug/tikovm-hostd"
-[ -x "$GUESTD" ] || die "tikovm-hostd not built"
+HOSTD="$REPO/target/debug/tikovm-hostd"
+[ -x "$HOSTD" ] || die "tikovm-hostd not built"
 # (re)build the echo rootfs (idempotent: re-injects fresh binaries + manifest)
 bash "$REPO/scripts/tikovm/build_echo_rootfs.sh" >/dev/null || die "build_echo_rootfs.sh failed"
 ok "binaries + echo rootfs ready"
@@ -75,7 +75,7 @@ EOF
 # Start hostd (real Firecracker backend, proxy, metrics)
 # ---------------------------------------------------------------------------
 step "1. start tikovm-hostd"
-setsid "$GUESTD" --data-dir "$DD" --api-listen 0.0.0.0:9000 \
+setsid "$HOSTD" --data-dir "$DD" --api-listen 0.0.0.0:9000 \
   --proxy-listen 0.0.0.0:8080 --proxy-default-vm vm-1 --proxy-default-port 8080 \
   >"$HOSTD_LOG" 2>&1 &
 HOSTD_PG=$!
@@ -122,7 +122,7 @@ curl -s -m 60 -X POST $API/vms/vm-1/suspend | grep -q suspended || bad "could no
 kill -TERM -$HOSTD_PG 2>/dev/null; kill -9 -- -"$HOSTD_PG" 2>/dev/null
 HOSTD_PG=""; sleep 1
 # keep the same data-dir (SQLite state) -> reconcile recovers the VM
-setsid "$GUESTD" --data-dir "$DD" --api-listen 0.0.0.0:9000 \
+setsid "$HOSTD" --data-dir "$DD" --api-listen 0.0.0.0:9000 \
   --proxy-listen 0.0.0.0:8080 --proxy-default-vm vm-1 --proxy-default-port 8080 \
   >>"$HOSTD_LOG" 2>&1 &
 HOSTD_PG=$!
