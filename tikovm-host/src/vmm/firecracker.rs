@@ -343,24 +343,37 @@ fn shell_quote(p: &Path) -> String {
 // local_fast volume images (ext4, labeled so the guest mounts by LABEL=<name>)
 // ============================================================================
 
-/// For each drive with a `size_mb`, ensure its backing ext4 image exists under
-/// `snapshot_dir/volumes/<vm_id>/<drive_id>.ext4` (formatted with `-L <drive_id>`
-/// so the guest mounts it by label). Rewrites `drive.path` to that real path.
+/// For each drive with a `size_mb`, ensure its backing ext4 image exists,
+/// formatted with `-L <drive_id>` so the guest mounts by label. Placement
+/// depends on tier:
+/// - `LocalFast` -> `snapshot_dir/volumes/<vm>/<name>.ext4` (ephemeral).
+/// - `RemoteSlow` -> `<source>/<vm>/<name>.ext4` on a host-mounted remote FS
+///   (persists across destroy). `source` must be set.
+///
+/// Rewrites each drive's `path` to the real image path.
 fn provision_drives(snapshot_dir: &Path, vm_id: &str, drives: &mut [DriveConfig]) -> VmmResult<()> {
     for d in drives.iter_mut() {
         let Some(size_mb) = d.size_mb else {
-            // Caller-supplied path (must already exist); nothing to provision.
-            continue;
+            continue; // caller-supplied path; nothing to provision.
         };
-        let dir = snapshot_dir.join("volumes").join(vm_id);
+        use tikovm_protocol::volume::VolumeTier;
+        let dir: PathBuf = match d.tier {
+            VolumeTier::LocalFast => snapshot_dir.join("volumes").join(vm_id),
+            VolumeTier::RemoteSlow => {
+                let base = d.source.clone().unwrap_or_else(|| {
+                    warn!(drive = %d.drive_id, "remote_slow volume has no source; using local fallback");
+                    snapshot_dir.join("volumes-remote").to_string_lossy().into_owned()
+                });
+                PathBuf::from(base).join(vm_id)
+            }
+        };
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.ext4", d.drive_id));
         if !path.exists() {
             let path_str = path.display().to_string();
             let size_arg = format!("{size_mb}M");
-            info!(drive = %d.drive_id, %path_str, size_mb, "creating local_fast volume image");
+            info!(drive = %d.drive_id, %path_str, size_mb, tier = ?d.tier, "creating volume image");
             run_user("truncate", &["-s", &size_arg, &path_str])?;
-            // -L sets the label the guest mounts by; -q quiets mkfs output.
             run_user("mkfs.ext4", &["-q", "-L", &d.drive_id, &path_str])?;
         }
         d.path = path;
@@ -865,6 +878,18 @@ impl Vmm for FirecrackerVmm {
         } else {
             Ok(None)
         }
+    }
+
+    async fn cleanup_vm(&self, vm_id: &VmId) -> VmmResult<()> {
+        // Delete ephemeral local_fast volume images. remote_slow images live on
+        // a host-mounted remote FS and persist across destroy by design.
+        let dir = self.snapshot_dir.join("volumes").join(vm_id);
+        if dir.exists()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+        {
+            warn!(vm_id = %vm_id, error = %e, "could not remove local volume dir");
+        }
+        Ok(())
     }
 }
 

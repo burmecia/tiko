@@ -152,5 +152,7 @@ pub fn test_drive(id: &str, path: &str) -> DriveConfig {
         path: path.into(),
         read_only: false,
         size_mb: None,
+        tier: tikovm_protocol::volume::VolumeTier::LocalFast,
+        source: None,
     }
 }

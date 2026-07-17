@@ -19,6 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tikovm_protocol::vm::VmId;
+use tikovm_protocol::volume::VolumeTier;
 
 #[cfg(target_os = "linux")]
 pub mod firecracker;
@@ -65,10 +66,16 @@ pub struct DriveConfig {
     pub drive_id: String,
     pub path: PathBuf,
     pub read_only: bool,
-    /// For `local_fast` volumes: image size in MiB (host creates the file if
-    /// absent). `None` = path must already exist.
+    /// Image size in MiB — the host creates the (sparse) ext4 file if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_mb: Option<u64>,
+    /// Where the image lives (and thus its lifetime):
+    /// - `LocalFast` -> under the host snapshot dir (ephemeral on destroy).
+    /// - `RemoteSlow` -> under `source` (a host-mounted remote FS; persists).
+    #[serde(default)]
+    pub tier: VolumeTier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// A snapshot of a paused VM — the source for `restore` / the artifact of
@@ -148,6 +155,12 @@ pub trait Vmm: Send + Sync {
     /// guest→host connections (Firecracker forwards CID 2:port there).
     async fn vsock_uds_path(&self, _vm_id: &VmId) -> VmmResult<Option<PathBuf>> {
         Ok(None)
+    }
+
+    /// Release durable-per-VM host resources on a **terminal** destroy (not
+    /// suspend — suspend must keep volumes so the VM can restore). Default: noop.
+    async fn cleanup_vm(&self, _vm_id: &VmId) -> VmmResult<()> {
+        Ok(())
     }
 }
 

@@ -272,6 +272,9 @@ impl Node {
                 self.commit(vm_id, prev);
             })?;
         }
+        // Terminal destroy: release ephemeral per-VM host resources (local_fast
+        // volume images). Best-effort — must not block cleanup.
+        let _ = self.vmm.cleanup_vm(vm_id).await;
         self.control.remove(vm_id);
         self.persist_delete(vm_id);
         Ok(())

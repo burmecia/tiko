@@ -9,14 +9,17 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Storage tier for a declared volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeTier {
     /// Per-VM ext4 image on host-local disk, attached as virtio-block.
-    /// Fast, capped size, survives suspend, ephemeral on destroy.
+    /// Fast, capped size, survives suspend, **ephemeral on destroy**.
+    #[default]
     LocalFast,
-    /// Host-mounted remote FS exposed as a virtio-block device (image on the
-    /// mount). Slow, unlimited, persists across destroy.
+    /// ext4 image on a host-mounted remote FS (e.g. S3 Files via NFS), attached
+    /// as virtio-block. Slow, **persists across destroy**, shared-capable.
+    /// Firecracker has no virtio-fs, so the host owns the remote mount and the
+    /// guest sees only a labeled block device.
     RemoteSlow,
 }
 
@@ -38,14 +41,16 @@ pub struct VolumeDecl {
     pub tier: VolumeTier,
     /// Where the guest mounts the volume (e.g. "/mnt/data").
     pub mount_path: PathBuf,
-    /// Size cap in MiB (`local_fast` only; `remote_slow` is unlimited).
+    /// Size cap in MiB for the ext4 image (sparse). Applies to both tiers:
+    /// `local_fast` is capped by host disk; `remote_slow` is sparse on the
+    /// remote mount (the backend capacity itself is effectively unlimited).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_mb: Option<u64>,
     /// Read-only mount.
     #[serde(default)]
     pub read_only: bool,
-    /// `remote_slow` only: source ref for the host mount (e.g. an S3 Files
-    /// path). Ignored for `local_fast`.
+    /// `remote_slow` only: host path where the remote FS is mounted (the image
+    /// is placed under `<source>/<vm_id>/<name>.ext4`). Ignored for `local_fast`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }

@@ -54,6 +54,14 @@ tier = "local_fast"
 mount_path = "/mnt/data"
 size_mb = 64
 
+# a remote_slow volume: the host places the image on a mounted remote FS
+# (source is set at provision time); persists across destroy.
+[[volumes]]
+name = "archive"
+tier = "remote_slow"
+mount_path = "/mnt/archive"
+size_mb = 64
+
 # scale-to-zero: after 15s with no connections to :8080, guestd asks the host
 # to suspend this VM. The host proxy wakes it on the next connection.
 [idle]
