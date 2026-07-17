@@ -1,0 +1,37 @@
+[package]
+name = "tikovm-host"
+description = "tikovm host library + tikovm-hostd daemon: microVM lifecycle, networking, storage, routing"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[lib]
+name = "tikovm_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tikovm-hostd"
+path = "src/main.rs"
+
+[dependencies]
+tikovm-protocol = { path = "../tikovm-protocol" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+async-trait = "0.1"
+libc = { workspace = true }
+toml = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+cron = "0.12"
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

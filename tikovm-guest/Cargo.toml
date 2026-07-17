@@ -1,0 +1,30 @@
+[package]
+name = "tikovm-guest"
+description = "tikovm in-VM guest agent: workload supervisor, health, idle detection, lifecycle hooks"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[lib]
+name = "tikovm_guest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tikovm-guestd"
+path = "src/main.rs"
+
+[dependencies]
+tikovm-protocol = { path = "../tikovm-protocol" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+libc = { workspace = true }
+toml = "0.8"
+async-trait = "0.1"

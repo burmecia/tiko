@@ -6,6 +6,9 @@ members = [
   "pgsys",
   "smgr",
   "tikod",
+  "tikovm-host",
+  "tikovm-guest",
+  "tikovm-protocol",
   "worker",
 ]
 resolver = "2"
