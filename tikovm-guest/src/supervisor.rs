@@ -10,13 +10,13 @@
 //! multiple await points in the loop and get lost).
 
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use tikovm_protocol::manifest::{ProcessSpec, RestartMode, RestartPolicy};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
-use tikovm_protocol::manifest::{ProcessSpec, RestartMode, RestartPolicy};
 
 /// Default grace period before escalating SIGTERM → SIGKILL.
 const STOP_GRACE_SECS: u64 = 5;
@@ -205,7 +205,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(spawns.load(Ordering::Relaxed) >= 2, "should have restarted at least twice");
+        assert!(
+            spawns.load(Ordering::Relaxed) >= 2,
+            "should have restarted at least twice"
+        );
         stop.stop();
         tokio::time::timeout(Duration::from_secs(STOP_GRACE_SECS + 5), handle)
             .await

@@ -191,10 +191,9 @@ async fn handle(
         ("POST", "/services/postgrest/start")
         | ("POST", "/services/postgrest/stop")
         | ("POST", "/services/postgrest/reload") => (204, ""),
-        ("GET", "/services/postgrest") | ("GET", "/services/postgrest/status") => (
-            200,
-            r#"{"status":"running","pid":1234}"#,
-        ),
+        ("GET", "/services/postgrest") | ("GET", "/services/postgrest/status") => {
+            (200, r#"{"status":"running","pid":1234}"#)
+        }
         ("PUT", "/pg/config") => {
             // Capture the request body (after the blank line).
             if let Some(body_start) = text.find("\r\n\r\n") {

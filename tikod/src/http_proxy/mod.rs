@@ -211,11 +211,9 @@ async fn resolve_route(
 /// Map a [`ResolveError`] to an HTTP response with an appropriate status.
 fn resolve_error_response(vm_id: &VmId, e: ResolveError) -> HttpResp {
     match e {
-        ResolveError::UnknownVm(id) => http_err(
-            404,
-            "unknown_vm",
-            &format!("VM {id} is not registered"),
-        ),
+        ResolveError::UnknownVm(id) => {
+            http_err(404, "unknown_vm", &format!("VM {id} is not registered"))
+        }
         ResolveError::Wake(err) => http_err(
             503,
             "wake_failed",
@@ -420,7 +418,10 @@ mod tests {
         Request {
             method: method.into(),
             path: path.into(),
-            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             body: body.to_vec(),
         }
     }
@@ -458,12 +459,7 @@ mod tests {
 
     #[test]
     fn header_lookup_is_case_insensitive() {
-        let r = req(
-            "GET",
-            "/",
-            &[("X-TIKO-ENDPOINT", "vm-7")],
-            &[],
-        );
+        let r = req("GET", "/", &[("X-TIKO-ENDPOINT", "vm-7")], &[]);
         assert_eq!(r.header(ENDPOINT_HEADER), Some("vm-7"));
     }
 

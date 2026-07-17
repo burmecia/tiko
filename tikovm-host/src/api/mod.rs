@@ -7,4 +7,4 @@
 
 pub mod server;
 
-pub use server::{dispatch, ApiServer, Response};
+pub use server::{ApiServer, Response, dispatch};

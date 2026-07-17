@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use tikovm_protocol::codec;
-use tikovm_protocol::rpc::{GuestToHost, HostReply, NetworkStats, HOST_CID, HOST_CTRL_PORT};
+use tikovm_protocol::rpc::{GuestToHost, HOST_CID, HOST_CTRL_PORT, HostReply, NetworkStats};
 
 use crate::idle::HostComm;
 
@@ -62,7 +62,12 @@ impl HostComm for VsockHostLink {
         .flatten();
         // On failure return a non-idle stats (last_data_age_secs:0) so we never
         // suspend a VM just because the control channel had a hiccup.
-        stats.unwrap_or(NetworkStats { established_conns: 1, last_data_age_secs: 0, bytes_in: 0, bytes_out: 0 })
+        stats.unwrap_or(NetworkStats {
+            established_conns: 1,
+            last_data_age_secs: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+        })
     }
 
     async fn request_suspend(&self) {
@@ -70,7 +75,12 @@ impl HostComm for VsockHostLink {
     }
 
     async fn report_health(&self, healthy: bool) {
-        let _ = tokio::task::spawn_blocking(move || vsock_rpc(&GuestToHost::HealthReport { healthy: Some(healthy) })).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            vsock_rpc(&GuestToHost::HealthReport {
+                healthy: Some(healthy),
+            })
+        })
+        .await;
     }
 }
 

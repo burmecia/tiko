@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -36,7 +36,9 @@ struct FcApiClient {
 
 impl FcApiClient {
     fn new(sock_path: impl AsRef<Path>) -> Self {
-        Self { sock_path: sock_path.as_ref().to_path_buf() }
+        Self {
+            sock_path: sock_path.as_ref().to_path_buf(),
+        }
     }
 
     async fn put(&self, path: &str, body: &serde_json::Value) -> VmmResult<()> {
@@ -52,12 +54,22 @@ impl FcApiClient {
         serde_json::from_str(&body_str).map_err(|e| VmmError::Backend(format!("JSON parse: {e}")))
     }
 
-    async fn request(&self, method: &str, path: &str, body: Option<&serde_json::Value>) -> VmmResult<()> {
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> VmmResult<()> {
         let _ = self.request_raw(method, path, body).await?;
         Ok(())
     }
 
-    async fn request_raw(&self, method: &str, path: &str, body: Option<&serde_json::Value>) -> VmmResult<String> {
+    async fn request_raw(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> VmmResult<String> {
         let body_str = body.map(|b| b.to_string()).unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
@@ -69,12 +81,18 @@ impl FcApiClient {
         let mut stream = UnixStream::connect(&self.sock_path)
             .await
             .map_err(|e| VmmError::Backend(format!("connect FC socket: {e}")))?;
-        stream.write_all(request.as_bytes()).await.map_err(|e| VmmError::Backend(format!("write FC socket: {e}")))?;
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| VmmError::Backend(format!("write FC socket: {e}")))?;
 
         let mut header_buf = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            let n = stream.read(&mut byte).await.map_err(|e| VmmError::Backend(format!("read header: {e}")))?;
+            let n = stream
+                .read(&mut byte)
+                .await
+                .map_err(|e| VmmError::Backend(format!("read header: {e}")))?;
             if n == 0 {
                 break;
             }
@@ -89,19 +107,27 @@ impl FcApiClient {
 
         let header_str = String::from_utf8_lossy(&header_buf);
         let status_line = header_str.lines().next().unwrap_or("");
-        let status_code = status_line.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
 
         let content_length: usize = header_str
             .lines()
             .find_map(|line| {
                 let line = line.to_lowercase();
-                line.strip_prefix("content-length:").and_then(|rest| rest.trim().parse().ok())
+                line.strip_prefix("content-length:")
+                    .and_then(|rest| rest.trim().parse().ok())
             })
             .unwrap_or(0);
 
         let mut body_buf = vec![0u8; content_length];
         if content_length > 0 {
-            stream.read_exact(&mut body_buf).await.map_err(|e| VmmError::Backend(format!("read body: {e}")))?;
+            stream
+                .read_exact(&mut body_buf)
+                .await
+                .map_err(|e| VmmError::Backend(format!("read body: {e}")))?;
         }
         let body_str = String::from_utf8_lossy(&body_buf).to_string();
 
@@ -110,7 +136,11 @@ impl FcApiClient {
         } else {
             let msg = serde_json::from_str::<serde_json::Value>(&body_str)
                 .ok()
-                .and_then(|v| v.get("fault_message").and_then(|f| f.as_str()).map(String::from))
+                .and_then(|v| {
+                    v.get("fault_message")
+                        .and_then(|f| f.as_str())
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| format!("HTTP {status_code}: {body_str}"));
             Err(VmmError::Backend(format!("FC API {method} {path}: {msg}")))
         }
@@ -124,15 +154,26 @@ impl FcApiClient {
 const MAX_VM_INDEX: u32 = 250;
 
 fn vm_index_from_id(vm_id: &str) -> VmmResult<u8> {
-    let digits: String = vm_id.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    let digits: String = vm_id
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     if digits.is_empty() {
         return Err(VmmError::InvalidConfig(format!(
             "vm_id '{vm_id}' must end in a unique integer in [0,{MAX_VM_INDEX}] (derives tap/subnet/MAC)"
         )));
     }
-    let n: u32 = digits.parse().map_err(|_| VmmError::InvalidConfig(format!("invalid vm_id index: {digits}")))?;
+    let n: u32 = digits
+        .parse()
+        .map_err(|_| VmmError::InvalidConfig(format!("invalid vm_id index: {digits}")))?;
     if n > MAX_VM_INDEX {
-        return Err(VmmError::InvalidConfig(format!("vm_id index must be <= {MAX_VM_INDEX} (got {n})")));
+        return Err(VmmError::InvalidConfig(format!(
+            "vm_id index must be <= {MAX_VM_INDEX} (got {n})"
+        )));
     }
     Ok(n as u8)
 }
@@ -170,7 +211,10 @@ fn parse_default_iface(ip_route_output: &str) -> Option<String> {
         }
         let mut iter = trimmed.split_whitespace();
         while let Some(tok) = iter.next() {
-            if tok == "dev" && let Some(iface) = iter.next() && !iface.is_empty() {
+            if tok == "dev"
+                && let Some(iface) = iter.next()
+                && !iface.is_empty()
+            {
                 return Some(iface.to_string());
             }
         }
@@ -183,11 +227,28 @@ fn create_tap(tap_name: &str, gateway_ip: &str, subnet: &str) -> VmmResult<()> {
     if !tap_exists {
         run_cmd("ip", &["tuntap", "add", tap_name, "mode", "tap"])?;
     }
-    let _ = run_shell(&format!("ip addr add {gateway_ip}/24 dev {tap_name} 2>/dev/null || true"));
+    let _ = run_shell(&format!(
+        "ip addr add {gateway_ip}/24 dev {tap_name} 2>/dev/null || true"
+    ));
     run_cmd("ip", &["link", "set", tap_name, "up"])?;
-    let nat_present = run_shell(&format!("iptables -t nat -C POSTROUTING -s {subnet} -j MASQUERADE 2>/dev/null")).is_ok();
+    let nat_present = run_shell(&format!(
+        "iptables -t nat -C POSTROUTING -s {subnet} -j MASQUERADE 2>/dev/null"
+    ))
+    .is_ok();
     if !nat_present {
-        run_cmd("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"])?;
+        run_cmd(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                subnet,
+                "-j",
+                "MASQUERADE",
+            ],
+        )?;
     }
     add_forward_rules(tap_name);
     let _ = run_shell("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1");
@@ -196,19 +257,38 @@ fn create_tap(tap_name: &str, gateway_ip: &str, subnet: &str) -> VmmResult<()> {
 
 fn destroy_tap(tap_name: &str, subnet: &str) {
     remove_forward_rules(tap_name);
-    let _ = run_cmd("iptables", &["-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"]);
+    let _ = run_cmd(
+        "iptables",
+        &[
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "-j",
+            "MASQUERADE",
+        ],
+    );
     let _ = run_cmd("ip", &["link", "set", tap_name, "down"]);
     let _ = run_cmd("ip", &["tuntap", "del", tap_name, "mode", "tap"]);
 }
 
 fn add_forward_rules(tap_name: &str) {
     let Ok(out_iface) = default_iface() else {
-        warn!(tap = tap_name, "no default route; skipping FORWARD rules (guest egress may be blocked)");
+        warn!(
+            tap = tap_name,
+            "no default route; skipping FORWARD rules (guest egress may be blocked)"
+        );
         return;
     };
     let rules = [
-        format!("iptables -C FORWARD -i {tap_name} -o {out_iface} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i {tap_name} -o {out_iface} -j ACCEPT"),
-        format!("iptables -C FORWARD -i {out_iface} -o {tap_name} -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i {out_iface} -o {tap_name} -m state --state RELATED,ESTABLISHED -j ACCEPT"),
+        format!(
+            "iptables -C FORWARD -i {tap_name} -o {out_iface} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i {tap_name} -o {out_iface} -j ACCEPT"
+        ),
+        format!(
+            "iptables -C FORWARD -i {out_iface} -o {tap_name} -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i {out_iface} -o {tap_name} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        ),
     ];
     for rule in rules {
         if let Err(e) = run_shell(&rule) {
@@ -219,7 +299,9 @@ fn add_forward_rules(tap_name: &str) {
 
 fn remove_forward_rules(tap_name: &str) {
     if let Ok(out_iface) = default_iface() {
-        let _ = run_shell(&format!("iptables -D FORWARD -i {tap_name} -o {out_iface} -j ACCEPT 2>/dev/null || true"));
+        let _ = run_shell(&format!(
+            "iptables -D FORWARD -i {tap_name} -o {out_iface} -j ACCEPT 2>/dev/null || true"
+        ));
         let _ = run_shell(&format!(
             "iptables -D FORWARD -i {out_iface} -o {tap_name} -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true"
         ));
@@ -235,7 +317,10 @@ fn run_cmd(program: &str, args: &[&str]) -> VmmResult<()> {
         .map_err(|e| VmmError::Backend(format!("spawn {program}: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::Backend(format!("{program} {} failed: {stderr}", args.join(" "))));
+        return Err(VmmError::Backend(format!(
+            "{program} {} failed: {stderr}",
+            args.join(" ")
+        )));
     }
     Ok(())
 }
@@ -262,26 +347,40 @@ fn run_user(program: &str, args: &[&str]) -> VmmResult<()> {
         .map_err(|e| VmmError::Backend(format!("spawn {program}: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::Backend(format!("{program} {} failed: {stderr}", args.join(" "))));
+        return Err(VmmError::Backend(format!(
+            "{program} {} failed: {stderr}",
+            args.join(" ")
+        )));
     }
     Ok(())
 }
 
 fn ensure_kvm_access() {
     const KVM: &str = "/dev/kvm";
-    if std::fs::OpenOptions::new().read(true).write(true).open(KVM).is_ok() {
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(KVM)
+        .is_ok()
+    {
         return;
     }
     let user = std::env::var("USER").unwrap_or_default();
     let setfacl_ok = !user.is_empty()
         && run_shell(&format!("setfacl -m u:{user}:rw {KVM} 2>/dev/null")).is_ok()
-        && std::fs::OpenOptions::new().read(true).write(true).open(KVM).is_ok();
+        && std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(KVM)
+            .is_ok();
     if setfacl_ok {
         info!(%user, "granted KVM access via setfacl");
         return;
     }
     match run_shell(&format!("chmod 666 {KVM}")) {
-        Ok(_) => warn!("fell back to chmod 666 /dev/kvm (add a udev rule or kvm group for persistence)"),
+        Ok(_) => {
+            warn!("fell back to chmod 666 /dev/kvm (add a udev rule or kvm group for persistence)")
+        }
         Err(e) => warn!(error = %e, "could not grant KVM access; create_vm will likely fail"),
     }
 }
@@ -291,7 +390,10 @@ fn copy_rootfs_per_vm(src: &Path, dest: &Path) -> VmmResult<()> {
         return Ok(());
     }
     if !src.exists() {
-        return Err(VmmError::InvalidConfig(format!("base rootfs not found: {}", src.display())));
+        return Err(VmmError::InvalidConfig(format!(
+            "base rootfs not found: {}",
+            src.display()
+        )));
     }
     info!(src = %src.display(), dest = %dest.display(), "copying base rootfs (sparse)");
     let output = std::process::Command::new("cp")
@@ -301,7 +403,10 @@ fn copy_rootfs_per_vm(src: &Path, dest: &Path) -> VmmResult<()> {
         .output()
         .map_err(|e| VmmError::Backend(format!("spawn cp: {e}")))?;
     if !output.status.success() {
-        return Err(VmmError::Backend(format!("sparse cp failed: {}", String::from_utf8_lossy(&output.stderr))));
+        return Err(VmmError::Backend(format!(
+            "sparse cp failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
     Ok(())
 }
@@ -310,7 +415,9 @@ fn inject_guest_net(rootfs: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
     let mnt = run_shell("mktemp -d")?;
     let mnt = mnt.trim_end_matches('\n');
     let cleanup = |mnt: &str| {
-        let _ = run_shell(&format!("umount {mnt} 2>/dev/null; rmdir {mnt} 2>/dev/null"));
+        let _ = run_shell(&format!(
+            "umount {mnt} 2>/dev/null; rmdir {mnt} 2>/dev/null"
+        ));
     };
     let guest_cidr = match net.guest_ip {
         IpAddr::V4(v4) => format!("{v4}/24"),
@@ -319,14 +426,22 @@ fn inject_guest_net(rootfs: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
             return Err(VmmError::Backend("guest IP must be IPv4".into()));
         }
     };
-    let net_unit = format!("[Match]\nName=eth0\n\n[Network]\nAddress={guest_cidr}\nGateway={}\nDNS=1.1.1.1\n", net.gateway_ip);
+    let net_unit = format!(
+        "[Match]\nName=eth0\n\n[Network]\nAddress={guest_cidr}\nGateway={}\nDNS=1.1.1.1\n",
+        net.gateway_ip
+    );
     let hostname = format!("tikovm-{vm_index}");
     if run_shell(&format!("mount {} {mnt}", shell_quote(rootfs))).is_err() {
         cleanup(mnt);
-        return Err(VmmError::Backend(format!("failed to mount rootfs {}", rootfs.display())));
+        return Err(VmmError::Backend(format!(
+            "failed to mount rootfs {}",
+            rootfs.display()
+        )));
     }
     let write_err = (|| {
-        run_shell(&format!("tee {mnt}/etc/systemd/network/20-eth0.network >/dev/null <<'NETUNIT'\n{net_unit}NETUNIT"))?;
+        run_shell(&format!(
+            "tee {mnt}/etc/systemd/network/20-eth0.network >/dev/null <<'NETUNIT'\n{net_unit}NETUNIT"
+        ))?;
         run_shell(&format!("echo {hostname} > {mnt}/etc/hostname"))?;
         Ok::<(), VmmError>(())
     })();
@@ -394,7 +509,10 @@ fn overlay_image_path(snapshot_dir: &Path, vm_index: u8) -> PathBuf {
 }
 
 fn overlay_size_mb() -> u64 {
-    std::env::var("OVERLAY_SIZE_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(2048)
+    std::env::var("OVERLAY_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048)
 }
 
 fn create_overlay_image(path: &Path, base: &Path, net: &VmNet, vm_index: u8) -> VmmResult<()> {
@@ -419,17 +537,25 @@ fn seed_overlay(overlay: &Path, base: &Path, net: &VmNet, vm_index: u8) -> VmmRe
     let bro = run_shell("mktemp -d")?;
     let bro = bro.trim_end_matches('\n');
     let cleanup = || {
-        let _ = run_shell(&format!("umount {ov} 2>/dev/null; umount {bro} 2>/dev/null; rmdir {ov} {bro} 2>/dev/null"));
+        let _ = run_shell(&format!(
+            "umount {ov} 2>/dev/null; umount {bro} 2>/dev/null; rmdir {ov} {bro} 2>/dev/null"
+        ));
     };
 
     if run_shell(&format!("mount {} {ov}", shell_quote(overlay))).is_err() {
         cleanup();
-        return Err(VmmError::Backend(format!("failed to mount overlay {}", overlay.display())));
+        return Err(VmmError::Backend(format!(
+            "failed to mount overlay {}",
+            overlay.display()
+        )));
     }
     // Base is mounted RO only to mirror ownership/mode of the network dir.
     if run_shell(&format!("mount -o ro,loop {} {bro}", shell_quote(base))).is_err() {
         cleanup();
-        return Err(VmmError::Backend(format!("failed to mount base {} RO", base.display())));
+        return Err(VmmError::Backend(format!(
+            "failed to mount base {} RO",
+            base.display()
+        )));
     }
 
     let (guest_cidr, gateway) = match net.guest_ip {
@@ -439,7 +565,9 @@ fn seed_overlay(overlay: &Path, base: &Path, net: &VmNet, vm_index: u8) -> VmmRe
             return Err(VmmError::Backend("guest IP must be IPv4".into()));
         }
     };
-    let net_unit = format!("[Match]\nName=eth0\n\n[Network]\nAddress={guest_cidr}\nGateway={gateway}\nDNS=1.1.1.1\n");
+    let net_unit = format!(
+        "[Match]\nName=eth0\n\n[Network]\nAddress={guest_cidr}\nGateway={gateway}\nDNS=1.1.1.1\n"
+    );
     let hostname = format!("tikovm-{vm_index}");
 
     let seed_err = (|| {
@@ -452,7 +580,9 @@ fn seed_overlay(overlay: &Path, base: &Path, net: &VmNet, vm_index: u8) -> VmmRe
         }
         run_shell("mkdir -p {ov}/work").map(|_| ()).unwrap_or(());
         run_shell(&format!("mkdir -p {ov}/work"))?;
-        run_shell(&format!("tee {ov}/upper/etc/systemd/network/20-eth0.network >/dev/null <<'NETUNIT'\n{net_unit}NETUNIT"))?;
+        run_shell(&format!(
+            "tee {ov}/upper/etc/systemd/network/20-eth0.network >/dev/null <<'NETUNIT'\n{net_unit}NETUNIT"
+        ))?;
         run_shell(&format!("echo {hostname} > {ov}/upper/etc/hostname"))?;
         Ok::<(), VmmError>(())
     })();
@@ -552,7 +682,9 @@ impl FirecrackerVmm {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                return Err(VmmError::Backend("Firecracker API socket did not appear within 10s".into()));
+                return Err(VmmError::Backend(
+                    "Firecracker API socket did not appear within 10s".into(),
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -569,7 +701,8 @@ impl FirecrackerVmm {
         guest_mac: &str,
         serial_log: &Path,
         overlay_path: Option<&Path>,
-    ) -> VmmResult<()> {        let mut boot_source = json!({
+    ) -> VmmResult<()> {
+        let mut boot_source = json!({
             "kernel_image_path": config.kernel_path.to_string_lossy(),
             "boot_args": config.kernel_cmdline,
         });
@@ -638,15 +771,28 @@ impl FirecrackerVmm {
         // virtio-vsock control channel.
         if let Some(cid) = config.guest_cid {
             let uds = self.vsock_uds(vm_id);
-            client.put("/vsock", &json!({ "guest_cid": cid, "uds_path": uds.to_string_lossy() })).await?;
+            client
+                .put(
+                    "/vsock",
+                    &json!({ "guest_cid": cid, "uds_path": uds.to_string_lossy() }),
+                )
+                .await?;
         }
 
-        client.put("/serial", &json!({ "serial_out_path": serial_log.to_string_lossy() })).await?;
+        client
+            .put(
+                "/serial",
+                &json!({ "serial_out_path": serial_log.to_string_lossy() }),
+            )
+            .await?;
         Ok(())
     }
 
     fn snapshot_paths(&self, vm_id: &str) -> (PathBuf, PathBuf) {
-        (self.snapshot_dir.join(format!("{vm_id}.snapshot")), self.snapshot_dir.join(format!("{vm_id}.mem")))
+        (
+            self.snapshot_dir.join(format!("{vm_id}.snapshot")),
+            self.snapshot_dir.join(format!("{vm_id}.mem")),
+        )
     }
 }
 
@@ -661,15 +807,24 @@ impl Vmm for FirecrackerVmm {
         }
         let vm_id = config.vm_id.clone();
         if !config.kernel_path.exists() {
-            return Err(VmmError::InvalidConfig(format!("kernel not found: {}", config.kernel_path.display())));
+            return Err(VmmError::InvalidConfig(format!(
+                "kernel not found: {}",
+                config.kernel_path.display()
+            )));
         }
         if !config.rootfs_path.exists() {
-            return Err(VmmError::InvalidConfig(format!("rootfs not found: {}", config.rootfs_path.display())));
+            return Err(VmmError::InvalidConfig(format!(
+                "rootfs not found: {}",
+                config.rootfs_path.display()
+            )));
         }
         if let Some(initrd) = &config.initrd_path
             && !initrd.exists()
         {
-            return Err(VmmError::InvalidConfig(format!("initrd not found: {}", initrd.display())));
+            return Err(VmmError::InvalidConfig(format!(
+                "initrd not found: {}",
+                initrd.display()
+            )));
         }
 
         let vm_index = vm_index_from_id(&vm_id)?;
@@ -707,7 +862,15 @@ impl Vmm for FirecrackerVmm {
         provision_drives(&self.snapshot_dir, &vm_id, &mut vm_config.drives)?;
         let client = FcApiClient::new(&api_sock);
         if let Err(e) = self
-            .configure_vm(&client, &vm_config, &vm_id, &net.tap_name, &net.guest_mac, &serial_log, overlay_path.as_deref())
+            .configure_vm(
+                &client,
+                &vm_config,
+                &vm_id,
+                &net.tap_name,
+                &net.guest_mac,
+                &serial_log,
+                overlay_path.as_deref(),
+            )
             .await
         {
             warn!(vm_id = %vm_id, error = %e, "configure_vm failed");
@@ -718,7 +881,17 @@ impl Vmm for FirecrackerVmm {
 
         self.vms.lock().unwrap().insert(
             vm_id.clone(),
-            FcVmEntry { child: Some(child), api_sock, vsock_uds: self.vsock_uds(&vm_id), tap_name: net.tap_name, subnet: net.subnet, serial_log, config, guest_ip: net.guest_ip, state: BackendState::Created },
+            FcVmEntry {
+                child: Some(child),
+                api_sock,
+                vsock_uds: self.vsock_uds(&vm_id),
+                tap_name: net.tap_name,
+                subnet: net.subnet,
+                serial_log,
+                config,
+                guest_ip: net.guest_ip,
+                state: BackendState::Created,
+            },
         );
         info!(vm_id = %vm_id, "Firecracker VM created and configured");
         Ok(vm_id)
@@ -727,7 +900,9 @@ impl Vmm for FirecrackerVmm {
     async fn start_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let sock_path = self.lock_sock(vm_id)?;
         let client = FcApiClient::new(&sock_path);
-        client.put("/actions", &json!({"action_type": "InstanceStart"})).await?;
+        client
+            .put("/actions", &json!({"action_type": "InstanceStart"}))
+            .await?;
         self.set_state(vm_id, BackendState::Started);
         info!(vm_id = %vm_id, "Firecracker VM started");
         Ok(())
@@ -754,11 +929,21 @@ impl Vmm for FirecrackerVmm {
     async fn snapshot_vm(&self, vm_id: &VmId) -> VmmResult<Snapshot> {
         let (sock_path, config, snap_paths) = {
             let vms = self.vms.lock().unwrap();
-            let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
             if entry.state != BackendState::Paused {
-                return Err(VmmError::InvalidState { vm_id: vm_id.clone(), current: "not paused", required: "paused" });
+                return Err(VmmError::InvalidState {
+                    vm_id: vm_id.clone(),
+                    current: "not paused",
+                    required: "paused",
+                });
             }
-            (entry.api_sock.clone(), entry.config.clone(), self.snapshot_paths(vm_id))
+            (
+                entry.api_sock.clone(),
+                entry.config.clone(),
+                self.snapshot_paths(vm_id),
+            )
         };
         let (snap_path, mem_path) = snap_paths;
         let client = FcApiClient::new(&sock_path);
@@ -769,7 +954,12 @@ impl Vmm for FirecrackerVmm {
             )
             .await?;
         info!(vm_id = %vm_id, snap = %snap_path.display(), "snapshot created");
-        Ok(Snapshot { vm_id: vm_id.clone(), state_path: snap_path, mem_path, config })
+        Ok(Snapshot {
+            vm_id: vm_id.clone(),
+            state_path: snap_path,
+            mem_path,
+            config,
+        })
     }
 
     async fn restore_vm(&self, snapshot: &Snapshot) -> VmmResult<VmId> {
@@ -780,7 +970,11 @@ impl Vmm for FirecrackerVmm {
         {
             let vms = self.vms.lock().unwrap();
             if vms.contains_key(&vm_id) {
-                return Err(VmmError::InvalidState { vm_id: vm_id.clone(), current: "present", required: "destroyed" });
+                return Err(VmmError::InvalidState {
+                    vm_id: vm_id.clone(),
+                    current: "present",
+                    required: "destroyed",
+                });
             }
         }
         let vm_index = vm_index_from_id(&vm_id)?;
@@ -817,7 +1011,17 @@ impl Vmm for FirecrackerVmm {
         let serial_log = self.runtime_dir.join(format!("{vm_id}.console.log"));
         self.vms.lock().unwrap().insert(
             vm_id.clone(),
-            FcVmEntry { child: Some(child), api_sock, vsock_uds: self.vsock_uds(&vm_id), tap_name: net.tap_name, subnet: net.subnet, serial_log, config: snapshot.config.clone(), guest_ip: net.guest_ip, state: BackendState::Paused },
+            FcVmEntry {
+                child: Some(child),
+                api_sock,
+                vsock_uds: self.vsock_uds(&vm_id),
+                tap_name: net.tap_name,
+                subnet: net.subnet,
+                serial_log,
+                config: snapshot.config.clone(),
+                guest_ip: net.guest_ip,
+                state: BackendState::Paused,
+            },
         );
         info!(vm_id = %vm_id, "Firecracker VM restored from snapshot");
         Ok(vm_id)
@@ -825,11 +1029,17 @@ impl Vmm for FirecrackerVmm {
 
     async fn destroy_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let mut entry = {
-            self.vms.lock().unwrap().remove(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?
+            self.vms
+                .lock()
+                .unwrap()
+                .remove(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?
         };
         info!(vm_id = %vm_id, "destroying Firecracker VM");
         let client = FcApiClient::new(&entry.api_sock);
-        let _ = client.put("/actions", &json!({"action_type": "SendCtrlAltDel"})).await;
+        let _ = client
+            .put("/actions", &json!({"action_type": "SendCtrlAltDel"}))
+            .await;
         if let Some(child) = entry.child.as_mut() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
             let _ = child.start_kill();
@@ -844,7 +1054,9 @@ impl Vmm for FirecrackerVmm {
     async fn vm_state(&self, vm_id: &VmId) -> VmmResult<BackendState> {
         let (sock_path, cached) = {
             let vms = self.vms.lock().unwrap();
-            let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+            let entry = vms
+                .get(vm_id)
+                .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
             (entry.api_sock.clone(), entry.state)
         };
         let client = FcApiClient::new(&sock_path);
@@ -863,12 +1075,20 @@ impl Vmm for FirecrackerVmm {
 
     async fn vm_guest_ip(&self, vm_id: &VmId) -> VmmResult<Option<IpAddr>> {
         let vms = self.vms.lock().unwrap();
-        let entry = vms.get(vm_id).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
+        let entry = vms
+            .get(vm_id)
+            .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))?;
         Ok(Some(entry.guest_ip))
     }
 
     async fn list_vms(&self) -> VmmResult<Vec<(VmId, BackendState)>> {
-        Ok(self.vms.lock().unwrap().iter().map(|(id, e)| (id.clone(), e.state)).collect())
+        Ok(self
+            .vms
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, e)| (id.clone(), e.state))
+            .collect())
     }
 
     async fn vsock_uds_path(&self, vm_id: &VmId) -> VmmResult<Option<PathBuf>> {
@@ -896,7 +1116,9 @@ impl Vmm for FirecrackerVmm {
 impl FirecrackerVmm {
     fn lock_sock(&self, vm_id: &VmId) -> VmmResult<PathBuf> {
         let vms = self.vms.lock().unwrap();
-        vms.get(vm_id).map(|e| e.api_sock.clone()).ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))
+        vms.get(vm_id)
+            .map(|e| e.api_sock.clone())
+            .ok_or_else(|| VmmError::VmNotFound(vm_id.clone()))
     }
 
     fn set_state(&self, vm_id: &VmId, state: BackendState) {
@@ -912,7 +1134,13 @@ mod tests {
 
     #[test]
     fn parse_default_iface_picks_dev_token() {
-        assert_eq!(parse_default_iface("default via 172.31.16.1 dev ens5 proto dhcp src 172.31.21.123 metric 100\n").as_deref(), Some("ens5"));
+        assert_eq!(
+            parse_default_iface(
+                "default via 172.31.16.1 dev ens5 proto dhcp src 172.31.21.123 metric 100\n"
+            )
+            .as_deref(),
+            Some("ens5")
+        );
     }
 
     #[test]

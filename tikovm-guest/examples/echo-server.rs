@@ -31,7 +31,10 @@ fn main() {
             let (status, body) = if path.starts_with("/health") {
                 (200, "{\"status\":\"ok\"}".to_string())
             } else {
-                (200, format!("{{\"echo\":true,\"path\":\"{path}\",\"method\":\"{first_line}\"}}"))
+                (
+                    200,
+                    format!("{{\"echo\":true,\"path\":\"{path}\",\"method\":\"{first_line}\"}}"),
+                )
             };
             let reason = if status == 200 { "OK" } else { "Error" };
             let resp = format!(

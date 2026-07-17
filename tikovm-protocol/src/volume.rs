@@ -67,7 +67,11 @@ impl VolumeDecl {
         }
     }
 
-    pub fn remote(name: impl Into<String>, mount_path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+    pub fn remote(
+        name: impl Into<String>,
+        mount_path: impl Into<PathBuf>,
+        source: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             tier: VolumeTier::RemoteSlow,

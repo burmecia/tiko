@@ -19,11 +19,19 @@ pub struct Response {
 
 impl Response {
     pub fn json<T: Serialize>(status: u16, val: &T) -> Self {
-        Self { status, body: serde_json::to_vec(val).unwrap_or_else(|_| b"null".to_vec()), content_type: "application/json" }
+        Self {
+            status,
+            body: serde_json::to_vec(val).unwrap_or_else(|_| b"null".to_vec()),
+            content_type: "application/json",
+        }
     }
 
     pub fn ok_empty() -> Self {
-        Self { status: 204, body: Vec::new(), content_type: "application/json" }
+        Self {
+            status: 204,
+            body: Vec::new(),
+            content_type: "application/json",
+        }
     }
 
     pub fn error(status: u16, kind: &str, message: impl Into<String>) -> Self {
@@ -76,7 +84,9 @@ impl ApiServer {
         let node = self.node.clone();
         let resp = provision(&node, spec, start).await;
         // Spawn the guestlink server only on a successful create.
-        if resp.status == 201 && let Ok(Some(uds)) = node.vmm().vsock_uds_path(&vm_id).await {
+        if resp.status == 201
+            && let Ok(Some(uds)) = node.vmm().vsock_uds_path(&vm_id).await
+        {
             let node = node.clone();
             tokio::spawn(async move {
                 let gl = crate::guestlink::GuestLink::new(node, vm_id.clone(), uds);
@@ -153,16 +163,24 @@ pub async fn dispatch(method: &str, path: &str, _body: &[u8], node: &Node) -> Re
         },
         // Guest-driven lifecycle signals (also reachable over vsock, but kept
         // on the HTTP API for operators/tests). Must precede `[id, op]`.
-        ["vms", id, "suspend-request"] if method == "POST" => match node.freeze(&id.to_string()).await {
-            Ok(_) => Response::json(202, &serde_json::json!({"pause_epoch": node.bump_pause_epoch(&id.to_string()).unwrap_or(0)})),
-            Err(e) => err_from(e),
-        },
-        ["vms", id, "shutdown-request"] if method == "POST" => match node.destroy(&id.to_string()).await {
-            Ok(_) => Response::ok_empty(),
-            Err(e) => err_from(e),
-        },
+        ["vms", id, "suspend-request"] if method == "POST" => {
+            match node.freeze(&id.to_string()).await {
+                Ok(_) => Response::json(
+                    202,
+                    &serde_json::json!({"pause_epoch": node.bump_pause_epoch(&id.to_string()).unwrap_or(0)}),
+                ),
+                Err(e) => err_from(e),
+            }
+        }
+        ["vms", id, "shutdown-request"] if method == "POST" => {
+            match node.destroy(&id.to_string()).await {
+                Ok(_) => Response::ok_empty(),
+                Err(e) => err_from(e),
+            }
+        }
         ["vms", id, op] if method == "POST" => lifecycle(node, id, op).await,
-        ["vms", id, "ip"] if method == "GET" => match node.vmm().vm_guest_ip(&id.to_string()).await {
+        ["vms", id, "ip"] if method == "GET" => match node.vmm().vm_guest_ip(&id.to_string()).await
+        {
             Ok(ip) => Response::json(200, &serde_json::json!({"vm_id": id, "guest_ip": ip})),
             Err(e) => err_from(e),
         },
@@ -185,9 +203,15 @@ async fn provision(node: &Node, spec: VmSpec, start: bool) -> Response {
                 if let Err(e) = node.start(&vm_id).await {
                     return err_from(e);
                 }
-                Response::json(201, &serde_json::json!({"vm_id": vm_id, "state": "started"}))
+                Response::json(
+                    201,
+                    &serde_json::json!({"vm_id": vm_id, "state": "started"}),
+                )
             } else {
-                Response::json(201, &serde_json::json!({"vm_id": vm_id, "state": "created"}))
+                Response::json(
+                    201,
+                    &serde_json::json!({"vm_id": vm_id, "state": "created"}),
+                )
             }
         }
         Err(e) => err_from(e),
@@ -286,29 +310,40 @@ fn parse_request_line(req: &str) -> Option<(String, String, usize)> {
 
 fn extract_body(req: &str, body_start: usize, raw: &[u8]) -> Vec<u8> {
     // Honor Content-Length when present.
-    let len = req
-        .lines()
-        .take_while(|l| !l.is_empty())
-        .find_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            (k.eq_ignore_ascii_case("content-length")).then(|| v.trim().parse::<usize>().ok())?
-        });
+    let len = req.lines().take_while(|l| !l.is_empty()).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        (k.eq_ignore_ascii_case("content-length")).then(|| v.trim().parse::<usize>().ok())?
+    });
     match len {
         Some(len) => {
             let start = body_start.min(raw.len());
             let end = (start + len).min(raw.len());
             raw[start..end].to_vec()
         }
-        None => raw.get(body_start..).map(|s| s.to_vec()).unwrap_or_default(),
+        None => raw
+            .get(body_start..)
+            .map(|s| s.to_vec())
+            .unwrap_or_default(),
     }
 }
 
-async fn write_response(stream: &mut tokio::net::TcpStream, status: u16, body: &[u8]) -> std::io::Result<()> {
-    let resp = Response { status, body: body.to_vec(), content_type: "application/json" };
+async fn write_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let resp = Response {
+        status,
+        body: body.to_vec(),
+        content_type: "application/json",
+    };
     write_response_with(stream, resp).await
 }
 
-async fn write_response_with(stream: &mut tokio::net::TcpStream, resp: Response) -> std::io::Result<()> {
+async fn write_response_with(
+    stream: &mut tokio::net::TcpStream,
+    resp: Response,
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let reason = match resp.status {
         200 => "OK",
@@ -359,7 +394,10 @@ mod tests {
     fn spec_json(id: &str) -> Vec<u8> {
         let s = VmSpec {
             vm_id: id.into(),
-            rootfs: tikovm_protocol::vm::RootfsRef { path: "/r".into(), read_only_base: true },
+            rootfs: tikovm_protocol::vm::RootfsRef {
+                path: "/r".into(),
+                read_only_base: true,
+            },
             resources: tikovm_protocol::vm::ResourceConfig::default(),
             kernel: tikovm_protocol::vm::KernelSpec {
                 kernel_path: "/k".into(),

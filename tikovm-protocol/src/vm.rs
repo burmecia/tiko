@@ -39,13 +39,25 @@ impl VmState {
     pub fn is_stable(self) -> bool {
         matches!(
             self,
-            VmState::Created | VmState::Started | VmState::Paused | VmState::Suspended | VmState::Destroyed
+            VmState::Created
+                | VmState::Started
+                | VmState::Paused
+                | VmState::Suspended
+                | VmState::Destroyed
         )
     }
 
     /// Whether a live VM process exists in this state.
     pub fn is_live(self) -> bool {
-        matches!(self, VmState::Started | VmState::Paused | VmState::Creating | VmState::Starting | VmState::Pausing | VmState::Resuming)
+        matches!(
+            self,
+            VmState::Started
+                | VmState::Paused
+                | VmState::Creating
+                | VmState::Starting
+                | VmState::Pausing
+                | VmState::Resuming
+        )
     }
 
     pub fn as_str(self) -> &'static str {
@@ -109,7 +121,12 @@ impl LifecycleOp {
         use VmState::*;
         let ok = matches!(
             (self, from),
-            (Create, _) | (Start, Created) | (Pause, Started) | (Resume, Paused) | (Suspend, Paused) | (Restore, Suspended)
+            (Create, _)
+                | (Start, Created)
+                | (Pause, Started)
+                | (Resume, Paused)
+                | (Suspend, Paused)
+                | (Restore, Suspended)
         ) || (self == Destroy && from.is_stable());
         if !ok {
             return Err(IllegalTransition { from, op: self });
@@ -161,7 +178,10 @@ pub struct ResourceConfig {
 
 impl Default for ResourceConfig {
     fn default() -> Self {
-        Self { memory_mb: 512, vcpus: 2 }
+        Self {
+            memory_mb: 512,
+            vcpus: 2,
+        }
     }
 }
 

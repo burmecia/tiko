@@ -20,7 +20,9 @@ use tokio::net::UnixListener;
 use tracing::{info, warn};
 
 use tikovm_protocol::codec;
-use tikovm_protocol::rpc::{GuestReply, GuestToHost, HostReply, HostToGuest, NetworkStats, HOST_CTRL_PORT, GUEST_VSOCK_PORT};
+use tikovm_protocol::rpc::{
+    GUEST_VSOCK_PORT, GuestReply, GuestToHost, HOST_CTRL_PORT, HostReply, HostToGuest, NetworkStats,
+};
 use tikovm_protocol::vm::VmId;
 
 use crate::node::Node;
@@ -75,11 +77,15 @@ async fn handle(
             Ok(_) => HostReply::Suspended {
                 pause_epoch: node.bump_pause_epoch(vm_id).unwrap_or(0),
             },
-            Err(e) => HostReply::Error { message: e.to_string() },
+            Err(e) => HostReply::Error {
+                message: e.to_string(),
+            },
         },
         GuestToHost::Shutdown => match node.destroy(vm_id).await {
             Ok(_) => HostReply::Ok,
-            Err(e) => HostReply::Error { message: e.to_string() },
+            Err(e) => HostReply::Error {
+                message: e.to_string(),
+            },
         },
         GuestToHost::Ready { workload, .. } => {
             info!(%vm_id, %workload, "guest ready");
@@ -109,9 +115,19 @@ fn vm_network_stats(node: &Node, vm_id: &VmId) -> NetworkStats {
         .and_then(|rec| rec.read().ok().and_then(|g| g.guest_ip));
     let conns = ip.map(count_conns_to_ip).unwrap_or(0);
     if conns == 0 {
-        NetworkStats { established_conns: 0, last_data_age_secs: 999, bytes_in: 0, bytes_out: 0 }
+        NetworkStats {
+            established_conns: 0,
+            last_data_age_secs: 999,
+            bytes_in: 0,
+            bytes_out: 0,
+        }
     } else {
-        NetworkStats { established_conns: conns, last_data_age_secs: 0, bytes_in: 0, bytes_out: 0 }
+        NetworkStats {
+            established_conns: conns,
+            last_data_age_secs: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+        }
     }
 }
 
@@ -131,7 +147,11 @@ pub fn count_conns_to_ip(ip: IpAddr) -> u64 {
                 None => return false,
             };
             let st = f.next().unwrap_or("");
-            st == "01" && rem.get(..8).map(|r| r.eq_ignore_ascii_case(&want)).unwrap_or(false)
+            st == "01"
+                && rem
+                    .get(..8)
+                    .map(|r| r.eq_ignore_ascii_case(&want))
+                    .unwrap_or(false)
         })
         .count() as u64
 }
@@ -154,11 +174,18 @@ async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, Strin
 /// `CONNECT <GUEST_VSOCK_PORT>`, and exchanging one framed RPC.
 ///
 /// `uds_base` is the VM's vsock UDS path (from `Vmm::vsock_uds_path`).
-pub async fn send_guest_cmd(uds_base: &std::path::Path, cmd: &HostToGuest) -> Result<GuestReply, String> {
-    let mut s = tokio::net::UnixStream::connect(uds_base).await.map_err(|e| e.to_string())?;
+pub async fn send_guest_cmd(
+    uds_base: &std::path::Path,
+    cmd: &HostToGuest,
+) -> Result<GuestReply, String> {
+    let mut s = tokio::net::UnixStream::connect(uds_base)
+        .await
+        .map_err(|e| e.to_string())?;
     // Firecracker vsock host-initiated handshake: "CONNECT <port>\n" -> "OK <p>\n".
     let connect = format!("CONNECT {GUEST_VSOCK_PORT}\n");
-    s.write_all(connect.as_bytes()).await.map_err(|e| e.to_string())?;
+    s.write_all(connect.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     s.flush().await.map_err(|e| e.to_string())?;
     // Read the ack line.
     let mut ack = Vec::new();
@@ -223,7 +250,11 @@ mod tests {
                 f.next();
                 let rem = f.next().unwrap_or("");
                 let st = f.next().unwrap_or("");
-                st == "01" && rem.get(..8).map(|r| r.eq_ignore_ascii_case(&want)).unwrap_or(false)
+                st == "01"
+                    && rem
+                        .get(..8)
+                        .map(|r| r.eq_ignore_ascii_case(&want))
+                        .unwrap_or(false)
             })
             .count();
         assert_eq!(n, 1);

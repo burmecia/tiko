@@ -236,9 +236,7 @@ async fn start_server(
     // shares the Postgres handle (same pg_ctl / data dir / tiko identity) and
     // spawns postgrest against the rootfs-baked conf after PG is ready.
     let postgrest = Arc::new(PostgRest::new(ctl.clone()));
-    let server = Arc::new(
-        PgServer::new(ctl, tiko_pitr, tiko_branch).with_service(postgrest),
-    );
+    let server = Arc::new(PgServer::new(ctl, tiko_pitr, tiko_branch).with_service(postgrest));
     server.run(listen_addr).await?;
     Ok(())
 }

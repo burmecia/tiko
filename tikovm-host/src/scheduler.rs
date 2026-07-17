@@ -34,7 +34,10 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(node: Arc<Node>) -> Self {
-        Self { node, next_fire: Mutex::new(HashMap::new()) }
+        Self {
+            node,
+            next_fire: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Run the scheduler loop until the process exits.
@@ -51,7 +54,9 @@ impl Scheduler {
         // Snapshot the ids to avoid holding registry guards across awaits.
         let ids: Vec<VmId> = self.node.control().ids();
         for vm_id in ids {
-            let Some(rec) = self.node.control().get(&vm_id) else { continue };
+            let Some(rec) = self.node.control().get(&vm_id) else {
+                continue;
+            };
             let (schedule, state) = {
                 let g = rec.read().unwrap();
                 (schedule_of(&g.spec), g.state)
@@ -72,7 +77,9 @@ impl Scheduler {
 
     fn is_due(&self, vm_id: &VmId, schedule: &SchedulePolicy, now: SystemTime) -> bool {
         let mut nf = self.next_fire.lock().unwrap();
-        let next = nf.entry(vm_id.clone()).or_insert_with(|| compute_next(schedule, now));
+        let next = nf
+            .entry(vm_id.clone())
+            .or_insert_with(|| compute_next(schedule, now));
         if now >= *next {
             // advance to the next fire after now
             *next = compute_next(schedule, now);
@@ -97,7 +104,10 @@ impl Scheduler {
                 }
                 VmState::Suspended | VmState::Paused => {
                     tracing::info!(%vm_id, "scheduled tick: restoring (keep-warm)");
-                    self.node.ensure_running(vm_id).await.map_err(|e| e.to_string())?;
+                    self.node
+                        .ensure_running(vm_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
                 VmState::Created => {
                     tracing::info!(%vm_id, "scheduled tick: starting (keep-warm, first run)");
@@ -184,7 +194,10 @@ mod tests {
         // Provision + suspend a VM so the scheduler can restore it.
         let mut spec = tikovm_protocol::vm::VmSpec {
             vm_id: "vm-s".into(),
-            rootfs: tikovm_protocol::vm::RootfsRef { path: "/r".into(), read_only_base: true },
+            rootfs: tikovm_protocol::vm::RootfsRef {
+                path: "/r".into(),
+                read_only_base: true,
+            },
             resources: tikovm_protocol::vm::ResourceConfig::default(),
             kernel: tikovm_protocol::vm::KernelSpec {
                 kernel_path: "/k".into(),

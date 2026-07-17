@@ -27,7 +27,11 @@ fn default_base_cid() -> u32 {
 impl HostConfig {
     /// Build config: start from file (if given), then override with the explicit
     /// `data_dir` / `api_listen` arguments.
-    pub fn load(file: Option<&Path>, data_dir: &Path, api_listen: &str) -> Result<Self, ConfigError> {
+    pub fn load(
+        file: Option<&Path>,
+        data_dir: &Path,
+        api_listen: &str,
+    ) -> Result<Self, ConfigError> {
         let mut cfg = if let Some(p) = file {
             let text = std::fs::read_to_string(p)
                 .map_err(|e| ConfigError::Read(p.to_path_buf(), e.to_string()))?;

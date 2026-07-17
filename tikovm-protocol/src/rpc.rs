@@ -69,7 +69,9 @@ pub enum HostReply {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostToGuest {
     Start,
-    Stop { mode: StopMode },
+    Stop {
+        mode: StopMode,
+    },
     /// About to suspend: run `[suspend].pre_suspend_cmd`, then ack. Sent while
     /// the VM is still running (before the host pauses).
     PreSuspend,

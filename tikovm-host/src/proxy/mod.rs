@@ -37,8 +37,18 @@ pub struct Proxy {
 
 impl Proxy {
     /// `default_vm` is the fallback when a request carries no routing header.
-    pub fn new(node: Arc<Node>, listen: SocketAddr, default_vm: Option<VmId>, default_port: u16) -> Self {
-        Self { node, listen, default_vm, default_port }
+    pub fn new(
+        node: Arc<Node>,
+        listen: SocketAddr,
+        default_vm: Option<VmId>,
+        default_port: u16,
+    ) -> Self {
+        Self {
+            node,
+            listen,
+            default_vm,
+            default_port,
+        }
     }
 
     pub async fn run(&self) -> std::io::Result<()> {
@@ -100,10 +110,9 @@ async fn handle(
     // Splice the rest bidirectionally until either side closes.
     let (mut cr, mut cw) = client.split();
     let (mut br, mut bw) = backend.split();
-    let (c2b, b2c) = tokio::join!(
-        async { tokio::io::copy(&mut cr, &mut bw).await },
-        async { tokio::io::copy(&mut br, &mut cw).await },
-    );
+    let (c2b, b2c) = tokio::join!(async { tokio::io::copy(&mut cr, &mut bw).await }, async {
+        tokio::io::copy(&mut br, &mut cw).await
+    },);
     let _ = (c2b, b2c);
     Ok(())
 }
@@ -155,7 +164,11 @@ fn resolve_target(
         .get(&vm_id)
         .and_then(|rec| {
             rec.read().ok().and_then(|g| {
-                g.spec.manifest.as_ref().and_then(|m| m.expose.as_ref()).map(|e| e.http_port)
+                g.spec
+                    .manifest
+                    .as_ref()
+                    .and_then(|m| m.expose.as_ref())
+                    .map(|e| e.http_port)
             })
         })
         .unwrap_or(default_port);
@@ -174,7 +187,11 @@ fn extract_header(head: &[u8], name_lower: &str) -> Option<VmId> {
     None
 }
 
-async fn retry_connect(addr: (IpAddr, u16), attempts: u32, interval_ms: u64) -> Result<TcpStream, String> {
+async fn retry_connect(
+    addr: (IpAddr, u16),
+    attempts: u32,
+    interval_ms: u64,
+) -> Result<TcpStream, String> {
     let mut last = String::from("no attempt");
     for _ in 0..attempts {
         match TcpStream::connect(addr).await {
@@ -195,7 +212,10 @@ mod tests {
     #[test]
     fn extracts_endpoint_header_case_insensitive() {
         let head = b"GET /hello HTTP/1.1\r\nHost: x\r\nX-Tiko-Endpoint: vm-7\r\n\r\n";
-        assert_eq!(extract_header(head, ENDPOINT_HEADER).as_deref(), Some("vm-7"));
+        assert_eq!(
+            extract_header(head, ENDPOINT_HEADER).as_deref(),
+            Some("vm-7")
+        );
     }
 
     #[test]

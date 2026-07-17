@@ -12,9 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::process::Command;
 use tikovm_protocol::manifest::{IdlePolicy, IdleProbe};
 use tikovm_protocol::rpc::NetworkStats;
+use tokio::process::Command;
 
 /// The guest's channel to the host: pull network stats, push suspend/health.
 /// Real impl talks vsock; tests use a fake.
@@ -67,7 +67,11 @@ impl IdleEvaluator {
                 if *acc >= self.policy.idle_secs {
                     let elapsed = *acc;
                     *acc = 0;
-                    tracing::info!(vm_id = self.host.vm_id(), idle_secs = elapsed, "idle threshold reached; requesting suspend");
+                    tracing::info!(
+                        vm_id = self.host.vm_id(),
+                        idle_secs = elapsed,
+                        "idle threshold reached; requesting suspend"
+                    );
                     true
                 } else {
                     false
@@ -138,9 +142,19 @@ mod tests {
         }
         async fn network_stats(&self) -> NetworkStats {
             if self.net_idle.load(Ordering::Relaxed) {
-                NetworkStats { established_conns: 0, last_data_age_secs: 999, bytes_in: 0, bytes_out: 0 }
+                NetworkStats {
+                    established_conns: 0,
+                    last_data_age_secs: 999,
+                    bytes_in: 0,
+                    bytes_out: 0,
+                }
             } else {
-                NetworkStats { established_conns: 1, last_data_age_secs: 0, bytes_in: 1, bytes_out: 0 }
+                NetworkStats {
+                    established_conns: 1,
+                    last_data_age_secs: 0,
+                    bytes_in: 1,
+                    bytes_out: 0,
+                }
             }
         }
         async fn request_suspend(&self) {
@@ -150,12 +164,20 @@ mod tests {
     }
 
     fn policy(idle_secs: u64, probes: Vec<IdleProbe>) -> IdlePolicy {
-        IdlePolicy { tick_secs: 1, idle_secs, probes }
+        IdlePolicy {
+            tick_secs: 1,
+            idle_secs,
+            probes,
+        }
     }
 
     #[tokio::test]
     async fn fires_after_sustained_idle() {
-        let host = Arc::new(FakeHost { vm_id: "vm-1".into(), net_idle: AtomicBool::new(true), suspends: AtomicU64::new(0) });
+        let host = Arc::new(FakeHost {
+            vm_id: "vm-1".into(),
+            net_idle: AtomicBool::new(true),
+            suspends: AtomicU64::new(0),
+        });
         let ev = IdleEvaluator::new(policy(3, vec![IdleProbe::HostNetwork]), host.clone());
         // idle_secs=3, tick_secs=1 => need 3 idle ticks.
         ev.tick().await; // acc=1
@@ -167,7 +189,11 @@ mod tests {
 
     #[tokio::test]
     async fn resets_on_busy_tick() {
-        let host = Arc::new(FakeHost { vm_id: "vm-2".into(), net_idle: AtomicBool::new(true), suspends: AtomicU64::new(0) });
+        let host = Arc::new(FakeHost {
+            vm_id: "vm-2".into(),
+            net_idle: AtomicBool::new(true),
+            suspends: AtomicU64::new(0),
+        });
         let ev = IdleEvaluator::new(policy(5, vec![IdleProbe::HostNetwork]), host.clone());
         ev.tick().await; // acc=1
         host.net_idle.store(false, Ordering::Relaxed);
@@ -179,10 +205,22 @@ mod tests {
 
     #[tokio::test]
     async fn exec_probe_exit_code_drives_idle() {
-        let host = Arc::new(FakeHost { vm_id: "vm-3".into(), net_idle: AtomicBool::new(true), suspends: AtomicU64::new(0) });
+        let host = Arc::new(FakeHost {
+            vm_id: "vm-3".into(),
+            net_idle: AtomicBool::new(true),
+            suspends: AtomicU64::new(0),
+        });
         // `/bin/true` exits 0 => idle. With both probes idle, evaluator accumulates.
         let ev = IdleEvaluator::new(
-            policy(1, vec![IdleProbe::HostNetwork, IdleProbe::Exec { cmd: "/bin/true".into() }]),
+            policy(
+                1,
+                vec![
+                    IdleProbe::HostNetwork,
+                    IdleProbe::Exec {
+                        cmd: "/bin/true".into(),
+                    },
+                ],
+            ),
             host.clone(),
         );
         ev.tick().await;
@@ -191,10 +229,19 @@ mod tests {
 
     #[tokio::test]
     async fn exec_probe_busy_blocks_suspend() {
-        let host = Arc::new(FakeHost { vm_id: "vm-4".into(), net_idle: AtomicBool::new(true), suspends: AtomicU64::new(0) });
+        let host = Arc::new(FakeHost {
+            vm_id: "vm-4".into(),
+            net_idle: AtomicBool::new(true),
+            suspends: AtomicU64::new(0),
+        });
         // `/bin/false` exits 1 => busy; suspends never fire.
         let ev = IdleEvaluator::new(
-            policy(1, vec![IdleProbe::Exec { cmd: "/bin/false".into() }]),
+            policy(
+                1,
+                vec![IdleProbe::Exec {
+                    cmd: "/bin/false".into(),
+                }],
+            ),
             host.clone(),
         );
         ev.tick().await;

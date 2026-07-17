@@ -271,7 +271,9 @@ impl SchedulePolicy {
     pub fn validate(&self) -> Result<(), String> {
         match (&self.cron, self.interval_secs) {
             (None, None) => Err("schedule must set `cron` or `interval_secs`".into()),
-            (Some(_), Some(_)) => Err("schedule must set only one of `cron`/`interval_secs`".into()),
+            (Some(_), Some(_)) => {
+                Err("schedule must set only one of `cron`/`interval_secs`".into())
+            }
             _ => Ok(()),
         }
     }

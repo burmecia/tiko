@@ -26,7 +26,11 @@ pub struct Node {
 
 impl Node {
     pub fn new(vmm: Arc<dyn Vmm>, control: Arc<Control>) -> Self {
-        Self { vmm, control, store: None }
+        Self {
+            vmm,
+            control,
+            store: None,
+        }
     }
 
     /// Attach a durable store; state changes write through to it.
@@ -46,7 +50,9 @@ impl Node {
     /// Persist the current record to the store (if attached).
     fn persist(&self, vm_id: &VmId) {
         let Some(store) = &self.store else { return };
-        let Some(rec) = self.control.get(vm_id) else { return };
+        let Some(rec) = self.control.get(vm_id) else {
+            return;
+        };
         let g = rec.read().unwrap();
         let _ = store.upsert(&PersistedVmRecord::from_record(&g));
     }
@@ -77,10 +83,14 @@ impl Node {
     /// Validate `op` against the current state, then set the transitional state.
     /// Returns the previous state for revert-on-error.
     fn begin(&self, vm_id: &VmId, op: LifecycleOp) -> Result<VmState, VmmError> {
-        let rec = self.control.get(vm_id).ok_or(VmmError::VmNotFound(vm_id.clone()))?;
+        let rec = self
+            .control
+            .get(vm_id)
+            .ok_or(VmmError::VmNotFound(vm_id.clone()))?;
         let prev = {
             let g = rec.read().unwrap();
-            LifecycleOp::transition(op, g.state).map_err(|it| Self::invalid(vm_id, it.op, it.from))?;
+            LifecycleOp::transition(op, g.state)
+                .map_err(|it| Self::invalid(vm_id, it.op, it.from))?;
             g.state
         };
         {
@@ -113,7 +123,9 @@ impl Node {
     pub async fn create(&self, config: VmConfig, spec: VmSpec) -> VmmResult<VmId> {
         let vm_id = config.vm_id.clone();
         if self.control.get(&vm_id).is_some() {
-            return Err(VmmError::InvalidConfig(format!("vm {vm_id} already exists")));
+            return Err(VmmError::InvalidConfig(format!(
+                "vm {vm_id} already exists"
+            )));
         }
         let mut record = VmRecord::new(spec, VmState::Creating);
         record.vsock_cid = config.guest_cid;
@@ -222,9 +234,14 @@ impl Node {
         let lock = self.control.restore_lock(vm_id);
         let _guard = lock.lock().await;
         let snap = {
-            let rec = self.control.get(vm_id).ok_or(VmmError::VmNotFound(vm_id.clone()))?;
+            let rec = self
+                .control
+                .get(vm_id)
+                .ok_or(VmmError::VmNotFound(vm_id.clone()))?;
             let g = rec.read().unwrap();
-            g.snapshot.clone().ok_or_else(|| VmmError::SnapshotNotFound(vm_id.clone()))?
+            g.snapshot
+                .clone()
+                .ok_or_else(|| VmmError::SnapshotNotFound(vm_id.clone()))?
         };
         if let Err(e) = self.vmm.restore_vm(&snap).await {
             self.commit(vm_id, prev);
@@ -235,8 +252,12 @@ impl Node {
                 self.commit(vm_id, VmState::Started);
                 self.touch_activity(vm_id);
                 // Tell the guest to resume (run post_restore_cmd), now that it's running.
-                self.guest_hook(vm_id, LifecycleOp::Restore, tikovm_protocol::rpc::HostToGuest::PostRestore)
-                    .await;
+                self.guest_hook(
+                    vm_id,
+                    LifecycleOp::Restore,
+                    tikovm_protocol::rpc::HostToGuest::PostRestore,
+                )
+                .await;
                 Ok(())
             }
             Err(e) => {
@@ -273,8 +294,12 @@ impl Node {
     async fn freeze_inner(&self, vm_id: &VmId) -> VmmResult<()> {
         if self.state_of(vm_id) == Some(VmState::Started) {
             // Ask the guest to quiesce (run pre_suspend_cmd) while it can still run.
-            self.guest_hook(vm_id, LifecycleOp::Suspend, tikovm_protocol::rpc::HostToGuest::PreSuspend)
-                .await;
+            self.guest_hook(
+                vm_id,
+                LifecycleOp::Suspend,
+                tikovm_protocol::rpc::HostToGuest::PreSuspend,
+            )
+            .await;
             self.pause(vm_id).await?;
         }
         self.suspend(vm_id).await
@@ -308,14 +333,13 @@ impl Node {
     /// Best-effort host→guest command (lifecycle hook). Never fails the
     /// enclosing lifecycle op — a missing/unresponsive guest just means an
     /// abrupt freeze instead of a clean quiesce. Capped at 5 s.
-    async fn guest_hook(&self, vm_id: &VmId, _op: LifecycleOp, cmd: tikovm_protocol::rpc::HostToGuest) {
-        let Some(uds) = self
-            .vmm
-            .vsock_uds_path(vm_id)
-            .await
-            .ok()
-            .flatten()
-        else {
+    async fn guest_hook(
+        &self,
+        vm_id: &VmId,
+        _op: LifecycleOp,
+        cmd: tikovm_protocol::rpc::HostToGuest,
+    ) {
+        let Some(uds) = self.vmm.vsock_uds_path(vm_id).await.ok().flatten() else {
             tracing::info!(%vm_id, "guest_hook: no vsock uds path");
             return;
         };
@@ -337,7 +361,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{reconcile, SqliteStore};
+    use crate::store::{SqliteStore, reconcile};
     use crate::vmm::mock::MockVmm;
     use tikovm_protocol::manifest::WorkloadManifest;
 
@@ -365,7 +389,10 @@ mod tests {
     fn spec(id: &str) -> VmSpec {
         VmSpec {
             vm_id: id.into(),
-            rootfs: tikovm_protocol::vm::RootfsRef { path: "/r".into(), read_only_base: true },
+            rootfs: tikovm_protocol::vm::RootfsRef {
+                path: "/r".into(),
+                read_only_base: true,
+            },
             resources: tikovm_protocol::vm::ResourceConfig::default(),
             kernel: tikovm_protocol::vm::KernelSpec {
                 kernel_path: "/k".into(),
@@ -450,7 +477,12 @@ mod tests {
         let recovered = reconcile(&new_control, &*store).unwrap();
         assert_eq!(recovered, 1);
         assert_eq!(
-            new_control.get(&"vm-cr".to_string()).unwrap().read().unwrap().state,
+            new_control
+                .get(&"vm-cr".to_string())
+                .unwrap()
+                .read()
+                .unwrap()
+                .state,
             VmState::Suspended
         );
 

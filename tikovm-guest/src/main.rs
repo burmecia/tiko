@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
 
@@ -24,7 +24,11 @@ use tikovm_guest::supervisor::Supervisor;
 #[command(name = "tikovm-guestd", version, about = "tikovm in-VM guest agent")]
 struct Args {
     /// Path to the workload manifest.
-    #[arg(long, default_value = "/etc/tikovm/workload.toml", env = "TIKOVM_MANIFEST")]
+    #[arg(
+        long,
+        default_value = "/etc/tikovm/workload.toml",
+        env = "TIKOVM_MANIFEST"
+    )]
     manifest: PathBuf,
 }
 

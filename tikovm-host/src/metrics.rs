@@ -3,8 +3,8 @@
 //! counters recorded from the lifecycle/proxy paths and gauges derived from the
 //! control registry at scrape time. Exposed at `GET /metrics`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tikovm_protocol::vm::VmState;
 
@@ -52,7 +52,8 @@ pub fn record_suspend(duration_micros: u64) {
     if let Some(m) = get() {
         m.suspends.fetch_add(1, Ordering::Relaxed);
         m.suspend_count.fetch_add(1, Ordering::Relaxed);
-        m.suspend_micros_sum.fetch_add(duration_micros, Ordering::Relaxed);
+        m.suspend_micros_sum
+            .fetch_add(duration_micros, Ordering::Relaxed);
     }
 }
 
@@ -61,7 +62,8 @@ pub fn record_restore(duration_micros: u64) {
     if let Some(m) = get() {
         m.restores.fetch_add(1, Ordering::Relaxed);
         m.restore_count.fetch_add(1, Ordering::Relaxed);
-        m.restore_micros_sum.fetch_add(duration_micros, Ordering::Relaxed);
+        m.restore_micros_sum
+            .fetch_add(duration_micros, Ordering::Relaxed);
     }
 }
 
@@ -111,18 +113,34 @@ pub fn render(control: &Control) -> String {
 
     out.push_str("# HELP tikovm_vm_healthy VMs by guest-reported health.\n");
     out.push_str("# TYPE tikovm_vm_healthy gauge\n");
-    out.push_str(&format!("tikovm_vm_healthy{{status=\"healthy\"}} {healthy}\n"));
-    out.push_str(&format!("tikovm_vm_healthy{{status=\"unhealthy\"}} {unhealthy}\n"));
+    out.push_str(&format!(
+        "tikovm_vm_healthy{{status=\"healthy\"}} {healthy}\n"
+    ));
+    out.push_str(&format!(
+        "tikovm_vm_healthy{{status=\"unhealthy\"}} {unhealthy}\n"
+    ));
 
     let m = match get() {
         Some(m) => m,
         None => return out,
     };
     let counter = |name: &str, v: u64| format!("# TYPE {name} counter\n{name} {v}\n");
-    out.push_str(&counter("tikovm_suspends_total", m.suspends.load(Ordering::Relaxed)));
-    out.push_str(&counter("tikovm_restores_total", m.restores.load(Ordering::Relaxed)));
-    out.push_str(&counter("tikovm_destroys_total", m.destroys.load(Ordering::Relaxed)));
-    out.push_str(&counter("tikovm_proxy_connections_total", m.proxy_connections.load(Ordering::Relaxed)));
+    out.push_str(&counter(
+        "tikovm_suspends_total",
+        m.suspends.load(Ordering::Relaxed),
+    ));
+    out.push_str(&counter(
+        "tikovm_restores_total",
+        m.restores.load(Ordering::Relaxed),
+    ));
+    out.push_str(&counter(
+        "tikovm_destroys_total",
+        m.destroys.load(Ordering::Relaxed),
+    ));
+    out.push_str(&counter(
+        "tikovm_proxy_connections_total",
+        m.proxy_connections.load(Ordering::Relaxed),
+    ));
 
     // Poor-man's histogram: _sum + _count (no buckets). Good enough for averages.
     out.push_str("# TYPE tikovm_suspend_duration_micros summary\n");
@@ -130,13 +148,19 @@ pub fn render(control: &Control) -> String {
         "tikovm_suspend_duration_micros{{quantile=\"sum\"}} {}\n",
         m.suspend_micros_sum.load(Ordering::Relaxed)
     ));
-    out.push_str(&format!("tikovm_suspend_count {}\n", m.suspend_count.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "tikovm_suspend_count {}\n",
+        m.suspend_count.load(Ordering::Relaxed)
+    ));
     out.push_str("# TYPE tikovm_restore_duration_micros summary\n");
     out.push_str(&format!(
         "tikovm_restore_duration_micros{{quantile=\"sum\"}} {}\n",
         m.restore_micros_sum.load(Ordering::Relaxed)
     ));
-    out.push_str(&format!("tikovm_restore_count {}\n", m.restore_count.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "tikovm_restore_count {}\n",
+        m.restore_count.load(Ordering::Relaxed)
+    ));
     out
 }
 

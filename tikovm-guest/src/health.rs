@@ -47,7 +47,8 @@ async fn check(probe: &HealthProbe) -> bool {
     match probe {
         HealthProbe::None => true,
         HealthProbe::Tcp { port, .. } => TcpStream::connect(("127.0.0.1", *port)).await.is_ok(),
-        HealthProbe::Exec { cmd, .. } => match Command::new("sh").arg("-c").arg(cmd).status().await {
+        HealthProbe::Exec { cmd, .. } => match Command::new("sh").arg("-c").arg(cmd).status().await
+        {
             Ok(s) => s.success(),
             Err(e) => {
                 warn!(error = %e, "health exec probe failed");
@@ -65,7 +66,10 @@ async fn http_healthy(port: u16, path: &str) -> bool {
         Err(_) => return false,
     };
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    if tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes()).await.is_err() {
+    if tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes())
+        .await
+        .is_err()
+    {
         return false;
     }
     let mut buf = [0u8; 64];

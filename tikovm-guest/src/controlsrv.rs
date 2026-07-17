@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tikovm_protocol::codec;
 use tikovm_protocol::manifest::WorkloadManifest;
-use tikovm_protocol::rpc::{GuestReply, HostToGuest, GUEST_VSOCK_PORT};
+use tikovm_protocol::rpc::{GUEST_VSOCK_PORT, GuestReply, HostToGuest};
 
 /// `VMADDR_CID_ANY` — bind to any CID (the guest accepts connections addressed
 /// to its own CID).
@@ -72,7 +72,9 @@ fn handle(stream: &mut vsock::VsockStream, manifest: &WorkloadManifest) -> std::
 /// Run a manifest hook command (`sh -c <cmd>`), capped at [`HOOK_TIMEOUT`].
 /// Returns `Ok` when there's no hook or it exited successfully; `Error` otherwise.
 fn run_hook(cmd: &Option<String>, label: &str) -> GuestReply {
-    let Some(cmd) = cmd else { return GuestReply::Ok };
+    let Some(cmd) = cmd else {
+        return GuestReply::Ok;
+    };
     let mut child = match std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -82,7 +84,11 @@ fn run_hook(cmd: &Option<String>, label: &str) -> GuestReply {
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return GuestReply::Error { message: format!("spawn {label}: {e}") },
+        Err(e) => {
+            return GuestReply::Error {
+                message: format!("spawn {label}: {e}"),
+            };
+        }
     };
     let start = Instant::now();
     loop {
@@ -91,17 +97,25 @@ fn run_hook(cmd: &Option<String>, label: &str) -> GuestReply {
                 return if status.success() {
                     GuestReply::Ok
                 } else {
-                    GuestReply::Error { message: format!("{label} hook exited {status}") }
+                    GuestReply::Error {
+                        message: format!("{label} hook exited {status}"),
+                    }
                 };
             }
             Ok(None) => {
                 if start.elapsed() >= HOOK_TIMEOUT {
                     let _ = child.kill();
-                    return GuestReply::Error { message: format!("{label} hook timed out") };
+                    return GuestReply::Error {
+                        message: format!("{label} hook timed out"),
+                    };
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return GuestReply::Error { message: format!("{label} hook wait: {e}") },
+            Err(e) => {
+                return GuestReply::Error {
+                    message: format!("{label} hook wait: {e}"),
+                };
+            }
         }
     }
 }

@@ -82,7 +82,9 @@ impl PersistedVmRecord {
 }
 
 fn to_ms(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn from_ms(ms: i64) -> SystemTime {
@@ -113,7 +115,9 @@ impl SqliteStore {
                 json  TEXT NOT NULL
             );",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// In-memory store (useful for tests).
@@ -125,7 +129,9 @@ impl SqliteStore {
                 json  TEXT NOT NULL
             );",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -221,7 +227,10 @@ mod tests {
     fn spec(id: &str) -> VmSpec {
         VmSpec {
             vm_id: id.into(),
-            rootfs: tikovm_protocol::vm::RootfsRef { path: "/r".into(), read_only_base: true },
+            rootfs: tikovm_protocol::vm::RootfsRef {
+                path: "/r".into(),
+                read_only_base: true,
+            },
             resources: tikovm_protocol::vm::ResourceConfig::default(),
             kernel: tikovm_protocol::vm::KernelSpec {
                 kernel_path: "/k".into(),

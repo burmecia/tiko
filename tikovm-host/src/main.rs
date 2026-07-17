@@ -17,8 +17,8 @@ use tikovm_host::metrics;
 use tikovm_host::node::Node;
 use tikovm_host::proxy::Proxy;
 use tikovm_host::scheduler::Scheduler;
-use tikovm_host::store::{reconcile, SqliteStore};
-use tikovm_host::vmm::{default_vmm, mock::MockVmm, Vmm};
+use tikovm_host::store::{SqliteStore, reconcile};
+use tikovm_host::vmm::{Vmm, default_vmm, mock::MockVmm};
 
 #[derive(Debug, Parser)]
 #[command(name = "tikovm-hostd", version, about = "tikovm host daemon")]
@@ -93,7 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.proxy_default_vm.clone(),
             args.proxy_default_port,
         );
-        tokio::spawn(async move { let _ = proxy.run().await; });
+        tokio::spawn(async move {
+            let _ = proxy.run().await;
+        });
     }
 
     // --- control API (blocks) ---

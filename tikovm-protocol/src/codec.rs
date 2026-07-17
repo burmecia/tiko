@@ -29,7 +29,9 @@ pub fn encode_frame_bytes(payload: &[u8]) -> Vec<u8> {
 ///
 /// If a complete frame is available, returns `(decoded_message, bytes_consumed)`
 /// and leaves the remainder in `buf`. Returns `Ok(None)` if more bytes are needed.
-pub fn decode_frame<T: serde::de::DeserializeOwned>(buf: &[u8]) -> ProtocolResult<Option<(T, usize)>> {
+pub fn decode_frame<T: serde::de::DeserializeOwned>(
+    buf: &[u8],
+) -> ProtocolResult<Option<(T, usize)>> {
     match try_take_frame(buf)? {
         Some((payload, n)) => {
             let msg = serde_json::from_slice(&payload)?;
@@ -101,7 +103,10 @@ mod tests {
 
     #[test]
     fn round_trip_single_frame() {
-        let msg = Msg { v: 7, s: "hi".into() };
+        let msg = Msg {
+            v: 7,
+            s: "hi".into(),
+        };
         let frame = encode_frame(&msg).unwrap();
         let (decoded, n) = decode_frame::<Msg>(&frame).unwrap().unwrap();
         assert_eq!(decoded, msg);
@@ -111,8 +116,16 @@ mod tests {
     #[test]
     fn decoder_handles_partial_and_multiple() {
         let mut dec = FrameDecoder::new();
-        let a = encode_frame(&Msg { v: 1, s: "a".into() }).unwrap();
-        let b = encode_frame(&Msg { v: 2, s: "bb".into() }).unwrap();
+        let a = encode_frame(&Msg {
+            v: 1,
+            s: "a".into(),
+        })
+        .unwrap();
+        let b = encode_frame(&Msg {
+            v: 2,
+            s: "bb".into(),
+        })
+        .unwrap();
 
         // Feed first half of `a`.
         let split = a.len() / 2;

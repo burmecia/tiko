@@ -48,22 +48,35 @@ impl Vmm for MockVmm {
         let vm_id = config.vm_id.clone();
         let mut map = self.inner.lock().unwrap();
         if map.contains_key(&vm_id) {
-            return Err(VmmError::InvalidConfig(format!("vm {vm_id} already exists")));
+            return Err(VmmError::InvalidConfig(format!(
+                "vm {vm_id} already exists"
+            )));
         }
-        map.insert(vm_id.clone(), MockVm { state: BackendState::Created, config, snapshot: None });
+        map.insert(
+            vm_id.clone(),
+            MockVm {
+                state: BackendState::Created,
+                config,
+                snapshot: None,
+            },
+        );
         Ok(vm_id)
     }
 
     async fn start_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let mut map = self.inner.lock().unwrap();
-        let vm = map.get_mut(vm_id).ok_or(VmmError::VmNotFound(vm_id.clone()))?;
+        let vm = map
+            .get_mut(vm_id)
+            .ok_or(VmmError::VmNotFound(vm_id.clone()))?;
         vm.state = BackendState::Started;
         Ok(())
     }
 
     async fn pause_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let mut map = self.inner.lock().unwrap();
-        let vm = map.get_mut(vm_id).ok_or(VmmError::VmNotFound(vm_id.clone()))?;
+        let vm = map
+            .get_mut(vm_id)
+            .ok_or(VmmError::VmNotFound(vm_id.clone()))?;
         if vm.state != BackendState::Started {
             return Err(VmmError::InvalidState {
                 vm_id: vm_id.clone(),
@@ -77,7 +90,9 @@ impl Vmm for MockVmm {
 
     async fn resume_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         let mut map = self.inner.lock().unwrap();
-        let vm = map.get_mut(vm_id).ok_or(VmmError::VmNotFound(vm_id.clone()))?;
+        let vm = map
+            .get_mut(vm_id)
+            .ok_or(VmmError::VmNotFound(vm_id.clone()))?;
         if vm.state != BackendState::Paused {
             return Err(VmmError::InvalidState {
                 vm_id: vm_id.clone(),
@@ -91,7 +106,9 @@ impl Vmm for MockVmm {
 
     async fn snapshot_vm(&self, vm_id: &VmId) -> VmmResult<Snapshot> {
         let mut map = self.inner.lock().unwrap();
-        let vm = map.get_mut(vm_id).ok_or(VmmError::VmNotFound(vm_id.clone()))?;
+        let vm = map
+            .get_mut(vm_id)
+            .ok_or(VmmError::VmNotFound(vm_id.clone()))?;
         if vm.state != BackendState::Paused {
             return Err(VmmError::InvalidState {
                 vm_id: vm_id.clone(),
@@ -132,7 +149,9 @@ impl Vmm for MockVmm {
 
     async fn vm_state(&self, vm_id: &VmId) -> VmmResult<BackendState> {
         let map = self.inner.lock().unwrap();
-        map.get(vm_id).map(|v| v.state).ok_or(VmmError::VmNotFound(vm_id.clone()))
+        map.get(vm_id)
+            .map(|v| v.state)
+            .ok_or(VmmError::VmNotFound(vm_id.clone()))
     }
 
     async fn vm_guest_ip(&self, _vm_id: &VmId) -> VmmResult<Option<IpAddr>> {

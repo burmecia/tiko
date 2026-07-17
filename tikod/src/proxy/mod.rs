@@ -438,7 +438,10 @@ pub async fn resolve_guest(
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(ResolveError::Wake(e)),
         Err(_) => {
-            return Err(ResolveError::WakeTimeout(vm_id.clone(), resume_timeout_secs));
+            return Err(ResolveError::WakeTimeout(
+                vm_id.clone(),
+                resume_timeout_secs,
+            ));
         }
     }
 

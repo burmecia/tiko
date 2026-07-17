@@ -10,8 +10,8 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
-use tokio::sync::Notify;
 use tikovm_protocol::vm::{VmId, VmInfo, VmSpec, VmState};
+use tokio::sync::Notify;
 
 use crate::vmm::Snapshot;
 

@@ -138,11 +138,7 @@ impl PostgRest {
     async fn reload(&self) -> Result<(), Response> {
         let pid = self.pid.load(Ordering::SeqCst);
         if pid == 0 {
-            return Err(service_err(
-                "not_running",
-                409,
-                "postgrest is not running",
-            ));
+            return Err(service_err("not_running", 409, "postgrest is not running"));
         }
         match nix_kill(pid, libc::SIGUSR2) {
             Ok(()) => {
