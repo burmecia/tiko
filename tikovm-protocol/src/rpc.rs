@@ -63,15 +63,28 @@ pub enum HostReply {
     Error { message: String },
 }
 
-/// Host → guest command (future: host connects to the guest's listener).
+/// Host → guest command. The host connects to the guest's AF_VSOCK listener on
+/// [`GUEST_VSOCK_PORT`] (via the vsock UDS + `CONNECT`) to drive these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostToGuest {
     Start,
     Stop { mode: StopMode },
+    /// About to suspend: run `[suspend].pre_suspend_cmd`, then ack. Sent while
+    /// the VM is still running (before the host pauses).
     PreSuspend,
+    /// Just restored+resumed: run `[suspend].post_restore_cmd`.
     PostRestore,
     GetHealth,
+}
+
+/// Guest → host reply to a [`HostToGuest`] command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuestReply {
+    Ok,
+    Health { healthy: bool },
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -53,6 +53,12 @@ tick_secs = 2
 idle_secs = 15
 [[idle.probes]]
 kind = "host_network"
+
+# lifecycle hooks: the host sends PreSuspend/PostRestore over vsock; these run
+# inside the guest while it can still execute (marker echoes hit the console).
+[suspend]
+pre_suspend_cmd = "echo tikovm: pre-suspend hook ran"
+post_restore_cmd = "echo tikovm: post-restore hook ran"
 TOML
 
 sudo tee "$MNT/etc/systemd/system/tikovm-guestd.service" >/dev/null <<'UNIT'

@@ -225,6 +225,9 @@ impl Node {
             Ok(_) => {
                 self.commit(vm_id, VmState::Started);
                 self.touch_activity(vm_id);
+                // Tell the guest to resume (run post_restore_cmd), now that it's running.
+                self.guest_hook(vm_id, LifecycleOp::Restore, tikovm_protocol::rpc::HostToGuest::PostRestore)
+                    .await;
                 Ok(())
             }
             Err(e) => {
@@ -250,9 +253,12 @@ impl Node {
         }
     }
 
-    /// Scale-to-zero convenience: Started → Paused → Suspended.
+    /// Scale-to-zero convenience: Started → (PreSuspend hook) → Paused → Suspended.
     pub async fn freeze(&self, vm_id: &VmId) -> VmmResult<()> {
         if self.state_of(vm_id) == Some(VmState::Started) {
+            // Ask the guest to quiesce (run pre_suspend_cmd) while it can still run.
+            self.guest_hook(vm_id, LifecycleOp::Suspend, tikovm_protocol::rpc::HostToGuest::PreSuspend)
+                .await;
             self.pause(vm_id).await?;
         }
         self.suspend(vm_id).await
@@ -277,6 +283,34 @@ impl Node {
         let mut g = rec.write().unwrap();
         g.pause_epoch += 1;
         Some(g.pause_epoch)
+    }
+
+    /// Best-effort host→guest command (lifecycle hook). Never fails the
+    /// enclosing lifecycle op — a missing/unresponsive guest just means an
+    /// abrupt freeze instead of a clean quiesce. Capped at 5 s.
+    async fn guest_hook(&self, vm_id: &VmId, _op: LifecycleOp, cmd: tikovm_protocol::rpc::HostToGuest) {
+        let Some(uds) = self
+            .vmm
+            .vsock_uds_path(vm_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            tracing::info!(%vm_id, "guest_hook: no vsock uds path");
+            return;
+        };
+        let timeout = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(timeout, crate::guestlink::send_guest_cmd(&uds, &cmd)).await {
+            Ok(Ok(reply)) => {
+                tracing::info!(%vm_id, ?reply, "guest_hook: reply");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%vm_id, error = %e, "guest hook failed (proceeding without quiesce)");
+            }
+            Err(_) => {
+                tracing::warn!(%vm_id, "guest hook timed out (proceeding without quiesce)");
+            }
+        }
     }
 }
 

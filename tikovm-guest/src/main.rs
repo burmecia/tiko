@@ -53,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stop = supervisor.stop_handle();
     let mut sup_task = tokio::spawn(async move { supervisor.run().await });
 
+    // --- host->guest command server (lifecycle hooks: PreSuspend/PostRestore) ---
+    tikovm_guest::controlsrv::spawn(std::sync::Arc::new(manifest.clone()));
+
     // --- idle evaluator: scale-to-zero over the vsock control channel ---
     let mut idle_cancel: Option<Arc<Notify>> = None;
     if let Some(idle_policy) = manifest.idle.clone() {

@@ -20,7 +20,7 @@ use tokio::net::UnixListener;
 use tracing::{info, warn};
 
 use tikovm_protocol::codec;
-use tikovm_protocol::rpc::{GuestToHost, HostReply, NetworkStats, HOST_CTRL_PORT};
+use tikovm_protocol::rpc::{GuestReply, GuestToHost, HostReply, HostToGuest, NetworkStats, HOST_CTRL_PORT, GUEST_VSOCK_PORT};
 use tikovm_protocol::vm::VmId;
 
 use crate::node::Node;
@@ -143,6 +143,44 @@ async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, Strin
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
     Ok(buf)
+}
+
+/// Send a host→guest command by connecting to the VM's vsock UDS, issuing
+/// `CONNECT <GUEST_VSOCK_PORT>`, and exchanging one framed RPC.
+///
+/// `uds_base` is the VM's vsock UDS path (from `Vmm::vsock_uds_path`).
+pub async fn send_guest_cmd(uds_base: &std::path::Path, cmd: &HostToGuest) -> Result<GuestReply, String> {
+    let mut s = tokio::net::UnixStream::connect(uds_base).await.map_err(|e| e.to_string())?;
+    // Firecracker vsock host-initiated handshake: "CONNECT <port>\n" -> "OK <p>\n".
+    let connect = format!("CONNECT {GUEST_VSOCK_PORT}\n");
+    s.write_all(connect.as_bytes()).await.map_err(|e| e.to_string())?;
+    s.flush().await.map_err(|e| e.to_string())?;
+    // Read the ack line.
+    let mut ack = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = s.read(&mut byte).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        ack.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+        if ack.len() > 128 {
+            return Err("vsock ack line too long".into());
+        }
+    }
+    let ack_str = String::from_utf8_lossy(&ack);
+    if !ack_str.starts_with("OK") {
+        return Err(format!("vsock CONNECT denied: {}", ack_str.trim()));
+    }
+    // Frame the command and read the reply.
+    let payload = serde_json::to_vec(cmd).map_err(|e| e.to_string())?;
+    write_frame(&mut s, &payload).await?;
+    let reply_payload = read_frame(&mut s).await?;
+    let reply: GuestReply = serde_json::from_slice(&reply_payload).map_err(|e| e.to_string())?;
+    Ok(reply)
 }
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> Result<(), String> {
