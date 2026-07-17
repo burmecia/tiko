@@ -1,7 +1,16 @@
 # tikovm — General-Purpose VM Management Platform
 
-> Status: **Design** (not yet implemented). New crates, no changes to existing
-> `tikod` / `tikoguest` / `core` / `smgr` / `worker` / `pgsys`.
+> Status: **Design + implementation in progress.** Three new crates
+> (`tikovm-protocol`, `tikovm-host`/`tikovm-hostd`, `tikovm-guest`/`tikovm-guestd`)
+> with **no changes** to the existing `tikod` / `tikoguest` / `core` / `smgr` /
+> `worker` / `pgsys` and no Cargo dependency on them.
+>
+> **Implemented and validated on KVM** (Ubuntu 24.04 + Firecracker v1.17-dev):
+> the 13-state lifecycle (incl. suspend/restore), SQLite crash recovery, the
+> scheduler, the generic guest supervisor, and the **scale-to-zero loop** over
+> the vsock control channel (idle → suspend → wake-on-connect). See the
+> [Implementation status](#-implementation-status) appendix for the full matrix
+> of what is built vs. designed.
 
 ## 1. Goal
 
@@ -324,18 +333,35 @@ now expressed as an explicit state machine with clearer naming.
 
 ## 7. vsock control protocol
 
+> **Status: implemented & validated on KVM.** `tikovm-host/guestlink.rs`
+> (per-VM AF_UNIX server on `{vsock_uds}_9001`) + `tikovm-guest/hostlink.rs`
+> (`VsockHostLink`, AF_VSOCK client to CID 2:9001). The guest→host direction
+> (`GetNetworkStats`, `Suspend`) drives the scale-to-zero loop; the host→guest
+> command direction (`Start`/`Stop`/`PreSuspend`/`PostRestore`) is defined but
+> not yet wired (the loop currently needs only guest→host + wake-on-connect).
+
 Host ↔ guest runs over **virtio-vsock** (replacing today's HTTP-over-TAP on
-:9000). Firecracker supports it (`PUT /vsock` with `guest_cid` + `uds_path`;
-host connects via AF_UNIX, sends `CONNECT <port>\n`). The CI microvm kernel 6.1
-already enables `CONFIG_VIRTIO_VSOCKETS`.
+:9000). Firecracker supports it (`PUT /vsock` with `guest_cid` + `uds_path`).
+The CI microvm kernel 6.1 already enables `CONFIG_VIRTIO_VSOCKETS`.
+
+Two directions:
+- **Guest → host (control):** the guest connects (AF_VSOCK) to the host
+  (CID 2) on port 9001. Firecracker forwards this to the host's per-VM AF_UNIX
+  socket at `{vsock_uds}_9001`, so the host derives the target VM from *which
+  socket* the connection arrived on — the messages carry no `vm_id`.
+- **Host → guest (commands):** the host connects to the guest's AF_VSOCK
+  listener (port 9000) by connecting to the UDS and sending
+  `CONNECT <port>\n`.
 
 **Framing:** length-delimited JSON (`tikovm-protocol/codec.rs`).
 
 **Messages:**
-- `HostToGuest`: `Start`, `Stop`, `PreSuspend`, `PostRestore`, `GetHealth`,
-  `GetNetworkStats` (host answers its own — VM-scoped traffic stats), `Exec{cmd}`
-- `GuestToHost`: `Ready`, `HealthReport`, `SuspendRequest` ("I'm idle, suspend
-  me"), `ShutdownRequest` ("I'm done, destroy me")
+- `GuestToHost` (guest→host): `GetNetworkStats`, `Suspend`, `Shutdown`,
+  `Ready{workload}`, `HealthReport{healthy}`.
+- `HostReply` (host→guest): `Stats(NetworkStats)`, `Suspended{pause_epoch}`,
+  `Ok`, `Error{message}`.
+- `HostToGuest` (host→guest, defined): `Start`, `Stop{mode}`, `PreSuspend`,
+  `PostRestore`, `GetHealth`.
 
 **Snapshot/restore caveats (validated against Firecracker docs):**
 1. On `snapshot/create` the vsock device is **reset**; in-flight vsock
@@ -639,3 +665,37 @@ loop with zero workload-specific code in host/guest.
    lifecycle + fs.
 8. Echo rootfs + boot test.
 9. Tests across all crates (incl. a hostd crash/restart recovery test).
+
+## 20. Implementation status
+
+What is **built and validated** vs. **designed but not yet built**. Validations
+run on the dev host (Ubuntu 24.04 + KVM + Firecracker v1.17-dev); 34 unit tests
+pass and `cargo clippy` is clean on all three new crates.
+
+| Area | Status | Notes |
+|---|---|---|
+| `tikovm-protocol` (manifest, state machine, codec, routing, rpc, volumes) | ✅ built, unit-tested | |
+| 13-state lifecycle (`Node`, transition enforcement) | ✅ built, unit-tested | `create/start/pause/resume/suspend/restore/destroy/freeze` |
+| `Vmm` backends | ✅ `FirecrackerVmm` (Linux/KVM), `StubBackend` (non-Linux), `MockVmm` (tests) | overlay model + deterministic per-VM TAP/NAT networking |
+| Crash recovery (`SqliteStore`, write-through, `reconcile`) | ✅ built, unit-tested + binary `kill -9` test | restore-on-demand policy |
+| Scheduler (cron + interval, keep-warm/ephemeral) | ✅ built, unit-tested | ephemeral provisioning needs the full pipeline |
+| Generic guest supervisor (restart policy + backoff + graceful stop) | ✅ built, unit-tested | |
+| Idle evaluator (guest-authoritative scale-to-zero) | ✅ built, unit-tested | |
+| **vsock control channel** (§7) | ✅ built, validated on KVM | guest→host: `GetNetworkStats`, `Suspend`. host→guest commands defined, not wired |
+| **Scale-to-zero loop** (idle → suspend → wake-on-connect) | ✅ validated on KVM | restore ~0.35 s; the marquee serverless behavior |
+| Control API (`api/server.rs`) + `tikovm-hostd` daemon | ✅ built, validated | `--mock` dev mode + real Firecracker |
+| Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` |
+| TCP proxy (wake-on-connect data plane) | ✅ built, validated | single fixed target VM (multi-VM routing = next) |
+| Workload volumes (`local_fast`, `remote_slow`) | 🟡 designed | `VolumeTier`/`VolumeDecl` types exist; provisioner not built. Firecracker has no virtio-fs → `remote_slow` via virtio-block-from-host-mount (fallback NFS-in-guest) |
+| Host→guest commands (`PreSuspend`/`PostRestore` hooks) | 🟡 defined | for clean-snapshot quiesce; current freeze is abrupt |
+| Multi-VM proxy routing (by `RoutingRule`: Host/path/header) | 🟡 designed | current proxy forwards to one configured VM |
+| Prometheus metrics | 🟡 designed | tracing logs only today |
+| vhost-user-block prod path for `remote_slow` | 🟡 future | |
+| Multi-node clustering / distributed registry | 🟡 future | `StateStore` is the seam |
+| PG / language-runtime / cron rootfs workloads | 🟡 future | the platform is workload-agnostic; concrete rootfs to follow |
+
+**Verified on real microVMs:** provision → boot to `multi-user` → echo
+reachable at the guest IP → idle → guest signals suspend over vsock → host
+freezes (1 GB snapshot, RAM freed) → next connection wakes the VM
+(restore-on-demand) → echo responds. Survives a hard `kill -9` of `hostd` with
+SQLite recovery.
