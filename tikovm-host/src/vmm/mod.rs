@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tikovm_protocol::vm::VmId;
 
+#[cfg(target_os = "linux")]
+pub mod firecracker;
 pub mod mock;
 
 /// Coarse live state as observed by a backend. The control layer maps the full
@@ -143,6 +145,17 @@ pub trait Vmm: Send + Sync {
 /// On non-Linux platforms there is no hypervisor, so this returns a
 /// [`StubBackend`] whose every operation fails — letting the rest of the binary
 /// (config, API, proxy) compile and run for development.
+/// Returns the platform-default VMM backend.
+///
+/// On Linux this is the Firecracker backend; elsewhere a [`StubBackend`] whose
+/// every operation fails (lets the rest of the binary compile/run for dev).
+#[cfg(target_os = "linux")]
+pub fn default_vmm(snapshot_dir: PathBuf) -> Arc<dyn Vmm> {
+    Arc::new(firecracker::FirecrackerVmm::new(snapshot_dir))
+}
+
+/// Returns the platform-default VMM backend (non-Linux: stub).
+#[cfg(not(target_os = "linux"))]
 pub fn default_vmm(_snapshot_dir: PathBuf) -> Arc<dyn Vmm> {
     Arc::new(StubBackend)
 }

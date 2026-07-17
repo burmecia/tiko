@@ -1,6 +1,5 @@
 //! HTTP/1.1 control API server + pure dispatch function.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -48,17 +47,16 @@ impl Response {
 /// §10 over a minimal HTTP/1.1 connection per request.
 pub struct ApiServer {
     node: Arc<Node>,
-    next_cid: AtomicU32,
 }
 
 impl ApiServer {
     pub fn new(node: Arc<Node>) -> Self {
-        Self { node, next_cid: AtomicU32::new(3) }
+        Self { node }
     }
 
     /// Dispatch a parsed request. Pure (no I/O) apart from driving the Node.
     pub async fn handle(&self, method: &str, path: &str, body: &[u8]) -> Response {
-        dispatch(method, path, body, &self.node, self.next_cid.fetch_add(0, Ordering::Relaxed)).await
+        dispatch(method, path, body, &self.node, 0).await
     }
 
     /// Run the HTTP/1.1 server until cancelled.
@@ -107,7 +105,7 @@ impl ApiServer {
 }
 
 /// Pure dispatch (testable with any Node, incl. MockVmm-backed).
-pub async fn dispatch(method: &str, path: &str, body: &[u8], node: &Node, cid: u32) -> Response {
+pub async fn dispatch(method: &str, path: &str, body: &[u8], node: &Node, _cid: u32) -> Response {
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segs.as_slice() {
         ["health"] => Response::json(200, &serde_json::json!({"status": "ok"})),
@@ -117,14 +115,14 @@ pub async fn dispatch(method: &str, path: &str, body: &[u8], node: &Node, cid: u
                 Ok(s) => s,
                 Err(e) => return Response::bad_request(format!("invalid VmSpec: {e}")),
             };
-            provision(node, spec, cid).await
+            provision(node, spec).await
         }
         ["vms", "provision"] if method == "POST" => {
             let spec = match serde_json::from_slice::<VmSpec>(body) {
                 Ok(s) => s,
                 Err(e) => return Response::bad_request(format!("invalid VmSpec: {e}")),
             };
-            provision(node, spec, cid).await
+            provision(node, spec).await
         }
         ["vms", id] if method == "GET" => vm_view(node, id),
         ["vms", id] if method == "DELETE" => {
@@ -166,9 +164,9 @@ pub async fn dispatch(method: &str, path: &str, body: &[u8], node: &Node, cid: u
     }
 }
 
-async fn provision(node: &Node, spec: VmSpec, cid: u32) -> Response {
+async fn provision(node: &Node, spec: VmSpec) -> Response {
     let vm_id = spec.vm_id.clone();
-    let config = vm_config_from_spec(&spec, cid);
+    let config = vm_config_from_spec(&spec);
     match node.create(config, spec).await {
         Ok(_) => {
             // provision = create + start
@@ -223,7 +221,7 @@ fn err_from(e: crate::vmm::VmmError) -> Response {
 /// Derive a low-level [`VmConfig`] from a provision [`VmSpec`]. (Networking/vsock
 /// CID allocation and volume→drive expansion are elaborated when those modules
 /// land; for now volumes become drives and `cid` is caller-allocated.)
-pub fn vm_config_from_spec(spec: &VmSpec, cid: u32) -> VmConfig {
+pub fn vm_config_from_spec(spec: &VmSpec) -> VmConfig {
     let drives = spec
         .manifest
         .as_ref()
@@ -248,7 +246,9 @@ pub fn vm_config_from_spec(spec: &VmSpec, cid: u32) -> VmConfig {
         vcpus: spec.resources.vcpus,
         drives,
         initrd_path: spec.kernel.initrd_path.clone(),
-        guest_cid: Some(cid),
+        // vsock (control channel) is enabled once the guest agent that uses it
+        // is wired; restoring a vsock device needs a fresh UDS path per restore.
+        guest_cid: None,
     }
 }
 
