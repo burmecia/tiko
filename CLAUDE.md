@@ -11,6 +11,13 @@ and streams WAL to S3 for point-in-time recovery. Written in Rust, compiled as P
 libraries (extensions) plus standalone control-plane/CLI binaries. This is experimental, not
 production software.
 
+The repo also ships **`tikovm`** — a general-purpose, workload-agnostic microVM management platform
+(three crates: `tikovm-protocol` / `tikovm-host` / `tikovm-guest`) extracted and generalized from
+the `tikod`/`tikoguest` compute layer. `tikovm` manages Firecracker microVMs with a self-describing
+rootfs model, a 13-state lifecycle machine, scale-to-zero, scheduled jobs, 2-tier volumes, crash
+recovery, and HTTP header routing — with **no dependency** on the Postgres storage crates
+(`core`/`smgr`/`worker`/`pgsys`). The design lives at `docs/tikovm-design.md`.
+
 ## Build & Test
 
 Requires Rust 1.88+ (edition 2024). PostgreSQL 18 is a git submodule under `postgres/`, patched
@@ -31,6 +38,15 @@ cargo build -p smgr    # produces target/{debug,release}/libtikosmgr.a (staticli
 cargo build -p worker  # produces target/{debug,release}/libtikoworker.{dylib,so} (cdylib+rlib)
 ```
 
+`tikovm` builds and tests independently of Postgres (no PG submodule needed):
+
+```bash
+cargo build -p tikovm-protocol -p tikovm-host -p tikovm-guest
+cargo test  -p tikovm-protocol -p tikovm-host -p tikovm-guest   # unit tests (no KVM needed)
+cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clean on these crates
+./scripts/tikovm/run_e2e.sh          # full E2E on real KVM/Firecracker (17 checks)
+```
+
 `run_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/`TIKO_PROJECT_ID`/`TIKO_PITR_INTERVAL_SECS`, builds
 `smgr`, builds Postgres, builds `worker`, copies `libtikoworker` into
 `postgres/src/test/modules/test_tiko/`, then runs `make check` there with
@@ -45,14 +61,18 @@ Clippy note: `cargo clippy` run against `core`/`cli` aborts on pre-existing lint
 
 ```
 tiko/
-├── postgres/     # vendored PostgreSQL 18 (git submodule) + Tiko patches
-├── pgsys/        # hand-written PostgreSQL FFI bindings
-├── core/         # storage layer: chunks, manifests, store, I/O engine
-├── smgr/         # tikosmgr — PostgreSQL storage manager
-├── worker/       # tikoworker — background worker (AIO, WAL receiver, compactor)
-├── cli/          # operator CLIs: tiko_pitr, tiko_branch, tiko_restore, tiko_tlseg_viewer
-├── tikod/        # control plane: proxy, node/VMM lifecycle, HTTP API
-└── tikoguest/    # in-VM agent: pg control, observability, scaler, freeze
+├── postgres/         # vendored PostgreSQL 18 (git submodule) + Tiko patches
+├── pgsys/            # hand-written PostgreSQL FFI bindings
+├── core/             # storage layer: chunks, manifests, store, I/O engine
+├── smgr/             # tikosmgr — PostgreSQL storage manager
+├── worker/           # tikoworker — background worker (AIO, WAL receiver, compactor)
+├── cli/              # operator CLIs: tiko_pitr, tiko_branch, tiko_restore, tiko_tlseg_viewer
+├── tikod/            # control plane: proxy, node/VMM lifecycle, HTTP API
+├── tikoguest/        # in-VM agent: pg control, observability, scaler, freeze
+├── tikovm-protocol/  # tikovm shared types: manifest, state machine, vsock RPC, codec
+├── tikovm-host/      # tikovm host: tikovm-hostd daemon (lifecycle, scheduler, proxy, metrics)
+├── tikovm-guest/     # tikovm guest: tikovm-guestd (supervisor, idle, health, hooks)
+└── docs/             # tikovm-design.md
 ```
 
 ```
@@ -191,14 +211,62 @@ cache-dirty state.
 HTTP control API + PG wire-protocol proxy + VM orchestration. Not a GC/retention service (see
 Roadmap). Modules: `proxy/` (wire-protocol proxy with wake-on-connect/freeze, startup/cancel/error
 handling), `control/` (VM registry, idle policy, auto-pause enforcement), `node/` (VM lifecycle via
-the `Vmm` trait — Firecracker on Linux, Apple Virtualization Framework on macOS dev — plus snapshot
-cache), `api/` (HTTP server/client: `/vms/provision`, `/vms/{id}/db/*`, `/vms/{id}/branch/*`,
+the `Vmm` trait — Firecracker on Linux; `UnsupportedVmm` stub on macOS so it compiles but cannot run
+VMs), `api/` (HTTP server/client: `/vms/provision`, `/vms/{id}/db/*`, `/vms/{id}/branch/*`,
 `/vms/{id}/pitr/*`), `guestcontrol.rs` (talks to `tikoguest` over HTTP).
 
 ### `tikoguest` — in-VM agent
 Runs inside each microVM: `pg_ctl` lifecycle, observability (`pgmetrics.rs`), autoscaling
 (`scaler.rs`), freeze/backup coordination (`backup.rs`), and an HTTP server (`server.rs`) that
 `tikod` talks to.
+
+### `tikovm` — general-purpose microVM platform (workload-agnostic)
+Three crates (`tikovm-protocol` / `tikovm-host` / `tikovm-guest`) that generalize the `tikod`/
+`tikoguest` compute layer into a standalone, workload-agnostic microVM manager. **No Rust
+dependency** on `core`/`smgr`/`worker`/`pgsys` — cleanly liftable. Design doc:
+`docs/tikovm-design.md`. All three crates are `rlib`; `tikovm-host` and `tikovm-guest` also build
+`[[bin]]` targets (`tikovm-hostd`, `tikovm-guestd`).
+
+- **`tikovm-protocol`** — the host/guest contract. Sync and dependency-light (serde + thiserror,
+  no tokio). `manifest.rs` (`WorkloadManifest` TOML schema baked into the rootfs: process spec,
+  health probe, idle policy, suspend hooks, restart policy, expose, schedule, volumes), `vm.rs`
+  (12-variant `VmState` + `LifecycleOp::transition()` state-machine validator, `VmSpec`, `VmInfo`),
+  `rpc.rs` (vsock RPC: `GuestToHost`/`HostReply`/`HostToGuest`/`GuestReply` + port constants),
+  `codec.rs` (length-delimited JSON framing with incremental `FrameDecoder`, 16 MiB max),
+  `volume.rs` (`VolumeTier`: `LocalFast` ephemeral ext4 / `RemoteSlow` persistent remote ext4),
+  `routing.rs` (`RoutingRule`: HTTP host/path/header, TCP, token selectors), `error.rs`
+  (`ErrorEnvelope` shared by vsock RPC and HTTP API).
+- **`tikovm-host`** (binary `tikovm-hostd`) — the host daemon. `vmm/` (`Vmm` async_trait +
+  `FirecrackerVmm` on Linux/KVM, `StubBackend` elsewhere, `MockVmm` for tests; `firecracker.rs`
+  derives per-VM networking from the `vm_id`, runs a base-RO + per-VM-RW-overlay rootfs model,
+  formats `local_fast` ext4 volumes, and does snapshot/restore over a Unix socket), `node.rs`
+  (lifecycle orchestration enforcing the 13-state machine; `suspend`=snapshot+destroy,
+  `restore`=restore+resume single-flight + timed; `freeze`=PreSuspend-hook+pause+suspend for
+  scale-to-zero; `ensure_running`=wake-on-demand; write-through persistence + best-effort host→guest
+  lifecycle hooks), `control.rs` (in-memory `DashMap` VM registry, single-flight restore locks),
+  `store.rs` (`SqliteStore` + `reconcile()` crash recovery: a VM live at crash is collapsed to
+  `Suspended` if a snapshot exists, else dropped), `scheduler.rs` (cron + interval scheduled jobs,
+  keep-warm/ephemeral), `proxy/` (TCP proxy that peeks the HTTP head, routes by
+  `X-Tiko-Endpoint` header, wakes a suspended VM on connect, then bidirectionally splices),
+  `guestlink.rs` (per-VM vsock server: `GetNetworkStats`/`Suspend`→freeze/`Shutdown`/`HealthReport`),
+  `metrics.rs` (Prometheus `/metrics`: VM-by-state + VM-by-health gauges, suspend/restore/destroy/
+  proxy counters, suspend/restore duration), `api/` (HTTP/1.1 control API:
+  `/vms/provision`, `/vms/{id}/{op}`, `/vms/{id}/ip`, `/metrics`).
+- **`tikovm-guest`** (binary `tikovm-guestd`) — in-VM agent. `supervisor.rs` (runs the manifest's
+  `[process]` under `RestartPolicy` with backoff + graceful SIGTERM→SIGKILL), `idle.rs`
+  (`IdleEvaluator` — the guest-authoritative scale-to-zero brain: collects probe signals each tick,
+  accumulates sustained-idle seconds, signals the host to `freeze` when the threshold is reached),
+  `health.rs` (`HealthMonitor`: http/tcp/exec/none probes, reports to host), `hostlink.rs`
+  (`VsockHostLink` — production `HostComm` impl over virtio-vsock to CID 2), `controlsrv.rs`
+  (AF_VSOCK listener for host→guest `PreSuspend`/`PostRestore` hook commands), `fs.rs`
+  (mounts volumes by `LABEL=` at boot), `manifest.rs` (TOML loader). `examples/echo-server.rs` is
+  the demo workload baked into the echo rootfs.
+
+**Scale-to-zero flow**: the guest `IdleEvaluator` signals the host over vsock → `Node.freeze`
+(runs PreSuspend hook → pause → snapshot → destroy the VM) → the VM is `Suspended`. An inbound
+proxy connection triggers `Node.ensure_running` → `restore` (single-flight) → resume → splice.
+Validated wake latency ~0.35–0.4 s on KVM. `scripts/tikovm/run_e2e.sh` is the canonical end-to-end
+test (provision → proxy → scale-to-zero → lifecycle → crash recovery → metrics).
 
 ### Copy-on-write branching
 Every database is a branch of a seed database. A chunk's `ChunkRef` can reference the *parent*
@@ -231,3 +299,12 @@ Per the README's own roadmap and verified absent from the code:
   filesystem, potentially NFS-mounted) is the only working backend today.
 - Baking more services (PostgREST, Auth) into the guest rootfs.
 - Externalizing scheduled jobs (`pg_cron`) into `tikod`.
+
+### tikovm (design §16, §20)
+All core designed features are implemented and validated on KVM (see `docs/tikovm-design.md` §20
+for the status matrix). Remaining / future:
+- **Module refactor**: `vmm/firecracker.rs` is ~1150 lines with networking + storage inline; split
+  into `network/` + `storage/` modules and a vhost-user-block production path.
+- **Concrete workloads**: the echo server is the only demo workload. PG migration (the real Tiko
+  use case), Lambda-style runtimes, and cron jobs are designed but not yet built.
+- **Multi-node clustering**: single-node today; no distributed scheduling or VM migration.

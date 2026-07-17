@@ -2,8 +2,8 @@
 
 Guide for AI agents working in this repo. `CLAUDE.md` has the full architecture
 write-up — read it for deep context (crate boundaries, smgr/worker IPC, AIO
-integration, COW branching, PITR). This file captures only what you'd likely get
-wrong without being told.
+integration, COW branching, PITR, and the tikovm microVM platform). This file
+captures only what you'd likely get wrong without being told.
 
 ## Build & test commands
 
@@ -24,11 +24,22 @@ build `smgr` (staticlib, linked into PG) → `make && make install` in `postgres
 Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
 `tikoguest`). `tikod`'s integration tests (`tikod/tests/`) only build on Linux.
 
+### tikovm (independent of Postgres — no PG submodule needed)
+
+```bash
+cargo build -p tikovm-protocol -p tikovm-host -p tikovm-guest
+cargo test  -p tikovm-protocol -p tikovm-host -p tikovm-guest   # unit tests, no KVM
+cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine on these
+./scripts/tikovm/run_e2e.sh    # full E2E on real KVM/Firecracker (provision→scale-to-zero→
+                               #   lifecycle→crash recovery→metrics; 17 PASS/FAIL checks)
+```
+
 ## Gotchas an agent will hit
 
 - **Do NOT run `cargo clippy`** on `core`/`smgr`/`worker`/`cli`/`pgsys`. Pre-existing
   lint errors in the hand-written FFI bindings (`pgsys`) abort the build. Verify
-  changes with `cargo build` / `cargo test` instead.
+  changes with `cargo build` / `cargo test` instead. (Exception: clippy is **fine**
+  on the `tikovm-*` crates — they have no `pgsys` dependency.)
 - **`tikod` builds on macOS but cannot run VMs.** `default_vmm` has a
   `#[cfg(target_os = "linux")]` Firecracker branch and a `#[cfg(not(target_os = "linux"))]`
   branch that returns an `UnsupportedVmm` stub (every `Vmm` op errors with
@@ -47,6 +58,20 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
 - **macOS System V shmem leak**: `run_test.sh` cleans orphaned `ipcs -m` segments
   first because macOS caps `kern.sysv.shmmni` at 32 and each killed postgres leaks
   one. If `make check` hangs/fails on shmem, clear them manually.
+- **`tikovm-hostd` compiles anywhere but only runs VMs on Linux + KVM.**
+  `default_vmm()` returns `FirecrackerVmm` under `#[cfg(target_os="linux")]` and a
+  `StubBackend` (every `Vmm` op errors with `VmmError::Backend`) elsewhere. So on
+  macOS you can build/test the `tikovm-*` crates (unit tests + `MockVmm` API tests
+  pass) but cannot create real VMs. Real runs need `/dev/kvm` + the `FIRECRACKER_BIN`
+  binary + passwordless sudo (for TAP/iptables/mount).
+- **`tikovm-*` crates have NO dependency on `core`/`smgr`/`worker`/`pgsys`** —
+  they are cleanly liftable into a standalone repo. The only inter-crate Cargo edge
+  is `tikovm-host`/`tikovm-guest` → `tikovm-protocol`.
+- **`run_e2e.sh` rebuilds the echo rootfs each run.**
+  `scripts/tikovm/build_echo_rootfs.sh` loop-mounts the ubuntu base rootfs and
+  injects the freshly-built `tikovm-guestd` + `echo-server` + `workload.toml`, so a
+  stale rootfs is never the bug. It expects assets under `tikod/assets/`
+  (`vmlinux-6.1`, `ubuntu-24.04-rootfs.ext4`, `tiko-initramfs.cpio.gz`).
 
 ## Architecture facts that aren't obvious from filenames
 
@@ -64,6 +89,13 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
   runtime via `shared_preload_libraries`. `cli`/`tikod`/`tikoguest` are binaries.
 - **`tikod` and `tikoguest` have NO Rust dependency on `core`/`smgr`/`worker`** —
   they orchestrate by spawning CLI binaries / `pg_ctl` and talking HTTP.
+- **`tikovm` is a separate platform** (3 crates: `tikovm-protocol`/`-host`/`-guest`)
+  generalized from `tikod`/`tikoguest`. It has its own daemon (`tikovm-hostd`), its
+  own guest agent (`tikovm-guestd`), and its own design doc
+  (`docs/tikovm-design.md`). Idle detection is **guest-authoritative**: the guest's
+  `IdleEvaluator` signals the host over vsock to `freeze` (pause→snapshot→destroy);
+  an inbound proxy connection triggers `restore`+`resume` (single-flight). `suspend`
+  in tikovm = snapshot+destroy (no checkpoint file beyond the snapshot).
 - **Two smgr I/O paths**: sync smgr functions call `core::ops` directly in the
   backend (correct because callers may pass backend-local memory the worker can't
   reach cross-process); the async path (`tiko_startreadv`) goes through the
@@ -88,5 +120,8 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
 ## Notes that differ from defaults
 
 - `psql` selects a database via `options='-c tiko.endpoint=vm-N'` (routed by `tikod`).
+- The `tikovm` proxy routes via `X-Tiko-Endpoint: vm-N` header (or a configured
+  default VM); `tikovm-hostd` is started with `--proxy-default-vm`/`--proxy-default-port`.
 - There is no `rust-toolchain.toml`; minimum is Rust **1.88, edition 2024**.
-- No CI workflows are defined; `./scripts/run_test.sh` is the canonical check.
+- No CI workflows are defined; `./scripts/run_test.sh` is the canonical PG check,
+  `./scripts/tikovm/run_e2e.sh` the canonical tikovm check.
