@@ -14,6 +14,7 @@ use tikovm_host::api::ApiServer;
 use tikovm_host::config::HostConfig;
 use tikovm_host::control::Control;
 use tikovm_host::node::Node;
+use tikovm_host::proxy::TcpProxy;
 use tikovm_host::scheduler::Scheduler;
 use tikovm_host::store::{reconcile, SqliteStore};
 use tikovm_host::vmm::{default_vmm, mock::MockVmm, Vmm};
@@ -38,6 +39,18 @@ struct Args {
     /// without KVM.
     #[arg(long, default_value_t = false)]
     mock: bool,
+
+    /// TCP proxy listen address (data plane). Enables wake-on-connect routing.
+    #[arg(long)]
+    proxy_listen: Option<String>,
+
+    /// Target VM id the proxy forwards to (single-VM demo mode).
+    #[arg(long, requires = "proxy_listen")]
+    proxy_target_vm: Option<String>,
+
+    /// Target workload port inside the VM.
+    #[arg(long, default_value_t = 8080, requires = "proxy_listen")]
+    proxy_target_port: u16,
 }
 
 #[tokio::main]
@@ -69,6 +82,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- scheduler (scheduled-job triggers) ---
     let sched = Arc::new(Scheduler::new(node.clone()));
     tokio::spawn(async move { sched.run().await });
+
+    // --- TCP proxy (wake-on-connect data plane), if configured ---
+    if let Some(proxy_listen) = args.proxy_listen.clone()
+        && let Some(target_vm) = args.proxy_target_vm.clone()
+    {
+        let proxy = TcpProxy::new(
+            node.clone(),
+            proxy_listen.parse().expect("proxy_listen addr"),
+            target_vm,
+            args.proxy_target_port,
+        );
+        tokio::spawn(async move { let _ = proxy.run().await; });
+    }
 
     // --- control API (blocks) ---
     let api = Arc::new(ApiServer::new(node));

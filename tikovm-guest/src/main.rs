@@ -1,16 +1,19 @@
 //! `tikovm-guestd` — the in-VM guest agent.
 //!
-//! Loads the `WorkloadManifest` and supervises its `[process]` per the restart
-//! policy. Health reporting, idle evaluation, and the vsock host channel are
-//! layered in as the corresponding modules land; this entry point wires the
-//! supervisor now so a rootfs-baked workload actually runs.
+//! Loads the `WorkloadManifest`, supervises its `[process]`, and (when an
+//! `[idle]` policy is declared) runs the idle evaluator that signals the host
+//! to suspend when the workload is sustained-idle (scale-to-zero).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
 
+use tikovm_guest::hostlink::HttpHostLink;
+use tikovm_guest::idle::IdleEvaluator;
 use tikovm_guest::manifest;
 use tikovm_guest::supervisor::Supervisor;
 
@@ -29,8 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    let manifest = manifest::load(&args.manifest);
-    let manifest = match manifest {
+    let manifest = match manifest::load(&args.manifest) {
         Ok(m) => {
             tracing::info!(workload = %m.workload, "tikovm-guestd started; supervising workload");
             m
@@ -46,21 +48,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    let sup = Supervisor::new(proc, manifest.restart.clone());
-    let stop = sup.stop_handle();
+    // --- supervisor: run the workload process under the restart policy ---
+    let supervisor = Supervisor::new(proc, manifest.restart.clone());
+    let stop = supervisor.stop_handle();
+    let mut sup_task = tokio::spawn(async move { supervisor.run().await });
 
-    // Graceful shutdown on SIGTERM / SIGINT (e.g. systemd stopping the unit).
+    // --- idle evaluator: scale-to-zero (only if [idle] + [expose] declared) ---
+    let mut idle_cancel: Option<Arc<Notify>> = None;
+    if let Some(idle_policy) = manifest.idle.clone()
+        && let Some(expose) = &manifest.expose
+    {
+        let vm_id = std::env::var("TIKOVM_VM_ID").unwrap_or_else(|_| "vm".into());
+        match HttpHostLink::discover(vm_id, expose.http_port).await {
+            Ok(link) => {
+                tracing::info!(
+                    host_api = %link.vm_id(),
+                    "idle evaluator enabled (scale-to-zero)"
+                );
+                let cancel = Arc::new(Notify::new());
+                idle_cancel = Some(cancel.clone());
+                let host = link.into_host_comm();
+                let ev = Arc::new(IdleEvaluator::new(idle_policy, host));
+                tokio::spawn(async move { ev.run(cancel).await });
+            }
+            Err(e) => tracing::warn!(error = %e, "could not enable idle evaluator; scale-to-zero disabled"),
+        }
+    }
+
+    // --- graceful shutdown on SIGTERM / SIGINT, or supervisor self-exit ---
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = term.recv() => tracing::info!("received SIGTERM"),
-            _ = int.recv() => tracing::info!("received SIGINT"),
+    tokio::select! {
+        biased;
+        _ = &mut sup_task => {
+            tracing::info!("supervisor exited");
+            if let Some(c) = &idle_cancel { c.notify_one(); }
+            return Ok(());
         }
-        stop.stop();
-    });
-
-    sup.run().await;
-    tracing::info!("supervisor exited; guestd shutting down");
+        _ = term.recv() => tracing::info!("received SIGTERM"),
+        _ = int.recv() => tracing::info!("received SIGINT"),
+    }
+    stop.stop();
+    if let Some(c) = &idle_cancel { c.notify_one(); }
+    let _ = sup_task.await;
+    tracing::info!("guestd shutting down");
     Ok(())
 }

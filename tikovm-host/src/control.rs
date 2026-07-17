@@ -98,6 +98,15 @@ impl Control {
         self.vms.get(vm_id).map(|r| r.clone())
     }
 
+    /// Find a VM by its guest IP (the guest signals over the TAP network
+    /// knowing only its own IP, not its vm_id).
+    pub fn find_by_guest_ip(&self, ip: IpAddr) -> Option<(VmId, Arc<RwLock<VmRecord>>)> {
+        self.vms
+            .iter()
+            .find(|r| r.value().read().unwrap().guest_ip == Some(ip))
+            .map(|r| (r.key().clone(), r.value().clone()))
+    }
+
     /// Remove a record (and its coordination primitives).
     pub fn remove(&self, vm_id: &VmId) -> Option<Arc<RwLock<VmRecord>>> {
         self.restore_locks.remove(vm_id);

@@ -5,6 +5,7 @@
 //!
 //! See `docs/tikovm-design.md`. Modules land as the implementation progresses.
 
+pub mod hostlink;
 pub mod idle;
 pub mod manifest;
 pub mod supervisor;

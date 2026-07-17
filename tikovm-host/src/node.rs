@@ -120,6 +120,13 @@ impl Node {
         self.control.register(record);
         match self.vmm.create_vm(config).await {
             Ok(id) => {
+                // Populate the guest IP (used by the proxy and the by-ip
+                // guest-signal resolution).
+                if let Ok(Some(ip)) = self.vmm.vm_guest_ip(&vm_id).await
+                    && let Some(rec) = self.control.get(&vm_id)
+                {
+                    rec.write().unwrap().guest_ip = Some(ip);
+                }
                 self.commit(&vm_id, VmState::Created);
                 Ok(id)
             }

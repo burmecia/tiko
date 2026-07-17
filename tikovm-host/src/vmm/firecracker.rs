@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
@@ -451,6 +452,8 @@ pub struct FirecrackerVmm {
     runtime_dir: PathBuf,
     firecracker_bin: PathBuf,
     vms: StdMutex<HashMap<VmId, FcVmEntry>>,
+    /// Next virtio-vsock guest CID to allocate (CIDs must be >= 3; 2 is host).
+    next_cid: AtomicU32,
 }
 
 impl FirecrackerVmm {
@@ -460,7 +463,23 @@ impl FirecrackerVmm {
         std::fs::create_dir_all(&snapshot_dir).ok();
         ensure_kvm_access();
         let fc_bin = std::env::var("FIRECRACKER_BIN").unwrap_or_else(|_| "firecracker".into());
-        Self { snapshot_dir, runtime_dir, firecracker_bin: PathBuf::from(fc_bin), vms: StdMutex::new(HashMap::new()) }
+        Self {
+            snapshot_dir,
+            runtime_dir,
+            firecracker_bin: PathBuf::from(fc_bin),
+            vms: StdMutex::new(HashMap::new()),
+            next_cid: AtomicU32::new(3),
+        }
+    }
+
+    /// Allocate a unique guest vsock CID (>= 3).
+    fn alloc_cid(&self) -> u32 {
+        loop {
+            let cid = self.next_cid.fetch_add(1, Ordering::Relaxed);
+            if cid >= 3 {
+                return cid;
+            }
+        }
     }
 
     fn vsock_uds(&self, vm_id: &str) -> PathBuf {
@@ -592,6 +611,12 @@ impl FirecrackerVmm {
 #[async_trait]
 impl Vmm for FirecrackerVmm {
     async fn create_vm(&self, config: VmConfig) -> VmmResult<VmId> {
+        // Assign a vsock CID if none given so it is captured in the snapshot and
+        // reused on restore (the guest's vsock identity must stay stable).
+        let mut config = config;
+        if config.guest_cid.is_none() {
+            config.guest_cid = Some(self.alloc_cid());
+        }
         let vm_id = config.vm_id.clone();
         if !config.kernel_path.exists() {
             return Err(VmmError::InvalidConfig(format!("kernel not found: {}", config.kernel_path.display())));

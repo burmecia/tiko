@@ -142,6 +142,25 @@ pub async fn dispatch(method: &str, path: &str, body: &[u8], node: &Node, _cid: 
                 Err(e) => err_from(e),
             }
         }
+        // Guest-driven signal: the agent POSTs its own IP (it doesn't know its
+        // vm_id); the host resolves guest_ip -> vm and freezes.
+        ["vms", "by-ip", ip, "suspend-request"] if method == "POST" => {
+            let ip: std::net::IpAddr = match ip.parse() {
+                Ok(v) => v,
+                Err(_) => return Response::bad_request("invalid ip"),
+            };
+            let (vm_id, _rec) = match node.control().find_by_guest_ip(ip) {
+                Some(x) => x,
+                None => return Response::not_found(format!("no vm with guest ip {ip}")),
+            };
+            match node.freeze(&vm_id).await {
+                Ok(_) => {
+                    let epoch = node.bump_pause_epoch(&vm_id).unwrap_or(0);
+                    Response::json(202, &serde_json::json!({"vm_id": vm_id, "pause_epoch": epoch}))
+                }
+                Err(e) => err_from(e),
+            }
+        }
         ["vms", id, "shutdown-request"] if method == "POST" => {
             match node.destroy(&id.to_string()).await {
                 Ok(_) => Response::ok_empty(),

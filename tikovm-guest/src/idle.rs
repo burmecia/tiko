@@ -44,7 +44,7 @@ impl IdleEvaluator {
     }
 
     /// Run the evaluator loop until cancelled.
-    pub async fn run(self: Arc<Self>, cancel: tokio::sync::Notify) {
+    pub async fn run(self: Arc<Self>, cancel: Arc<tokio::sync::Notify>) {
         let tick = Duration::from_secs(self.policy.tick_secs.max(1));
         loop {
             tokio::select! {

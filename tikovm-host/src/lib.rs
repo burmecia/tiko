@@ -10,6 +10,7 @@ pub mod api;
 pub mod config;
 pub mod control;
 pub mod node;
+pub mod proxy;
 pub mod scheduler;
 pub mod store;
 pub mod vmm;

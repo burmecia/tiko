@@ -42,6 +42,17 @@ kind = "http"
 path = "/health"
 port = 8080
 interval_secs = 10
+
+[expose]
+http_port = 8080
+
+# scale-to-zero: after 15s with no connections to :8080, guestd asks the host
+# to suspend this VM. The host proxy wakes it on the next connection.
+[idle]
+tick_secs = 2
+idle_secs = 15
+[[idle.probes]]
+kind = "host_network"
 TOML
 
 sudo tee "$MNT/etc/systemd/system/tikovm-guestd.service" >/dev/null <<'UNIT'
