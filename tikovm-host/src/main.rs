@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 use tikovm_host::api::ApiServer;
 use tikovm_host::config::HostConfig;
 use tikovm_host::control::Control;
+use tikovm_host::metrics;
 use tikovm_host::node::Node;
 use tikovm_host::proxy::Proxy;
 use tikovm_host::scheduler::Scheduler;
@@ -58,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
+    metrics::init();
 
     let args = Args::parse();
     let cfg = HostConfig::load(args.config.as_deref(), &args.data_dir, &args.api_listen)?;

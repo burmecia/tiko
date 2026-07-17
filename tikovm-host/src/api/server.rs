@@ -140,6 +140,11 @@ pub async fn dispatch(method: &str, path: &str, _body: &[u8], node: &Node) -> Re
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segs.as_slice() {
         ["health"] => Response::json(200, &serde_json::json!({"status": "ok"})),
+        ["metrics"] if method == "GET" => Response {
+            status: 200,
+            body: crate::metrics::render(node.control()).into_bytes(),
+            content_type: "text/plain; version=0.0.4",
+        },
         ["vms"] if method == "GET" => Response::json(200, &node.control().list()),
         ["vms", id] if method == "GET" => vm_view(node, id),
         ["vms", id] if method == "DELETE" => match node.destroy(&id.to_string()).await {

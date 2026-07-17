@@ -15,7 +15,7 @@ pub type VmId = String;
 /// The full VM state machine. Tracked by the host's control registry; the
 /// `Vmm` backend reports only coarse live states (`Created`/`Started`/`Paused`/
 /// `Destroyed`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VmState {
     // --- transitional ---

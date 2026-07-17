@@ -77,6 +77,7 @@ async fn handle(
 ) -> Result<(), String> {
     // Peek the HTTP request head to extract the routing header.
     let head = read_http_head(&mut client).await?;
+    crate::metrics::record_proxy_connection();
 
     // Resolve the target VM + workload port.
     let (vm_id, port) = resolve_target(&head, &node, default_vm.clone(), default_port)?;

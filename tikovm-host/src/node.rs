@@ -209,6 +209,15 @@ impl Node {
 
     /// Wake a suspended VM (Suspended → Started). Single-flight per VM.
     pub async fn restore(&self, vm_id: &VmId) -> VmmResult<()> {
+        let t = std::time::Instant::now();
+        let res = self.restore_inner(vm_id).await;
+        if res.is_ok() {
+            crate::metrics::record_restore(t.elapsed().as_micros() as u64);
+        }
+        res
+    }
+
+    async fn restore_inner(&self, vm_id: &VmId) -> VmmResult<()> {
         let prev = self.begin(vm_id, LifecycleOp::Restore)?;
         let lock = self.control.restore_lock(vm_id);
         let _guard = lock.lock().await;
@@ -255,6 +264,13 @@ impl Node {
 
     /// Scale-to-zero convenience: Started → (PreSuspend hook) → Paused → Suspended.
     pub async fn freeze(&self, vm_id: &VmId) -> VmmResult<()> {
+        let t = std::time::Instant::now();
+        let res = self.freeze_inner(vm_id).await;
+        crate::metrics::record_suspend(t.elapsed().as_micros() as u64);
+        res
+    }
+
+    async fn freeze_inner(&self, vm_id: &VmId) -> VmmResult<()> {
         if self.state_of(vm_id) == Some(VmState::Started) {
             // Ask the guest to quiesce (run pre_suspend_cmd) while it can still run.
             self.guest_hook(vm_id, LifecycleOp::Suspend, tikovm_protocol::rpc::HostToGuest::PreSuspend)
@@ -275,6 +291,7 @@ impl Node {
         // Terminal destroy: release ephemeral per-VM host resources (local_fast
         // volume images). Best-effort — must not block cleanup.
         let _ = self.vmm.cleanup_vm(vm_id).await;
+        crate::metrics::record_destroy();
         self.control.remove(vm_id);
         self.persist_delete(vm_id);
         Ok(())
