@@ -28,3 +28,4 @@ clap = { version = "4", features = ["derive", "env"] }
 libc = { workspace = true }
 toml = "0.8"
 async-trait = "0.1"
+vsock = "0.5"

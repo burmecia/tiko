@@ -56,7 +56,36 @@ impl ApiServer {
 
     /// Dispatch a parsed request. Pure (no I/O) apart from driving the Node.
     pub async fn handle(&self, method: &str, path: &str, body: &[u8]) -> Response {
-        dispatch(method, path, body, &self.node, 0).await
+        let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        // Provision/create need Arc<Node> to spawn the per-VM vsock guestlink.
+        let is_provision = (method == "POST" && segs == ["vms", "provision"])
+            || (method == "PUT" && segs == ["vms"]);
+        if is_provision {
+            let spec = match serde_json::from_slice::<VmSpec>(body) {
+                Ok(s) => s,
+                Err(e) => return Response::bad_request(format!("invalid VmSpec: {e}")),
+            };
+            return self.provision(spec, method == "POST").await;
+        }
+        dispatch(method, path, body, &self.node).await
+    }
+
+    /// Create (+ optionally start) a VM and spawn its per-VM vsock guestlink.
+    async fn provision(&self, spec: VmSpec, start: bool) -> Response {
+        let vm_id = spec.vm_id.clone();
+        let node = self.node.clone();
+        let resp = provision(&node, spec, start).await;
+        // Spawn the guestlink server only on a successful create.
+        if resp.status == 201 && let Ok(Some(uds)) = node.vmm().vsock_uds_path(&vm_id).await {
+            let node = node.clone();
+            tokio::spawn(async move {
+                let gl = crate::guestlink::GuestLink::new(node, vm_id.clone(), uds);
+                if let Err(e) = gl.run().await {
+                    tracing::warn!(%vm_id, error = %e, "guestlink exited");
+                }
+            });
+        }
+        resp
     }
 
     /// Run the HTTP/1.1 server until cancelled.
@@ -104,95 +133,57 @@ impl ApiServer {
     }
 }
 
-/// Pure dispatch (testable with any Node, incl. MockVmm-backed).
-pub async fn dispatch(method: &str, path: &str, body: &[u8], node: &Node, _cid: u32) -> Response {
+/// Pure dispatch (testable with any Node, incl. MockVmm-backed). Provision/
+/// create are handled by [`ApiServer::provision`] (they need `Arc<Node>` to
+/// spawn the per-VM guestlink), not here.
+pub async fn dispatch(method: &str, path: &str, _body: &[u8], node: &Node) -> Response {
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segs.as_slice() {
         ["health"] => Response::json(200, &serde_json::json!({"status": "ok"})),
         ["vms"] if method == "GET" => Response::json(200, &node.control().list()),
-        ["vms"] if method == "PUT" => {
-            let spec = match serde_json::from_slice::<VmSpec>(body) {
-                Ok(s) => s,
-                Err(e) => return Response::bad_request(format!("invalid VmSpec: {e}")),
-            };
-            provision(node, spec).await
-        }
-        ["vms", "provision"] if method == "POST" => {
-            let spec = match serde_json::from_slice::<VmSpec>(body) {
-                Ok(s) => s,
-                Err(e) => return Response::bad_request(format!("invalid VmSpec: {e}")),
-            };
-            provision(node, spec).await
-        }
         ["vms", id] if method == "GET" => vm_view(node, id),
-        ["vms", id] if method == "DELETE" => {
-            match node.destroy(&id.to_string()).await {
-                Ok(_) => Response::ok_empty(),
-                Err(e) => err_from(e),
-            }
-        }
-        // Guest signals: the agent asks the host to suspend/shutdown.
-        // (Must precede the generic `[id, op]` lifecycle arm.)
-        ["vms", id, "suspend-request"] if method == "POST" => {
-            match node.freeze(&id.to_string()).await {
-                Ok(_) => {
-                    let epoch = node.bump_pause_epoch(&id.to_string()).unwrap_or(0);
-                    Response::json(202, &serde_json::json!({"pause_epoch": epoch}))
-                }
-                Err(e) => err_from(e),
-            }
-        }
-        // Guest-driven signal: the agent POSTs its own IP (it doesn't know its
-        // vm_id); the host resolves guest_ip -> vm and freezes.
-        ["vms", "by-ip", ip, "suspend-request"] if method == "POST" => {
-            let ip: std::net::IpAddr = match ip.parse() {
-                Ok(v) => v,
-                Err(_) => return Response::bad_request("invalid ip"),
-            };
-            let (vm_id, _rec) = match node.control().find_by_guest_ip(ip) {
-                Some(x) => x,
-                None => return Response::not_found(format!("no vm with guest ip {ip}")),
-            };
-            match node.freeze(&vm_id).await {
-                Ok(_) => {
-                    let epoch = node.bump_pause_epoch(&vm_id).unwrap_or(0);
-                    Response::json(202, &serde_json::json!({"vm_id": vm_id, "pause_epoch": epoch}))
-                }
-                Err(e) => err_from(e),
-            }
-        }
-        ["vms", id, "shutdown-request"] if method == "POST" => {
-            match node.destroy(&id.to_string()).await {
-                Ok(_) => Response::ok_empty(),
-                Err(e) => err_from(e),
-            }
-        }
+        ["vms", id] if method == "DELETE" => match node.destroy(&id.to_string()).await {
+            Ok(_) => Response::ok_empty(),
+            Err(e) => err_from(e),
+        },
+        // Guest-driven lifecycle signals (also reachable over vsock, but kept
+        // on the HTTP API for operators/tests). Must precede `[id, op]`.
+        ["vms", id, "suspend-request"] if method == "POST" => match node.freeze(&id.to_string()).await {
+            Ok(_) => Response::json(202, &serde_json::json!({"pause_epoch": node.bump_pause_epoch(&id.to_string()).unwrap_or(0)})),
+            Err(e) => err_from(e),
+        },
+        ["vms", id, "shutdown-request"] if method == "POST" => match node.destroy(&id.to_string()).await {
+            Ok(_) => Response::ok_empty(),
+            Err(e) => err_from(e),
+        },
         ["vms", id, op] if method == "POST" => lifecycle(node, id, op).await,
-        ["vms", id, "ip"] if method == "GET" => {
-            match node.vmm().vm_guest_ip(&id.to_string()).await {
-                Ok(ip) => Response::json(200, &serde_json::json!({"vm_id": id, "guest_ip": ip})),
-                Err(e) => err_from(e),
-            }
-        }
+        ["vms", id, "ip"] if method == "GET" => match node.vmm().vm_guest_ip(&id.to_string()).await {
+            Ok(ip) => Response::json(200, &serde_json::json!({"vm_id": id, "guest_ip": ip})),
+            Err(e) => err_from(e),
+        },
         // Generic guest proxy passthrough (tunneled over vsock in production).
-        ["vms", id, "guest", rest @ ..] => {
-            // TODO: forward to the guest agent over vsock. For now 502.
-            Response::error(502, "not_implemented", format!("guest proxy not yet wired for {id}: {}", rest.join("/")))
-        }
+        ["vms", id, "guest", rest @ ..] => Response::error(
+            502,
+            "not_implemented",
+            format!("guest proxy not yet wired for {id}: {}", rest.join("/")),
+        ),
         _ => Response::not_found(format!("no route for {method} {path}")),
     }
 }
 
-async fn provision(node: &Node, spec: VmSpec) -> Response {
+async fn provision(node: &Node, spec: VmSpec, start: bool) -> Response {
     let vm_id = spec.vm_id.clone();
     let config = vm_config_from_spec(&spec);
     match node.create(config, spec).await {
         Ok(_) => {
-            // provision = create + start
-            if let Err(e) = node.start(&vm_id).await {
-                return err_from(e);
+            if start {
+                if let Err(e) = node.start(&vm_id).await {
+                    return err_from(e);
+                }
+                Response::json(201, &serde_json::json!({"vm_id": vm_id, "state": "started"}))
+            } else {
+                Response::json(201, &serde_json::json!({"vm_id": vm_id, "state": "created"}))
             }
-            Response::json(201, &serde_json::json!({"vm_id": vm_id, "state": "started"}))
         }
         Err(e) => err_from(e),
     }
@@ -351,6 +342,10 @@ mod tests {
         ))
     }
 
+    fn srv(n: &Arc<Node>) -> ApiServer {
+        ApiServer::new(n.clone())
+    }
+
     fn spec_json(id: &str) -> Vec<u8> {
         let s = VmSpec {
             vm_id: id.into(),
@@ -373,31 +368,28 @@ mod tests {
     #[tokio::test]
     async fn health() {
         let n = node();
-        let r = dispatch("GET", "/health", &[], &n, 3).await;
+        let r = dispatch("GET", "/health", &[], &n).await;
         assert_eq!(r.status, 200);
     }
 
     #[tokio::test]
     async fn provision_then_lifecycle() {
         let n = node();
-        // provision
-        let r = dispatch("POST", "/vms/provision", &spec_json("vm-a"), &n, 3).await;
+        let s = srv(&n);
+        // provision (create + start) via the ApiServer (spawns guestlink if vsock)
+        let r = s.handle("POST", "/vms/provision", &spec_json("vm-a")).await;
         assert_eq!(r.status, 201);
-        // GET shows started
-        let r = dispatch("GET", "/vms/vm-a", &[], &n, 3).await;
+        let r = dispatch("GET", "/vms/vm-a", &[], &n).await;
         assert_eq!(r.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(body["state"], "started");
-        // pause
-        let r = dispatch("POST", "/vms/vm-a/pause", &[], &n, 3).await;
+        let r = dispatch("POST", "/vms/vm-a/pause", &[], &n).await;
         assert_eq!(r.status, 200);
-        // suspend (Paused -> Suspended)
-        let r = dispatch("POST", "/vms/vm-a/suspend", &[], &n, 3).await;
+        let r = dispatch("POST", "/vms/vm-a/suspend", &[], &n).await;
         assert_eq!(r.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(body["state"], "suspended");
-        // restore (Suspended -> Started)
-        let r = dispatch("POST", "/vms/vm-a/restore", &[], &n, 3).await;
+        let r = dispatch("POST", "/vms/vm-a/restore", &[], &n).await;
         assert_eq!(r.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(body["state"], "started");
@@ -406,22 +398,22 @@ mod tests {
     #[tokio::test]
     async fn illegal_transition_returns_conflict() {
         let n = node();
-        dispatch("POST", "/vms/provision", &spec_json("vm-b"), &n, 3).await;
-        // suspend requires Paused; from Started it should be 409
-        let r = dispatch("POST", "/vms/vm-b/suspend", &[], &n, 3).await;
+        let s = srv(&n);
+        s.handle("POST", "/vms/provision", &spec_json("vm-b")).await;
+        let r = dispatch("POST", "/vms/vm-b/suspend", &[], &n).await;
         assert_eq!(r.status, 409);
     }
 
     #[tokio::test]
     async fn suspend_request_freezes_and_bumps_epoch() {
         let n = node();
-        dispatch("POST", "/vms/provision", &spec_json("vm-c"), &n, 3).await;
-        let r = dispatch("POST", "/vms/vm-c/suspend-request", &[], &n, 3).await;
+        let s = srv(&n);
+        s.handle("POST", "/vms/provision", &spec_json("vm-c")).await;
+        let r = dispatch("POST", "/vms/vm-c/suspend-request", &[], &n).await;
         assert_eq!(r.status, 202);
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(body["pause_epoch"], 1);
-        // VM should now be suspended
-        let r = dispatch("GET", "/vms/vm-c", &[], &n, 3).await;
+        let r = dispatch("GET", "/vms/vm-c", &[], &n).await;
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(body["state"], "suspended");
     }

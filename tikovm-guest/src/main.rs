@@ -12,7 +12,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
 
-use tikovm_guest::hostlink::HttpHostLink;
+use tikovm_guest::hostlink::VsockHostLink;
 use tikovm_guest::idle::IdleEvaluator;
 use tikovm_guest::manifest;
 use tikovm_guest::supervisor::Supervisor;
@@ -53,26 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stop = supervisor.stop_handle();
     let mut sup_task = tokio::spawn(async move { supervisor.run().await });
 
-    // --- idle evaluator: scale-to-zero (only if [idle] + [expose] declared) ---
+    // --- idle evaluator: scale-to-zero over the vsock control channel ---
     let mut idle_cancel: Option<Arc<Notify>> = None;
-    if let Some(idle_policy) = manifest.idle.clone()
-        && let Some(expose) = &manifest.expose
-    {
-        let vm_id = std::env::var("TIKOVM_VM_ID").unwrap_or_else(|_| "vm".into());
-        match HttpHostLink::discover(vm_id, expose.http_port).await {
-            Ok(link) => {
-                tracing::info!(
-                    host_api = %link.vm_id(),
-                    "idle evaluator enabled (scale-to-zero)"
-                );
-                let cancel = Arc::new(Notify::new());
-                idle_cancel = Some(cancel.clone());
-                let host = link.into_host_comm();
-                let ev = Arc::new(IdleEvaluator::new(idle_policy, host));
-                tokio::spawn(async move { ev.run(cancel).await });
-            }
-            Err(e) => tracing::warn!(error = %e, "could not enable idle evaluator; scale-to-zero disabled"),
-        }
+    if let Some(idle_policy) = manifest.idle.clone() {
+        tracing::info!("idle evaluator enabled (scale-to-zero over vsock)");
+        let cancel = Arc::new(Notify::new());
+        idle_cancel = Some(cancel.clone());
+        let host = VsockHostLink::new().into_host_comm();
+        let ev = Arc::new(IdleEvaluator::new(idle_policy, host));
+        tokio::spawn(async move { ev.run(cancel).await });
     }
 
     // --- graceful shutdown on SIGTERM / SIGINT, or supervisor self-exit ---

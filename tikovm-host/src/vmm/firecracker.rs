@@ -825,6 +825,15 @@ impl Vmm for FirecrackerVmm {
     async fn list_vms(&self) -> VmmResult<Vec<(VmId, BackendState)>> {
         Ok(self.vms.lock().unwrap().iter().map(|(id, e)| (id.clone(), e.state)).collect())
     }
+
+    async fn vsock_uds_path(&self, vm_id: &VmId) -> VmmResult<Option<PathBuf>> {
+        let vms = self.vms.lock().unwrap();
+        if vms.contains_key(vm_id) {
+            Ok(Some(self.vsock_uds(vm_id)))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl FirecrackerVmm {

@@ -9,6 +9,7 @@
 pub mod api;
 pub mod config;
 pub mod control;
+pub mod guestlink;
 pub mod node;
 pub mod proxy;
 pub mod scheduler;

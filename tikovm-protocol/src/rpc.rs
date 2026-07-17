@@ -1,33 +1,76 @@
 //! vsock RPC messages between host and guest (design §7).
 //!
-//! Framed with [`crate::codec`]. The host drives lifecycle (`Start`, `Stop`,
-//! `PreSuspend`, `PostRestore`); the guest reports runtime status
-//! (`Ready`, `HealthReport`) and requests lifecycle actions (`SuspendRequest`,
-//! `ShutdownRequest`). The host also answers its own `GetNetworkStats` (the
-//! proxy is the authoritative source of VM-scoped traffic stats for the guest's
-//! `host_network` idle probe).
+//! Two directions over virtio-vsock:
+//!
+//! - **Guest → host (control):** the guest connects (AF_VSOCK) to the host
+//!   (CID 2) on [`HOST_CTRL_PORT`] to pull network stats and request lifecycle
+//!   actions. The host listens on a **per-VM** AF_UNIX socket
+//!   (`{vsock_uds}_HOST_CTRL_PORT`), so it derives the target VM from *which
+//!   socket* the connection arrived on — the messages carry no `vm_id`.
+//! - **Host → guest (commands):** the host connects to the guest's AF_VSOCK
+//!   listener on [`GUEST_VSOCK_PORT`] (future: `Start`/`Stop`/`PreSuspend`/
+//!   `PostRestore`).
+//!
+//! All messages are framed with [`crate::codec`] (length-delimited JSON).
 
 use serde::{Deserialize, Serialize};
 
-use crate::vm::VmId;
-
-/// Default vsock port the guest agent listens on.
+/// AF_VSOCK port the guest agent listens on (host→guest commands).
 pub const GUEST_VSOCK_PORT: u32 = 9000;
 
-/// Host → guest requests.
+/// AF_VSOCK port the guest connects to on the host (guest→host control).
+/// Firecracker forwards a guest connection to CID 2:`HOST_CTRL_PORT` to the
+/// host's AF_UNIX socket at `{vsock_uds}_HOST_CTRL_PORT`.
+pub const HOST_CTRL_PORT: u32 = 9001;
+
+/// The host's well-known vsock CID (guests connect here to reach the host).
+pub const HOST_CID: u32 = 2;
+
+/// Guest → host control request (carried on the guest→host channel).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuestToHost {
+    /// Pull VM-scoped network statistics from the host (idle probe).
+    GetNetworkStats,
+    /// "I'm idle — please suspend me." Host obeys via pause → suspend.
+    Suspend,
+    /// "I'm done — please destroy me." (ephemeral/scheduled completion.)
+    Shutdown,
+    /// Announced on boot: the agent is up and the manifest has been loaded.
+    Ready {
+        workload: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_port: Option<u16>,
+    },
+    /// Periodic health report.
+    HealthReport {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        healthy: Option<bool>,
+    },
+}
+
+/// Host → guest reply to a [`GuestToHost`] request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostReply {
+    /// Reply to `GetNetworkStats`.
+    Stats(NetworkStats),
+    /// Reply to `Suspend`: the VM is being suspended; `pause_epoch` bumped.
+    Suspended { pause_epoch: u64 },
+    /// Generic ack.
+    Ok,
+    /// Error reply.
+    Error { message: String },
+}
+
+/// Host → guest command (future: host connects to the guest's listener).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostToGuest {
-    /// Start (or ensure started) the workload process.
     Start,
-    /// Stop the workload process.
-    /// mode: "graceful" (SIGTERM+wait) | "force" (SIGKILL).
     Stop { mode: StopMode },
-    /// About to suspend: run quiesce hooks, then ack.
     PreSuspend,
-    /// Just restored: run resume hooks.
     PostRestore,
-    /// Query current health status.
     GetHealth,
 }
 
@@ -38,49 +81,8 @@ pub enum StopMode {
     Force,
 }
 
-/// Guest → host messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum GuestToHost {
-    /// Announced on boot: the agent is up and the manifest has been loaded.
-    Ready {
-        vm_id: VmId,
-        workload: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        http_port: Option<u16>,
-    },
-    /// Periodic health report.
-    HealthReport {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        healthy: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    /// "I'm idle — please suspend me." (design §8; host obeys via pause→suspend.)
-    SuspendRequest { vm_id: VmId },
-    /// "I'm done — please destroy me." (ephemeral/scheduled completion.)
-    ShutdownRequest { vm_id: VmId },
-}
-
-/// Response envelope for a `HostToGuest` request. Used when the host expects a
-/// reply (e.g. `GetHealth`, `PreSuspend` ack).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum GuestResponse {
-    Ok,
-    Health {
-        healthy: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    Error {
-        message: String,
-    },
-}
-
-/// VM-scoped network statistics, served by the host to the guest's
-/// `host_network` idle probe. VM-scoped = aggregated across all ports, so the
-/// guest needs no port config (design §8).
+/// VM-scoped network statistics, served by the host to the guest's idle probe.
+/// VM-scoped = aggregated across all ports, so the guest needs no port config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkStats {
     /// Currently established client connections to this VM.

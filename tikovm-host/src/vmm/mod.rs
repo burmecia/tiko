@@ -138,6 +138,13 @@ pub trait Vmm: Send + Sync {
 
     /// List every live VM the backend currently knows about.
     async fn list_vms(&self) -> VmmResult<Vec<(VmId, BackendState)>>;
+
+    /// Path to the virtio-vsock host-side UDS for `vm_id`, if the VM has a
+    /// vsock device. The control plane binds `{path}_HOST_CTRL_PORT` to receive
+    /// guest→host connections (Firecracker forwards CID 2:port there).
+    async fn vsock_uds_path(&self, _vm_id: &VmId) -> VmmResult<Option<PathBuf>> {
+        Ok(None)
+    }
 }
 
 /// Returns the platform-default VMM backend.
