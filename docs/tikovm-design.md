@@ -435,7 +435,8 @@ leading implementation is therefore:
 
 Both tiers live behind a `RemoteBacking` trait in `tikovm-host/storage`; the
 protocol-level `VolumeSpec` stays identical regardless of backing. Both tiers are
-optional — the echo demo declares none.
+optional — the echo demo's rootfs manifest declares one of each (`data` +
+`archive`), though the e2e provision request doesn't forward them.
 
 **Validation against real Tiko/PG:** the PG workload would declare a `local_fast`
 `cache` volume (→ `TIKO_LOCAL_PATH`) and a `remote_slow` `archive` volume
@@ -686,7 +687,7 @@ pass and `cargo clippy` is clean on all three new crates.
 | Control API (`api/server.rs`) + `tikovm-hostd` daemon | ✅ built, validated | `--mock` dev mode + real Firecracker |
 | Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` |
 | TCP proxy (wake-on-connect data plane) | ✅ built, validated | single fixed target VM (multi-VM routing = next) |
-| Workload volumes (`local_fast`, `remote_slow`) | 🟡 designed | `VolumeTier`/`VolumeDecl` types exist; provisioner not built. Firecracker has no virtio-fs → `remote_slow` via virtio-block-from-host-mount (fallback NFS-in-guest) |
+| Workload volumes (`local_fast`, `remote_slow`) | ✅ built | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`), creates labeled sparse ext4 images and attaches virtio-block (`firecracker.rs::provision_drives`); `local_fast` ephemeral on destroy, `remote_slow` (image on host-mounted remote FS) persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). Not yet: `RemoteBacking` trait/`VolumeProvisioner` module (provisioning is inlined in `firecracker.rs`), guest volume-readiness reporting, e2e coverage (the echo rootfs manifest declares both tiers, but `scripts/tikovm/provision.json` passes no `volumes`, so the host attaches none and the guest's label mounts are skipped). NFS-in-guest fallback not built |
 | Host→guest commands (`PreSuspend`/`PostRestore` hooks) | 🟡 defined | for clean-snapshot quiesce; current freeze is abrupt |
 | Multi-VM proxy routing (by `RoutingRule`: Host/path/header) | 🟡 designed | current proxy forwards to one configured VM |
 | Prometheus metrics | 🟡 designed | tracing logs only today |
