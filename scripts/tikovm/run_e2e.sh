@@ -27,6 +27,7 @@ DD=/tmp/tikovm-e2e
 HOSTD_LOG="$DD/hostd.log"
 HOSTD_PG=""
 PROV_JSON="$DD/provision.json"
+PROV_TEMPLATE="$REPO/scripts/tikovm/provision.json"
 
 PASS=0; FAIL=0
 ok()   { echo "  [PASS] $1"; PASS=$((PASS+1)); }
@@ -35,8 +36,7 @@ step() { echo; echo "=== $1 ==="; }
 die()  { echo "FATAL: $1" >&2; exit 1; }
 
 cleanup() {
-  [ -n "$HOSTD_PG" ] && kill -TERM -$HOSTD_PG 2>/dev/null
-  wait 2>/dev/null
+  bash "$REPO/scripts/tikovm/cleanup.sh" "$HOSTD_PG" "$DD"
 }
 trap cleanup EXIT
 
@@ -64,12 +64,10 @@ HOSTD="$REPO/target/debug/tikovm-hostd"
 bash "$REPO/scripts/tikovm/build_echo_rootfs.sh" >/dev/null || die "build_echo_rootfs.sh failed"
 ok "binaries + echo rootfs ready"
 
-pkill -f tikovm-hostd 2>/dev/null; sleep 1
-rm -rf "$DD"; mkdir -p "$DD"
+bash "$REPO/scripts/tikovm/cleanup.sh" "" "$DD"
+mkdir -p "$DD"
 
-cat > "$PROV_JSON" <<EOF
-{"vm_id":"vm-1","rootfs":{"path":"$ASSETS/echo-rootfs.ext4","read_only_base":true},"resources":{"memory_mb":1024,"vcpus":2},"kernel":{"kernel_path":"$ASSETS/vmlinux-6.1","kernel_cmdline":"console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0","initrd_path":"$ASSETS/tiko-initramfs.cpio.gz"},"network":{},"manifest":{"version":1,"workload":"echo","health":{"kind":"none"}}}
-EOF
+ASSETS="$ASSETS" envsubst < "$PROV_TEMPLATE" > "$PROV_JSON" || die "envsubst failed"
 
 # ---------------------------------------------------------------------------
 # Start hostd (real Firecracker backend, proxy, metrics)
@@ -141,9 +139,9 @@ echo "$M" | grep -q 'tikovm_vm_total{state="started"}' && ok "metrics: vm_total 
 echo "$M" | grep -q 'tikovm_restores_total' && ok "metrics: restore counter present" || bad "metrics missing restores"
 
 # ---------------------------------------------------------------------------
-# 7. Cleanup
+# 7. Cleanup VMs
 # ---------------------------------------------------------------------------
-step "7. cleanup"
+step "7. cleanup vms"
 curl -s -m 30 -X DELETE $API/vms/vm-1 -o /dev/null -w "destroy: HTTP %{http_code}\n"
 
 echo
