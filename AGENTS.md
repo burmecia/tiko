@@ -70,7 +70,10 @@ cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine
 - **`run_e2e.sh` rebuilds the echo rootfs each run.**
   `scripts/tikovm/build_echo_rootfs.sh` loop-mounts the ubuntu base rootfs and
   injects the freshly-built `tikovm-guestd` + `echo-server` + `workload.toml`, so a
-  stale rootfs is never the bug. It expects assets under `tikod/assets/`
+  stale rootfs is never the bug. It also bakes an SSH key into
+  `/root/.ssh/authorized_keys` (from `TIKOVM_SSH_PUBKEY`/`TIKOVM_SSH_PUBKEY_FILE`,
+  default `~/.ssh/id_*.pub`) for dev/debug: `ssh root@172.16.<n>.2` from the host
+  (n = vm index). It expects assets under `tikod/assets/`
   (`vmlinux-6.1`, `ubuntu-24.04-rootfs.ext4`, `tiko-initramfs.cpio.gz`).
 
 ## Architecture facts that aren't obvious from filenames

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build an echo-workload rootfs: copy the base ubuntu rootfs and inject the
 # tikovm-guestd agent, a tiny echo HTTP server, the workload manifest, and a
-# systemd unit that runs guestd at boot. Output: tikod/assets/echo-rootfs.ext4
+# systemd unit that runs guestd at boot. Also bakes in SSH access (root
+# authorized_keys) for dev/debug. Output: tikod/assets/echo-rootfs.ext4
 set -euo pipefail
 
 REPO=/home/ubuntu/tiko
@@ -99,6 +100,29 @@ sudo ln -sf /etc/systemd/system/tikovm-guestd.service \
 # Avoid noise from the legacy Tiko agent (its host is absent in tikovm).
 sudo ln -sf /dev/null "$MNT/etc/systemd/system/tikoguest.service"
 
+# Bake in SSH access for dev/debug. openssh-server is already installed in the
+# base rootfs with PermitRootLogin yes; what's missing is an authorized key.
+# Defaults to the current user's pubkey; override with TIKOVM_SSH_PUBKEY
+# (key contents) or TIKOVM_SSH_PUBKEY_FILE (path).
+echo "baking ssh access (root authorized_keys)"
+sudo ln -sf /usr/lib/systemd/system/ssh.service \
+            "$MNT/etc/systemd/system/multi-user.target.wants/ssh.service"
+PUBKEY=${TIKOVM_SSH_PUBKEY:-}
+if [ -z "$PUBKEY" ]; then
+  for f in ${TIKOVM_SSH_PUBKEY_FILE:-} "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
+    if [ -n "$f" ] && [ -f "$f" ]; then PUBKEY=$(cat "$f"); break; fi
+  done
+fi
+if [ -z "$PUBKEY" ]; then
+  echo "WARNING: no SSH pubkey found; skipping authorized_keys"
+  echo "         (set TIKOVM_SSH_PUBKEY or TIKOVM_SSH_PUBKEY_FILE to enable ssh)"
+else
+  sudo install -d -m700 "$MNT/root/.ssh"
+  echo "$PUBKEY" | sudo tee "$MNT/root/.ssh/authorized_keys" >/dev/null
+  sudo chmod 600 "$MNT/root/.ssh/authorized_keys"
+fi
+
 sync
 sudo umount "$MNT"
 echo "built $OUT"
+echo "ssh access (from host): ssh root@172.16.<n>.2  (n = vm index, e.g. vm-0 -> 172.16.0.2)"
