@@ -3,24 +3,29 @@
 # tikovm language-runtime Lambda-style e2e test (real KVM + Firecracker).
 #
 # Validates the 2nd tikovm workload kind — a lambda-like language-runtime
-# serverless worker — with two request-driven lifecycle paths per runtime
-# (Node.js 22 LTS, then Python 3.12):
+# serverless worker — with the Lambda compute-vs-storage separation:
 #
-#   cold-start path: provision VM from scratch  ->  wait for workload reachable
-#                    ->  curl / and /health  ->  destroy the VM.  (pays full
-#                    boot cost; one Lambda cold invocation per runtime)
+#   - The rootfs (lang-rootfs.ext4) contains ONLY the language RUNTIMES
+#     (Node.js + Python) and a generic bootstrap loader. NO application code.
+#   - The application CODE (echo-node.js, echo-python.py) lives on the
+#     remote_slow volume, deployed by this test before provisioning.
+#   - At cold start, the bootstrap loader reads the code from /mnt/archive/,
+#     selects the runtime via a .runtime marker file, and exec's the handler.
 #
-#   warm-start path: provision VM from scratch  ->  wait for workload reachable
-#                    ->  issue N back-to-back requests (only the first pays any
-#                    runtime-level warmup; the rest are steady-state warm)
-#                    ->  destroy the VM.  Reports per-request + avg warm latency
-#                    so the cold-vs-warm delta is visible — the Lambda warm-start
-#                    benefit.
+# Two request-driven lifecycle paths per runtime (Node.js 22 LTS, Python 3.12):
 #
-# The VM is provisioned on demand for each path and destroyed once the response
-# is served. No scale-to-zero suspend/wake (that path is covered by run_e2e.sh
-# against the echo rootfs). Each step prints [PASS]/[FAIL]; exits non-zero on
-# any failure.
+#   cold-start path: seed code -> provision VM -> wait for workload reachable
+#                    -> curl / and /health -> destroy the VM.
+#
+#   warm-start path: provision VM -> wait for workload reachable -> issue N
+#                    back-to-back requests -> destroy. Reports per-request +
+#                    avg warm latency so the cold-vs-warm delta is visible.
+#
+# Switching runtimes is a STORAGE-SIDE operation: call seed_volume to change
+# the .runtime marker on the remote_slow volume. The rootfs is unchanged —
+# the same ephemeral compute image serves both runtimes.
+#
+# Each step prints [PASS]/[FAIL]; exits non-zero on any failure.
 #
 # Prerequisites (checked at start):
 #   * Linux + KVM (/dev/kvm), passwordless sudo (for TAP/iptables/mount)
@@ -41,8 +46,11 @@ DD=/tmp/tikovm-lang-e2e
 HOSTD_LOG="$DD/hostd.log"
 HOSTD_PG=""
 PROV_TEMPLATE="$REPO/scripts/tikovm/provision-lang.json"
-NODE_ROOTFS="$ASSETS/lang-rootfs.ext4"
-PYTHON_ROOTFS="$ASSETS/lang-python-rootfs.ext4"
+LANG_ROOTFS="$ASSETS/lang-rootfs.ext4"
+LANG_CODE_DIR="$REPO/scripts/tikovm/lang-code"
+# Where the remote_slow volume image is placed on the host. Defaults to the
+# S3 Files mount; override with REMOTE_SLOW_SOURCE for a local fallback.
+REMOTE_SLOW_SOURCE="${REMOTE_SLOW_SOURCE:-/mnt/s3files/tikoblk}"
 # How many back-to-back requests the warm-start path issues per runtime.
 WARM_REQ_COUNT="${WARM_REQ_COUNT:-3}"
 
@@ -58,23 +66,64 @@ cleanup() {
 trap cleanup EXIT
 
 # -----------------------------------------------------------------------------
+# Deploy "function code" to the remote_slow volume. Creates the ext4 image
+# (labeled "archive") if it doesn't exist, then writes the handler source +
+# a .runtime marker. The provisioner is idempotent (skips image creation if
+# it already exists), so a pre-seeded image is used as-is at provision time.
+#
+# This is the Lambda "deploy code" step — done BEFORE provisioning the compute
+# VM, and persisted ACROSS destroy/provision cycles. Switching runtimes is
+# just re-calling this with a different marker value.
+#
+# Args: $1 = runtime ("node" or "python")
+# -----------------------------------------------------------------------------
+seed_volume() {
+  local runtime="$1"
+  local img_dir="$REMOTE_SLOW_SOURCE/vm-1"
+  local img="$img_dir/archive.ext4"
+
+  mkdir -p "$img_dir" 2>/dev/null || sudo -n mkdir -p "$img_dir"
+  if [ ! -w "$img_dir" ]; then
+    sudo -n chown "$(id -u):$(id -g)" "$img_dir" 2>/dev/null || true
+  fi
+
+  if [ ! -f "$img" ]; then
+    truncate -s 64M "$img"
+    mkfs.ext4 -q -L archive "$img"
+  fi
+
+  local mnt
+  mnt=$(mktemp -d)
+  sudo mount -o loop "$img" "$mnt"
+  sudo mkdir -p "$mnt/code"
+  sudo install -m644 "$LANG_CODE_DIR/echo-node.js"   "$mnt/code/echo-node.js"
+  sudo install -m644 "$LANG_CODE_DIR/echo-python.py" "$mnt/code/echo-python.py"
+  echo "$runtime" | sudo tee "$mnt/code/.runtime" >/dev/null
+  sync
+  sudo umount "$mnt"
+  rmdir "$mnt" 2>/dev/null || true
+  ok "deployed function code to remote_slow: $img (runtime=$runtime)"
+}
+
+# -----------------------------------------------------------------------------
 # Lambda cycle: cold-start provision -> serve one request -> destroy.
 #   $1 = runtime label (node | python)
-#   $2 = rootfs path
-#   $3 = substring expected in the GET / response body
-# Each cycle is a full, independent Lambda-style invocation.
+#   $2 = substring expected in the GET / response body
+# Uses the single LANG_ROOTFS for both runtimes; runtime selection is via
+# the .runtime marker on the remote_slow volume (seed_volume).
 # -----------------------------------------------------------------------------
 lambda_cycle() {
-  local runtime="$1" rootfs="$2" needle="$3"
+  local runtime="$1" needle="$2"
   step "Lambda cycle: $runtime  (cold-start -> serve -> destroy)"
 
   local PROV_JSON="$DD/provision-$runtime.json"
-  ASSETS="$ASSETS" ROOTFS="$rootfs" envsubst < "$PROV_TEMPLATE" > "$PROV_JSON" \
+  ASSETS="$ASSETS" ROOTFS="$LANG_ROOTFS" REMOTE_SLOW_SOURCE="$REMOTE_SLOW_SOURCE" \
+    envsubst < "$PROV_TEMPLATE" > "$PROV_JSON" \
     || { bad "$runtime: envsubst failed"; return; }
 
   local t0 t1 cold_ms
   t0=$(date +%s%3N)
-  echo "  provisioning vm-1 from $rootfs ..."
+  echo "  provisioning vm-1 (rootfs=$LANG_ROOTFS, code from remote_slow) ..."
   curl -s -m 60 -X POST $API/vms/provision \
        -H 'Content-Type: application/json' -d @"$PROV_JSON" >/dev/null \
     || { bad "$runtime: provision request failed"; return; }
@@ -105,39 +154,36 @@ lambda_cycle() {
 
   local h
   h=$(curl -s -m 5 $PROXY/health | tr -d '\n')
+  # Match both Node's {"ok":true} and Python's {"ok": true} (json.dumps adds
+  # a space after the colon; JSON.stringify does not).
   case "$h" in
-    *'"ok":true'*) ok "$runtime: GET /health -> $h" ;;
+    *'"ok"'*true*) ok "$runtime: GET /health -> $h" ;;
     *)             bad "$runtime: GET /health mismatched ($h)" ;;
   esac
 
   echo "  destroying vm-1 ..."
   curl -s -m 30 -X DELETE $API/vms/vm-1 \
        -o /dev/null -w "  destroy: HTTP %{http_code}\n"
-  ok "$runtime: Lambda cycle complete (VM destroyed)"
+  ok "$runtime: Lambda cycle complete (VM destroyed, code persists on remote_slow)"
 }
 
 # -----------------------------------------------------------------------------
 # Warm-start cycle: provision -> N back-to-back warm requests -> destroy.
 #   $1 = runtime label (node | python)
-#   $2 = rootfs path
-#   $3 = substring expected in the GET / response body
-#
-# The provision + wait-for-ready is the cold-start cost (reported for context);
-# the per-request latencies are the warm-start measurements. Request 1 may
-# include runtime-level warmup (V8 JIT, Python module init); requests 2..N are
-# steady-state warm. The cold-vs-warm delta is the Lambda warm-start benefit.
+#   $2 = substring expected in the GET / response body
 # -----------------------------------------------------------------------------
 warm_cycle() {
-  local runtime="$1" rootfs="$2" needle="$3"
+  local runtime="$1" needle="$2"
   step "Warm-start cycle: $runtime  (provision -> ${WARM_REQ_COUNT} warm requests -> destroy)"
 
   local PROV_JSON="$DD/provision-warm-$runtime.json"
-  ASSETS="$ASSETS" ROOTFS="$rootfs" envsubst < "$PROV_TEMPLATE" > "$PROV_JSON" \
+  ASSETS="$ASSETS" ROOTFS="$LANG_ROOTFS" REMOTE_SLOW_SOURCE="$REMOTE_SLOW_SOURCE" \
+    envsubst < "$PROV_TEMPLATE" > "$PROV_JSON" \
     || { bad "$runtime warm: envsubst failed"; return; }
 
   local t0 t1 cold_ms
   t0=$(date +%s%3N)
-  echo "  provisioning vm-1 from $rootfs ..."
+  echo "  provisioning vm-1 ..."
   curl -s -m 60 -X POST $API/vms/provision \
        -H 'Content-Type: application/json' -d @"$PROV_JSON" >/dev/null \
     || { bad "$runtime warm: provision request failed"; return; }
@@ -158,8 +204,6 @@ warm_cycle() {
     return
   fi
 
-  # Issue WARM_REQ_COUNT back-to-back requests. The VM is already up; each
-  # request latency is the warm-start cost (proxy -> guest -> workload -> back).
   local i wt0 wt1 req_ms body warm_total=0 warm_ok=0
   echo "  issuing $WARM_REQ_COUNT warm requests ..."
   for i in $(seq 1 "$WARM_REQ_COUNT"); do
@@ -201,11 +245,13 @@ command -v envsubst >/dev/null && ok "envsubst on PATH" || die "envsubst not fou
 for f in vmlinux-6.1 tikovm-base-rootfs.ext4 tiko-initramfs.cpio.gz; do
   [ -f "$ASSETS/$f" ] && ok "asset $f" || die "missing asset $ASSETS/$f (build with scripts/tikovm/build_base_rootfs.sh)"
 done
+[ -f "$LANG_CODE_DIR/echo-node.js" ] && ok "handler: echo-node.js" || die "missing $LANG_CODE_DIR/echo-node.js"
+[ -f "$LANG_CODE_DIR/echo-python.py" ] && ok "handler: echo-python.py" || die "missing $LANG_CODE_DIR/echo-python.py"
 
 # ---------------------------------------------------------------------------
-# 0b. Build tikovm-guestd + tikovm-hostd + lang rootfs (node) + python variant
+# 0b. Build tikovm-guestd + tikovm-hostd + lang rootfs (runtimes + bootstrap)
 # ---------------------------------------------------------------------------
-step "0b. build guestd + hostd + lang rootfs (node) + python variant"
+step "0b. build guestd + hostd + lang rootfs (runtimes only, no app code)"
 ( cd "$REPO" && cargo build -p tikovm-guest -p tikovm-host ) \
   || die "cargo build failed"
 HOSTD="$REPO/target/debug/tikovm-hostd"
@@ -215,68 +261,17 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
   bash "$REPO/scripts/tikovm/build_lang_rootfs.sh" >/dev/null \
     || die "build_lang_rootfs.sh failed"
 fi
-[ -f "$NODE_ROOTFS" ] || die "node rootfs missing: $NODE_ROOTFS"
-ok "node rootfs: $NODE_ROOTFS"
-
-# Python variant: sparse-copy the lang rootfs and rewrite
-# /etc/tikovm/workload.toml to point [process] at python3 + echo-python.py.
-# Demonstrates that a single base rootfs serves both runtimes via a one-file
-# manifest swap (the platform is workload-agnostic; a different runtime is
-# just a different rootfs).
-echo "  building python variant (sparse copy + manifest swap) ..."
-# If a previous run was killed mid-mount, the file may still be attached to a
-# loop device. Best-effort detach before we replace it.
-sudo -n losetup -j "$PYTHON_ROOTFS" 2>/dev/null | awk -F: '{print $1}' | \
-  while read -r ld; do sudo -n losetup -d "$ld" 2>/dev/null || true; done
-[ -f "$PYTHON_ROOTFS" ] && rm -f "$PYTHON_ROOTFS"
-cp --sparse=always "$NODE_ROOTFS" "$PYTHON_ROOTFS"
-PMNT=$(mktemp -d)
-sudo mount -o loop "$PYTHON_ROOTFS" "$PMNT"
-sudo tee "$PMNT/etc/tikovm/workload.toml" >/dev/null <<'TOML'
-version = 1
-workload = "lang-echo-python"
-
-# Same shape as the node manifest; only [process] differs.
-[process]
-cmd = "/usr/bin/python3"
-args = ["/usr/local/lib/tikovm/echo-python.py", "--port", "8080"]
-
-[health]
-kind = "http"
-path = "/health"
-port = 8080
-interval_secs = 5
-
-[expose]
-http_port = 8080
-
-[[volumes]]
-name = "data"
-tier = "local_fast"
-mount_path = "/mnt/data"
-size_mb = 64
-
-[[volumes]]
-name = "archive"
-tier = "remote_slow"
-mount_path = "/mnt/archive"
-size_mb = 64
-TOML
-sync
-sudo umount "$PMNT"
-rmdir "$PMNT" 2>/dev/null || true
-ok "python rootfs: $PYTHON_ROOTFS"
+[ -f "$LANG_ROOTFS" ] || die "lang rootfs missing: $LANG_ROOTFS"
+ok "lang rootfs: $LANG_ROOTFS (runtimes + bootstrap, code is on remote_slow)"
 
 bash "$REPO/scripts/tikovm/cleanup.sh" "" "$DD"
 mkdir -p "$DD"
 
-# The s3files_image backing writes <source>/vm-1/ as the (unprivileged) hostd
-# user; pre-create it with our ownership on the root-owned mount (same trick
-# as run_e2e.sh). No-op if /mnt/s3files isn't mounted.
-if mountpoint -q /mnt/s3files 2>/dev/null; then
-  sudo -n mkdir -p /mnt/s3files/tikoblk/vm-1 2>/dev/null || true
-  sudo -n chown "$(id -u):$(id -g)" /mnt/s3files/tikoblk/vm-1 2>/dev/null || true
-fi
+# ---------------------------------------------------------------------------
+# 0c. Deploy function code to remote_slow volume (the Lambda "deploy" step)
+# ---------------------------------------------------------------------------
+step "0c. deploy function code to remote_slow (runtime: node)"
+seed_volume "node"
 
 # ---------------------------------------------------------------------------
 # 1. Start hostd (real Firecracker backend, proxy)
@@ -291,25 +286,37 @@ curl -sf -m 2 $API/health >/dev/null && ok "hostd up (log: $HOSTD_LOG)" \
   || die "hostd did not start"
 
 # ---------------------------------------------------------------------------
-# 2. Lambda cycles per runtime: cold-start path, then warm-start path
+# 2. Node.js Lambda cycles: cold-start, then warm-start
 # ---------------------------------------------------------------------------
-# Node.js 22 LTS
-lambda_cycle "node" "$NODE_ROOTFS"   "hello world from node"
-warm_cycle   "node" "$NODE_ROOTFS"   "hello world from node"
-# Python 3.12
-lambda_cycle "python" "$PYTHON_ROOTFS" "hello world from python"
-warm_cycle   "python" "$PYTHON_ROOTFS" "hello world from python"
+lambda_cycle "node" "hello world from node"
+warm_cycle   "node" "hello world from node"
 
 # ---------------------------------------------------------------------------
-# 3. Cleanup remote_slow artifacts left behind by destroy
+# 3. Switch to Python: redeploy code on remote_slow (change .runtime marker)
+#    The rootfs is UNCHANGED — same ephemeral compute image. This is the
+#    Lambda "deploy new function" operation: pure storage-side, no rebuild.
 # ---------------------------------------------------------------------------
-step "3. cleanup remote_slow artifacts"
-if mountpoint -q /mnt/s3files 2>/dev/null; then
-  sudo -n rm -f /mnt/s3files/tikoblk/vm-1/archive.ext4 2>/dev/null || true
-  sudo -n rmdir /mnt/s3files/tikoblk/vm-1 2>/dev/null || true
-  ok "cleaned s3files image dir"
+step "3. redeploy function code to remote_slow (runtime: python)"
+seed_volume "python"
+
+# ---------------------------------------------------------------------------
+# 4. Python Lambda cycles: cold-start, then warm-start
+# ---------------------------------------------------------------------------
+lambda_cycle "python" "hello world from python"
+warm_cycle   "python" "hello world from python"
+
+# ---------------------------------------------------------------------------
+# 5. Cleanup remote_slow artifacts left behind by destroy
+# ---------------------------------------------------------------------------
+step "5. cleanup remote_slow artifacts"
+if [ -f "$REMOTE_SLOW_SOURCE/vm-1/archive.ext4" ]; then
+  rm -f "$REMOTE_SLOW_SOURCE/vm-1/archive.ext4" 2>/dev/null \
+    || sudo -n rm -f "$REMOTE_SLOW_SOURCE/vm-1/archive.ext4" 2>/dev/null || true
+  rmdir "$REMOTE_SLOW_SOURCE/vm-1" 2>/dev/null \
+    || sudo -n rmdir "$REMOTE_SLOW_SOURCE/vm-1" 2>/dev/null || true
+  ok "cleaned remote_slow volume image"
 else
-  ok "skipped remote_slow cleanup (no /mnt/s3files)"
+  ok "skipped remote_slow cleanup (image not found)"
 fi
 
 echo

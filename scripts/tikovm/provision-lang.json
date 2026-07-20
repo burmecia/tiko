@@ -32,7 +32,7 @@
                 "tier": "remote_slow",
                 "mount_path": "/mnt/archive",
                 "size_mb": 64,
-                "source": "/mnt/s3files/tikoblk"
+                "source": "${REMOTE_SLOW_SOURCE}"
             }
         ]
     }
