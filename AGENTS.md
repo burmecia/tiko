@@ -83,6 +83,9 @@ cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine
 ./scripts/tikovm/run_lang_e2e.sh  # lang-runtime Lambda-style E2E: per-runtime cold-start
                                   #   (provision→serve→destroy) for Node.js 22 + Python 3.12;
                                   #   builds lang-rootfs.ext4 + lang-python-rootfs.ext4 inline
+./scripts/tikovm/run_cron_e2e.sh  # scheduled-job E2E: provision→idle-suspend→scheduler-wake
+                                  #   (x2)→destroy for the cron "hello world" shell job;
+                                  #   builds cron-rootfs.ext4 inline; verifies via serial log
 ```
 
 ## Gotchas an agent will hit

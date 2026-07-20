@@ -674,13 +674,33 @@ generic supervisor, same vsock scale-to-zero loop. This is the marquee
 serverless-worker shape: the platform is workload-agnostic, and a lambda-like
 runtime is *just another rootfs*.
 
+### 15.2 Scheduled-job workload (cron)
+
+The third rootfs kind: a host-scheduled job that runs periodically. Built as a
+derivative of the tikovm base rootfs by
+`scripts/tikovm/build_cron_rootfs.sh` (`tikod/assets/cron-rootfs.ext4`). The
+workload is a `/bin/sh` loop that prints `"hello world from scheduled job"` to
+the serial console every 2s — no language runtime, no HTTP server, just a
+shell script. The manifest declares an `[idle]` policy (auto-suspend after a
+few seconds of no HTTP traffic — since the job serves no HTTP, the
+`host_network` probe is always idle) and the provision request's `[schedule]`
+(host-driven restore on an interval) drives the periodic wake. Together they
+produce the periodic-run pattern of §13 (keep-warm mode): the guest idle
+evaluator suspends the VM shortly after each wake, and the host scheduler
+restores it on the configured interval — no workload-specific scheduler code.
+
+End-to-end test: `scripts/tikovm/run_cron_e2e.sh` verifies the full loop
+(provision → auto-suspend → scheduler wake → job output → repeat → destroy)
+against real KVM + Firecracker, checking state transitions via the API and
+job output via the Firecracker serial log.
+
 ## 16. What's deferred (designed, not built initially)
 
 - Migrating the real Tiko Postgres to a rootfs + manifest (validates against the
   real workload; first real user of both storage tiers).
-- Concrete cron-job **rootfs workloads** (the scheduling mechanism itself is
-  in-scope — see §13; the language-runtime rootfs — Node.js 22 LTS + Python
-  3.12 — is built, see §15.1).
+- The scheduling mechanism itself is in-scope — see §13; the language-runtime
+  rootfs (Node.js 22 LTS + Python 3.12) is built — see §15.1 — and the
+  scheduled-job (cron) rootfs is built — see §15.2.
 - `vhost-user-block` production scale path for `remote_slow`.
 - Multi-node clustering / distributed registry (the `StateStore` trait is the
   seam; §14).
@@ -757,6 +777,7 @@ pass and `cargo clippy` is clean on all three new crates.
 | tikovm base rootfs | ✅ built, validated | `scripts/tikovm/build_base_rootfs.sh` → `tikod/assets/tikovm-base-rootfs.ext4` (debootstrap Ubuntu 24.04 minbase; foundation for all tikovm-family rootfs) |
 | Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` (derivative of the tikovm base) |
 | Language-runtime rootfs (Node.js 22 LTS + Python 3.12) | ✅ built | `scripts/tikovm/build_lang_rootfs.sh` (derivative of the tikovm base; both runtimes baked in, "hello world" echo per runtime, manifest defaults to Node). Lambda-style serverless worker — same supervisor + scale-to-zero as echo, different runtime |
+| Scheduled-job rootfs (cron) | ✅ built | `scripts/tikovm/build_cron_rootfs.sh` (derivative of the tikovm base; `/bin/sh` "hello world" loop). Periodic-run pattern: guest idle evaluator auto-suspends, host scheduler (§13, keep-warm mode) restores on interval. e2e: `run_cron_e2e.sh` |
 | TCP proxy (wake-on-connect data plane) | ✅ built, validated | single fixed target VM (multi-VM routing = next) |
 | Workload volumes (`local_fast`, `remote_slow`) | ✅ built, e2e-covered | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`) and provisions via `tikovm-host/storage` (`VolumeProvisioner` + `RemoteBacking`, extracted from `firecracker.rs`). Two `remote_slow` backings, selected by `[storage] remote_slow_backing`: `s3files_image` (ext4 image on the host-mounted remote FS, legacy default) and `ublk` (tikoblkd chunk store on `/dev/ublkbN`). Declared drives attach with `cache_type: "Writeback"` (durability fix). `local_fast` ephemeral on destroy; `remote_slow` persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). e2e: `provision.json` declares both tiers; `run_e2e.sh` checks LABEL mounts, suspend/restore + destroy persistence of a checksummed file on `remote_slow`, for both backings (`BACKING=s3files_image|ublk`; ublk run additionally verified on this host — pending rerun after the ublk2 driver loss on reboot). Not yet: guest volume-readiness reporting, NFS-in-guest fallback |
 | Host→guest commands (`PreSuspend`/`PostRestore` hooks) | 🟡 defined | for clean-snapshot quiesce; current freeze is abrupt |
@@ -764,7 +785,7 @@ pass and `cargo clippy` is clean on all three new crates.
 | Prometheus metrics | 🟡 designed | tracing logs only today |
 | vhost-user-block prod path for `remote_slow` | 🟡 future | |
 | Multi-node clustering / distributed registry | 🟡 future | `StateStore` is the seam |
-| PG / cron rootfs workloads | 🟡 future | the platform is workload-agnostic; the language-runtime rootfs is built (§15.1), PG + cron rootfs to follow |
+| PG rootfs workloads | 🟡 future | the platform is workload-agnostic; the language-runtime rootfs (§15.1) and scheduled-job rootfs (§15.2) are built, PG rootfs to follow |
 
 **Verified on real microVMs:** provision → boot to `multi-user` → echo
 reachable at the guest IP → idle → guest signals suspend over vsock → host

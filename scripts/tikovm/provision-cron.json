@@ -1,0 +1,36 @@
+{
+    "vm_id": "vm-1",
+    "rootfs": {
+        "path": "${ROOTFS}",
+        "read_only_base": true
+    },
+    "resources": {
+        "memory_mb": 512,
+        "vcpus": 1
+    },
+    "kernel": {
+        "kernel_path": "$ASSETS/vmlinux-6.1",
+        "kernel_cmdline": "console=ttyS0 reboot=k panic=1 pci=off systemd.unified_cgroup_hierarchy=0",
+        "initrd_path": "$ASSETS/tiko-initramfs.cpio.gz"
+    },
+    "network": {},
+    "manifest": {
+        "version": 1,
+        "workload": "cron-echo",
+        "health": {
+            "kind": "none"
+        },
+        "volumes": [
+            {
+                "name": "data",
+                "tier": "local_fast",
+                "mount_path": "/mnt/data",
+                "size_mb": 64
+            }
+        ],
+        "schedule": {
+            "interval_secs": ${CRON_INTERVAL_SECS},
+            "keep_warm": true
+        }
+    }
+}
