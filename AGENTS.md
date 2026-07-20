@@ -80,6 +80,9 @@ cargo test  -p tikovm-protocol -p tikovm-host -p tikovm-guest   # unit tests, no
 cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine on these
 ./scripts/tikovm/run_e2e.sh    # full E2E on real KVM/Firecracker (provision→scale-to-zero→
                                #   lifecycle→crash recovery→metrics; 17 PASS/FAIL checks)
+./scripts/tikovm/run_lang_e2e.sh  # lang-runtime Lambda-style E2E: per-runtime cold-start
+                                  #   (provision→serve→destroy) for Node.js 22 + Python 3.12;
+                                  #   builds lang-rootfs.ext4 + lang-python-rootfs.ext4 inline
 ```
 
 ## Gotchas an agent will hit
