@@ -126,7 +126,12 @@ cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine
   `ssh root@172.16.<n>.2` from the host (n = vm index). Expects assets under
   `tikod/assets/` (`vmlinux-6.1`, `tikovm-base-rootfs.ext4`,
   `tiko-initramfs.cpio.gz`); the legacy `ubuntu-24.04-rootfs.ext4` is the
-  **tikod**-platform base (Postgres + s3files), separate lineage.
+  **tikod**-platform base (Postgres + s3files), separate lineage. A second
+  derivative, `scripts/tikovm/build_lang_rootfs.sh`
+  (`tikod/assets/lang-rootfs.ext4`), bakes in Node.js 22 LTS + Python 3.12 and a
+  "hello world" echo HTTP server per runtime — the lambda-style serverless-worker
+  demo; manifest defaults to Node, swap to Python via a two-line
+  `/etc/tikovm/workload.toml` edit.
 
 ## Architecture facts that aren't obvious from filenames
 
