@@ -645,7 +645,12 @@ A trivial **HTTP echo server** rootfs:
 - A tiny echo binary (small Rust static binary, or busybox httpd) baked into a
   minimal rootfs (no PG, no PostgREST, no S3 mount).
 - Build script `scripts/tikovm/build_echo_rootfs.sh` (modeled on
-  `create_rootfs.sh` but minimal).
+  `create_rootfs.sh` but minimal). It is a derivative of the tikovm base
+  rootfs, built once by `scripts/tikovm/build_base_rootfs.sh`
+  (`tikod/assets/tikovm-base-rootfs.ext4` — debootstrap Ubuntu 24.04 minbase,
+  no PG/PostgREST/S3 mount, with conventional `/mnt/data` + `/mnt/archive`
+  placeholders); the echo script copies that base and injects the
+  echo payload + `tikovm-guestd`.
 
 **Validates:** provision → guest reads manifest → runs+supervises echo → HTTP
 routing wired → `curl` reaches echo → idle → `SuspendRequest` → suspend →
@@ -731,7 +736,8 @@ pass and `cargo clippy` is clean on all three new crates.
 | **vsock control channel** (§7) | ✅ built, validated on KVM | guest→host: `GetNetworkStats`, `Suspend`. host→guest commands defined, not wired |
 | **Scale-to-zero loop** (idle → suspend → wake-on-connect) | ✅ validated on KVM | restore ~0.35 s; the marquee serverless behavior |
 | Control API (`api/server.rs`) + `tikovm-hostd` daemon | ✅ built, validated | `--mock` dev mode + real Firecracker |
-| Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` |
+| tikovm base rootfs | ✅ built, validated | `scripts/tikovm/build_base_rootfs.sh` → `tikod/assets/tikovm-base-rootfs.ext4` (debootstrap Ubuntu 24.04 minbase; foundation for all tikovm-family rootfs) |
+| Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` (derivative of the tikovm base) |
 | TCP proxy (wake-on-connect data plane) | ✅ built, validated | single fixed target VM (multi-VM routing = next) |
 | Workload volumes (`local_fast`, `remote_slow`) | ✅ built, e2e-covered | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`) and provisions via `tikovm-host/storage` (`VolumeProvisioner` + `RemoteBacking`, extracted from `firecracker.rs`). Two `remote_slow` backings, selected by `[storage] remote_slow_backing`: `s3files_image` (ext4 image on the host-mounted remote FS, legacy default) and `ublk` (tikoblkd chunk store on `/dev/ublkbN`). Declared drives attach with `cache_type: "Writeback"` (durability fix). `local_fast` ephemeral on destroy; `remote_slow` persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). e2e: `provision.json` declares both tiers; `run_e2e.sh` checks LABEL mounts, suspend/restore + destroy persistence of a checksummed file on `remote_slow`, for both backings (`BACKING=s3files_image|ublk`; ublk run additionally verified on this host — pending rerun after the ublk2 driver loss on reboot). Not yet: guest volume-readiness reporting, NFS-in-guest fallback |
 | Host→guest commands (`PreSuspend`/`PostRestore` hooks) | 🟡 defined | for clean-snapshot quiesce; current freeze is abrupt |

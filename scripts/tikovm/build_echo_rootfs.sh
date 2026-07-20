@@ -1,18 +1,23 @@
 #!/bin/bash
-# Build an echo-workload rootfs: copy the base ubuntu rootfs and inject the
-# tikovm-guestd agent, a tiny echo HTTP server, the workload manifest, and a
-# systemd unit that runs guestd at boot. Also bakes in SSH access (root
-# authorized_keys) for dev/debug. Output: tikod/assets/echo-rootfs.ext4
+# Build an echo-workload rootfs as a derivative of the tikovm base rootfs:
+# sparse-copy the base and inject the tikovm-guestd agent, a tiny echo HTTP
+# server, the workload manifest, and a systemd unit that runs guestd at boot.
+# SSH access is baked into the base (see build_base_rootfs.sh); this script
+# only adds the echo payload. Output: tikod/assets/echo-rootfs.ext4
 set -euo pipefail
 
 REPO=/home/ubuntu/tiko
-BASE=$REPO/tikod/assets/ubuntu-24.04-rootfs.ext4
+# tikovm-family base (scripts/tikovm/build_base_rootfs.sh). The legacy
+# ubuntu-24.04-rootfs.ext4 carries Postgres/s3files/tikoguest cruft for the
+# tikod platform; the tikovm base is a clean bare-bone Ubuntu.
+BASE=$REPO/tikod/assets/tikovm-base-rootfs.ext4
 OUT=$REPO/tikod/assets/echo-rootfs.ext4
 GUESTD=$REPO/target/debug/tikovm-guestd
 ECHO=$REPO/target/debug/examples/echo-server
 
 [ -f "$GUESTD" ] || { echo "build guestd first: cargo build -p tikovm-guest"; exit 1; }
 [ -f "$ECHO" ]   || { echo "build echo-server first: cargo build -p tikovm-guest --example echo-server"; exit 1; }
+[ -f "$BASE" ]   || { echo "build the tikovm base first: bash scripts/tikovm/build_base_rootfs.sh"; exit 1; }
 
 if [ ! -f "$OUT" ]; then
   echo "sparse-copying base rootfs -> $OUT (one-time)"
@@ -97,30 +102,12 @@ UNIT
 sudo mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants"
 sudo ln -sf /etc/systemd/system/tikovm-guestd.service \
             "$MNT/etc/systemd/system/multi-user.target.wants/tikovm-guestd.service"
-# Avoid noise from the legacy Tiko agent (its host is absent in tikovm).
+# Defensive: mask the legacy Tiko agent from the tikod platform. The tikovm
+# base already does this, but keep it so a future base swap can't resurrect it.
 sudo ln -sf /dev/null "$MNT/etc/systemd/system/tikoguest.service"
 
-# Bake in SSH access for dev/debug. openssh-server is already installed in the
-# base rootfs with PermitRootLogin yes; what's missing is an authorized key.
-# Defaults to the current user's pubkey; override with TIKOVM_SSH_PUBKEY
-# (key contents) or TIKOVM_SSH_PUBKEY_FILE (path).
-echo "baking ssh access (root authorized_keys)"
-sudo ln -sf /usr/lib/systemd/system/ssh.service \
-            "$MNT/etc/systemd/system/multi-user.target.wants/ssh.service"
-PUBKEY=${TIKOVM_SSH_PUBKEY:-}
-if [ -z "$PUBKEY" ]; then
-  for f in ${TIKOVM_SSH_PUBKEY_FILE:-} "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
-    if [ -n "$f" ] && [ -f "$f" ]; then PUBKEY=$(cat "$f"); break; fi
-  done
-fi
-if [ -z "$PUBKEY" ]; then
-  echo "WARNING: no SSH pubkey found; skipping authorized_keys"
-  echo "         (set TIKOVM_SSH_PUBKEY or TIKOVM_SSH_PUBKEY_FILE to enable ssh)"
-else
-  sudo install -d -m700 "$MNT/root/.ssh"
-  echo "$PUBKEY" | sudo tee "$MNT/root/.ssh/authorized_keys" >/dev/null
-  sudo chmod 600 "$MNT/root/.ssh/authorized_keys"
-fi
+# SSH access (root authorized_keys) is baked into the tikovm base rootfs by
+# build_base_rootfs.sh; nothing to do here.
 
 sync
 sudo umount "$MNT"

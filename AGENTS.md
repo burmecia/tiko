@@ -116,13 +116,17 @@ cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine
   they are cleanly liftable into a standalone repo. The only inter-crate Cargo edge
   is `tikovm-host`/`tikovm-guest` → `tikovm-protocol`.
 - **`run_e2e.sh` rebuilds the echo rootfs each run.**
-  `scripts/tikovm/build_echo_rootfs.sh` loop-mounts the ubuntu base rootfs and
+  `scripts/tikovm/build_echo_rootfs.sh` loop-mounts the tikovm base rootfs and
   injects the freshly-built `tikovm-guestd` + `echo-server` + `workload.toml`, so a
-  stale rootfs is never the bug. It also bakes an SSH key into
-  `/root/.ssh/authorized_keys` (from `TIKOVM_SSH_PUBKEY`/`TIKOVM_SSH_PUBKEY_FILE`,
-  default `~/.ssh/id_*.pub`) for dev/debug: `ssh root@172.16.<n>.2` from the host
-  (n = vm index). It expects assets under `tikod/assets/`
-  (`vmlinux-6.1`, `ubuntu-24.04-rootfs.ext4`, `tiko-initramfs.cpio.gz`).
+  stale rootfs is never the bug. The base rootfs itself is built once by
+  `scripts/tikovm/build_base_rootfs.sh` (debootstrap Ubuntu 24.04 minbase,
+  `tikod/assets/tikovm-base-rootfs.ext4`) — lean (no Postgres/PostgREST/S3 Files),
+  with `/mnt/data` + `/mnt/archive` placeholders and a baked SSH key
+  (`TIKOVM_SSH_PUBKEY`/`TIKOVM_SSH_PUBKEY_FILE`, default `~/.ssh/id_*.pub`).
+  `ssh root@172.16.<n>.2` from the host (n = vm index). Expects assets under
+  `tikod/assets/` (`vmlinux-6.1`, `tikovm-base-rootfs.ext4`,
+  `tiko-initramfs.cpio.gz`); the legacy `ubuntu-24.04-rootfs.ext4` is the
+  **tikod**-platform base (Postgres + s3files), separate lineage.
 
 ## Architecture facts that aren't obvious from filenames
 
