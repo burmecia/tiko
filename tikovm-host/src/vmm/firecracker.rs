@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -340,20 +341,7 @@ fn run_shell(snippet: &str) -> VmmResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn run_user(program: &str, args: &[&str]) -> VmmResult<()> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| VmmError::Backend(format!("spawn {program}: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::Backend(format!(
-            "{program} {} failed: {stderr}",
-            args.join(" ")
-        )));
-    }
-    Ok(())
-}
+use crate::storage::run_user;
 
 fn ensure_kvm_access() {
     const KVM: &str = "/dev/kvm";
@@ -456,45 +444,10 @@ fn shell_quote(p: &Path) -> String {
 
 // ============================================================================
 // local_fast volume images (ext4, labeled so the guest mounts by LABEL=<name>)
+//
+// Provisioning now lives in `crate::storage` (VolumeProvisioner +
+// RemoteBacking); this section intentionally left as a pointer.
 // ============================================================================
-
-/// For each drive with a `size_mb`, ensure its backing ext4 image exists,
-/// formatted with `-L <drive_id>` so the guest mounts by label. Placement
-/// depends on tier:
-/// - `LocalFast` -> `snapshot_dir/volumes/<vm>/<name>.ext4` (ephemeral).
-/// - `RemoteSlow` -> `<source>/<vm>/<name>.ext4` on a host-mounted remote FS
-///   (persists across destroy). `source` must be set.
-///
-/// Rewrites each drive's `path` to the real image path.
-fn provision_drives(snapshot_dir: &Path, vm_id: &str, drives: &mut [DriveConfig]) -> VmmResult<()> {
-    for d in drives.iter_mut() {
-        let Some(size_mb) = d.size_mb else {
-            continue; // caller-supplied path; nothing to provision.
-        };
-        use tikovm_protocol::volume::VolumeTier;
-        let dir: PathBuf = match d.tier {
-            VolumeTier::LocalFast => snapshot_dir.join("volumes").join(vm_id),
-            VolumeTier::RemoteSlow => {
-                let base = d.source.clone().unwrap_or_else(|| {
-                    warn!(drive = %d.drive_id, "remote_slow volume has no source; using local fallback");
-                    snapshot_dir.join("volumes-remote").to_string_lossy().into_owned()
-                });
-                PathBuf::from(base).join(vm_id)
-            }
-        };
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.ext4", d.drive_id));
-        if !path.exists() {
-            let path_str = path.display().to_string();
-            let size_arg = format!("{size_mb}M");
-            info!(drive = %d.drive_id, %path_str, size_mb, tier = ?d.tier, "creating volume image");
-            run_user("truncate", &["-s", &size_arg, &path_str])?;
-            run_user("mkfs.ext4", &["-q", "-L", &d.drive_id, &path_str])?;
-        }
-        d.path = path;
-    }
-    Ok(())
-}
 
 // ============================================================================
 // Two-drive overlay model (base RO + per-VM RW overlayfs upper)
@@ -626,21 +579,36 @@ pub struct FirecrackerVmm {
     vms: StdMutex<HashMap<VmId, FcVmEntry>>,
     /// Next virtio-vsock guest CID to allocate (CIDs must be >= 3; 2 is host).
     next_cid: AtomicU32,
+    /// Volume provisioning (local_fast inline + remote_slow backing).
+    provisioner: crate::storage::VolumeProvisioner,
 }
 
 impl FirecrackerVmm {
-    pub fn new(snapshot_dir: PathBuf) -> Self {
+    pub fn new(snapshot_dir: PathBuf, storage: &crate::config::StorageConfig) -> Self {
         let runtime_dir = snapshot_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir).ok();
         std::fs::create_dir_all(&snapshot_dir).ok();
         ensure_kvm_access();
         let fc_bin = std::env::var("FIRECRACKER_BIN").unwrap_or_else(|_| "firecracker".into());
+        let remote: Arc<dyn crate::storage::RemoteBacking> = match storage.backing() {
+            Ok(crate::config::RemoteSlowBacking::S3FilesImage) => {
+                Arc::new(crate::storage::s3files_image::S3FilesImage::new(snapshot_dir.clone()))
+            }
+            Ok(crate::config::RemoteSlowBacking::Ublk) => {
+                Arc::new(crate::storage::ublk::UblkBacking::new(&storage.ublk_sock))
+            }
+            Err(e) => {
+                warn!(error = %e, "invalid storage config; falling back to s3files_image");
+                Arc::new(crate::storage::s3files_image::S3FilesImage::new(snapshot_dir.clone()))
+            }
+        };
         Self {
-            snapshot_dir,
+            snapshot_dir: snapshot_dir.clone(),
             runtime_dir,
             firecracker_bin: PathBuf::from(fc_bin),
             vms: StdMutex::new(HashMap::new()),
             next_cid: AtomicU32::new(3),
+            provisioner: crate::storage::VolumeProvisioner::new(snapshot_dir, remote),
         }
     }
 
@@ -751,12 +719,7 @@ impl FirecrackerVmm {
             client
                 .put(
                     &format!("/drives/{}", drive.drive_id),
-                    &json!({
-                        "drive_id": drive.drive_id,
-                        "path_on_host": drive.path.to_string_lossy(),
-                        "is_root_device": false,
-                        "is_read_only": drive.read_only,
-                    }),
+                    &declared_drive_json(drive),
                 )
                 .await?;
         }
@@ -794,6 +757,21 @@ impl FirecrackerVmm {
             self.snapshot_dir.join(format!("{vm_id}.mem")),
         )
     }
+}
+
+/// Firecracker PUT /drives body for a declared volume. Writeback + Sync so
+/// guest fsync actually reaches the backing (the previous default, Unsafe
+/// cache, silently dropped flushes — fatal for the remote_slow durability
+/// chain through tikoblk's FLUSH journal).
+fn declared_drive_json(drive: &DriveConfig) -> serde_json::Value {
+    json!({
+        "drive_id": drive.drive_id,
+        "path_on_host": drive.path.to_string_lossy(),
+        "is_root_device": false,
+        "is_read_only": drive.read_only,
+        "cache_type": "Writeback",
+        "io_engine": "Sync",
+    })
 }
 
 #[async_trait]
@@ -857,9 +835,11 @@ impl Vmm for FirecrackerVmm {
 
         let mut vm_config = config.clone();
         vm_config.rootfs_path = rootfs_for_attach;
-        // Provision local_fast volume images (ext4, labeled by drive_id so the
-        // guest can mount by LABEL=<name>). Reused across restarts.
-        provision_drives(&self.snapshot_dir, &vm_id, &mut vm_config.drives)?;
+        // Provision volume backing (local_fast images + remote_slow via the
+        // configured backing; labeled by drive_id so the guest mounts by
+        // LABEL=<name>). Reused across restarts.
+        self.provisioner
+            .provision_drives(&vm_id, &mut vm_config.drives)?;
         let client = FcApiClient::new(&api_sock);
         if let Err(e) = self
             .configure_vm(
@@ -888,7 +868,9 @@ impl Vmm for FirecrackerVmm {
                 tap_name: net.tap_name,
                 subnet: net.subnet,
                 serial_log,
-                config,
+                // Store the PROVISIONED config (real drive paths): snapshots
+                // reference these, and restore re-attaches the same nodes.
+                config: vm_config,
                 guest_ip: net.guest_ip,
                 state: BackendState::Created,
             },
@@ -983,6 +965,17 @@ impl Vmm for FirecrackerVmm {
         let _ = std::fs::remove_file(self.vsock_uds(&vm_id));
         create_tap(&net.tap_name, &net.gateway_ip.to_string(), &net.subnet)?;
 
+        // Re-attach remote_slow volumes BEFORE snapshot/load: the snapshot
+        // references the same device paths (tikoblk reserves dev ids, so the
+        // backing must hand back the identical node).
+        if let Err(e) = self
+            .provisioner
+            .reattach_drives(&vm_id, &snapshot.config.drives)
+        {
+            destroy_tap(&net.tap_name, &net.subnet);
+            return Err(e);
+        }
+
         let (child, api_sock) = match self.spawn_firecracker(&vm_id) {
             Ok(r) => r,
             Err(e) => {
@@ -1046,6 +1039,11 @@ impl Vmm for FirecrackerVmm {
             let _ = child.wait().await;
         }
         entry.state = BackendState::Destroyed;
+        // NOTE: no remote_slow detach here. destroy_vm is shared by suspend
+        // (snapshot+destroy) and terminal destroy; a suspended VM keeps its
+        // ublk devices attached (detaching a device that just served a live
+        // guest risks a driver-level wedge). Detach happens in cleanup_vm
+        // (terminal destroy only).
         drop(entry); // FcVmEntry::drop tears down TAP + socket
         info!(vm_id = %vm_id, "Firecracker VM destroyed");
         Ok(())
@@ -1101,8 +1099,9 @@ impl Vmm for FirecrackerVmm {
     }
 
     async fn cleanup_vm(&self, vm_id: &VmId) -> VmmResult<()> {
-        // Delete ephemeral local_fast volume images. remote_slow images live on
-        // a host-mounted remote FS and persist across destroy by design.
+        // Terminal destroy: detach remote_slow volumes (their data persists
+        // on the backing), then delete ephemeral local_fast volume images.
+        self.provisioner.on_destroy_volumes(vm_id);
         let dir = self.snapshot_dir.join("volumes").join(vm_id);
         if dir.exists()
             && let Err(e) = std::fs::remove_dir_all(&dir)
@@ -1147,5 +1146,22 @@ mod tests {
     fn parse_default_iface_ignores_non_default() {
         assert!(parse_default_iface("10.0.0.0/8 via 10.0.0.1 dev eth0 metric 100\n").is_none());
         assert!(parse_default_iface("").is_none());
+    }
+
+    #[test]
+    fn declared_drive_json_uses_writeback() {
+        let d = DriveConfig {
+            drive_id: "archive".into(),
+            path: PathBuf::from("/dev/ublkb3"),
+            read_only: false,
+            size_mb: Some(64),
+            tier: tikovm_protocol::volume::VolumeTier::RemoteSlow,
+            source: None,
+        };
+        let j = declared_drive_json(&d);
+        assert_eq!(j["cache_type"], "Writeback");
+        assert_eq!(j["io_engine"], "Sync");
+        assert_eq!(j["path_on_host"], "/dev/ublkb3");
+        assert_eq!(j["is_read_only"], false);
     }
 }

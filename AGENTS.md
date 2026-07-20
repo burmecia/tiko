@@ -24,6 +24,54 @@ build `smgr` (staticlib, linked into PG) → `make && make install` in `postgres
 Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
 `tikoguest`). `tikod`'s integration tests (`tikod/tests/`) only build on Linux.
 
+### tikoblk (host block storage on ublk — Linux + root only)
+
+```bash
+cargo test  -p tikoblk          # unit tests, no ublk needed
+cargo clippy -p tikoblk         # clippy IS fine here (no pgsys dep)
+sudo scripts/tikoblk/run_test.sh   # full E2E: ublk device, ext4, checksums,
+                                   #   daemon-restart recovery sweep; re-runnable
+sudo scripts/tikoblk/setup_host.sh # fresh-host setup (module, dirs, units)
+bash scripts/tikoblk/build_ublk_fixed.sh          # build+install fixed ublk_drv.ko
+bash scripts/tikoblk/build_ublk_fixed.sh --check  # rc 0 = fixed module present
+```
+
+`tikoblkd` serves ublk devices on a pluggable `BlockBackend` (loop-file
+backend, plus the chunked engine: immutable chunks in a store-root-wide
+pool (`--store-root`, default `/mnt/s3files/tikoblk`) referenced by
+per-volume maps, NVMe write journal/read cache on the data dir, daemon-wide
+flusher thread). Volume ops: COW snapshots/clones (zero-copy, map copies),
+mark-and-sweep GC of the chunk pool (`POST /gc` + periodic), single-attach
+lease (flock on `map.lock` per volume), Prometheus metrics at
+`GET /metrics` on the control socket. Driver situation: Ubuntu
+6.17.0-10xx mainline `ublk_drv` NULL-derefs on ADD_DEV (NUMA backport onto
+the old call order — see `target/tmp/ublk-spike/NOTES.md`), so
+`scripts/tikoblk/build_ublk_fixed.sh` builds a **patched mainline**
+ublk_drv.ko from the exact Ubuntu source + the call-order patch
+(`scripts/tikoblk/ublk-fix-adddev-order.patch`) and installs it to
+`/lib/modules/<krel>/updates/` (depmod top priority; `ublk_drv` in
+`/etc/modules-load.d/tikoblk.conf`). `tikoblk-module.service` (oneshot,
+before tikoblkd) rebuilds it at boot after kernel upgrades; offline source
+cache lives in `/var/lib/tikoblk/module-src/`. The old out-of-tree
+`ublk2_drv` is gone (source lost). `tikoblkd` refuses to start on a broken
+driver (startup ADD_DEV+DEL_DEV smoke test). Never SIGKILL a ublk daemon
+with I/O in flight; node names are mainline (`/dev/ublkcN`/`/dev/ublkbN`) —
+the ublk2 symlink bridge is gated on `/sys/class/ublk2-char` existing.
+Operator runbook: `docs/tikoblk.md`.
+
+### tikovm storage integration (design §9, `tikovm-host/src/storage/`)
+
+`remote_slow` volumes go through `VolumeProvisioner` + `RemoteBacking`:
+`s3files_image` (legacy default) or `ublk` (tikoblkd). Config:
+`[storage] remote_slow_backing = "s3files_image"|"ublk"` +
+`ublk_sock = "/run/tikoblk/daemon.sock"`, or CLI
+`--remote-slow-backing/--ublk-sock`. Declared drives attach with
+`cache_type: "Writeback"` (guest-fsync durability fix). Suspend keeps ublk
+devices attached; detach is terminal-destroy only (`cleanup_vm`). e2e:
+`BACKING=s3files_image|ublk scripts/tikovm/run_e2e.sh`. The S3 Files mount
+is persistent via fstab (`fs-02b6905b6653757b6:/ /mnt/s3files s3files
+_netdev,nofail,mounttargetip=...,tls,iam`).
+
 ### tikovm (independent of Postgres — no PG submodule needed)
 
 ```bash

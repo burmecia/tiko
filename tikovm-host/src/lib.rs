@@ -14,5 +14,6 @@ pub mod metrics;
 pub mod node;
 pub mod proxy;
 pub mod scheduler;
+pub mod storage;
 pub mod store;
 pub mod vmm;

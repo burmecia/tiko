@@ -28,6 +28,21 @@ HOSTD_LOG="$DD/hostd.log"
 HOSTD_PG=""
 PROV_JSON="$DD/provision.json"
 PROV_TEMPLATE="$REPO/scripts/tikovm/provision.json"
+# remote_slow backing under test: s3files_image (default) or ublk.
+BACKING="${BACKING:-s3files_image}"
+GUEST_IP=172.16.1.2
+
+# ssh into the guest (key baked by build_echo_rootfs.sh).
+SSH_KEY=""
+for f in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+  [ -f "$f" ] && SSH_KEY="$f" && break
+done
+ssh_g() {
+  local keyarg=()
+  [ -n "$SSH_KEY" ] && keyarg=(-i "$SSH_KEY")
+  ssh "${keyarg[@]}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=5 -o LogLevel=ERROR "root@$GUEST_IP" "$@"
+}
 
 PASS=0; FAIL=0
 ok()   { echo "  [PASS] $1"; PASS=$((PASS+1)); }
@@ -67,14 +82,22 @@ ok "binaries + echo rootfs ready"
 bash "$REPO/scripts/tikovm/cleanup.sh" "" "$DD"
 mkdir -p "$DD"
 
+# The s3files_image backing writes <source>/vm-1/ as the (unprivileged)
+# hostd user; pre-create it with our ownership on the root-owned mount.
+if [ "$BACKING" = "s3files_image" ] && mountpoint -q /mnt/s3files; then
+  sudo -n mkdir -p /mnt/s3files/tikoblk/vm-1 || die "cannot create image dir on /mnt/s3files"
+  sudo -n chown "$(id -u):$(id -g)" /mnt/s3files/tikoblk/vm-1 || die "cannot chown image dir"
+fi
+
 ASSETS="$ASSETS" envsubst < "$PROV_TEMPLATE" > "$PROV_JSON" || die "envsubst failed"
 
 # ---------------------------------------------------------------------------
 # Start hostd (real Firecracker backend, proxy, metrics)
 # ---------------------------------------------------------------------------
-step "1. start tikovm-hostd"
+step "1. start tikovm-hostd (remote_slow backing: $BACKING)"
 setsid "$HOSTD" --data-dir "$DD" --api-listen 0.0.0.0:9000 \
   --proxy-listen 0.0.0.0:8080 --proxy-default-vm vm-1 --proxy-default-port 8080 \
+  --remote-slow-backing "$BACKING" \
   >"$HOSTD_LOG" 2>&1 &
 HOSTD_PG=$!
 for i in $(seq 1 30); do curl -sf -m 1 $API/health >/dev/null 2>&1 && break; sleep 0.5; done
@@ -105,6 +128,22 @@ W=$(curl -s -m 30 $PROXY/woken)
 echo "$W" | grep -q '"path":"/woken"' && ok "proxy woke the VM: $W" || bad "wake failed ($W)"
 
 # ---------------------------------------------------------------------------
+# 3b. Volume checks: LABEL mounts + remote_slow persistence over suspend
+# ---------------------------------------------------------------------------
+step "3b. volume checks ($BACKING)"
+ssh_g true 2>/dev/null && ok "ssh into guest" || bad "ssh into guest failed"
+ssh_g 'findmnt /mnt/data' >/dev/null 2>&1 \
+  && ok "local_fast mounted: $(ssh_g 'findmnt -n -o SOURCE /mnt/data' 2>/dev/null)" \
+  || bad "local_fast /mnt/data not mounted"
+ssh_g 'findmnt /mnt/archive' >/dev/null 2>&1 \
+  && ok "remote_slow mounted: $(ssh_g 'findmnt -n -o SOURCE /mnt/archive' 2>/dev/null)" \
+  || bad "remote_slow /mnt/archive not mounted"
+ssh_g 'dd if=/dev/urandom of=/mnt/archive/e2e.bin bs=1M count=4 status=none && sha256sum /mnt/archive/e2e.bin > /mnt/archive/e2e.sha256 && sync' \
+  && ok "wrote 4 MiB checksummed file to /mnt/archive" || bad "could not write /mnt/archive"
+ssh_g 'cd /mnt/archive && sha256sum -c e2e.sha256' >/dev/null 2>&1 \
+  && ok "archive checksum OK after suspend/restore" || bad "archive checksum FAILED after suspend/restore"
+
+# ---------------------------------------------------------------------------
 # 4. Lifecycle: pause -> resume
 # ---------------------------------------------------------------------------
 step "4. lifecycle (pause/resume)"
@@ -122,6 +161,7 @@ HOSTD_PG=""; sleep 1
 # keep the same data-dir (SQLite state) -> reconcile recovers the VM
 setsid "$HOSTD" --data-dir "$DD" --api-listen 0.0.0.0:9000 \
   --proxy-listen 0.0.0.0:8080 --proxy-default-vm vm-1 --proxy-default-port 8080 \
+  --remote-slow-backing "$BACKING" \
   >>"$HOSTD_LOG" 2>&1 &
 HOSTD_PG=$!
 for i in $(seq 1 30); do curl -sf -m 1 $API/health >/dev/null 2>&1 && break; sleep 0.5; done
@@ -139,10 +179,27 @@ echo "$M" | grep -q 'tikovm_vm_total{state="started"}' && ok "metrics: vm_total 
 echo "$M" | grep -q 'tikovm_restores_total' && ok "metrics: restore counter present" || bad "metrics missing restores"
 
 # ---------------------------------------------------------------------------
-# 7. Cleanup VMs
+# 7. Cleanup VMs + remote_slow persistence across destroy
 # ---------------------------------------------------------------------------
-step "7. cleanup vms"
+step "7. cleanup vms + remote_slow persistence across destroy ($BACKING)"
 curl -s -m 30 -X DELETE $API/vms/vm-1 -o /dev/null -w "destroy: HTTP %{http_code}\n"
+
+# Re-provision the same VM: the archive volume must still hold our file.
+curl -s -m 60 -X POST $API/vms/provision -H 'Content-Type: application/json' -d @"$PROV_JSON" >/dev/null \
+  || die "re-provision failed"
+for i in $(seq 1 40); do curl -sf -m 2 $PROXY/health >/dev/null 2>&1 && break; sleep 2; done
+ssh_g 'cd /mnt/archive && sha256sum -c e2e.sha256' >/dev/null 2>&1 \
+  && ok "archive file persisted across destroy ($BACKING)" || bad "archive file LOST across destroy ($BACKING)"
+curl -s -m 30 -X DELETE $API/vms/vm-1 -o /dev/null -w "re-destroy: HTTP %{http_code}\n"
+
+# Leave the store clean.
+if [ "$BACKING" = "ublk" ]; then
+  D=$(sudo -n curl -s --unix-socket /run/tikoblk/daemon.sock -X DELETE http://localhost/volumes/vm-1-archive -w '%{http_code}' -o /dev/null)
+  [ "$D" = 200 ] && ok "tikoblk volume vm-1-archive deleted" || bad "tikoblk volume delete: HTTP $D"
+else
+  sudo -n rm -f /mnt/s3files/tikoblk/vm-1/archive.ext4 && sudo -n rmdir /mnt/s3files/tikoblk/vm-1 2>/dev/null \
+    && ok "s3files image removed" || bad "s3files image cleanup failed"
+fi
 
 echo
 echo "============================================="

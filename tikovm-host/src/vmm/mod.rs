@@ -171,16 +171,17 @@ pub trait Vmm: Send + Sync {
 /// (config, API, proxy) compile and run for development.
 /// Returns the platform-default VMM backend.
 ///
-/// On Linux this is the Firecracker backend; elsewhere a [`StubBackend`] whose
-/// every operation fails (lets the rest of the binary compile/run for dev).
+/// On Linux this is the Firecracker backend (with volume provisioning from
+/// the storage config); elsewhere a [`StubBackend`] whose every operation
+/// fails (lets the rest of the binary compile/run for dev).
 #[cfg(target_os = "linux")]
-pub fn default_vmm(snapshot_dir: PathBuf) -> Arc<dyn Vmm> {
-    Arc::new(firecracker::FirecrackerVmm::new(snapshot_dir))
+pub fn default_vmm(snapshot_dir: PathBuf, storage: &crate::config::StorageConfig) -> Arc<dyn Vmm> {
+    Arc::new(firecracker::FirecrackerVmm::new(snapshot_dir, storage))
 }
 
 /// Returns the platform-default VMM backend (non-Linux: stub).
 #[cfg(not(target_os = "linux"))]
-pub fn default_vmm(_snapshot_dir: PathBuf) -> Arc<dyn Vmm> {
+pub fn default_vmm(_snapshot_dir: PathBuf, _storage: &crate::config::StorageConfig) -> Arc<dyn Vmm> {
     Arc::new(StubBackend)
 }
 

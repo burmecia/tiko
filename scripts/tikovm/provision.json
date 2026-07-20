@@ -19,6 +19,21 @@
         "workload": "echo",
         "health": {
             "kind": "none"
-        }
+        },
+        "volumes": [
+            {
+                "name": "data",
+                "tier": "local_fast",
+                "mount_path": "/mnt/data",
+                "size_mb": 64
+            },
+            {
+                "name": "archive",
+                "tier": "remote_slow",
+                "mount_path": "/mnt/archive",
+                "size_mb": 64,
+                "source": "/mnt/s3files/tikoblk"
+            }
+        ]
     }
 }

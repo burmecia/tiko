@@ -421,22 +421,40 @@ virtio-block, vhost-user-block, virtio-net, virtio-vsock, virtio-rng,
 virtio-pmem, virtio-mem — confirmed in Firecracker's `device-api.md`). The
 leading implementation is therefore:
 
-- **virtio-block from host-mounted remote** (recommended): the host mounts S3
-  Files (or any remote FS) and attaches an image file on that mount as a
-  virtio-block device. The guest sees a plain block device and mounts it — **no
-  NFS client, no credentials, no backend awareness in the guest**. Keeps the
-  host-owned / guest-generic property we wanted from virtio-fs. Survives destroy
-  (the backing file persists on the remote mount).
+- **virtio-block from host-mounted remote** (`s3files_image` backing, built):
+  the host mounts S3 Files (or any remote FS) and attaches an image file on
+  that mount as a virtio-block device. The guest sees a plain block device
+  and mounts it — **no NFS client, no credentials, no backend awareness in
+  the guest**. Keeps the host-owned / guest-generic property we wanted from
+  virtio-fs. Survives destroy (the backing file persists on the remote
+  mount).
+- **virtio-block from the tikoblk chunk store** (`ublk` backing, built): a
+  host-side `tikoblkd` daemon serves the volume as `/dev/ublkbN` (immutable
+  chunks on the S3 Files store + NVMe journal/cache, COW snapshots/clones,
+  single-attach lease — see `tikoblk/`). Same guest-visible shape as the
+  image backing (plain block device, no guest coupling), but data lives in
+  the chunk store instead of a monolithic ext4 image, so volume ops
+  (snapshot/clone) become map copies. tikoblkd reserves ublk dev ids in its
+  registry, so detach/attach and Firecracker snapshot restore always see
+  the same device node. Suspended VMs keep devices attached (detach is
+  terminal-destroy only — a kill on a just-active device can wedge the
+  ublk driver); terminal destroy detaches.
 - **NFS-in-guest** (fallback): the guest itself mounts the remote FS (the proven
   current Tiko approach, `mount_s3files_vm.sh`). Simpler, but re-couples the
   guest/rootfs to the backend and puts credentials in the guest.
 - **vhost-user-block** (future production scale path): an external daemon serves
-  remote-backed block storage; noted, not built initially.
+  remote-backed block storage; noted, not built initially (the ublk backing
+  covers the same role with a plain kernel device instead of a vhost socket).
 
-Both tiers live behind a `RemoteBacking` trait in `tikovm-host/storage`; the
-protocol-level `VolumeSpec` stays identical regardless of backing. Both tiers are
-optional — the echo demo's rootfs manifest declares one of each (`data` +
-`archive`), though the e2e provision request doesn't forward them.
+Both tiers live behind the now-built `RemoteBacking` trait in
+`tikovm-host/storage` (`VolumeProvisioner` + `s3files_image`/`ublk`
+impls, selected by `[storage] remote_slow_backing` in the host config);
+the protocol-level `VolumeSpec` stays identical regardless of backing. Both
+tiers are optional — the echo demo's rootfs manifest declares one of each
+(`data` + `archive`), and `scripts/tikovm/provision.json` forwards them so
+the e2e exercises both tiers. Declared-volume drives are attached with
+`cache_type: "Writeback"` so guest fsync reaches the backing (the Firecracker
+default, Unsafe, silently drops flushes).
 
 **Validation against real Tiko/PG:** the PG workload would declare a `local_fast`
 `cache` volume (→ `TIKO_LOCAL_PATH`) and a `remote_slow` `archive` volume
@@ -450,6 +468,34 @@ declarations at provision. The provision request carries the manifest
 (operator-provided, authoritative); the host reads **only its `[[volumes]]`
 section** to create/attach storage before boot, then injects the manifest into
 the guest. The host never reads `idle`/`health`/`process`.
+
+### 9.1 ublk chunk-store backing (tikoblk), as built
+
+The `ublk` `RemoteBacking` is a host daemon (`tikoblkd`, crate `tikoblk`)
+serving volumes as `/dev/ublkbN` kernel block devices via libublk:
+
+- **Storage**: immutable 1 MiB chunks (256 KiB–4 MiB per volume) in a
+  store-root-wide pool on the S3 Files mount, referenced by small per-volume
+  maps (`map` + append-only `map.journal`, folded on checkpoint). Chunk
+  writes are tmp+fsync+rename, so maps/chunks are crash-atomic and clones
+  are zero-copy (COW snapshots = frozen map copies under
+  `volumes/<id>/snapshots/`).
+- **Durability**: guest FLUSH appends dirty whole-chunk images to a
+  per-volume NVMe journal segment with one sequential write+fsync; a
+  daemon-wide flusher then writes chunk files (data before metadata: chunk
+  fsynced before its map delta), folds the map periodically, and reclaims
+  journal segments. Daemon death quiesces devices (UBLK_F_USER_RECOVERY);
+  the next start replays journals and reattaches.
+- **Volume ops**: single-attach lease (flock on `map.lock` + epoch bump),
+  COW snapshots/clones, mark-and-sweep GC of the chunk pool (grace-period
+  protected), Prometheus metrics at `GET /metrics` on the control socket.
+- **Driver caveat**: Ubuntu's 6.17.0-10xx cloud kernels ship a mainline
+  `ublk_drv` that NULL-derefs every ADD_DEV (a 6.18 NUMA backport without
+  its call-order prerequisite). The host runs a patched mainline module
+  built by `scripts/tikoblk/build_ublk_fixed.sh` (exact Ubuntu source +
+  one-line order fix), rebuilt at boot by `tikoblk-module.service` after
+  kernel upgrades; `tikoblkd` smoke-tests ADD_DEV+DEL_DEV at startup and
+  refuses to run on a broken driver. Operator details: `docs/tikoblk.md`.
 
 ## 10. Control API & generic guest proxy
 
@@ -687,7 +733,7 @@ pass and `cargo clippy` is clean on all three new crates.
 | Control API (`api/server.rs`) + `tikovm-hostd` daemon | ✅ built, validated | `--mock` dev mode + real Firecracker |
 | Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` |
 | TCP proxy (wake-on-connect data plane) | ✅ built, validated | single fixed target VM (multi-VM routing = next) |
-| Workload volumes (`local_fast`, `remote_slow`) | ✅ built | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`), creates labeled sparse ext4 images and attaches virtio-block (`firecracker.rs::provision_drives`); `local_fast` ephemeral on destroy, `remote_slow` (image on host-mounted remote FS) persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). Not yet: `RemoteBacking` trait/`VolumeProvisioner` module (provisioning is inlined in `firecracker.rs`), guest volume-readiness reporting, e2e coverage (the echo rootfs manifest declares both tiers, but `scripts/tikovm/provision.json` passes no `volumes`, so the host attaches none and the guest's label mounts are skipped). NFS-in-guest fallback not built |
+| Workload volumes (`local_fast`, `remote_slow`) | ✅ built, e2e-covered | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`) and provisions via `tikovm-host/storage` (`VolumeProvisioner` + `RemoteBacking`, extracted from `firecracker.rs`). Two `remote_slow` backings, selected by `[storage] remote_slow_backing`: `s3files_image` (ext4 image on the host-mounted remote FS, legacy default) and `ublk` (tikoblkd chunk store on `/dev/ublkbN`). Declared drives attach with `cache_type: "Writeback"` (durability fix). `local_fast` ephemeral on destroy; `remote_slow` persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). e2e: `provision.json` declares both tiers; `run_e2e.sh` checks LABEL mounts, suspend/restore + destroy persistence of a checksummed file on `remote_slow`, for both backings (`BACKING=s3files_image|ublk`; ublk run additionally verified on this host — pending rerun after the ublk2 driver loss on reboot). Not yet: guest volume-readiness reporting, NFS-in-guest fallback |
 | Host→guest commands (`PreSuspend`/`PostRestore` hooks) | 🟡 defined | for clean-snapshot quiesce; current freeze is abrupt |
 | Multi-VM proxy routing (by `RoutingRule`: Host/path/header) | 🟡 designed | current proxy forwards to one configured VM |
 | Prometheus metrics | 🟡 designed | tracing logs only today |

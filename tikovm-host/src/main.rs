@@ -52,6 +52,14 @@ struct Args {
     /// Default workload port inside the VM (when the manifest has no [expose]).
     #[arg(long, default_value_t = 8080, requires = "proxy_listen")]
     proxy_default_port: u16,
+
+    /// remote_slow backing: "s3files_image" (default) or "ublk".
+    #[arg(long)]
+    remote_slow_backing: Option<String>,
+
+    /// tikoblkd control socket (ublk backing).
+    #[arg(long)]
+    ublk_sock: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -62,7 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     metrics::init();
 
     let args = Args::parse();
-    let cfg = HostConfig::load(args.config.as_deref(), &args.data_dir, &args.api_listen)?;
+    let mut cfg = HostConfig::load(args.config.as_deref(), &args.data_dir, &args.api_listen)?;
+    if let Some(b) = &args.remote_slow_backing {
+        cfg.storage.remote_slow_backing = b.clone();
+    }
+    if let Some(s) = &args.ublk_sock {
+        cfg.storage.ublk_sock = s.clone();
+    }
+    // Validate early so a typo fails at boot, not at first provision.
+    cfg.storage.backing()?;
 
     std::fs::create_dir_all(&cfg.data_dir)?;
 
@@ -77,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("running with MockVmm (no real VMs)");
         Arc::new(MockVmm::new(cfg.snapshots_dir()))
     } else {
-        default_vmm(cfg.snapshots_dir())
+        default_vmm(cfg.snapshots_dir(), &cfg.storage)
     };
     let node = Arc::new(Node::new(vmm, control).with_store(store));
 
