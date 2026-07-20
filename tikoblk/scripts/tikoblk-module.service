@@ -1,0 +1,19 @@
+[Unit]
+Description=tikoblk ublk module rebuild (patched mainline ublk_drv)
+# Rebuilds the ADD_DEV-fixed ublk_drv.ko when the running kernel lacks it
+# (e.g. after a kernel upgrade dropped us back to the broken in-tree
+# module). Runs BEFORE tikoblkd so the daemon's own startup guard never
+# sees a broken driver. Offline-safe: source is cached under
+# /var/lib/tikoblk/module-src.
+DefaultDependencies=no
+After=local-fs.target
+Before=tikoblkd.service
+ConditionPathExists=/usr/local/lib/tikoblk/build_ublk_fixed.sh
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/lib/tikoblk/build_ublk_fixed.sh --boot --quiet
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

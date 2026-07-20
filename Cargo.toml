@@ -5,6 +5,7 @@ members = [
   "tikoguest",
   "pgsys",
   "smgr",
+  "tikoblk",
   "tikod",
   "tikovm-host",
   "tikovm-guest",

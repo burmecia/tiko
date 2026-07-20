@@ -1,0 +1,26 @@
+[Unit]
+Description=tikoblk host block-storage daemon (ublk)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tikoblkd --data-dir /var/lib/tikoblk --sock /run/tikoblk/daemon.sock
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+RuntimeDirectory=tikoblk
+# tikoblkd unshares its own mount namespace and bind-mounts the ublk control
+# device over /dev/ublk-control internally; do NOT wrap ExecStart in
+# unshare(1). The ublk daemon must not share a mount namespace with
+# processes using its devices.
+#
+# Stop policy: SIGTERM makes the daemon exit immediately; the kernel then
+# quiesces its ublk devices (they were created with USER_RECOVERY) and the
+# next daemon start reattaches via the recovery sweep. KillMode=process so
+# systemd never SIGKILLs ublk queue threads: killing a ublk daemon mid-I/O
+# can wedge it in uninterruptible exit (D-state) until reboot.
+KillMode=process
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

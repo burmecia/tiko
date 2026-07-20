@@ -1,0 +1,25 @@
+[package]
+name = "tikoblk"
+description = "tikoblk host block-storage daemon (ublk devices on pluggable backends)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "tikoblk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tikoblkd"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+libublk = "0.4.6"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+zstd.workspace = true
