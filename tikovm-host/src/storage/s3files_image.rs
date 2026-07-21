@@ -78,6 +78,7 @@ mod tests {
             size_mb: Some(64),
             tier: VolumeTier::RemoteSlow,
             source: source.map(|s| s.to_string()),
+            persist_key: None,
         }
     }
 

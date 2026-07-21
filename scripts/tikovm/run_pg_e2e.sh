@@ -17,8 +17,14 @@
 #   Phase 3: WARM PAUSE/RESUME (bonus lifecycle)
 #     API pause  ->  API resume  ->  verify data intact.
 #
+#   Phase 4: DESTROY + RE-PROVISION (local_fast persists across destroy)
+#     destroy vm-0  ->  re-provision with the same persist_key  ->
+#     pg-supervisor reuses the existing PGDATA (no initdb)  ->
+#     verify data intact.
+#
 # PGDATA lives on local_fast (/mnt/data/pgdata) — fast I/O, survives
-# suspend/restore. Bulk data (chunks, WAL) goes through the smgr to remote_slow
+# suspend/restore AND destroy (the volume carries a persist_key). Bulk data
+# (chunks, WAL) goes through the smgr to remote_slow
 # (/mnt/archive/tiko_root) — durable, survives destroy.
 #
 # The proxy on port 15432 forwards raw TCP to the guest's PG on 5432, with
@@ -59,8 +65,10 @@ cleanup() {
 trap cleanup EXIT
 
 # Run a psql command via the proxy (wake-on-connect if suspended).
+# (env -u PGSERVICE: an EMPTY PGSERVICE is an error in psql 18 —
+# "definition of service \"\" not found" — so unset it instead.)
 psql_g() {
-  PGSERVICE='' PGUSER=postgres psql -h 127.0.0.1 -p "$PROXY_PORT" -U postgres \
+  env -u PGSERVICE PGUSER=postgres psql -h 127.0.0.1 -p "$PROXY_PORT" -U postgres \
       -t -A --set ON_ERROR_STOP=1 "$@" 2>/dev/null
 }
 
@@ -121,6 +129,9 @@ bash "$REPO/scripts/tikovm/cleanup.sh" "" "$DD"
 mkdir -p "$DD"
 
 # Pre-create remote_slow source dir with our ownership (same as run_e2e.sh).
+# Also drop any stale volume image from a previous failed run — the end-of-run
+# cleanup is skipped when the script dies early, and a stale image breaks the
+# next run's initdb (tiko_create: relfork already exists).
 if mountpoint -q /mnt/s3files 2>/dev/null; then
   sudo -n mkdir -p "$REMOTE_SLOW_SOURCE/$VM_ID" 2>/dev/null || true
   sudo -n chown "$(id -u):$(id -g)" "$REMOTE_SLOW_SOURCE/$VM_ID" 2>/dev/null || true
@@ -129,6 +140,7 @@ else
   REMOTE_SLOW_SOURCE="$DD/remote-slow"
   mkdir -p "$REMOTE_SLOW_SOURCE/$VM_ID"
 fi
+rm -f "$REMOTE_SLOW_SOURCE/$VM_ID/archive.ext4" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 1. Start hostd (API + proxy on $PROXY_PORT forwarding to guest:5432)
@@ -234,6 +246,45 @@ if [ "$PAUSE_RESULT" = "123" ]; then
   ok "warm pause/resume: data intact (SELECT a FROM tt -> $PAUSE_RESULT)"
 else
   bad "warm pause/resume: data mismatch (got '$PAUSE_RESULT')"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 4: DESTROY + RE-PROVISION (local_fast persists across destroy)
+# ---------------------------------------------------------------------------
+step "Phase 4: DESTROY + RE-PROVISION (persist_key keeps PGDATA)"
+
+echo "  destroying $VM_ID ..."
+DESTROYED=""
+for i in $(seq 1 6); do
+  code=$(curl -s -m 30 -X DELETE $API/vms/$VM_ID -o /dev/null -w '%{http_code}')
+  if [ "$code" = "204" ]; then
+    DESTROYED=1
+    echo "  destroy: HTTP $code"
+    break
+  fi
+  echo "  destroy attempt $i: HTTP $code, retrying..."
+  sleep 3
+done
+[ -n "$DESTROYED" ] && ok "VM destroyed" || die "destroy failed (HTTP $code)"
+
+echo "  re-provisioning $VM_ID with the same persist_key ..."
+curl -s -m 120 -X POST $API/vms/provision \
+     -H 'Content-Type: application/json' -d @"$PROV_JSON" >/dev/null \
+  || die "re-provision failed"
+
+echo "  waiting for PG (existing PGDATA reused — no initdb, fast start) ..."
+if wait_pg 120; then
+  ok "PG is up after re-provision"
+else
+  bad "PG did not come back within 240s after re-provision (see $HOSTD_LOG)"
+  die "cannot continue without PG"
+fi
+
+REPROV_RESULT=$(psql_g -c "SELECT a FROM tt" 2>/dev/null || echo "ERROR")
+if [ "$REPROV_RESULT" = "123" ]; then
+  ok "local_fast persisted across destroy: data intact (SELECT a FROM tt -> $REPROV_RESULT)"
+else
+  bad "local_fast persistence: data mismatch after re-provision (got '$REPROV_RESULT')"
 fi
 
 # ---------------------------------------------------------------------------

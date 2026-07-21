@@ -70,12 +70,18 @@ pub struct DriveConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_mb: Option<u64>,
     /// Where the image lives (and thus its lifetime):
-    /// - `LocalFast` -> under the host snapshot dir (ephemeral on destroy).
+    /// - `LocalFast` -> under the host snapshot dir; per-VM + ephemeral on
+    ///   destroy unless `persist_key` is set (then a shared local-fast store
+    ///   keyed by it, persistent across destroy).
     /// - `RemoteSlow` -> under `source` (a host-mounted remote FS; persists).
     #[serde(default)]
     pub tier: VolumeTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// `LocalFast` only: stable persist-across-destroy identity (see
+    /// [`tikovm_protocol::volume::VolumeDecl::persist_key`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_key: Option<String>,
 }
 
 /// A snapshot of a paused VM — the source for `restore` / the artifact of

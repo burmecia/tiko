@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum VolumeTier {
     /// Per-VM ext4 image on host-local disk, attached as virtio-block.
-    /// Fast, capped size, survives suspend, **ephemeral on destroy**.
+    /// Fast, capped size, survives suspend. Lifetime across destroy is
+    /// governed by [`VolumeDecl::persist_key`]: with a key the image lives in
+    /// a shared local-fast store and **persists across destroy** (a later VM
+    /// provisioned with the same key reattaches the same data); without one
+    /// it is per-VM and **ephemeral on destroy**.
     #[default]
     LocalFast,
     /// ext4 image on a host-mounted remote FS (e.g. S3 Files via NFS), attached
@@ -53,6 +57,17 @@ pub struct VolumeDecl {
     /// is placed under `<source>/<vm_id>/<name>.ext4`). Ignored for `local_fast`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// `local_fast` only: stable identity that makes the volume **persist
+    /// across VM destroy**. The host stores the image in a shared local-fast
+    /// store keyed by this value instead of under the per-VM dir, so a later
+    /// VM provisioned with the same key reattaches the same data (e.g. PGDATA
+    /// + local cache for a serverless-Postgres endpoint). The key is
+    /// operator-supplied (typically a tenant/endpoint id) because `vm_id` is
+    /// ephemeral. When `None`, the volume is per-VM and deleted on destroy.
+    /// Attaching the same key to two live VMs concurrently is a caller error
+    /// (shared ext4 images are single-attach).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_key: Option<String>,
 }
 
 impl VolumeDecl {
@@ -64,6 +79,7 @@ impl VolumeDecl {
             size_mb: Some(size_mb),
             read_only: false,
             source: None,
+            persist_key: None,
         }
     }
 
@@ -79,6 +95,7 @@ impl VolumeDecl {
             size_mb: None,
             read_only: false,
             source: Some(source.into()),
+            persist_key: None,
         }
     }
 }

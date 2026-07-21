@@ -1100,7 +1100,10 @@ impl Vmm for FirecrackerVmm {
 
     async fn cleanup_vm(&self, vm_id: &VmId) -> VmmResult<()> {
         // Terminal destroy: detach remote_slow volumes (their data persists
-        // on the backing), then delete ephemeral local_fast volume images.
+        // on the backing), then delete this VM's ephemeral local_fast volume
+        // images. Keyed persistent local_fast images live under
+        // volumes/_persist/<key>/ (outside this per-VM dir) and are retained
+        // by design — deleting one is an explicit operator action.
         self.provisioner.on_destroy_volumes(vm_id);
         let dir = self.snapshot_dir.join("volumes").join(vm_id);
         if dir.exists()
@@ -1157,6 +1160,7 @@ mod tests {
             size_mb: Some(64),
             tier: tikovm_protocol::volume::VolumeTier::RemoteSlow,
             source: None,
+            persist_key: None,
         };
         let j = declared_drive_json(&d);
         assert_eq!(j["cache_type"], "Writeback");

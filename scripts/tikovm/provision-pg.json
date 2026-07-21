@@ -25,7 +25,8 @@
                 "name": "data",
                 "tier": "local_fast",
                 "mount_path": "/mnt/data",
-                "size_mb": 768
+                "size_mb": 768,
+                "persist_key": "pg-e2e-data"
             },
             {
                 "name": "archive",

@@ -8,7 +8,9 @@
 #
 # COMPUTE-STORAGE SEPARATION (Lambda model):
 #   - PGDATA (catalogs, WAL, control files) on local_fast (/mnt/data/pgdata).
-#     Hot data on fast local storage; persists across suspend/restore.
+#     Hot data on fast local storage; persists across suspend/restore AND
+#     across destroy when the provision request sets a persist_key on the
+#     volume (see scripts/tikovm/provision-pg.json).
 #   - Chunk cache (TIKO_LOCAL_PATH) on local_fast (/mnt/data/tiko_local).
 #   - Bulk data (TIKO_STORAGE_ROOT — chunks, WAL, manifests) on remote_slow
 #     (/mnt/archive/tiko_root). Durable; persists across destroy.
@@ -16,7 +18,8 @@
 # The pg-supervisor creates a symlink /var/lib/postgresql/tt -> /mnt/data/pgdata
 # so all existing PG scripts and CLI tools (which use DB="tt") work unchanged.
 # On first seed, initdb creates PGDATA on local_fast. On subsequent boots
-# (after suspend/restore), the existing PGDATA is reused — fast start/stop.
+# (after suspend/restore, or re-provision onto a persistent local_fast
+# volume), the existing PGDATA is reused — fast start/stop.
 #
 # Prerequisites: build_postgres.sh must have been run (target/pg-install/).
 #
@@ -109,7 +112,8 @@ sudo tee "$MNT/usr/local/bin/pg-supervisor" >/dev/null <<'SCRIPT'
 # entire VM is frozen/thawed (no process-level signals needed).
 #
 # PGDATA lives on local_fast (/mnt/data/pgdata) — fast I/O, persists across
-# suspend/restore, ephemeral on destroy. Bulk data goes through the smgr to
+# suspend/restore, and across destroy when the volume carries a persist_key
+# (provision-side). Bulk data goes through the smgr to
 # remote_slow (/mnt/archive/tiko_root) — durable, persists across destroy.
 set -ex
 
@@ -144,7 +148,8 @@ ENV
 chown postgres:postgres "$PGHOME/tiko.env"
 
 # Initialize PGDATA on first seed only. On subsequent boots (after
-# suspend/restore), the existing PGDATA on local_fast is reused — fast start.
+# suspend/restore, or re-provision onto a persistent local_fast volume), the
+# existing PGDATA on local_fast is reused — fast start.
 if [ ! -f "$PGDATA_VOL/PG_VERSION" ]; then
     echo "pg-supervisor: initializing PGDATA at $PGDATA_VOL (first seed)..."
     su postgres -c "export PATH=/usr/local/bin:/usr/bin:/bin; initdb -D $PGDATA_VOL"
@@ -167,14 +172,18 @@ sudo chmod 755 "$MNT/usr/local/bin/pg-supervisor"
 sudo tee "$MNT/usr/local/bin/pg-idle-check" >/dev/null <<'SCRIPT'
 #!/bin/sh
 # pg-idle-check: exec idle probe for tikovm-guestd's idle evaluator.
-# Exit 0 (idle) if PG has no active backends (excluding this probe's own
-# connection); exit 1 (busy) otherwise or if PG is unreachable.
+# Exit 0 (idle) if PG has no active CLIENT backends (excluding this probe's
+# own connection); exit 1 (busy) otherwise or if PG is unreachable.
 #
-# The pid != pg_backend_pid() filter excludes this probe's own connection,
-# preventing a self-referential false-positive (the probe's own SELECT would
-# otherwise count as an "active" backend).
+# Two filters:
+# - pid != pg_backend_pid() excludes this probe's own connection (its own
+#   SELECT would otherwise count as an "active" backend).
+# - backend_type = 'client backend' excludes non-session backends — crucially
+#   the tikoworker WAL-streaming walsender (START_REPLICATION SLOT
+#   tiko_wal_stream), which sits at state='active' forever and would block
+#   scale-to-zero permanently; autovacuum workers are likewise ignored.
 ACTIVE=$(psql -h 127.0.0.1 -p 5432 -U postgres -t -A -c \
-    "SELECT count(*) FROM pg_stat_activity WHERE state != 'idle' AND pid != pg_backend_pid()" \
+    "SELECT count(*) FROM pg_stat_activity WHERE state != 'idle' AND pid != pg_backend_pid() AND backend_type = 'client backend'" \
     2>/dev/null) || ACTIVE=1
 [ "${ACTIVE:-1}" -eq 0 ]
 SCRIPT
@@ -211,7 +220,8 @@ kind = "exec"
 cmd = "/usr/local/bin/pg-idle-check"
 
 # local_fast: PGDATA + chunk cache. Fast local storage; persists across
-# suspend/restore; ephemeral on destroy.
+# suspend/restore; persists across destroy when the provision request sets a
+# persist_key on this volume (see provision-pg.json).
 [[volumes]]
 name = "data"
 tier = "local_fast"

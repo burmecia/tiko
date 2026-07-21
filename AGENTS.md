@@ -72,6 +72,17 @@ devices attached; detach is terminal-destroy only (`cleanup_vm`). e2e:
 is persistent via fstab (`fs-02b6905b6653757b6:/ /mnt/s3files s3files
 _netdev,nofail,mounttargetip=...,tls,iam`).
 
+`local_fast` volumes are per-VM ephemeral **unless the declaration carries a
+`persist_key`** (operator-supplied stable id, e.g. a tenant/endpoint id —
+`vm_id` is ephemeral): the image then lives in the shared
+`volumes/_persist/<key>/` store under the snapshot dir, survives destroy, and
+is reattached (never reformatted) by a later VM provisioned with the same
+key. Validated `[A-Za-z0-9._-]+` (it becomes a dir name); single-attach is
+the caller's responsibility; deletion is an explicit operator action. This is
+the PGDATA/chunk-cache persistence path for the serverless-PG rootfs
+(`provision-pg.json` sets `persist_key`; `run_pg_e2e.sh` Phase 4 verifies
+destroy → re-provision → data intact).
+
 ### tikovm (independent of Postgres — no PG submodule needed)
 
 ```bash
@@ -87,7 +98,8 @@ cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine
                                   #   (x2)→destroy for the cron "hello world" shell job;
                                   #   builds cron-rootfs.ext4 inline; verifies via serial log
 ./scripts/tikovm/run_pg_e2e.sh    # serverless PG E2E: seed→scale-to-zero→wake-on-connect→
-                                  #   pause/resume; builds pg-rootfs.ext4 inline (needs PG build:
+                                  #   pause/resume→destroy→re-provision (persist_key PGDATA
+                                  #   survives); builds pg-rootfs.ext4 inline (needs PG build:
                                   #   ./scripts/build_postgres.sh); psql via proxy on :15432
 ```
 

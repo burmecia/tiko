@@ -259,6 +259,7 @@ mod tests {
             size_mb: Some(64),
             tier: VolumeTier::RemoteSlow,
             source: None,
+            persist_key: None,
         }
     }
 

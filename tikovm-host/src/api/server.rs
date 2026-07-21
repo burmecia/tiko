@@ -277,6 +277,7 @@ pub fn vm_config_from_spec(spec: &VmSpec) -> VmConfig {
                     size_mb: v.size_mb,
                     tier: v.tier,
                     source: v.source.clone(),
+                    persist_key: v.persist_key.clone(),
                 })
                 .collect::<Vec<_>>()
         })

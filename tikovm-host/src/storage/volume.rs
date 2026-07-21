@@ -1,7 +1,8 @@
 //! Volume provisioning: the [`RemoteBacking`] trait for `remote_slow`
 //! storage plus the [`VolumeProvisioner`] that owns `local_fast` image
-//! creation (unchanged semantics) and dispatches `remote_slow` to the
-//! configured backing (design §9).
+//! creation (per-VM ephemeral, or persistent across destroy when the drive
+//! carries a `persist_key`) and dispatches `remote_slow` to the configured
+//! backing (design §9).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,8 +32,10 @@ pub trait RemoteBacking: Send + Sync {
 }
 
 /// Owns volume provisioning for the VMM. `local_fast` images are created
-/// inline exactly as before (ephemeral, under the snapshot dir);
-/// `remote_slow` drives are delegated to the configured backing.
+/// inline: per-VM + ephemeral under the snapshot dir when the drive has no
+/// `persist_key`, or in a shared local-fast store keyed by `persist_key`
+/// (persistent across destroy) when it does. `remote_slow` drives are
+/// delegated to the configured backing.
 ///
 /// Suspend does NOT detach remote volumes: `destroy_vm` is shared between
 /// suspend (snapshot+destroy) and terminal destroy, and detaching a ublk
@@ -66,7 +69,12 @@ impl VolumeProvisioner {
 
     /// For each drive with a `size_mb`, ensure its backing exists and is
     /// formatted so the guest can mount by `LABEL=<drive_id>`. Placement:
-    /// - `LocalFast` -> `snapshot_dir/volumes/<vm>/<name>.ext4` (ephemeral).
+    /// - `LocalFast`, no `persist_key` -> `snapshot_dir/volumes/<vm>/<name>.ext4`
+    ///   (per-VM, deleted on terminal destroy).
+    /// - `LocalFast` with `persist_key` ->
+    ///   `snapshot_dir/volumes/_persist/<key>/<name>.ext4` (shared store,
+    ///   survives destroy; re-provisioning the same key reattaches the
+    ///   existing image — the `!path.exists()` guard never reformats).
     /// - `RemoteSlow` -> the configured [`RemoteBacking`] (persists across
     ///   destroy).
     ///
@@ -78,7 +86,7 @@ impl VolumeProvisioner {
             };
             match d.tier {
                 VolumeTier::LocalFast => {
-                    let dir = self.snapshot_dir.join("volumes").join(vm_id);
+                    let dir = self.local_fast_dir(vm_id, d)?;
                     std::fs::create_dir_all(&dir)?;
                     let path = dir.join(format!("{}.ext4", d.drive_id));
                     if !path.exists() {
@@ -105,10 +113,39 @@ impl VolumeProvisioner {
         Ok(())
     }
 
+    /// Directory for a `local_fast` image: keyed shared store when the drive
+    /// carries a `persist_key` (persistent across destroy), else the per-VM
+    /// dir (deleted by `cleanup_vm` on terminal destroy). The key becomes a
+    /// directory name, so it is restricted to a safe charset.
+    fn local_fast_dir(&self, vm_id: &str, drive: &DriveConfig) -> VmmResult<PathBuf> {
+        let base = self.snapshot_dir.join("volumes");
+        match &drive.persist_key {
+            Some(key) => {
+                if key.is_empty()
+                    || key == ".."
+                    || !key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                {
+                    return Err(VmmError::InvalidConfig(format!(
+                        "invalid persist_key {key:?} for volume {}: expected [A-Za-z0-9._-]+",
+                        drive.drive_id
+                    )));
+                }
+                Ok(base.join("_persist").join(key))
+            }
+            None => Ok(base.join(vm_id)),
+        }
+    }
+
     /// Terminal-destroy hook (called from `cleanup_vm`, NOT from
     /// `destroy_vm` — suspend must not detach): forward to the remote
     /// backing for each remote_slow drive provisioned for this VM. Errors
     /// are logged, not fatal — teardown must proceed.
+    ///
+    /// `local_fast` needs no hook here: per-VM images are removed with the
+    /// per-VM dir by the caller; keyed persistent images live outside it and
+    /// are retained by design.
     pub fn on_destroy_volumes(&self, vm_id: &str) {
         let drives = self
             .provisioned
@@ -181,6 +218,60 @@ mod tests {
             size_mb: Some(64),
             tier: VolumeTier::RemoteSlow,
             source: None,
+            persist_key: None,
+        }
+    }
+
+    fn local_drive(name: &str, persist_key: Option<&str>) -> DriveConfig {
+        DriveConfig {
+            drive_id: name.into(),
+            path: PathBuf::new(),
+            read_only: false,
+            size_mb: Some(64),
+            tier: VolumeTier::LocalFast,
+            source: None,
+            persist_key: persist_key.map(|s| s.to_string()),
+        }
+    }
+
+    fn test_provisioner() -> VolumeProvisioner {
+        VolumeProvisioner::new(
+            PathBuf::from("/snap"),
+            Arc::new(FakeRemote {
+                calls: StdMutex::new(Vec::new()),
+            }),
+        )
+    }
+
+    #[test]
+    fn local_fast_without_key_is_per_vm() {
+        let prov = test_provisioner();
+        let d = local_drive("data", None);
+        let dir = prov.local_fast_dir("vm-1", &d).unwrap();
+        assert_eq!(dir, PathBuf::from("/snap/volumes/vm-1"));
+    }
+
+    #[test]
+    fn local_fast_with_key_lives_in_shared_store_across_vms() {
+        let prov = test_provisioner();
+        let d = local_drive("data", Some("tenant-42.pg"));
+        // Two different VM generations with the same key map to the SAME dir —
+        // this is what makes PGDATA survive destroy + re-provision.
+        let dir_a = prov.local_fast_dir("vm-1", &d).unwrap();
+        let dir_b = prov.local_fast_dir("vm-7", &d).unwrap();
+        assert_eq!(dir_a, dir_b);
+        assert_eq!(dir_a, PathBuf::from("/snap/volumes/_persist/tenant-42.pg"));
+    }
+
+    #[test]
+    fn local_fast_rejects_unsafe_persist_keys() {
+        let prov = test_provisioner();
+        for bad in ["", "..", "a/b", "a b", "../x", "x\\y"] {
+            let d = local_drive("data", Some(bad));
+            assert!(
+                prov.local_fast_dir("vm-1", &d).is_err(),
+                "key {bad:?} should be rejected"
+            );
         }
     }
 

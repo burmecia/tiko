@@ -243,6 +243,8 @@ name = "data"
 tier = "local_fast"                    # local_fast | remote_slow
 mount_path = "/mnt/data"
 size_mb = 1024                         # local_fast only
+persist_key = "tenant-42-pgdata"       # local_fast only, optional: stable identity
+                                       # that survives destroy (see §9)
 ```
 
 Everything in the manifest is **guest-internal behavior** except the two sections
@@ -408,12 +410,32 @@ Two optional storage tiers, **declared in the rootfs manifest** (`[[volumes]]`):
 
 | Tier | Backing | Lifetime | Sizing |
 |---|---|---|---|
-| `local_fast` | per-VM ext4 image on host-local disk, attached as virtio-block | survives suspend; **ephemeral on destroy** | capped (`size_mb`) |
+| `local_fast` | per-VM ext4 image on host-local disk, attached as virtio-block | survives suspend; **persists across destroy when a `persist_key` is set** (ephemeral otherwise) | capped (`size_mb`) |
 | `remote_slow` | host-mounted remote FS, attached as virtio-block (image on the mount) | **persists across destroy** | unlimited (backend-enforced) |
 
 **`local_fast`** generalizes today's per-VM overlay (`/dev/vdb`) +
 `DriveConfig`. The host creates a sparse ext4 image of `size_mb`, attaches it as
 a virtio-block device; the guest mounts it at `mount_path`.
+
+**Persistent `local_fast` (`persist_key`).** By default a `local_fast` image
+lives under the per-VM dir (`volumes/<vm_id>/`) and is deleted on terminal
+destroy. A volume that must outlive its VM — PGDATA + local cache files for a
+serverless-Postgres endpoint is the driving case — declares a
+**`persist_key`**: an operator-supplied stable identity (typically a
+tenant/endpoint id, since `vm_id` is ephemeral). The image then lives in a
+shared local-fast store (`volumes/_persist/<persist_key>/<name>.ext4`),
+outside the per-VM dir, so destroy retains it and a later VM provisioned with
+the same key **reattaches the existing image** (provisioning is idempotent —
+an existing image is never reformatted). Semantics:
+
+- The key is validated (`[A-Za-z0-9._-]+`) since it becomes a directory name.
+- **Single-attach is the caller's responsibility**: attaching the same key to
+  two live VMs concurrently mounts one ext4 image twice and will corrupt it
+  (same contract as the `s3files_image` remote backing; the `ublk` backing
+  enforces leases, plain files rely on the orchestrator).
+- **Deletion is explicit**: keyed images are never garbage-collected by
+  destroy; reclaiming them is an operator action (a volume-management API is
+  deferred, §16).
 
 **`remote_slow`** exposes slow, durable, shared-capable storage to the guest.
 Firecracker **does not implement virtio-fs** (its device set is only
@@ -456,11 +478,13 @@ the e2e exercises both tiers. Declared-volume drives are attached with
 `cache_type: "Writeback"` so guest fsync reaches the backing (the Firecracker
 default, Unsafe, silently drops flushes).
 
-**Validation against real Tiko/PG:** the PG workload would declare a `local_fast`
-`cache` volume (→ `TIKO_LOCAL_PATH`) and a `remote_slow` `archive` volume
-(→ `TIKO_STORAGE_ROOT`). The 2 tiers express precisely the local-cache-vs-
-durable-archive split the storage engine already assumes — now without the
-generic layer knowing anything about PG chunks.
+**Validation against real Tiko/PG:** the PG workload declares a `local_fast`
+`data` volume **with a `persist_key`** (PGDATA at `/mnt/data/pgdata` + chunk
+cache at `TIKO_LOCAL_PATH` — both survive destroy) and a `remote_slow`
+`archive` volume (→ `TIKO_STORAGE_ROOT`). The 2 tiers plus the persist key
+express precisely the local-hot-vs-durable-archive split the storage engine
+already assumes — now without the generic layer knowing anything about PG
+chunks.
 
 **Provisioning mechanism (confirmed):** Firecracker attaches block devices at
 VM-create time, before the guest boots, so the host must learn the volume
@@ -705,9 +729,12 @@ CLI tools, and a Lambda-style `pg-supervisor` entrypoint.
 The `pg-supervisor` sets up volumes, initializes PGDATA on first seed (via
 `initdb`), then execs `postgres` in foreground. PGDATA lives on `local_fast`
 (`/mnt/data/pgdata`) for fast I/O — it persists across suspend/restore (the
-volume stays attached) but is ephemeral on destroy. Bulk data (chunks, WAL,
-manifests) flows through the smgr to `remote_slow` (`/mnt/archive/tiko_root`)
-— durable, persists across destroy.
+volume stays attached) **and across destroy**: the provision request sets a
+`persist_key` on the volume (§9), so a re-provisioned VM reattaches the same
+image and the supervisor reuses the existing PGDATA (no `initdb`, fast
+start). The local chunk cache (`/mnt/data/tiko_local`) rides the same volume.
+Bulk data (chunks, WAL, manifests) flows through the smgr to `remote_slow`
+(`/mnt/archive/tiko_root`) — durable, persists across destroy.
 
 The manifest's `[idle]` policy uses two probes: `host_network` (no external
 traffic) + an `exec` probe (`pg-idle-check`) that queries
@@ -717,15 +744,19 @@ idle on both probes, the guest signals suspend. The next psql connection
 with all data intact — sub-second cold start to serving queries.
 
 End-to-end test: `scripts/tikovm/run_pg_e2e.sh` validates the full loop
-(seed → scale-to-zero → wake-on-connect → warm pause/resume) against real
-KVM + Firecracker, connecting via psql through the proxy.
+(seed → scale-to-zero → wake-on-connect → warm pause/resume → **destroy +
+re-provision with the same `persist_key`, verifying PGDATA survives**)
+against real KVM + Firecracker, connecting via psql through the proxy.
 
 ## 16. What's deferred (designed, not built initially)
 
-- PITR-based data persistence across VM destroy (the current PG rootfs
-  survives suspend/restore via PGDATA on local_fast, but destroy requires
-  restoring PGDATA from a `pg_basebackup` tarball via `tiko_pitr recover`;
-  see §15.3). COW branching via `tiko_branch` is similarly deferred.
+- PITR-based disaster recovery (PGDATA itself now survives destroy via a
+  `persist_key`'d `local_fast` volume, §9; PITR via `tiko_pitr recover` from a
+  `pg_basebackup` tarball remains the path for host loss / volume corruption /
+  point-in-time restore; see §15.3). COW branching via `tiko_branch` is
+  similarly deferred.
+- Explicit volume-management API for keyed `local_fast` images (list/delete
+  `volumes/_persist/<key>/`; today deletion is a manual operator action).
 - The scheduling mechanism itself is in-scope — see §13; the language-runtime
   rootfs (Node.js 22 LTS + Python 3.12) is built — see §15.1, the
   scheduled-job (cron) rootfs is built — see §15.2, and the scale-to-zero
@@ -807,15 +838,15 @@ pass and `cargo clippy` is clean on all three new crates.
 | Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` (derivative of the tikovm base) |
 | Language-runtime rootfs (Node.js 22 LTS + Python 3.12) | ✅ built | `scripts/tikovm/build_lang_rootfs.sh` (derivative of the tikovm base; both runtimes baked in, "hello world" echo per runtime, manifest defaults to Node). Lambda-style serverless worker — same supervisor + scale-to-zero as echo, different runtime |
 | Scheduled-job rootfs (cron) | ✅ built | `scripts/tikovm/build_cron_rootfs.sh` (derivative of the tikovm base; `/bin/sh` "hello world" loop). Periodic-run pattern: guest idle evaluator auto-suspends, host scheduler (§13, keep-warm mode) restores on interval. e2e: `run_cron_e2e.sh` |
-| Scale-to-zero Postgres rootfs | ✅ built | `scripts/tikovm/build_pg_rootfs.sh` (derivative of the tikovm base; PG 18 + tikosmgr/tikoworker + pg-supervisor). PGDATA on `local_fast` (fast start/stop, survives suspend), bulk data on `remote_slow` (durable). Idle probes: `host_network` + `pg-idle-check` (queries `pg_stat_activity`). Proxy wake-on-connect for psql. e2e: `run_pg_e2e.sh` (seed → scale-to-zero → pause/resume) |
+| Scale-to-zero Postgres rootfs | ✅ built | `scripts/tikovm/build_pg_rootfs.sh` (derivative of the tikovm base; PG 18 + tikosmgr/tikoworker + pg-supervisor). PGDATA on `local_fast` **with a `persist_key`** (fast start/stop, survives suspend **and destroy**), bulk data on `remote_slow` (durable). Idle probes: `host_network` + `pg-idle-check` (queries `pg_stat_activity`). Proxy wake-on-connect for psql. e2e: `run_pg_e2e.sh` (seed → scale-to-zero → pause/resume → destroy + re-provision, PGDATA intact) |
 | TCP proxy (wake-on-connect data plane) | ✅ built, validated | single fixed target VM (multi-VM routing = next) |
-| Workload volumes (`local_fast`, `remote_slow`) | ✅ built, e2e-covered | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`) and provisions via `tikovm-host/storage` (`VolumeProvisioner` + `RemoteBacking`, extracted from `firecracker.rs`). Two `remote_slow` backings, selected by `[storage] remote_slow_backing`: `s3files_image` (ext4 image on the host-mounted remote FS, legacy default) and `ublk` (tikoblkd chunk store on `/dev/ublkbN`). Declared drives attach with `cache_type: "Writeback"` (durability fix). `local_fast` ephemeral on destroy; `remote_slow` persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). e2e: `provision.json` declares both tiers; `run_e2e.sh` checks LABEL mounts, suspend/restore + destroy persistence of a checksummed file on `remote_slow`, for both backings (`BACKING=s3files_image|ublk`; ublk run additionally verified on this host — pending rerun after the ublk2 driver loss on reboot). Not yet: guest volume-readiness reporting, NFS-in-guest fallback |
+| Workload volumes (`local_fast`, `remote_slow`) | ✅ built, e2e-covered | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`) and provisions via `tikovm-host/storage` (`VolumeProvisioner` + `RemoteBacking`, extracted from `firecracker.rs`). Two `remote_slow` backings, selected by `[storage] remote_slow_backing`: `s3files_image` (ext4 image on the host-mounted remote FS, legacy default) and `ublk` (tikoblkd chunk store on `/dev/ublkbN`). Declared drives attach with `cache_type: "Writeback"` (durability fix). **`local_fast` persists across destroy when the declaration carries a `persist_key`** (operator-supplied stable identity; image in the shared `volumes/_persist/<key>/` store, idempotent reattach, never reformatted, explicit operator deletion; single-attach is the caller's responsibility) — without a key it stays per-VM ephemeral. `remote_slow` persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). e2e: `provision.json` declares both tiers; `run_e2e.sh` checks LABEL mounts, suspend/restore + destroy persistence of a checksummed file on `remote_slow`, for both backings (`BACKING=s3files_image|ublk`; ublk run additionally verified on this host — pending rerun after the ublk2 driver loss on reboot); `run_pg_e2e.sh` Phase 4 checks `persist_key`'d `local_fast` survives destroy + re-provision. Not yet: guest volume-readiness reporting, NFS-in-guest fallback, volume-management API for keyed images |
 | Host→guest commands (`PreSuspend`/`PostRestore` hooks) | 🟡 defined | for clean-snapshot quiesce; current freeze is abrupt |
 | Multi-VM proxy routing (by `RoutingRule`: Host/path/header) | 🟡 designed | current proxy forwards to one configured VM |
 | Prometheus metrics | 🟡 designed | tracing logs only today |
 | vhost-user-block prod path for `remote_slow` | 🟡 future | |
 | Multi-node clustering / distributed registry | 🟡 future | `StateStore` is the seam |
-| PITR-based PG persistence across destroy + COW branching | 🟡 future | PGDATA on local_fast survives suspend/restore; destroy requires `tiko_pitr recover` from a `pg_basebackup` tarball. `tiko_branch` for COW branching (design §15.3) |
+| PITR disaster recovery + COW branching | 🟡 future | PGDATA on `persist_key`'d local_fast now survives destroy; PITR (`tiko_pitr recover` from a `pg_basebackup` tarball) remains for host loss / point-in-time. `tiko_branch` for COW branching (design §15.3) |
 
 **Verified on real microVMs:** provision → boot to `multi-user` → echo
 reachable at the guest IP → idle → guest signals suspend over vsock → host
