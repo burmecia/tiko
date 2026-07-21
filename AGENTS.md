@@ -86,6 +86,9 @@ cargo clippy -p tikovm-protocol -p tikovm-host -p tikovm-guest  # clippy IS fine
 ./scripts/tikovm/run_cron_e2e.sh  # scheduled-job E2E: provision→idle-suspend→scheduler-wake
                                   #   (x2)→destroy for the cron "hello world" shell job;
                                   #   builds cron-rootfs.ext4 inline; verifies via serial log
+./scripts/tikovm/run_pg_e2e.sh    # serverless PG E2E: seed→scale-to-zero→wake-on-connect→
+                                  #   pause/resume; builds pg-rootfs.ext4 inline (needs PG build:
+                                  #   ./scripts/build_postgres.sh); psql via proxy on :15432
 ```
 
 ## Gotchas an agent will hit

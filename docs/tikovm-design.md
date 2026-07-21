@@ -694,13 +694,42 @@ End-to-end test: `scripts/tikovm/run_cron_e2e.sh` verifies the full loop
 against real KVM + Firecracker, checking state transitions via the API and
 job output via the Firecracker serial log.
 
+### 15.3 Scale-to-zero Postgres (serverless database)
+
+The fourth rootfs kind: serverless Postgres with Lambda-like compute-storage
+separation. Built as a derivative of the tikovm base rootfs by
+`scripts/tikovm/build_pg_rootfs.sh` (`tikod/assets/pg-rootfs.ext4`), which
+installs PostgreSQL 18 + Tiko storage extensions (tikosmgr + tikoworker),
+CLI tools, and a Lambda-style `pg-supervisor` entrypoint.
+
+The `pg-supervisor` sets up volumes, initializes PGDATA on first seed (via
+`initdb`), then execs `postgres` in foreground. PGDATA lives on `local_fast`
+(`/mnt/data/pgdata`) for fast I/O — it persists across suspend/restore (the
+volume stays attached) but is ephemeral on destroy. Bulk data (chunks, WAL,
+manifests) flows through the smgr to `remote_slow` (`/mnt/archive/tiko_root`)
+— durable, persists across destroy.
+
+The manifest's `[idle]` policy uses two probes: `host_network` (no external
+traffic) + an `exec` probe (`pg-idle-check`) that queries
+`pg_stat_activity` to check for active PG backends. After 30s of sustained
+idle on both probes, the guest signals suspend. The next psql connection
+(waking through the proxy's wake-on-connect) restores the VM from snapshot
+with all data intact — sub-second cold start to serving queries.
+
+End-to-end test: `scripts/tikovm/run_pg_e2e.sh` validates the full loop
+(seed → scale-to-zero → wake-on-connect → warm pause/resume) against real
+KVM + Firecracker, connecting via psql through the proxy.
+
 ## 16. What's deferred (designed, not built initially)
 
-- Migrating the real Tiko Postgres to a rootfs + manifest (validates against the
-  real workload; first real user of both storage tiers).
+- PITR-based data persistence across VM destroy (the current PG rootfs
+  survives suspend/restore via PGDATA on local_fast, but destroy requires
+  restoring PGDATA from a `pg_basebackup` tarball via `tiko_pitr recover`;
+  see §15.3). COW branching via `tiko_branch` is similarly deferred.
 - The scheduling mechanism itself is in-scope — see §13; the language-runtime
-  rootfs (Node.js 22 LTS + Python 3.12) is built — see §15.1 — and the
-  scheduled-job (cron) rootfs is built — see §15.2.
+  rootfs (Node.js 22 LTS + Python 3.12) is built — see §15.1, the
+  scheduled-job (cron) rootfs is built — see §15.2, and the scale-to-zero
+  Postgres rootfs is built — see §15.3.
 - `vhost-user-block` production scale path for `remote_slow`.
 - Multi-node clustering / distributed registry (the `StateStore` trait is the
   seam; §14).
@@ -778,6 +807,7 @@ pass and `cargo clippy` is clean on all three new crates.
 | Echo workload rootfs | ✅ built, validated | `scripts/tikovm/build_echo_rootfs.sh` (derivative of the tikovm base) |
 | Language-runtime rootfs (Node.js 22 LTS + Python 3.12) | ✅ built | `scripts/tikovm/build_lang_rootfs.sh` (derivative of the tikovm base; both runtimes baked in, "hello world" echo per runtime, manifest defaults to Node). Lambda-style serverless worker — same supervisor + scale-to-zero as echo, different runtime |
 | Scheduled-job rootfs (cron) | ✅ built | `scripts/tikovm/build_cron_rootfs.sh` (derivative of the tikovm base; `/bin/sh` "hello world" loop). Periodic-run pattern: guest idle evaluator auto-suspends, host scheduler (§13, keep-warm mode) restores on interval. e2e: `run_cron_e2e.sh` |
+| Scale-to-zero Postgres rootfs | ✅ built | `scripts/tikovm/build_pg_rootfs.sh` (derivative of the tikovm base; PG 18 + tikosmgr/tikoworker + pg-supervisor). PGDATA on `local_fast` (fast start/stop, survives suspend), bulk data on `remote_slow` (durable). Idle probes: `host_network` + `pg-idle-check` (queries `pg_stat_activity`). Proxy wake-on-connect for psql. e2e: `run_pg_e2e.sh` (seed → scale-to-zero → pause/resume) |
 | TCP proxy (wake-on-connect data plane) | ✅ built, validated | single fixed target VM (multi-VM routing = next) |
 | Workload volumes (`local_fast`, `remote_slow`) | ✅ built, e2e-covered | `VolumeTier`/`VolumeDecl` in `tikovm-protocol/volume.rs`; host expands `[[volumes]]` → drives at provision (`api/server.rs`) and provisions via `tikovm-host/storage` (`VolumeProvisioner` + `RemoteBacking`, extracted from `firecracker.rs`). Two `remote_slow` backings, selected by `[storage] remote_slow_backing`: `s3files_image` (ext4 image on the host-mounted remote FS, legacy default) and `ublk` (tikoblkd chunk store on `/dev/ublkbN`). Declared drives attach with `cache_type: "Writeback"` (durability fix). `local_fast` ephemeral on destroy; `remote_slow` persists; guest mounts by `LABEL=` at boot (`tikovm-guest/fs.rs`). e2e: `provision.json` declares both tiers; `run_e2e.sh` checks LABEL mounts, suspend/restore + destroy persistence of a checksummed file on `remote_slow`, for both backings (`BACKING=s3files_image|ublk`; ublk run additionally verified on this host — pending rerun after the ublk2 driver loss on reboot). Not yet: guest volume-readiness reporting, NFS-in-guest fallback |
 | Host→guest commands (`PreSuspend`/`PostRestore` hooks) | 🟡 defined | for clean-snapshot quiesce; current freeze is abrupt |
@@ -785,7 +815,7 @@ pass and `cargo clippy` is clean on all three new crates.
 | Prometheus metrics | 🟡 designed | tracing logs only today |
 | vhost-user-block prod path for `remote_slow` | 🟡 future | |
 | Multi-node clustering / distributed registry | 🟡 future | `StateStore` is the seam |
-| PG rootfs workloads | 🟡 future | the platform is workload-agnostic; the language-runtime rootfs (§15.1) and scheduled-job rootfs (§15.2) are built, PG rootfs to follow |
+| PITR-based PG persistence across destroy + COW branching | 🟡 future | PGDATA on local_fast survives suspend/restore; destroy requires `tiko_pitr recover` from a `pg_basebackup` tarball. `tiko_branch` for COW branching (design §15.3) |
 
 **Verified on real microVMs:** provision → boot to `multi-user` → echo
 reachable at the guest IP → idle → guest signals suspend over vsock → host
