@@ -21,35 +21,29 @@ build `smgr` (staticlib, linked into PG) → `make && make install` in `postgres
 `postgres/src/test/modules/test_tiko/worker/` → `make check` there with
 `shared_preload_libraries=libtikoworker`. Don't reorder these.
 
-Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
-`tikoguest`). `tikod`'s integration tests (`tikod/tests/`) only build on Linux.
+Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
 
 ## Gotchas an agent will hit
 
 - **Do NOT run `cargo clippy`** on `core`/`smgr`/`worker`/`cli`/`pgsys`. Pre-existing
   lint errors in the hand-written FFI bindings (`pgsys`) abort the build. Verify
   changes with `cargo build` / `cargo test` instead.
-- **`tikod` builds on macOS but cannot run VMs.** `default_vmm` has a
-  `#[cfg(target_os = "linux")]` Firecracker branch and a `#[cfg(not(target_os = "linux"))]`
-  branch that returns an `UnsupportedVmm` stub (every `Vmm` op errors with
-  `VmmError::Backend`). So on macOS `tikod` compiles/starts (useful for working on
-  config/HTTP API/proxy) but no VM can be created. The CLAUDE.md mention of an Apple
-  Virtualization Framework macOS backend is stale; `tikod/src/vmm/` ships only
-  `firecracker.rs` (Linux prod) plus the in-`mod.rs` `UnsupportedVmm` stub. On macOS you
-  can build/test `core`, `pgsys`, `smgr`, `worker`, `cli`, `tikoguest`, and now `tikod`
-  (VM ops aside).
 - **`build_postgres.sh`** installs deps via `apt-get` on Linux and `brew` on
   macOS (auto-detected). On macOS it also checks for Xcode Command Line Tools.
 - **Required env vars**: `run_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/
   `TIKO_PROJECT_ID`/`TIKO_PITR_INTERVAL_SECS`. It also `unset`s
   `TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH` (the smoke test uses defaults). In a VM
-  these come from `/var/lib/postgresql/tiko.env` (see `scripts/tiko_env.sh`).
+  these are provisioned by the tikovm guest image (sourced from
+  `/var/lib/postgresql/tiko_env.sh`).
 - **macOS System V shmem leak**: `run_test.sh` cleans orphaned `ipcs -m` segments
   first because macOS caps `kern.sysv.shmmni` at 32 and each killed postgres leaks
   one. If `make check` hangs/fails on shmem, clear them manually.
 
 ## Architecture facts that aren't obvious from filenames
 
+- **The compute layer moved to [tikovm](https://github.com/burmecia/tikovm).** This repo is the
+  storage engine only: `core`/`pgsys`/`smgr`/`worker`/`cli`. VM orchestration (`hostd`,
+  `guestd`, Firecracker, proxying) is tikovm's concern — nothing here creates or manages VMs.
 - **Storage backend today is `S3Sim`** (`core/src/io/storage/s3_sim.rs`) — a
   local-filesystem zstd-compressed stand-in. It is **not just a test double**: in
   production its root is an NFSv4.2-mounted S3 Files share, so this is the real
@@ -61,9 +55,7 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
   (`OrgMeta.deleted_at`) is tracked but nothing reclaims the data.
 - **crate-type matters**: `smgr` (`tikosmgr`) = `staticlib`+`rlib`, linked *into*
   postgres at build time. `worker` (`tikoworker`) = `cdylib`+`rlib`, loaded at
-  runtime via `shared_preload_libraries`. `cli`/`tikod`/`tikoguest` are binaries.
-- **`tikod` and `tikoguest` have NO Rust dependency on `core`/`smgr`/`worker`** —
-  they orchestrate by spawning CLI binaries / `pg_ctl` and talking HTTP.
+  runtime via `shared_preload_libraries`. `cli` produces the operator binaries.
 - **Two smgr I/O paths**: sync smgr functions call `core::ops` directly in the
   backend (correct because callers may pass backend-local memory the worker can't
   reach cross-process); the async path (`tiko_startreadv`) goes through the
@@ -87,6 +79,8 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`,
 
 ## Notes that differ from defaults
 
-- `psql` selects a database via `options='-c tiko.endpoint=vm-N'` (routed by `tikod`).
+- Through the tikovm proxy, `psql` authenticates with a per-VM JWT:
+  `options='-c tikovm_token=<jwt>'` (routed by tikovm's `hostd`). Tiko's own test
+  scripts talk to Postgres directly, no proxy involved.
 - There is no `rust-toolchain.toml`; minimum is Rust **1.88, edition 2024**.
 - No CI workflows are defined; `./scripts/run_test.sh` is the canonical check.

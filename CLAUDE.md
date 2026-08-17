@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tiko is a serverless Postgres proof-of-concept: S3-backed storage + Firecracker microVM compute.
-It replaces PostgreSQL's magnetic-disk (`md`) storage manager with an S3-backed block store, runs
-each database in its own microVM that scales to zero when idle, supports copy-on-write branching,
-and streams WAL to S3 for point-in-time recovery. Written in Rust, compiled as PostgreSQL shared
-libraries (extensions) plus standalone control-plane/CLI binaries. This is experimental, not
+Tiko is a serverless Postgres proof-of-concept: an S3-backed storage engine for PostgreSQL.
+It replaces PostgreSQL's magnetic-disk (`md`) storage manager with an S3-backed block store,
+supports copy-on-write branching, and streams WAL to S3 for point-in-time recovery. Written in
+Rust, compiled as PostgreSQL shared libraries (extensions) plus standalone CLI binaries. The
+compute layer (running Postgres in Firecracker microVMs that scale to zero when idle) lives in
+the separate [tikovm](https://github.com/burmecia/tikovm) project. This is experimental, not
 production software.
 
 ## Build & Test
@@ -51,8 +52,6 @@ tiko/
 ├── smgr/         # tikosmgr — PostgreSQL storage manager
 ├── worker/       # tikoworker — background worker (AIO, WAL receiver, compactor)
 ├── cli/          # operator CLIs: tiko_pitr, tiko_branch, tiko_restore, tiko_tlseg_viewer
-├── tikod/        # control plane: proxy, node/VMM lifecycle, HTTP API
-└── tikoguest/    # in-VM agent: pg control, observability, scaler, freeze
 ```
 
 ```
@@ -61,9 +60,12 @@ pgsys ──→ core ──→ smgr (tikosmgr)  ──→ postgres
                 └──→ cli (tiko_pitr, tiko_branch, tiko_restore, ...)
 ```
 
-`tikod` and `tikoguest` are standalone binaries with no internal Rust dependency on
-`core`/`smgr`/`worker` — they orchestrate everything by spawning CLI binaries / `pg_ctl` and
-talking HTTP.
+The compute layer is **not in this repo**. VM orchestration (Firecracker lifecycle,
+snapshot/restore, connection proxying) lives in [tikovm](https://github.com/burmecia/tikovm):
+`hostd` runs on the KVM host and `guestd` inside each VM (starts/stops Postgres via `pg_ctl`,
+reports idleness). Tiko's crates have no Rust dependency on tikovm — integration is by
+convention: `guestd` spawns Tiko's CLI binaries / `pg_ctl` inside the VM and exposes HTTP
+routes that consume their JSON output.
 
 ### `pgsys` — PostgreSQL FFI bindings
 Raw `extern "C"` declarations for PG internals: smgr, background workers, shared memory, LWLocks,
@@ -187,25 +189,19 @@ cache-dirty state.
   but is commented out of `Cargo.toml`'s `[[bin]]` list — dead code from a prior CLI shape, not
   part of the build.
 
-### `tikod` — compute control plane
-HTTP control API + PG wire-protocol proxy + VM orchestration. Not a GC/retention service (see
-Roadmap). Modules: `proxy/` (wire-protocol proxy with wake-on-connect/freeze, startup/cancel/error
-handling), `control/` (VM registry, idle policy, auto-pause enforcement), `node/` (VM lifecycle via
-the `Vmm` trait — Firecracker on Linux, Apple Virtualization Framework on macOS dev — plus snapshot
-cache), `api/` (HTTP server/client: `/vms/provision`, `/vms/{id}/db/*`, `/vms/{id}/branch/*`,
-`/vms/{id}/pitr/*`), `guestcontrol.rs` (talks to `tikoguest` over HTTP).
-
-### `tikoguest` — in-VM agent
-Runs inside each microVM: `pg_ctl` lifecycle, observability (`pgmetrics.rs`), autoscaling
-(`scaler.rs`), freeze/backup coordination (`backup.rs`), and an HTTP server (`server.rs`) that
-`tikod` talks to.
+### Compute layer (tikovm)
+The compute half of the stack — running Postgres in Firecracker microVMs that scale to zero —
+lives in the separate [tikovm](https://github.com/burmecia/tikovm) project and is out of scope
+for this repo. In brief: `hostd` (on the KVM host) owns VM lifecycle, snapshot/restore, and the
+client-facing proxy that wakes a frozen VM on connect; `guestd` (inside each VM) manages the
+Postgres process via `pg_ctl`, runs Tiko's CLI binaries (`tiko_branch`, `tiko_pitr`, ...) and
+reports idleness so `hostd` knows when to freeze.
 
 ### Copy-on-write branching
 Every database is a branch of a seed database. A chunk's `ChunkRef` can reference the *parent*
 database's `db_id`, so a freshly restored branch shares all inherited chunks without copying —
 only newly written/modified blocks land under the branch's own `db_id`. Driven end-to-end by
-`tiko_branch backup`/`restore` and `tikod`'s `/vms/{id}/branch/backup|restore` HTTP endpoints (see
-README for a full worked example).
+`tiko_branch backup`/`restore` (in a deployment, invoked inside the VM by tikovm's `guestd`).
 
 ### Point-in-time recovery
 WAL streams to S3 in near-real-time via `worker::tasks::wal_receiver`. `tiko_pitr recover
@@ -229,5 +225,3 @@ Per the README's own roadmap and verified absent from the code:
   but nothing physically reclaims deleted orgs' data yet.
 - **Real S3 backend**: `core::io::storage::s3::S3` is a stub (`todo!()`); `S3Sim` (local
   filesystem, potentially NFS-mounted) is the only working backend today.
-- Baking more services (PostgREST, Auth) into the guest rootfs.
-- Externalizing scheduled jobs (`pg_cron`) into `tikod`.
