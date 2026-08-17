@@ -2,10 +2,8 @@
 members = [
   "cli",
   "core",
-  "tikoguest",
   "pgsys",
   "smgr",
-  "tikod",
   "worker",
 ]
 resolver = "2"
