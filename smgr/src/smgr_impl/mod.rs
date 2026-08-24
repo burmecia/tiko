@@ -19,7 +19,7 @@ mod writeback;
 mod writev;
 mod zeroextend;
 
-use pgsys::common::{TABLESPACE_VERSION_DIRECTORY, data_dir_path};
+use pgsys::{common::data_dir_path, version::TABLESPACE_VERSION_DIRECTORY};
 
 /// Build the path of the per-relation marker file that Tiko maintains
 /// inside the standard `pg_tblspc` directory structure.

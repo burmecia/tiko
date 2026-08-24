@@ -6,7 +6,6 @@
 pub mod aio;
 pub mod bgworker;
 pub mod common;
-pub mod condition_variable;
 pub mod cshim;
 pub mod latch;
 pub mod logging;
@@ -16,6 +15,7 @@ pub mod shmem;
 pub mod smgr;
 pub mod timeline_id;
 pub mod utils;
+pub mod version;
 pub mod wait_events;
 
 pub use lsn::Lsn;

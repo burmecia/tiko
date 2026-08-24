@@ -1,5 +1,5 @@
 use core::store::Store;
-use pgsys::common::PG_VERSION_NUM;
+use pgsys::version::PG_VERSION_NUM;
 use std::fs;
 use std::path::Path;
 use std::process::Command;

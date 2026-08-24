@@ -1,8 +1,9 @@
 use core::io::store::Store;
 use core::io_control::IoControl;
 use pgsys::{
-    common::{MaxBackends, NUM_AUXILIARY_PROCS, get_my_proc_number},
+    common::{MaxBackends, get_my_proc_number},
     logging::*,
+    version::NUM_AUXILIARY_PROCS,
     wait_events::new_wait_event,
 };
 

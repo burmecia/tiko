@@ -16,8 +16,9 @@ mod thread_pool;
 use core::io::store::Store;
 use pgsys::{
     bgworker::*,
-    common::{FLOAT8PASSBYVAL, FUNC_MAX_ARGS, INDEX_MAX_KEYS, NAMEDATALEN, PG_VERSION_NUM},
+    common::{FLOAT8PASSBYVAL, FUNC_MAX_ARGS, INDEX_MAX_KEYS, NAMEDATALEN},
     utils,
+    version::PG_VERSION_NUM,
 };
 use std::ffi::{c_char, c_int};
 

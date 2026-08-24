@@ -32,14 +32,11 @@ unsafe extern "C" {
     /// * `signum` - Signal number (SIGTERM, SIGHUP, SIGINT, etc.)
     /// * `handler` - Signal handler function, SIG_IGN, or SIG_DFL
     ///
-    /// # Returns
-    /// Previous signal handler
-    ///
     /// # Source
     /// Defined in: src/port/pqsignal.c
     /// Declared in: src/include/port.h
     #[link_name = "pqsignal_be"]
-    pub fn pqsignal(signum: c_int, handler: PqSignalT) -> PqSignalT;
+    pub fn pqsignal(signum: c_int, handler: PqSignalT);
 
     /// Get the current process's latch
     pub static MyLatch: *mut Latch;

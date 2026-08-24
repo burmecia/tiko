@@ -52,7 +52,6 @@ unsafe extern "C" {
     pub fn mdclose(reln: *mut SMgrRelationData, forknum: ForkNumber);
     pub fn mdcreate(reln: *mut SMgrRelationData, forknum: ForkNumber, isRedo: bool);
     pub fn mdexists(reln: *mut SMgrRelationData, forknum: ForkNumber) -> bool;
-    pub fn mdunlink(rlocator: *mut RelFileLocatorBackend, forknum: ForkNumber, isRedo: bool);
     pub fn mdextend(
         reln: *mut SMgrRelationData,
         forknum: ForkNumber,

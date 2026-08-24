@@ -20,7 +20,6 @@ pub const INVALID_FORK_NUMBER: ForkNumber = -1;
 pub const MAIN_FORKNUM: ForkNumber = 0;
 pub const MAX_FORKNUM: ForkNumber = 3; // INIT_FORKNUM
 
-pub const PG_VERSION_NUM: c_int = 180001; // in src/include/pg_config.h
 pub const MAXPGPATH: usize = 1024;
 pub const FUNC_MAX_ARGS: c_int = 100;
 pub const INDEX_MAX_KEYS: c_int = 32;
@@ -33,26 +32,11 @@ pub const DEFAULTTABLESPACE_OID: Oid = 1663;
 /// OID of the global tablespace (pg_global / global/).
 pub const GLOBALTABLESPACE_OID: Oid = 1664;
 
-/// Version-specific subdirectory name inside pg_tblspc/<spc_oid>/.
-/// Matches TABLESPACE_VERSION_DIRECTORY in relpath.h:
-///   "PG_" PG_MAJORVERSION "_" CATALOG_VERSION_NO
-pub const TABLESPACE_VERSION_DIRECTORY: &str = "PG_18_202506291";
-
 /// PostgreSQL block size in bytes
 pub const BLCKSZ: usize = 8192;
 
 /// PostgreSQL default WAL segment size in bytes
 pub const XLOG_SEG_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
-
-/// Maximum number of I/O worker processes (proc.h: MAX_IO_WORKERS).
-/// Compile-time upper bound; actual count is controlled by the `io_workers` GUC.
-pub const MAX_IO_WORKERS: c_int = 32;
-
-/// Number of auxiliary process slots in PG18 (proc.h: NUM_AUXILIARY_PROCS).
-/// = 6 traditional (Startup, BgWriter, Checkpointer, WalWriter, WalReceiver, WalSummarizer)
-///   + MAX_IO_WORKERS (up to 32 I/O worker processes).
-/// These have ProcNumbers from MaxBackends to MaxBackends + NUM_AUXILIARY_PROCS - 1.
-pub const NUM_AUXILIARY_PROCS: c_int = 6 + MAX_IO_WORKERS;
 
 /// PostgreSQL ProcNumber type (typedef int ProcNumber).
 ///

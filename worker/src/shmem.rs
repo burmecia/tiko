@@ -7,11 +7,7 @@
 //! - `ShmemInitStruct` to create the shared control structure + backend pools
 
 use core::io_control::IoControl;
-use pgsys::{
-    common::{MaxBackends, NUM_AUXILIARY_PROCS},
-    logging::*,
-    shmem::*,
-};
+use pgsys::{common::MaxBackends, logging::*, shmem::*, version::NUM_AUXILIARY_PROCS};
 
 static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C" fn()> = None;
 static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C" fn()> = None;
