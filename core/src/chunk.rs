@@ -13,8 +13,17 @@ pub const BLOCKS_PER_CHUNK: u32 = 32;
 pub const CHUNK_SIZE: usize = BLOCKS_PER_CHUNK as usize * BLCKSZ;
 
 // FNV-1a 32-bit hash parameters for ChunkTag hashing.
-const FNV_OFFSET: u32 = 2166136261;
-const FNV_PRIME: u32 = 16777619;
+pub(crate) const FNV_OFFSET: u32 = 2166136261;
+pub(crate) const FNV_PRIME: u32 = 16777619;
+
+/// Fold bytes into an existing FNV-1a state.
+pub(crate) fn fnv1a_step(mut h: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
 
 // ── ChunkTag ──
 
@@ -63,27 +72,11 @@ impl ChunkTag {
     /// FNV-1a hash for fast hash table probing.
     pub fn hash(&self) -> u32 {
         let mut h = FNV_OFFSET;
-        for &byte in &self.spc_oid.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        for &byte in &self.db_oid.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        for &byte in &self.rel_number.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        for &byte in &self.fork_number.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        for &byte in &self.chunk_id.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        h
+        h = fnv1a_step(h, &self.spc_oid.to_le_bytes());
+        h = fnv1a_step(h, &self.db_oid.to_le_bytes());
+        h = fnv1a_step(h, &self.rel_number.to_le_bytes());
+        h = fnv1a_step(h, &self.fork_number.to_le_bytes());
+        fnv1a_step(h, &self.chunk_id.to_le_bytes())
     }
 
     /// Format this chunk tag as a storage path segment:

@@ -1,13 +1,9 @@
 //! Relation-fork identifier: the (spc, db, rel, fork) key for a relation fork.
 
-use crate::chunk::{ChunkTag, ChunkTagIter};
+use crate::chunk::{ChunkTag, ChunkTagIter, FNV_OFFSET, fnv1a_step};
 use pgsys::common::{BlockNumber, ForkNumber, Oid, RelFileNumber};
 use pgsys::smgr::SMgrRelationData;
 use serde::{Deserialize, Serialize};
-
-// FNV-1a 32-bit hash parameters.
-const FNV_OFFSET: u32 = 2166136261;
-const FNV_PRIME: u32 = 16777619;
 
 /// Wire size of a serialised `RelFork` (4 × 4-byte LE fields).
 pub const REL_FORK_SIZE: usize = 16;
@@ -75,23 +71,10 @@ impl RelFork {
     /// FNV-1a hash over the four `RelFork` fields.
     pub(crate) fn hash(&self) -> u32 {
         let mut h = FNV_OFFSET;
-        for &byte in &self.spc_oid.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        for &byte in &self.db_oid.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        for &byte in &self.rel_number.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        for &byte in &self.fork_number.to_le_bytes() {
-            h ^= byte as u32;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        h
+        h = fnv1a_step(h, &self.spc_oid.to_le_bytes());
+        h = fnv1a_step(h, &self.db_oid.to_le_bytes());
+        h = fnv1a_step(h, &self.rel_number.to_le_bytes());
+        fnv1a_step(h, &self.fork_number.to_le_bytes())
     }
 
     /// Iterate over every chunk touched by `[start_block, start_block+nblocks)`,
