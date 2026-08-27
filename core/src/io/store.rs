@@ -1369,8 +1369,6 @@ impl Store {
     ///
     /// `parent_db_id` identifies the parent database within this store's org
     /// (`self.ns.org_id`); the branch shares the org, so only `db_id` differs.
-    /// (`project_id` is not part of the storage path — `Locator` keys on
-    /// `{org}/{db}`.)
     ///
     /// The manifest bytes are copied as-is, so the branch's manifest carries
     /// `ChunkRef.db_id = parent_db_id` — which is exactly the copy-on-write
@@ -1388,7 +1386,7 @@ impl Store {
         branch_ns: DbNamespace,
         ckpt: Checkpoint,
     ) -> Result<()> {
-        let parent_ns = DbNamespace::new(self.ns.org_id, parent_db_id, parent_db_id);
+        let parent_ns = DbNamespace::new(self.ns.org_id, parent_db_id);
         let parent_lctr = Locator::new(parent_ns);
         let prefix = parent_lctr.bases_dir();
         let keys = self.storage_list_prefix(&prefix)?;

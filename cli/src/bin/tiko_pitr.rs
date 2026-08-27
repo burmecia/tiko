@@ -24,7 +24,7 @@
 //!
 //! Storage is configured from the environment exactly as `tiko_restore`
 //! expects (`Store::init()`): `TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH`/`PGDATA`,
-//! `TIKO_ORG_ID`, `TIKO_DB_ID`, `TIKO_PROJECT_ID`.
+//! `TIKO_ORG_ID`, `TIKO_DB_ID`.
 
 use std::path::{Path, PathBuf};
 use std::process::exit;

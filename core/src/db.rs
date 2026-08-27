@@ -9,23 +9,17 @@ use pgsys::Lsn;
 pub struct DbNamespace {
     pub org_id: u64,
     pub db_id: u64,
-    pub project_id: u64,
 }
 
 impl DbNamespace {
-    pub fn new(org_id: u64, db_id: u64, project_id: u64) -> Self {
-        Self {
-            org_id,
-            db_id,
-            project_id,
-        }
+    pub fn new(org_id: u64, db_id: u64) -> Self {
+        Self { org_id, db_id }
     }
 
     pub(crate) fn new_from_env() -> Self {
         let org_id = env::read_u64(env::ENV_ORG_ID);
         let db_id = env::read_u64(env::ENV_DB_ID);
-        let project_id = env::read_u64(env::ENV_PROJECT_ID);
-        DbNamespace::new(org_id, db_id, project_id)
+        DbNamespace::new(org_id, db_id)
     }
 }
 

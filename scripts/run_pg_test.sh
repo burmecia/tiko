@@ -12,7 +12,6 @@ ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 unset TIKO_STORAGE_ROOT TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
-export TIKO_PROJECT_ID="56"
 
 # Pin the macOS deployment target to the SDK's major version (e.g. "26.0").
 # Without this, the Rust `cc` crate (zstd-sys and other C deps compiled into
@@ -56,10 +55,13 @@ if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p worker) >/dev/null
   exit 1
 fi
 
-# Copy the compiled library to the test directory for use in tests
+# Copy the compiled worker library to the test directory for use in tests
 if [ -f "${TARGET_DIR}/debug/libtikoworker.dylib" ]; then
     echo "Copying Tiko Worker extension files ..."
     cp "${TARGET_DIR}/debug/libtikoworker.dylib" "${TEST_DIR}/worker"
+elif [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
+    echo "Copying Tiko Worker extension files ..."
+    cp "${TARGET_DIR}/debug/libtikoworker.so" "${TEST_DIR}/worker"
 fi
 
 echo "Running tests..."

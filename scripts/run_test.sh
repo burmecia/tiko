@@ -12,7 +12,6 @@ ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 unset TIKO_STORAGE_ROOT TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
-export TIKO_PROJECT_ID="56"
 export TIKO_PITR_INTERVAL_SECS="300"
 
 # Pin the macOS deployment target to the SDK's major version (e.g. "26.0").

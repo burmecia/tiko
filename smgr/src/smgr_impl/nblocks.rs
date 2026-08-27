@@ -29,12 +29,11 @@ pub extern "C-unwind" fn tiko_nblocks(
             pg_log_error(&format!(
                 "tiko_nblocks: failed for relfork {relfork}: {err} \
                  [cache_available={} \
-                  TIKO_ORG_ID={} TIKO_DB_ID={} TIKO_PROJECT_ID={} \
+                  TIKO_ORG_ID={} TIKO_DB_ID={} \
                   storage_root={} local_path={}]",
                 IoControl::cache_is_available(),
                 env_val(env::ENV_ORG_ID),
                 env_val(env::ENV_DB_ID),
-                env_val(env::ENV_PROJECT_ID),
                 storage_root_path().display(),
                 local_path().display(),
             ));

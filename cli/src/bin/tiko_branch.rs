@@ -115,10 +115,6 @@ struct RestoreArgs {
     /// The NEW database id for the branch (`TIKO_DB_ID`). Required.
     #[arg(long)]
     db_id: u64,
-    /// The NEW project id for the branch (`TIKO_PROJECT_ID`). Defaults to
-    /// `db_id` when omitted.
-    #[arg(long)]
-    project_id: Option<u64>,
     /// Branch PostgreSQL data directory (created if absent).
     #[arg(long)]
     pgdata: PathBuf,
@@ -149,9 +145,6 @@ struct RestartArgs {
     /// The branch database id (`TIKO_DB_ID`). Required.
     #[arg(long)]
     db_id: u64,
-    /// The branch project id (`TIKO_PROJECT_ID`). Defaults to `db_id`.
-    #[arg(long)]
-    project_id: Option<u64>,
     /// Branch PostgreSQL data directory.
     #[arg(long)]
     pgdata: PathBuf,
@@ -198,8 +191,6 @@ struct RestoreOutput {
     status: String,
     /// The NEW branch database id.
     db_id: u64,
-    /// The branch project id.
-    project_id: u64,
     /// The PARENT database id the branch was copied from.
     parent_db_id: u64,
     /// Fixed-width hex timeline id (e.g. `"00000001"`).
@@ -261,8 +252,8 @@ fn main() {
                 }
 
                 // `Store::init` reads the shared `TIKO_ORG_ID`/`TIKO_STORAGE_ROOT`
-                // (and requires `TIKO_DB_ID`/`TIKO_PROJECT_ID` to be set, though
-                // their values are irrelevant here — the parent's db_id comes from
+                // (and requires `TIKO_DB_ID` to be set, though its value is
+                // irrelevant here — the parent's db_id comes from
                 // `--parent-db-id`). `TIKO_ORG_ID` identifies the shared org the
                 // parent and branch live in.
                 let store = Store::init()?;
@@ -353,19 +344,16 @@ fn run_backup(args: &BackupArgs) -> Result<()> {
 /// via `backup_label`. Once the branch promotes it is **stopped** — leaving it
 /// quiesced for `tiko_branch restart`.
 fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
-    // A branch shares the parent's org; only db_id/project_id differ.
+    // A branch shares the parent's org; only db_id differs.
     let org_id = env::read_u64(env::ENV_ORG_ID);
-    // Default the branch's project_id to its db_id when not specified.
-    let project_id = branch.project_id.unwrap_or(branch.db_id);
-    let branch_ns = DbNamespace::new(org_id, branch.db_id, project_id);
+    let branch_ns = DbNamespace::new(org_id, branch.db_id);
     let branch_local = branch
         .local_path
         .clone()
         .unwrap_or_else(|| branch.pgdata.join("tiko"));
     eprintln!(
-        "tiko_branch: restoring branch db_id={} project_id={} (port {}) from pack {} (parent db_id={})",
+        "tiko_branch: restoring branch db_id={} (port {}) from pack {} (parent db_id={})",
         branch.db_id,
-        project_id,
         branch.branch_port,
         branch.pack.display(),
         branch.parent_db_id,
@@ -424,14 +412,13 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
 
     // 5. Start the branch PostgreSQL to drive archive recovery to the backup's
     //    consistency point, then it promotes — no recovery.signal or
-    //    recovery_target needed. The branch runs under its own db_id/project
+    //    recovery_target needed. The branch runs under its own db_id
     //    with the parent's shared storage root and its own local cache path.
     start_branch_pg(
         &branch.pg_ctl,
         &branch.pgdata,
         branch.branch_port,
         branch.db_id,
-        project_id,
         &branch_local,
     )?;
 
@@ -454,7 +441,6 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
     print_json(&RestoreOutput {
         status: "restored".to_string(),
         db_id: branch.db_id,
-        project_id,
         parent_db_id: branch.parent_db_id,
         timeline: ckpt.timeline_id.to_hex(),
         checkpoint_lsn: ckpt.lsn.to_pg_string(),
@@ -466,7 +452,6 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
 /// branch PGDATA with the branch's Tiko environment — no recovery, no promotion
 /// wait.
 fn run_restart(args: &RestartArgs) -> Result<()> {
-    let project_id = args.project_id.unwrap_or(args.db_id);
     let branch_local = args
         .local_path
         .clone()
@@ -476,7 +461,6 @@ fn run_restart(args: &RestartArgs) -> Result<()> {
         &args.pgdata,
         args.branch_port,
         args.db_id,
-        project_id,
         &branch_local,
     )?;
     eprintln!(
@@ -491,8 +475,8 @@ fn run_restart(args: &RestartArgs) -> Result<()> {
 }
 
 /// Start the branch PostgreSQL via `pg_ctl start` with the branch's Tiko
-/// environment (`TIKO_DB_ID`/`TIKO_PROJECT_ID`/`TIKO_STORAGE_ROOT`/
-/// `TIKO_LOCAL_PATH`) and the given listen port. Used by both `restore` (to
+/// environment (`TIKO_DB_ID`/`TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH`) and the
+/// given listen port. Used by both `restore` (to
 /// drive recovery) and `restart` (to bring the branch back up).
 ///
 /// Absolutizes the Tiko paths passed to the branch PG: postgres changes its CWD
@@ -504,7 +488,6 @@ fn start_branch_pg(
     pgdata: &Path,
     branch_port: u16,
     db_id: u64,
-    project_id: u64,
     local_path: &Path,
 ) -> Result<()> {
     std::fs::create_dir_all(local_path)?;
@@ -525,7 +508,6 @@ fn start_branch_pg(
         .arg(format!("-c port={}", branch_port))
         .env("TIKO_ORG_ID", org_id.to_string())
         .env("TIKO_DB_ID", db_id.to_string())
-        .env("TIKO_PROJECT_ID", project_id.to_string())
         .env(
             "TIKO_STORAGE_ROOT",
             storage_root_abs.to_string_lossy().to_string(),

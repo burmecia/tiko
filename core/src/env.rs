@@ -11,10 +11,9 @@ pub const ENV_TIKO_STORAGE_ROOT: &str = "TIKO_STORAGE_ROOT";
 /// (parent or branch) uses its own value so these don't collide.
 pub const ENV_TIKO_LOCAL_PATH: &str = "TIKO_LOCAL_PATH";
 
-// Environment variable names for db identity (org_id, db_id, project_id).
+/// Environment variable names for db identity (org_id, db_id).
 pub const ENV_ORG_ID: &str = "TIKO_ORG_ID";
 pub const ENV_DB_ID: &str = "TIKO_DB_ID";
-pub const ENV_PROJECT_ID: &str = "TIKO_PROJECT_ID";
 
 /// Environment variable for how often the compactor worker should materialize a new base manifest, in seconds (default: 3600).
 pub const ENV_COMPACT_INTERVAL_SECS: &str = "TIKO_COMPACT_INTERVAL_SECS";

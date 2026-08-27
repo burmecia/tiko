@@ -15,7 +15,6 @@ ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 unset TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
-export TIKO_PROJECT_ID="56"
 
 # Pin the macOS deployment target to the SDK's major version (e.g. "26.0").
 # Without this, the Rust `cc` crate (zstd-sys and other C deps compiled into
