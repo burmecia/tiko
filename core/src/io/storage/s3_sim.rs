@@ -49,8 +49,7 @@ impl ObjectStorage for S3Sim {
         if skip_compression(&path) {
             f.write_all(data)?;
         } else {
-            let compressed =
-                zstd::encode_all(data, 1).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let compressed = zstd::encode_all(data, 1).map_err(io::Error::other)?;
             f.write_all(&compressed)?;
         }
         Ok(())
@@ -121,10 +120,10 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             collect_files(root, &entry.path(), out)?;
-        } else if let Ok(rel) = entry.path().strip_prefix(root) {
-            if let Some(s) = rel.to_str() {
-                out.push(s.to_owned());
-            }
+        } else if let Ok(rel) = entry.path().strip_prefix(root)
+            && let Some(s) = rel.to_str()
+        {
+            out.push(s.to_owned());
         }
     }
     Ok(())

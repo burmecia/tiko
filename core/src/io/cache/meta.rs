@@ -551,7 +551,7 @@ impl MetaCache {
                     // retry the same failing slot, then move on.
                     self.touch(slot_index);
                     self.unpin(slot_index);
-                    pg_log_warning(&format!(
+                    pg_log_warning(format!(
                         "tiko: evict flush failed for slot {slot_index}, \
                          leaving in-chain for retry: {e}"
                     ));
@@ -567,13 +567,11 @@ impl MetaCache {
                 // Concurrent readers may have pinned the slot while we
                 // flushed. If still pinned by anyone other than us, abort —
                 // a future sweep can evict the slot for free (it's clean).
-                if slot.pin_count.load(Ordering::Relaxed) != 1 {
-                    false
-                }
                 // A concurrent put_nblocks / put_deleted (cache hit on this
                 // tag) may have updated the slot and re-set dirty=true after
                 // our flush. Don't drop that data: leave the slot in-chain.
-                else if slot.dirty.load(Ordering::Acquire) {
+                if slot.pin_count.load(Ordering::Relaxed) != 1 || slot.dirty.load(Ordering::Acquire)
+                {
                     false
                 } else {
                     self.unlink_from_chain(slot_index, bucket);
@@ -723,7 +721,7 @@ impl MetaCache {
             Ok(_) => Ok(true),
             Err(e) => {
                 slot.dirty.store(true, Ordering::Release);
-                pg_log_debug2(&format!(
+                pg_log_debug2(format!(
                     "tiko: try_flush_dirty_meta failed for slot {slot_index}: {e}",
                 ));
                 Err(e)

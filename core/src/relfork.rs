@@ -40,6 +40,8 @@ impl RelFork {
         }
     }
 
+    // FFI boundary: `reln` points to PG process-local smgr state.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn from_rel(reln: *mut SMgrRelationData, fork_number: ForkNumber) -> Self {
         let loc = unsafe { &(*reln).smgr_rlocator.locator };
         RelFork {

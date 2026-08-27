@@ -1,5 +1,6 @@
 pub mod s3;
 pub mod s3_sim;
+#[allow(clippy::module_inception)]
 pub mod storage;
 
 use crate::error::Result;

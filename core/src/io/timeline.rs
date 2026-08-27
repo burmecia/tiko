@@ -341,7 +341,7 @@ impl RelforkIndex {
     /// keeps the first `RELFORK_INDEX_CAP` sorted entries.
     pub fn populate(&mut self, relforks: impl IntoIterator<Item = (RelFork, RelForkMeta)>) {
         let mut buf: Vec<(RelFork, RelForkMeta)> = relforks.into_iter().collect();
-        buf.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        buf.sort_unstable_by_key(|a| a.0);
 
         self.overflowed = buf.len() > RELFORK_INDEX_CAP;
         let n = buf.len().min(RELFORK_INDEX_CAP);
@@ -657,7 +657,7 @@ mod tests {
             Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
-            &vec![1, 2, 3, 4],
+            &[1, 2, 3, 4],
         );
         s.chunks.insert(tag(1, 0));
         s.chunks.insert(tag(1, 1));
@@ -687,7 +687,7 @@ mod tests {
             Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
-            &vec![5, 6, 7, 8],
+            &[5, 6, 7, 8],
         );
         s.chunks.insert(tag(1, 0));
         seg.push(s);

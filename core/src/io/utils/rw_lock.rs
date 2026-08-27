@@ -54,14 +54,14 @@ impl AtomicRWLock {
         loop {
             let s = self.state.load(Ordering::Relaxed);
             // Only attempt CAS when not write-locked and no writer is pending.
-            if s >= 0 && (s & WRITER_PENDING) == 0 {
-                if self
+            if s >= 0
+                && (s & WRITER_PENDING) == 0
+                && self
                     .state
                     .compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
-                {
-                    break;
-                }
+            {
+                break;
             }
             std::hint::spin_loop();
         }
@@ -101,8 +101,8 @@ impl AtomicRWLock {
             }
 
             // WRITER_PENDING is set — check if all readers have drained.
-            if (s & READER_MASK) == 0 {
-                if self
+            if (s & READER_MASK) == 0
+                && self
                     .state
                     .compare_exchange_weak(
                         WRITER_PENDING,
@@ -111,9 +111,8 @@ impl AtomicRWLock {
                         Ordering::Relaxed,
                     )
                     .is_ok()
-                {
-                    break;
-                }
+            {
+                break;
             }
 
             std::hint::spin_loop();

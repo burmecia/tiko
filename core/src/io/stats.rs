@@ -119,7 +119,7 @@ impl IoStats {
 
     /// Log a summary of cache performance stats.
     pub fn log_summary(&self) {
-        pgsys::logging::pg_log_debug1(&format!(
+        pgsys::logging::pg_log_debug1(format!(
             "tiko io stats: chunk_cache=({}) meta_cache=({}) storage=({})",
             self.chunk_cache.summary(),
             self.meta_cache.summary(),

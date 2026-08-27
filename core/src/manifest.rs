@@ -91,6 +91,16 @@ const META_ENTRY_SIZE: usize = REL_FORK_SIZE + 8;
 /// Size of the meta-section header (`meta_count` u64).
 const META_HEADER_SIZE: usize = 8;
 
+/// S3 wire format 6-tuple: `(checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state)`.
+type ManifestWire = (
+    Checkpoint,
+    Checkpoint,
+    i64,
+    Vec<(ChunkTag, ChunkRef)>,
+    HashMap<RelFork, RelForkMeta>,
+    Vec<u8>,
+);
+
 // ── ChunkRef ──
 
 /// Reference to a specific version of a chunk stored in S3.
@@ -464,15 +474,9 @@ impl Manifest {
     /// Wire format: 6-tuple
     /// `(checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state)`.
     pub fn from_bytes(data: &[u8], root_path: &Path) -> Result<Self> {
-        let (checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state): (
-            Checkpoint,
-            Checkpoint,
-            i64,
-            Vec<(ChunkTag, ChunkRef)>,
-            HashMap<RelFork, RelForkMeta>,
-            Vec<u8>,
-        ) = rmp_serde::from_slice(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let (checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state): ManifestWire =
+            rmp_serde::from_slice(data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Self::new(
             checkpoint, redo_ckpt, timestamp, chunks, meta_map, pg_state, root_path,
@@ -591,6 +595,7 @@ impl Manifest {
     /// - `checkpoint_lsn` and `timestamp` advance to the newest non-empty
     ///   segment-checkpoint's values.
     /// - An empty `segments` slice is a no-op.
+    ///
     /// Compute the merged manifest from `segments` applied on top of `self`.
     /// Pure: does not touch the local TIKM file or `self`'s internal state.
     /// Returns the merged state + S3 wire bytes for the caller to publish.
@@ -841,7 +846,7 @@ mod tests {
             Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
-            &vec![1, 2, 3, 4],
+            &[1, 2, 3, 4],
         );
         for t in tags {
             s.chunks.insert(*t);

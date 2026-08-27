@@ -142,6 +142,8 @@ fn get_chunk_merge(
 /// On `Err`, the contents of `buffer_ptr` are unspecified — earlier loop
 /// iterations may have already written to it before a later chunk fetch
 /// failed. Callers must treat the buffer as poisoned on error.
+// FFI boundary: callers pass PG backend-local buffers the worker cannot reach.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn read_blocks(
     rf: &RelFork,
     block_number: BlockNumber,
@@ -179,6 +181,8 @@ pub fn read_blocks(
     Ok(nblocks_to_read)
 }
 
+// FFI boundary: callers pass PG backend-local buffers the worker cannot reach.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn write_blocks(
     rf: &RelFork,
     block_number: BlockNumber,
@@ -187,9 +191,9 @@ pub fn write_blocks(
 ) -> Result<BlockNumber> {
     // Get current nblocks for the relfork.
     let rf_nblocks = if IoControl::cache_is_available() {
-        IoControl::get_cache().get_nblocks(&rf)?
+        IoControl::get_cache().get_nblocks(rf)?
     } else {
-        Store::get().get_nblocks(&rf)?
+        Store::get().get_nblocks(rf)?
     };
 
     if nblocks == 0 {
@@ -216,9 +220,9 @@ pub fn write_blocks(
     let new_nblocks = block_number + nblocks;
     if new_nblocks > rf_nblocks {
         if IoControl::cache_is_available() {
-            IoControl::get_cache().put_nblocks(&rf, new_nblocks)?;
+            IoControl::get_cache().put_nblocks(rf, new_nblocks)?;
         } else {
-            Store::get().put_nblocks(&rf, new_nblocks)?;
+            Store::get().put_nblocks(rf, new_nblocks)?;
         }
     }
 

@@ -731,7 +731,7 @@ impl IoControl {
 
             // Transition Submitted → InProgress
             if !slot.try_start_processing() {
-                pg_log_warning(&format!(
+                pg_log_warning(format!(
                     "tiko: slot {}/{} not in Submitted state (state={:?}), skipping",
                     backend_id,
                     slot_idx,
@@ -745,7 +745,7 @@ impl IoControl {
 
             // Validate slot data
             if let Err(error_code) = slot.validate() {
-                pg_log_warning(&format!(
+                pg_log_warning(format!(
                     "tiko: invalid slot data at backend={} slot={} (error={})",
                     backend_id, slot_idx, error_code
                 ));
@@ -766,7 +766,7 @@ impl IoControl {
             match dispatch(request) {
                 Ok(()) => {
                     dispatched_count += 1;
-                    pg_log_debug3(&format!(
+                    pg_log_debug3(format!(
                         "tiko: dispatched backend={} slot={} op={:?} blk={} nblk={}",
                         backend_id, slot_idx, slot.op, slot.block_number, slot.nblocks
                     ));
@@ -774,12 +774,12 @@ impl IoControl {
                     entry.store(0, Ordering::Relaxed);
                     tail = tail.wrapping_add(1);
                 }
-                Err(Error::TrySendError(err)) if matches!(err, TrySendError::Full(_)) => {
+                Err(Error::TrySendError(TrySendError::Full(_))) => {
                     // Channel full — slot is InProgress but we can't dispatch yet.
                     // Revert to Submitted, leave entry in place for next poll.
                     slot.state
                         .store(SlotState::Submitted as u8, Ordering::Release);
-                    pg_log_debug1(&format!(
+                    pg_log_debug1(format!(
                         "tiko: dispatcher full, reverted backend={} slot={}",
                         backend_id, slot_idx
                     ));
@@ -787,7 +787,7 @@ impl IoControl {
                 }
                 Err(err) => {
                     // Fatal — fail the slot so the backend doesn't hang forever
-                    pg_log_warning(&format!(
+                    pg_log_warning(format!(
                         "tiko: dispatcher failed, failing backend={} slot={}",
                         backend_id, slot_idx
                     ));

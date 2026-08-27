@@ -230,15 +230,16 @@ impl ChunkCache {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&path)
                 .unwrap_or_else(|_| panic!("failed to open cache file {}", path.display()));
 
             let expected_size = CHUNK_NUM_SLOTS as u64 * CHUNK_SIZE as u64;
-            if let Ok(meta) = file.metadata() {
-                if meta.len() < expected_size {
-                    file.set_len(expected_size)
-                        .expect("failed to pre-allocate cache file");
-                }
+            if let Ok(meta) = file.metadata()
+                && meta.len() < expected_size
+            {
+                file.set_len(expected_size)
+                    .expect("failed to pre-allocate cache file");
             }
             file
         })
@@ -620,7 +621,7 @@ impl ChunkCache {
                     // retry the same failing slot, then move on.
                     self.touch(slot_index);
                     self.unpin(slot_index);
-                    pg_log_warning(&format!(
+                    pg_log_warning(format!(
                         "tiko: evict flush failed for slot {slot_index}, \
                          leaving in-chain for retry: {e}"
                     ));
@@ -636,13 +637,11 @@ impl ChunkCache {
                 // Concurrent readers may have pinned the slot while we
                 // flushed. If still pinned by anyone other than us, abort —
                 // a future sweep can evict the slot for free (it's clean).
-                if slot.pin_count.load(Ordering::Relaxed) != 1 {
-                    false
-                }
                 // A concurrent patch_chunk (cache hit on this tag) may have
                 // re-set dirty=true after our flush. Don't drop that data:
                 // leave the slot in-chain.
-                else if slot.dirty.load(Ordering::Acquire) {
+                if slot.pin_count.load(Ordering::Relaxed) != 1 || slot.dirty.load(Ordering::Acquire)
+                {
                     false
                 } else {
                     self.unlink_from_chain(slot_index, bucket);
@@ -784,7 +783,7 @@ impl ChunkCache {
             Ok(_) => Ok(true),
             Err(e) => {
                 slot.dirty.store(true, Ordering::Release);
-                pg_log_debug2(&format!(
+                pg_log_debug2(format!(
                     "tiko: try_flush_dirty_chunk failed for slot {slot_index}: {e}",
                 ));
                 Err(e)

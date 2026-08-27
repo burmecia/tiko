@@ -15,6 +15,8 @@ pub struct CacheControl {
 }
 
 impl CacheControl {
+    // Field layout is fixed by the shared-memory ABI with PG.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn init(
         &mut self,
         chunk_slots: *mut ChunkSlot,

@@ -90,7 +90,7 @@ fn parse_wal_key(key: &str, wal_prefix: &str) -> Option<(u64, Option<usize>)> {
 fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
     let seg = XLOG_SEG_SIZE as u64;
     let mut sorted: Vec<SegEntry> = entries.to_vec();
-    sorted.sort_unstable_by(|a, b| b.seg_no.cmp(&a.seg_no)); // descending
+    sorted.sort_unstable_by_key(|e| std::cmp::Reverse(e.seg_no)); // descending
     let top = *sorted.first()?;
     let (mut w_lo, w_hi) = (top.lo, top.hi);
     let mut cur = top;
@@ -382,10 +382,10 @@ impl Store {
             return Manifest::empty(&self.local_root);
         }
 
-        if let Ok(manifest) = Manifest::open_local(&self.local_root) {
-            if manifest.checkpoint() == ckpt {
-                return Ok(manifest);
-            }
+        if let Ok(manifest) = Manifest::open_local(&self.local_root)
+            && manifest.checkpoint() == ckpt
+        {
+            return Ok(manifest);
         }
 
         // S3 fallback. `Manifest::from_bytes` materialises the local TIKM
@@ -407,7 +407,7 @@ impl Store {
 
     /// Return the global `Store`, or `None` if not yet initialised.
     pub fn try_get() -> Result<&'static Self> {
-        STORE.get().ok_or_else(|| Error::StoreNotAvailable)
+        STORE.get().ok_or(Error::StoreNotAvailable)
     }
 
     // ── RelFork meta operations ──────────────────────────────────────────────────
@@ -641,33 +641,33 @@ impl Store {
 
     pub fn storage_put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.storage.put(key, data)?;
-        IoControl::try_get().map(|io_control| {
+        if let Some(io_control) = IoControl::try_get() {
             io_control.stats.storage.inc_puts(data.len());
-        });
+        }
         Ok(())
     }
 
     pub fn storage_get(&self, key: &str) -> Result<Vec<u8>> {
         let data = self.storage.get(key)?;
-        IoControl::try_get().map(|io_control| {
+        if let Some(io_control) = IoControl::try_get() {
             io_control.stats.storage.inc_gets(data.len());
-        });
+        }
         Ok(data)
     }
 
     pub fn storage_list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let ret = self.storage.list_prefix(prefix)?;
-        IoControl::try_get().map(|io_control| {
+        if let Some(io_control) = IoControl::try_get() {
             io_control.stats.storage.inc_lists();
-        });
+        }
         Ok(ret)
     }
 
     pub fn storage_delete(&self, key: &str) -> Result<()> {
         self.storage.delete(key)?;
-        IoControl::try_get().map(|io_control| {
+        if let Some(io_control) = IoControl::try_get() {
             io_control.stats.storage.inc_deletes();
-        });
+        }
         Ok(())
     }
 
@@ -971,9 +971,7 @@ impl Store {
         {
             let _write_guard = io_control.timeline.lock.write();
             if io_control.timeline.base_ckpt != base_ckpt {
-                pg_log_warning(
-                    "tiko: compaction raced; another compactor advanced base_ckpt".to_string(),
-                );
+                pg_log_warning("tiko: compaction raced; another compactor advanced base_ckpt");
                 return Ok(CompactionResult::Raced);
             }
             io_control.timeline.set_base_ckpt(new_base_ckpt);
@@ -1074,8 +1072,7 @@ impl Store {
             let _write_guard = io_control.timeline.lock.write();
             if io_control.timeline.base_ckpt != base_ckpt {
                 pg_log_warning(
-                    "tiko: compaction-through raced; another compactor advanced base_ckpt"
-                        .to_string(),
+                    "tiko: compaction-through raced; another compactor advanced base_ckpt",
                 );
                 return Ok(CompactionResult::Raced);
             }
