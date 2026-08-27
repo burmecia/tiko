@@ -21,7 +21,6 @@ pub const TABLESPACE_VERSION_DIRECTORY: &str = "PG_18_202506291";
 pub const MAX_IO_WORKERS: c_int = 32;
 
 /// Number of auxiliary process slots (proc.h: NUM_AUXILIARY_PROCS).
-/// = 6 traditional (Startup, BgWriter, Checkpointer, WalWriter, WalReceiver, WalSummarizer)
-///   + MAX_IO_WORKERS (up to 32 I/O worker processes).
+/// = 6 traditional (Startup, BgWriter, Checkpointer, WalWriter, WalReceiver, WalSummarizer) + MAX_IO_WORKERS (up to 32 I/O worker processes).
 /// These have ProcNumbers from MaxBackends to MaxBackends + NUM_AUXILIARY_PROCS - 1.
 pub const NUM_AUXILIARY_PROCS: c_int = 6 + MAX_IO_WORKERS;

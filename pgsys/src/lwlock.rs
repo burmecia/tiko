@@ -13,19 +13,34 @@ unsafe extern "C" {
     fn LWLockRelease(lock: *mut LWLock);
 }
 
-pub fn acquire_lwlock_exclusive(lock: *mut LWLock) -> bool {
+/// # Safety
+///
+/// `lock` must point to a valid `LWLock` in PG shared memory and the caller
+/// must be running in a PostgreSQL backend process.
+pub unsafe fn acquire_lwlock_exclusive(lock: *mut LWLock) -> bool {
     unsafe { LWLockAcquire(lock, LWLOCKMODE_LW_EXCLUSIVE) }
 }
 
-pub fn acquire_lwlock_shared(lock: *mut LWLock) -> bool {
+/// # Safety
+///
+/// `lock` must point to a valid `LWLock` in PG shared memory and the caller
+/// must be running in a PostgreSQL backend process.
+pub unsafe fn acquire_lwlock_shared(lock: *mut LWLock) -> bool {
     unsafe { LWLockAcquire(lock, LWLOCKMODE_LW_SHARED) }
 }
 
-pub fn acquire_lwlock_wait_until_free(lock: *mut LWLock) -> bool {
+/// # Safety
+///
+/// `lock` must point to a valid `LWLock` in PG shared memory and the caller
+/// must be running in a PostgreSQL backend process.
+pub unsafe fn acquire_lwlock_wait_until_free(lock: *mut LWLock) -> bool {
     unsafe { LWLockAcquire(lock, LWLOCKMODE_LW_WAIT_UNTIL_FREE) }
 }
 
-pub fn release_lwlock(lock: *mut LWLock) {
+/// # Safety
+///
+/// `lock` must point to a valid `LWLock` currently held by this backend.
+pub unsafe fn release_lwlock(lock: *mut LWLock) {
     unsafe { LWLockRelease(lock) }
 }
 

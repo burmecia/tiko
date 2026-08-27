@@ -8,6 +8,10 @@ unsafe extern "C" {
     fn WaitEventExtensionNew(wait_event_name: *const c_char) -> u32;
 }
 
-pub fn new_wait_event(wait_event_name: *const c_char) -> u32 {
+/// # Safety
+///
+/// `wait_event_name` must be a valid NUL-terminated C string that outlives
+/// the call, and the caller must be running in a PostgreSQL backend process.
+pub unsafe fn new_wait_event(wait_event_name: *const c_char) -> u32 {
     unsafe { WaitEventExtensionNew(wait_event_name) }
 }
