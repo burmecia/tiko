@@ -84,3 +84,13 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
   scripts talk to Postgres directly, no proxy involved.
 - There is no `rust-toolchain.toml`; minimum is Rust **1.88, edition 2024**.
 - No CI workflows are defined; `./scripts/run_test.sh` is the canonical check.
+
+## Code Style & Comments
+
+- **Minimize comments**: Only add comments when absolutely necessary
+- **Comment only the "why"**, never the "what" (code should be self-documenting)
+- Keep comments **short, concise, and to the point** (1-2 lines maximum)
+- Prefer meaningful variable/function names over explanatory comments
+- **Do not** add doc comments (`///`) for every function - only for public API surfaces
+- **Do not** add inline comments for obvious operations (e.g., `// increment counter`)
+- Use `//` for single-line comments, avoid block comments `/* */` unless necessary
