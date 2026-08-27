@@ -5,7 +5,6 @@ pub mod error;
 pub mod io;
 pub mod manifest;
 pub mod ops;
-pub mod org;
 pub mod pgcontrol;
 pub mod pitr;
 pub mod relfork;
@@ -20,8 +19,8 @@ pub use io::{cache, io_control};
 
 use std::path::PathBuf;
 
-/// Default base for tiko paths when the relevant env var is unset:
-/// `$PGDATA/tiko`.
+// Default base for tiko paths when the relevant env var is unset:
+// `$PGDATA/tiko`.
 fn data_dir_tiko() -> PathBuf {
     pgsys::common::data_dir_path().join("tiko")
 }

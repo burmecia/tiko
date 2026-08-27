@@ -8,14 +8,6 @@ license = { workspace = true }
 repository = { workspace = true }
 rust-version = { workspace = true }
 
-# [[bin]]
-# name = "tiko_ctl"
-# path = "src/bin/tiko_ctl.rs"
-# 
-# [[bin]]
-# name = "tiko_archive"
-# path = "src/bin/tiko_archive.rs"
-
 [[bin]]
 name = "tiko_pitr"
 path = "src/bin/tiko_pitr.rs"

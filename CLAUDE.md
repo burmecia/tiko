@@ -76,7 +76,7 @@ running postgres process.
 ### `core` — storage layer (library, no PG dependency)
 Chunks, manifests, the object-store abstraction, and the shared-memory I/O/cache engine. Key
 modules:
-- `org.rs` / `db.rs` — `OrgMeta` (org lifecycle, soft-delete) and `DbNamespace { org_id, db_id,
+- `db.rs` — `DbNamespace { org_id, db_id,
   project_id }`, built from `TIKO_ORG_ID`/`TIKO_DB_ID`/`TIKO_PROJECT_ID` env vars. Only
   `org_id`/`db_id` currently appear in storage keys.
 - `io/locator.rs` — `Locator`: builds S3 object keys, e.g. `{org}/{db}/chunks/{ckpt}/{relfork}/{chunk_id}`,
@@ -185,9 +185,6 @@ cache-dirty state.
 - `pg_stubs.rs` — standalone binaries statically link `core`/`pgsys`, which declare `extern "C"`
   symbols normally resolved by the running postmaster (e.g. `DataDir`, `rust_pg_log`). `pg_stubs.rs`
   provides no-op definitions so these binaries link outside of a running Postgres process.
-- `cli/legacy/` exists in the tree (`tiko_ctl`, old `tiko_restore`/`tiko_archive`/manifest viewer)
-  but is commented out of `Cargo.toml`'s `[[bin]]` list — dead code from a prior CLI shape, not
-  part of the build.
 
 ### Compute layer (tikovm)
 The compute half of the stack — running Postgres in Firecracker microVMs that scale to zero —
@@ -221,7 +218,7 @@ WAL streams to S3 in near-real-time via `worker::tasks::wal_receiver`. `tiko_pit
 Per the README's own roadmap and verified absent from the code:
 - **Garbage collection**: no chunk/retention GC exists. `worker::tasks::compactor` only deletes
   timeline segments once folded into a new base manifest — there is no delta-manifest GC,
-  base-manifest GC, WAL GC, or orphaned-chunk GC. Org soft-delete (`OrgMeta.deleted_at`) is tracked
-  but nothing physically reclaims deleted orgs' data yet.
+  base-manifest GC, WAL GC, or orphaned-chunk GC. There is also no org deletion
+  mechanism anymore (`org.rs` and its `deleted_at` soft-delete field were removed).
 - **Real S3 backend**: `core::io::storage::s3::S3` is a stub (`todo!()`); `S3Sim` (local
   filesystem, potentially NFS-mounted) is the only working backend today.

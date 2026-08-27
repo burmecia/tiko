@@ -4,9 +4,8 @@ use crate::io::io_control::IoWorkRequest;
 
 /// Crate-level error type for `core`.
 #[derive(Debug, thiserror::Error)]
-
 pub enum Error {
-    /// Wraps a low-level I/O error from the OS or file operations.
+    // Wraps a low-level I/O error from the OS or file operations.
     #[error("io: {0}")]
     Io(#[from] IoError),
 
@@ -28,7 +27,7 @@ pub enum Error {
     #[error("eviction sweep exhausted")]
     EvictionSweepExhausted,
 
-    /// A catch-all for errors that don't fit a specific variant.
+    // A catch-all for errors that don't fit a specific variant.
     #[error("{0}")]
     Other(String),
 }

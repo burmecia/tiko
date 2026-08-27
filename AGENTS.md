@@ -51,8 +51,8 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
   is not implemented).
 - **No garbage collector exists.** `worker::tasks::compactor` only folds
   superseded timeline segments into a base manifest and deletes the redundant
-  segment objects. There is no chunk/delta-manifest/WAL/orphan GC. Org soft-delete
-  (`OrgMeta.deleted_at`) is tracked but nothing reclaims the data.
+  segment objects. There is no chunk/delta-manifest/WAL/orphan GC, and no org
+  deletion mechanism at all (the old `org.rs` soft-delete module was removed).
 - **crate-type matters**: `smgr` (`tikosmgr`) = `staticlib`+`rlib`, linked *into*
   postgres at build time. `worker` (`tikoworker`) = `cdylib`+`rlib`, loaded at
   runtime via `shared_preload_libraries`. `cli` produces the operator binaries.
@@ -75,7 +75,6 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
   `SetLatch` — they must **not** call `ConditionVariable*`, `LWLock*`,
   `ereport`/`elog`, or `palloc`/`pfree` (those are PG process-local).
 - Hook chaining: always save and call the `prev_*_hook` before installing your own.
-- `cli/legacy/` is dead code (commented out of `Cargo.toml`'s `[[bin]]` list).
 
 ## Notes that differ from defaults
 
