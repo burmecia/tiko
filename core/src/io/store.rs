@@ -939,33 +939,38 @@ impl Store {
         // so last-write-wins is correct across timeline transitions.
         to_apply.sort_by_key(|s| s.ckpt);
 
-        // Merge chunks + relfork meta into the base manifest. Three-step
-        // sequence ensures the locally-visible TIKM file is never ahead of
-        // S3 — if the S3 PUT fails, the local TIKM stays at the old state.
+        // Merge chunks + relfork meta into the base manifest. Sequence
+        // ensures the locally-visible TIKM file is never ahead of S3 — if
+        // the S3 PUT fails, the local TIKM stays at the old state.
         //
         //   1. `apply_segments`: pure compute; returns merged state + bytes.
         //   2. `storage.put`: publish the new base manifest to S3.
-        //   3. `commit_applied`: atomically rewrite the local TIKM file and
-        //      return a fresh `Manifest`. We swap it into `base_manifest`;
-        //      existing `Arc<Manifest>` readers keep using the old file via
-        //      their FD until they drop their `Arc`.
+        //   3. Under the timeline write lock: re-check `base_ckpt` (a raced
+        //      compactor discards here, before touching the local file),
+        //      `commit_applied` to atomically rewrite the local TIKM, then
+        //      advance `base_ckpt`. Holding the lock across the rename makes
+        //      the check and the local publish atomic w.r.t. other
+        //      compactors, so the on-disk file always matches the shmem base.
+        //      We then swap the new Manifest into `base_manifest`; existing
+        //      `Arc<Manifest>` readers keep using the old file via their FD
+        //      until they drop their `Arc`.
         let current = self.base_manifest()?;
         let new_base_ckpt = to_apply.last().unwrap().ckpt;
         let key = self.lctr.base_manifest(&new_base_ckpt);
 
         let applied = current.apply_segments(&to_apply, self.ns.db_id)?;
         self.storage.put(&key, &applied.bytes)?;
-        let new_manifest = Arc::new(current.commit_applied(applied)?);
 
-        // Advance `base_ckpt` in shmem under the write lock.
-        {
+        let new_manifest = {
             let _write_guard = io_control.timeline.lock.write();
             if io_control.timeline.base_ckpt != base_ckpt {
                 pg_log_warning("tiko: compaction raced; another compactor advanced base_ckpt");
                 return Ok(CompactionResult::Raced);
             }
+            let new_manifest = Arc::new(current.commit_applied(applied)?);
             io_control.timeline.set_base_ckpt(new_base_ckpt);
-        }
+            new_manifest
+        };
 
         // Swap the fresh Manifest in so this process's next
         // `base_manifest()` call short-circuits instead of re-loading.
@@ -1056,9 +1061,11 @@ impl Store {
         let new_base_ckpt = applied.checkpoint;
         let key = self.lctr.base_manifest(&new_base_ckpt);
         self.storage.put(&key, &applied.bytes)?;
-        let new_manifest = Arc::new(current.commit_applied(applied)?);
 
-        {
+        // Same protocol as `run_compaction`: re-check `base_ckpt` and
+        // publish the local TIKM atomically under the write lock, so a raced
+        // compactor discards before touching the local file.
+        let new_manifest = {
             let _write_guard = io_control.timeline.lock.write();
             if io_control.timeline.base_ckpt != base_ckpt {
                 pg_log_warning(
@@ -1066,8 +1073,10 @@ impl Store {
                 );
                 return Ok(CompactionResult::Raced);
             }
+            let new_manifest = Arc::new(current.commit_applied(applied)?);
             io_control.timeline.set_base_ckpt(new_base_ckpt);
-        }
+            new_manifest
+        };
         *self.base_manifest.lock().unwrap() = new_manifest;
 
         // Delete superseded segment files entirely below the new base.
