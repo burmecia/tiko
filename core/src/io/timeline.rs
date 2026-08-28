@@ -532,16 +532,18 @@ impl TimelineState {
     // ── Basebackup compaction coordination ───────────────────────────────
     //
     // The checkpointer's `CHECKPOINT_CAUSE_BASEBACKUP` path wants to run
-    // `run_compaction` itself to form a base manifest at the basebackup LSN.
-    // To avoid racing the background compactor (wasted S3 PUTs + the
-    // post-hoc `Raced` discard), it:
-    //   1. `pause_compaction()` — the compactor's next tick observes the
-    //      flag and skips.
-    //   2. `drain_compaction()` — spin until any already-running compaction
-    //      finishes (compactor bumps `compaction_in_progress` around its
-    //      `run_compaction` call).
-    //   3. runs its own `run_compaction`.
-    //   4. `resume_compaction()`.
+    // compaction itself to form a base manifest at the basebackup LSN.
+    // Mutual exclusion with the background compactor:
+    //   1. Checkpointer: `pause_compaction()` (store), then
+    //      `drain_compaction()` — spin until `compaction_in_progress` is 0.
+    //   2. Compactor: `begin_compaction()` (bump) FIRST, then checks
+    //      `is_compaction_paused()` and backs off if set.
+    // Ordering argument: either the compactor's bump precedes the
+    // checkpointer's drain read (drain waits for the compactor to finish),
+    // or the pause store precedes the compactor's flag load (it backs off).
+    // Checking the flag before bumping would leave a window where both run.
+    //   3. The checkpointer wraps its own compaction in begin/end too, so
+    //      any concurrent drainer observes it.
 
     /// Request the background compactor to skip its ticks. Process-local
     /// shmem flag; safe to call from any process sharing `IoControl`.
@@ -559,10 +561,9 @@ impl TimelineState {
         self.compaction_paused.load(Ordering::Acquire)
     }
 
-    /// Record the start of a `run_compaction` call. Callers MUST pair this
-    /// with [`end_compaction`]. Used by both the background compactor and
-    /// the checkpointer's basebackup compaction so `drain_compaction` can
-    /// observe in-flight work.
+    /// Record the start of a compaction run. Callers MUST pair this with
+    /// [`end_compaction`], and MUST bump before checking
+    /// [`Self::is_compaction_paused`] — see the section comment above.
     pub fn begin_compaction(&self) {
         self.compaction_in_progress.fetch_add(1, Ordering::Release);
     }

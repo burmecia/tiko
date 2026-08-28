@@ -115,7 +115,13 @@ fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
         // Ensure the flag is always cleared, even if the compaction errors.
         let result = (|| {
             io_control.timeline.drain_compaction();
-            store.run_compaction_through(commit_ckpt)
+            // Bump the counter around our own run so any concurrent
+            // drainer observes it (and to match the protocol the compactor
+            // follows: begin before checking the pause flag).
+            io_control.timeline.begin_compaction();
+            let r = store.run_compaction_through(commit_ckpt);
+            io_control.timeline.end_compaction();
+            r
         })();
         io_control.timeline.resume_compaction();
         if let Err(e) = result {

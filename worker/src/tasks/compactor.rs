@@ -73,24 +73,27 @@ pub async fn compactor_task(store: &'static Store) {
             continue;
         }
 
-        // A `CHECKPOINT_CAUSE_BASEBACKUP` checkpoint runs compaction itself to
-        // form a base manifest at the basebackup LSN; skip this tick so we
-        // don't race it. The checkpointer unpauses after its own compaction.
-        if let Some(io_control) = IoControl::try_get() {
-            if io_control.timeline.is_compaction_paused() {
-                relay_debug2("tiko: compactor: paused for basebackup checkpoint — skipping tick");
-                continue;
-            }
-        }
-
-        // Wrap the synchronous `run_compaction` in the in-progress guard so a
-        // pausing checkpointer's `drain_compaction` observes our work.
+        // Bump the in-progress counter FIRST, then check the pause flag.
+        // A pausing checkpointer stores `compaction_paused` before draining:
+        // either our bump precedes its drain (it waits for us) or its pause
+        // store precedes this load (we back off here) — the two can never
+        // run compaction concurrently.
         let result = match IoControl::try_get() {
             Some(io_control) => {
                 let _guard = CompactionGuard::new(io_control);
-                store.run_compaction()
+                if io_control.timeline.is_compaction_paused() {
+                    relay_debug2(
+                        "tiko: compactor: paused for basebackup checkpoint — skipping tick",
+                    );
+                    None
+                } else {
+                    Some(store.run_compaction())
+                }
             }
-            None => store.run_compaction(),
+            None => Some(store.run_compaction()),
+        };
+        let Some(result) = result else {
+            continue;
         };
 
         match result {
