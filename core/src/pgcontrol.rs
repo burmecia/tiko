@@ -27,17 +27,6 @@ const PG_CONTROL_VERSION_PG18: u32 = 1800;
 const OFF_VERSION: usize = 8;
 const OFF_CRC: usize = 292;
 
-/// PostgreSQL WAL segment file name: `{tli:08X}{logid:08X}{logseg:08X}`, where
-/// `logid = seg_no / SEGS_PER_LOGID`, `logseg = seg_no % SEGS_PER_LOGID`.
-pub fn xlog_file_name(tli: TimelineId, seg_no: u64) -> String {
-    format!(
-        "{:08X}{:08X}{:08X}",
-        tli.as_u32(),
-        seg_no / SEGS_PER_LOGID,
-        seg_no % SEGS_PER_LOGID
-    )
-}
-
 /// Build a WAL `XLogLongPageHeaderData` — the descriptor on page 0 of every
 /// segment that PostgreSQL validates (`XLogReaderValidatePageHeader`) on first
 /// access. Synthesized when a mid-stream-start segment never archived its
@@ -63,7 +52,7 @@ pub fn wal_long_header(
     h
 }
 
-/// Inverse of [`xlog_file_name`]: parse a 24-hex WAL segment name into its
+/// Parse a 24-hex WAL segment name into its
 /// segment number (`logid * SEGS_PER_LOGID + logseg`). `None` for any name that
 /// is not exactly 24 hex digits. The timeline prefix is ignored — segment
 /// numbers are timeline-independent; callers needing the timeline parse it
@@ -106,13 +95,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xlog_file_name_format() {
-        let tl = TimelineId::new(1);
-        assert_eq!(xlog_file_name(tl, 2), "000000010000000000000002");
-        assert_eq!(xlog_file_name(tl, 256), "000000010000000100000000");
-    }
-
-    #[test]
     fn wal_long_header_bytes() {
         let h = wal_long_header(TimelineId::new(1), 2, 0x0123_4567_89AB_CDEF);
         assert_eq!(
@@ -147,11 +129,7 @@ mod tests {
     fn parse_wal_seg_no_values() {
         assert_eq!(parse_wal_seg_no("000000010000000000000002"), Some(2));
         assert_eq!(parse_wal_seg_no("000000010000000100000000"), Some(256));
-        // Round-trips with xlog_file_name.
-        assert_eq!(
-            parse_wal_seg_no(&xlog_file_name(TimelineId::new(1), 700)),
-            Some(700)
-        );
+        assert_eq!(parse_wal_seg_no("0000000100000000000002BC"), Some(700));
         assert_eq!(parse_wal_seg_no("short"), None);
         assert_eq!(parse_wal_seg_no("00000001.history"), None);
     }
