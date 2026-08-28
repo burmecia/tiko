@@ -347,19 +347,9 @@ impl Store {
             .map(|c| c.timeline.base_ckpt)
             .unwrap_or_default();
 
-        {
-            let guard = self.base_manifest.lock().unwrap();
-            if guard.checkpoint() == target {
-                return Ok(guard.clone());
-            }
-        }
-
-        // Slow path: reload from S3 (or local TIKM via open_local).
-        let new = Arc::new(self.load_manifest_at(target)?);
         let mut guard = self.base_manifest.lock().unwrap();
         if guard.checkpoint() != target {
-            *guard = new.clone();
-            return Ok(new);
+            *guard = Arc::new(self.load_manifest_at(target)?);
         }
         Ok(guard.clone())
     }
