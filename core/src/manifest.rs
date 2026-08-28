@@ -264,6 +264,7 @@ fn write_tikm(
     }
 
     f.flush()?;
+    f.sync_all()?;
     drop(f);
 
     // Open the read handle on the *tmp* file before the rename. This guarantees
@@ -277,6 +278,13 @@ fn write_tikm(
     let file = File::open(&tmp_path)?;
 
     fs::rename(&tmp_path, path)?;
+
+    // Best-effort directory fsync so the rename itself survives a crash.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
 
     Ok(file)
 }
@@ -408,11 +416,32 @@ impl Manifest {
         let timestamp = i64::from_le_bytes(header[32..40].try_into().unwrap());
         let entry_count = u64::from_le_bytes(header[40..48].try_into().unwrap());
 
-        // Meta count lives in an 8-byte header immediately after the chunk body.
-        let meta_header_offset = HEADER_SIZE as u64 + entry_count * ENTRY_SIZE as u64;
+        let file_len = file.metadata()?.len();
+
+        // Validate entry_count against the file size before trusting it to
+        // locate the meta section — guards against garbage counts and
+        // arithmetic overflow on a corrupt file.
+        let meta_header_offset = entry_count
+            .checked_mul(ENTRY_SIZE as u64)
+            .and_then(|n| n.checked_add(HEADER_SIZE as u64))
+            .filter(|&off| {
+                off.checked_add(META_HEADER_SIZE as u64)
+                    .is_some_and(|end| end <= file_len)
+            })
+            .ok_or_else(|| Error::invalid_data("invalid TIKM entry count"))?;
         let mut meta_count_buf = [0u8; META_HEADER_SIZE];
         pread_exact(&file, &mut meta_count_buf, meta_header_offset)?;
         let meta_count = u64::from_le_bytes(meta_count_buf);
+
+        // The file size must match the header counts exactly; a crash-torn
+        // or corrupt file fails here and callers fall back to the S3 reload.
+        let expected_len = meta_count
+            .checked_mul(META_ENTRY_SIZE as u64)
+            .and_then(|n| n.checked_add(meta_header_offset + META_HEADER_SIZE as u64))
+            .ok_or_else(|| Error::invalid_data("invalid TIKM meta count"))?;
+        if expected_len != file_len {
+            return Err(Error::invalid_data("TIKM file size mismatch"));
+        }
 
         Ok(Manifest {
             checkpoint: Checkpoint::new(timeline_id, lsn),
@@ -923,5 +952,39 @@ mod tests {
         // Survives open_local (reads the header from the TIKM file).
         let reopened = Manifest::open_local(dir2.path()).unwrap();
         assert_eq!(reopened.redo_ckpt.lsn.as_u64(), 190);
+    }
+
+    #[test]
+    fn open_local_rejects_truncated_file() {
+        let dir = tempdir().unwrap();
+        let s = segment(
+            100,
+            0,
+            &[tag(1, 0)],
+            &[(rf(1), RelForkMeta::new(32, false))],
+        );
+        let base = Manifest::empty(dir.path()).unwrap();
+        let applied = base.apply_segments(&[s], 34).unwrap();
+        let _base = base.commit_applied(applied).unwrap();
+
+        // Truncate inside the chunk body: header parses, size check fails.
+        let path = dir.path().join(BASE_MANIFEST_FILE_NAME);
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len((HEADER_SIZE + ENTRY_SIZE - 1) as u64).unwrap();
+        drop(f);
+        assert!(Manifest::open_local(dir.path()).is_err());
+    }
+
+    #[test]
+    fn open_local_rejects_garbage_entry_count() {
+        let dir = tempdir().unwrap();
+        let _base = Manifest::empty(dir.path()).unwrap();
+
+        // Corrupt entry_count to u64::MAX: must fail cleanly, not overflow.
+        let path = dir.path().join(BASE_MANIFEST_FILE_NAME);
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&u64::MAX.to_le_bytes(), 40).unwrap();
+        drop(f);
+        assert!(Manifest::open_local(dir.path()).is_err());
     }
 }
