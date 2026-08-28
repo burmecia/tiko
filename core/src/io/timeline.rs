@@ -6,7 +6,7 @@
 //! - [`TimelineState`] / [`ActiveCheckpoint`] / [`ChunkBloom`]: consolidated
 //!   shmem state for the segment-based design. Lives inside `IoControl`.
 //! - [`TimelineSegment`] / [`SegmentCheckpoint`]: durable per-checkpoint
-//!   summary stored on disk and in S3. Replaces the old delta-manifest path.
+//!   summary stored on disk and in S3.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;

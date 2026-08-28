@@ -51,7 +51,7 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
   is not implemented).
 - **No garbage collector exists.** `worker::tasks::compactor` only folds
   superseded timeline segments into a base manifest and deletes the redundant
-  segment objects. There is no chunk/delta-manifest/WAL/orphan GC, and no org
+  segment objects. There is no chunk/WAL/orphan GC, and no org
   deletion mechanism at all (the old `org.rs` soft-delete module was removed).
 - **crate-type matters**: `smgr` (`tikosmgr`) = `staticlib`+`rlib`, linked *into*
   postgres at build time. `worker` (`tikoworker`) = `cdylib`+`rlib`, loaded at

@@ -217,7 +217,7 @@ WAL streams to S3 in near-real-time via `worker::tasks::wal_receiver`. `tiko_pit
 
 Per the README's own roadmap and verified absent from the code:
 - **Garbage collection**: no chunk/retention GC exists. `worker::tasks::compactor` only deletes
-  timeline segments once folded into a new base manifest — there is no delta-manifest GC,
+  timeline segments once folded into a new base manifest — there is no
   base-manifest GC, WAL GC, or orphaned-chunk GC. There is also no org deletion
   mechanism anymore (`org.rs` and its `deleted_at` soft-delete field were removed).
 - **Real S3 backend**: `core::io::storage::s3::S3` is a stub (`todo!()`); `S3Sim` (local
