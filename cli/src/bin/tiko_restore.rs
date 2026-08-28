@@ -27,7 +27,8 @@ use std::process::exit;
 
 use clap::Parser;
 
-use core::{error::Result, io::store::Store, pgcontrol};
+use cli::pgcontrol;
+use core::{error::Result, io::store::Store};
 use pgsys::common::XLOG_SEG_SIZE;
 use pgsys::timeline_id::TimelineId;
 

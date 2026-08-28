@@ -5,7 +5,6 @@ pub mod error;
 pub mod io;
 pub mod manifest;
 pub mod ops;
-pub mod pgcontrol;
 pub mod pitr;
 pub mod relfork;
 

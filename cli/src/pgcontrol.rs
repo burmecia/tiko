@@ -6,7 +6,7 @@
 use pgsys::common::XLOG_SEG_SIZE;
 use pgsys::timeline_id::TimelineId;
 
-use crate::error::{Error, Result};
+use core::error::{Error, Result};
 
 /// WAL segments per logical xlog id: 2^32 / XLOG_SEG_SIZE (= 256 for 16 MiB).
 const SEGS_PER_LOGID: u64 = (1u64 << 32) / XLOG_SEG_SIZE as u64;
