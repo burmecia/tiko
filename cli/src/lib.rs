@@ -4,3 +4,4 @@
 pub mod pg_stubs;
 pub mod pgcontrol;
 pub mod pgops;
+pub mod pitr;

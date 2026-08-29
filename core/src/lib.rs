@@ -4,7 +4,6 @@ pub mod env;
 pub mod error;
 pub mod io;
 pub mod manifest;
-pub mod pitr;
 pub mod relfork;
 pub mod relfork_ops;
 

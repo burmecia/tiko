@@ -109,8 +109,6 @@ I/O/cache engine. Key modules:
   `Store` → `Storage` (S3Sim) directly on eviction/flush.
 - `io/store.rs` — `Store` ties cache + locator + storage together (`get_chunk`,
   `patch_chunk`, `run_compaction`).
-- `pitr.rs` — recovery-config helpers (`postgresql.auto.conf` recovery block),
-  crash-safe PGDATA snapshot/restore excluding the bulk `tiko/` dir.
 - `env.rs` — env var parsing, incl. `TIKO_LOCAL_PATH` for the small local state
   dir (base-manifest cache file, draft spill file — not block data).
 
@@ -209,6 +207,8 @@ recoverability, and on restart the worker reconciles any cache-dirty state.
   (`tiko_restore %f %p`), reading sealed-segment or in-flight `.chunks/` WAL
   objects written by `wal_receiver`.
 - `tiko_tlseg_viewer` — inspects timeline/segment objects.
+- `pitr.rs` — recovery-config helpers (`postgresql.auto.conf` recovery block),
+  crash-safe PGDATA snapshot/restore excluding the bulk `tiko/` dir.
 - `pg_stubs.rs` — standalone binaries statically link `core`/`pgsys`, which
   declare `extern "C"` symbols normally resolved by the running postmaster
   (e.g. `DataDir`, `rust_pg_log`). `pg_stubs.rs` provides no-op definitions so
