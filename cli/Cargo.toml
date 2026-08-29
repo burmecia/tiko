@@ -1,6 +1,6 @@
 [package]
 name = "cli"
-description = "Tiko operator CLI tools: tiko_archive, tiko_restore, manifest_viewer"
+description = "Tiko operator CLI tools: tiko_pitr, tiko_branch, tiko_restore, tiko_tlseg_viewer"
 version = { workspace = true }
 edition = { workspace = true }
 homepage = { workspace = true }
