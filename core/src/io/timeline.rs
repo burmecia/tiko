@@ -147,7 +147,6 @@ pub struct SegmentCheckpoint {
     pub redo_ckpt: Checkpoint,
     pub chunks: HashSet<ChunkTag>,
     pub relforks: HashMap<RelFork, RelForkMeta>,
-    pub pg_state: Vec<u8>,
     pub created_at: i64,
 }
 
@@ -158,7 +157,6 @@ impl SegmentCheckpoint {
         redo_ckpt: Checkpoint,
         chunks: HashSet<ChunkTag>,
         relforks: HashMap<RelFork, RelForkMeta>,
-        pg_state: &[u8],
     ) -> Self {
         Self {
             ckpt,
@@ -166,7 +164,6 @@ impl SegmentCheckpoint {
             redo_ckpt,
             chunks,
             relforks,
-            pg_state: pg_state.to_vec(),
             created_at: chrono::Utc::now().timestamp(),
         }
     }
@@ -658,7 +655,6 @@ mod tests {
             Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
-            &[1, 2, 3, 4],
         );
         s.chunks.insert(tag(1, 0));
         s.chunks.insert(tag(1, 1));
@@ -673,7 +669,6 @@ mod tests {
         assert_eq!(decoded.redo_ckpt, s.redo_ckpt);
         assert_eq!(decoded.chunks, s.chunks);
         assert_eq!(decoded.relforks, s.relforks);
-        assert_eq!(decoded.pg_state, s.pg_state);
     }
 
     #[test]
@@ -688,7 +683,6 @@ mod tests {
             Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
-            &[5, 6, 7, 8],
         );
         s.chunks.insert(tag(1, 0));
         seg.push(s);

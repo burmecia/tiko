@@ -853,7 +853,6 @@ impl Store {
         prev_ckpt: Checkpoint,
         redo_ckpt: Checkpoint,
         drained: DraftFrame,
-        pg_state_bytes: &[u8],
     ) -> Result<SegmentCheckpoint> {
         let segment_id = commit_ckpt.to_segment_id();
         let mut seg = match self.load_segment(&segment_id) {
@@ -867,7 +866,6 @@ impl Store {
             redo_ckpt,
             drained.chunks,
             drained.relforks,
-            pg_state_bytes,
         );
         seg.push(summary.clone());
 
@@ -1569,7 +1567,6 @@ impl Store {
         &self,
         commit_ckpt: &Checkpoint,
         redo_ckpt: &Checkpoint,
-        pg_state_bytes: &[u8],
     ) -> Result<()> {
         let io_control = match IoControl::try_get() {
             Some(c) => c,
@@ -1592,8 +1589,7 @@ impl Store {
 
         // Drain the centralized shmem draft ring + its on-disk spill file.
         let drained = timeline.draft.drain(&self.draft_spill_path)?;
-        let summary =
-            self.commit_segment(*commit_ckpt, prev_ckpt, *redo_ckpt, drained, pg_state_bytes)?;
+        let summary = self.commit_segment(*commit_ckpt, prev_ckpt, *redo_ckpt, drained)?;
 
         timeline.push_active(
             *commit_ckpt,

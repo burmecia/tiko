@@ -785,7 +785,6 @@ mod tests {
             Checkpoint::default(),
             HashSet::new(),
             HashMap::new(),
-            &[1, 2, 3, 4],
         );
         for t in tags {
             s.chunks.insert(*t);
@@ -910,14 +909,8 @@ mod tests {
 
         // Two segments with distinct redo_ckpt. The highest (checkpoint P =
         // s2) is the one the base must inherit.
-        let mut s1 = SegmentCheckpoint::new(
-            ckpt(100),
-            ckpt(0),
-            ckpt(90),
-            HashSet::new(),
-            HashMap::new(),
-            &[],
-        );
+        let mut s1 =
+            SegmentCheckpoint::new(ckpt(100), ckpt(0), ckpt(90), HashSet::new(), HashMap::new());
         s1.chunks.insert(tag(1, 0));
         let mut s2 = SegmentCheckpoint::new(
             ckpt(200),
@@ -925,7 +918,6 @@ mod tests {
             ckpt(190),
             HashSet::new(),
             HashMap::new(),
-            &[],
         );
         s2.chunks.insert(tag(2, 0));
 

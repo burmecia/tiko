@@ -33,11 +33,11 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
+use cli::pitr;
 use core::env;
 use core::error::{Error, Result};
 use core::io::store::Store;
 use core::io::timeline::Checkpoint;
-use cli::pitr;
 use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
 

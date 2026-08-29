@@ -39,10 +39,9 @@ fn run(args: &Args) -> Result<(), String> {
             i, ckpt.ckpt, ckpt.prev_ckpt, ckpt.redo_ckpt
         );
         println!(
-            "      chunks: {},\t\trelforks: {},\t\tpg_state: {} bytes",
+            "      chunks: {},\t\trelforks: {}",
             ckpt.chunks.len(),
-            ckpt.relforks.len(),
-            ckpt.pg_state.len()
+            ckpt.relforks.len()
         );
         let created_at = DateTime::<Utc>::from_timestamp(ckpt.created_at, 0)
             .map(|t| t.to_rfc3339())

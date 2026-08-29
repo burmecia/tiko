@@ -12,9 +12,7 @@
 //!    relfork meta to the express bucket, write-lock fence, set `redo_ckpt`,
 //!    drain the backend `DraftBuffer`, append a `SegmentCheckpoint` to the
 //!    timeline segment file, push the active window, advance `head_ckpt`,
-//!    and persist `DbMeta`. (pg_state is no longer captured here: PITR bases
-//!    now come from `pg_basebackup` tarballs uploaded by `tiko_pitr backup`,
-//!    and segments carry an empty `pg_state` trailer.)
+//!    and persist `DbMeta`.
 //!
 //! 2. **Basebackups** (`CHECKPOINT_CAUSE_BASEBACKUP`): materialise a base
 //!    manifest at the checkpoint LSN so `tiko_pitr` can pair the (small)
@@ -59,9 +57,8 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
         Err(_) => return,
     };
 
-    // Commit the interval's dirty state into a timeline segment. pg_state is
-    // no longer captured: PITR bases come from pg_basebackup tarballs.
-    if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt, &[]) {
+    // Commit the interval's dirty state into a timeline segment.
+    if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt) {
         pg_log_error(&format!(
             "tiko: tiko_perform_checkpoint: run_commit_protocol failed at {ckpt}, redo {redo_ckpt}: {e}"
         ));
