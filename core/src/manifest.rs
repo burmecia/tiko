@@ -137,6 +137,22 @@ const CHUNK_REF_SIZE: usize = 20;
 // encoding is 20 (explicit encode/decode, no padding). Catches accidental layout changes.
 const _: () = assert!(std::mem::size_of::<ChunkRef>() == 24);
 
+// ── AppliedManifest ──
+
+/// Result of [`Manifest::apply_segments`] — the merged state plus the S3
+/// wire bytes, ready for the caller to publish externally before committing
+/// via [`Manifest::commit_applied`].
+pub(crate) struct AppliedManifest {
+    pub checkpoint: Checkpoint,
+    pub redo_ckpt: Checkpoint,
+    pub timestamp: i64,
+    pub chunks: Vec<(ChunkTag, ChunkRef)>,
+    pub meta: Vec<(RelFork, RelForkMeta)>,
+    /// msgpack-encoded `(checkpoint, redo_ckpt, timestamp, chunks, meta_map)`
+    /// ready to PUT to S3 at the base-manifest key for `checkpoint`.
+    pub bytes: Vec<u8>,
+}
+
 // ── Manifest ──
 
 /// File-backed sorted manifest for chunk lookup and PITR merge operations.
@@ -168,181 +184,6 @@ pub(crate) struct Manifest {
     /// Number of meta entries in the meta body.
     meta_count: u64,
 }
-
-impl Manifest {
-    /// Byte offset of the meta-section header inside the file.
-    fn meta_header_offset(&self) -> u64 {
-        HEADER_SIZE as u64 + self.entry_count * ENTRY_SIZE as u64
-    }
-
-    /// Byte offset of the first meta-entry in the file.
-    fn meta_body_offset(&self) -> u64 {
-        self.meta_header_offset() + META_HEADER_SIZE as u64
-    }
-}
-
-// ── Low-level file I/O ──
-
-/// `pread` exactly `buf.len()` bytes from `file` at `offset`.
-fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    let mut done = 0;
-    while done < buf.len() {
-        let n = file.read_at(&mut buf[done..], offset + done as u64)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "TIKM file truncated",
-            ));
-        }
-        done += n;
-    }
-    Ok(())
-}
-
-/// Write a TIKM file from pre-sorted `chunks` and `meta` slices. Returns an
-/// open read handle to the published file.
-///
-/// Atomicity: writes to a per-PID tmp path, then renames over `path`.
-/// Concurrent writers from other processes cannot tear the visible file.
-/// Creates parent directories as needed.
-fn write_tikm(
-    path: &Path,
-    checkpoint: Checkpoint,
-    redo_ckpt: Checkpoint,
-    timestamp: i64,
-    chunks: &[(ChunkTag, ChunkRef)],
-    meta: &[(RelFork, RelForkMeta)],
-) -> Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Tmp path must be unique per *call*, not just per process: the s3worker
-    // writes TIKM files from multiple Tokio threads concurrently (each
-    // `base_manifest()` reload can call `write_tikm`). A per-PID-only tmp path
-    // would let sibling threads truncate/clobber each other's in-progress tmp,
-    // publishing a torn `base_manifest.tikm`. The atomic sequence makes each
-    // writer own a private tmp file.
-    let seq = TIKM_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = path.with_extension(format!("tikm.{}.{}.tmp", std::process::id(), seq));
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-
-    // Header (48 bytes): magic[4] + version[4] + timeline_id[4] +
-    //                    redo_timeline_id[4] + lsn[8] + redo_lsn[8] +
-    //                    timestamp[8] + entry_count[8]
-    let mut header = [0u8; HEADER_SIZE];
-    header[0..4].copy_from_slice(&TIKM_MAGIC);
-    header[4..8].copy_from_slice(&TIKM_VERSION.to_le_bytes());
-    header[8..12].copy_from_slice(&checkpoint.timeline_id.as_u32().to_le_bytes());
-    header[12..16].copy_from_slice(&redo_ckpt.timeline_id.as_u32().to_le_bytes());
-    header[16..24].copy_from_slice(&checkpoint.lsn.as_u64().to_le_bytes());
-    header[24..32].copy_from_slice(&redo_ckpt.lsn.as_u64().to_le_bytes());
-    header[32..40].copy_from_slice(&timestamp.to_le_bytes());
-    header[40..48].copy_from_slice(&(chunks.len() as u64).to_le_bytes());
-    f.write_all(&header)?;
-
-    // Chunk body (sorted ascending by ChunkTag).
-    for (tag, cref) in chunks {
-        f.write_all(&tag.encode())?;
-        f.write_all(&cref.encode())?;
-    }
-
-    // Meta header: count.
-    f.write_all(&(meta.len() as u64).to_le_bytes())?;
-    // Meta body (sorted ascending by RelFork).
-    let mut entry = [0u8; META_ENTRY_SIZE];
-    for (rf, m) in meta {
-        entry.fill(0);
-        entry[0..REL_FORK_SIZE].copy_from_slice(&rf.encode());
-        entry[REL_FORK_SIZE..REL_FORK_SIZE + 4].copy_from_slice(&m.nblocks.to_le_bytes());
-        entry[REL_FORK_SIZE + 4] = m.deleted as u8;
-        f.write_all(&entry)?;
-    }
-
-    f.flush()?;
-    f.sync_all()?;
-    drop(f);
-
-    // Open the read handle on the *tmp* file before the rename. This guarantees
-    // the returned FD points at exactly the bytes just written — if a concurrent
-    // writer renames a different manifest over `path` right after, our handle
-    // (and the `Manifest` metadata built around it) stay mutually consistent.
-    // Reopening `path` after the rename would risk attaching to another writer's
-    // file while carrying this manifest's checkpoint/entry_count, corrupting
-    // lookups. The renamed inode stays alive via this FD after `tmp_path` is
-    // unlinked by the rename.
-    let file = File::open(&tmp_path)?;
-
-    fs::rename(&tmp_path, path)?;
-
-    // Best-effort directory fsync so the rename itself survives a crash.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-
-    Ok(file)
-}
-
-/// Decode one meta entry from a fixed-size buffer.
-fn decode_meta_entry(buf: &[u8; META_ENTRY_SIZE]) -> (RelFork, RelForkMeta) {
-    let rf = RelFork::decode(buf[0..REL_FORK_SIZE].try_into().unwrap());
-    let nblocks = u32::from_le_bytes(buf[REL_FORK_SIZE..REL_FORK_SIZE + 4].try_into().unwrap());
-    let deleted = buf[REL_FORK_SIZE + 4] != 0;
-    (rf, RelForkMeta { nblocks, deleted })
-}
-
-// ── Private helpers ──
-
-/// Sequential `pread` of all chunk entries starting at `HEADER_SIZE`.
-fn read_all_entries(manifest: &Manifest) -> io::Result<Vec<(ChunkTag, ChunkRef)>> {
-    let n = manifest.entry_count as usize;
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let byte_len = n * ENTRY_SIZE;
-    let mut buf = vec![0u8; byte_len];
-    pread_exact(&manifest.file, &mut buf, HEADER_SIZE as _)?;
-
-    let mut entries = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = i * ENTRY_SIZE;
-        let tag = ChunkTag::decode(buf[off..off + CHUNK_TAG_SIZE].try_into().unwrap());
-        let cref = ChunkRef::decode(
-            buf[off + CHUNK_TAG_SIZE..off + ENTRY_SIZE]
-                .try_into()
-                .unwrap(),
-        );
-        entries.push((tag, cref));
-    }
-    Ok(entries)
-}
-
-/// Sequential `pread` of all meta entries (sorted ascending by `RelFork`).
-fn read_all_meta_entries(manifest: &Manifest) -> io::Result<Vec<(RelFork, RelForkMeta)>> {
-    let n = manifest.meta_count as usize;
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let byte_len = n * META_ENTRY_SIZE;
-    let mut buf = vec![0u8; byte_len];
-    pread_exact(&manifest.file, &mut buf, manifest.meta_body_offset())?;
-
-    let mut entries = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = i * META_ENTRY_SIZE;
-        let slice: &[u8; META_ENTRY_SIZE] = buf[off..off + META_ENTRY_SIZE].try_into().unwrap();
-        entries.push(decode_meta_entry(slice));
-    }
-    Ok(entries)
-}
-
-// ── Manifest impl ──
 
 impl Manifest {
     /// Construct a `Manifest` from an arbitrary list of chunks, writing the
@@ -452,6 +293,66 @@ impl Manifest {
             entry_count,
             meta_count,
         })
+    }
+
+    // Byte offset of the meta-section header inside the file.
+    fn meta_header_offset(&self) -> u64 {
+        HEADER_SIZE as u64 + self.entry_count * ENTRY_SIZE as u64
+    }
+
+    // Byte offset of the first meta-entry in the file.
+    fn meta_body_offset(&self) -> u64 {
+        self.meta_header_offset() + META_HEADER_SIZE as u64
+    }
+
+    // Sequential `pread` of all chunk entries starting at `HEADER_SIZE`.
+    fn read_all_entries(&self) -> Result<Vec<(ChunkTag, ChunkRef)>> {
+        let n = self.entry_count as usize;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_len = n * ENTRY_SIZE;
+        let mut buf = vec![0u8; byte_len];
+        pread_exact(&self.file, &mut buf, HEADER_SIZE as _)?;
+
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = i * ENTRY_SIZE;
+            let tag = ChunkTag::decode(buf[off..off + CHUNK_TAG_SIZE].try_into().unwrap());
+            let cref = ChunkRef::decode(
+                buf[off + CHUNK_TAG_SIZE..off + ENTRY_SIZE]
+                    .try_into()
+                    .unwrap(),
+            );
+            entries.push((tag, cref));
+        }
+        Ok(entries)
+    }
+
+    // Sequential `pread` of all meta entries (sorted ascending by `RelFork`).
+    fn read_all_meta_entries(&self) -> Result<Vec<(RelFork, RelForkMeta)>> {
+        let n = self.meta_count as usize;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_len = n * META_ENTRY_SIZE;
+        let mut buf = vec![0u8; byte_len];
+        pread_exact(&self.file, &mut buf, self.meta_body_offset())?;
+
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = i * META_ENTRY_SIZE;
+            let slice: &[u8; META_ENTRY_SIZE] = buf[off..off + META_ENTRY_SIZE].try_into().unwrap();
+
+            // Decode one meta entry from the fixed-size slice buffer.
+            let rf = RelFork::decode(slice[0..REL_FORK_SIZE].try_into().unwrap());
+            let nblocks =
+                u32::from_le_bytes(slice[REL_FORK_SIZE..REL_FORK_SIZE + 4].try_into().unwrap());
+            let deleted = slice[REL_FORK_SIZE + 4] != 0;
+
+            entries.push((rf, RelForkMeta { nblocks, deleted }));
+        }
+        Ok(entries)
     }
 
     /// Deserialize from the S3 wire format (`msgpack(...)`).
@@ -613,7 +514,7 @@ impl Manifest {
         combined.dedup_by_key(|(tag, _)| *tag);
 
         // 3. Two-pointer merge of existing base chunks + new combined.
-        let base_entries = read_all_entries(self)?;
+        let base_entries = self.read_all_entries()?;
         let mut output: Vec<(ChunkTag, ChunkRef)> =
             Vec::with_capacity(base_entries.len() + combined.len());
         let mut bi = 0usize;
@@ -649,7 +550,7 @@ impl Manifest {
         }
 
         // 4. Merge existing on-disk meta with `new_meta` (new wins).
-        let base_meta = read_all_meta_entries(self)?;
+        let base_meta = self.read_all_meta_entries()?;
         let mut merged_meta: HashMap<RelFork, RelForkMeta> = base_meta.into_iter().collect();
         for (rf, meta) in new_meta {
             merged_meta.insert(rf, meta);
@@ -715,18 +616,110 @@ impl Manifest {
     }
 }
 
-/// Result of [`Manifest::apply_segments`] — the merged state plus the S3
-/// wire bytes, ready for the caller to publish externally before committing
-/// via [`Manifest::commit_applied`].
-pub(crate) struct AppliedManifest {
-    pub checkpoint: Checkpoint,
-    pub redo_ckpt: Checkpoint,
-    pub timestamp: i64,
-    pub chunks: Vec<(ChunkTag, ChunkRef)>,
-    pub meta: Vec<(RelFork, RelForkMeta)>,
-    /// msgpack-encoded `(checkpoint, redo_ckpt, timestamp, chunks, meta_map)`
-    /// ready to PUT to S3 at the base-manifest key for `checkpoint`.
-    pub bytes: Vec<u8>,
+// `pread` exactly `buf.len()` bytes from `file` at `offset`.
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let n = file.read_at(&mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "TIKM file truncated",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+// Write a TIKM file from pre-sorted `chunks` and `meta` slices. Returns an
+// open read handle to the published file.
+//
+// Atomicity: writes to a per-PID tmp path, then renames over `path`.
+// Concurrent writers from other processes cannot tear the visible file.
+// Creates parent directories as needed.
+fn write_tikm(
+    path: &Path,
+    checkpoint: Checkpoint,
+    redo_ckpt: Checkpoint,
+    timestamp: i64,
+    chunks: &[(ChunkTag, ChunkRef)],
+    meta: &[(RelFork, RelForkMeta)],
+) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Tmp path must be unique per *call*, not just per process: the s3worker
+    // writes TIKM files from multiple Tokio threads concurrently (each
+    // `base_manifest()` reload can call `write_tikm`). A per-PID-only tmp path
+    // would let sibling threads truncate/clobber each other's in-progress tmp,
+    // publishing a torn `base_manifest.tikm`. The atomic sequence makes each
+    // writer own a private tmp file.
+    let seq = TIKM_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("tikm.{}.{}.tmp", std::process::id(), seq));
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+
+    // Header (48 bytes): magic[4] + version[4] + timeline_id[4] +
+    //                    redo_timeline_id[4] + lsn[8] + redo_lsn[8] +
+    //                    timestamp[8] + entry_count[8]
+    let mut header = [0u8; HEADER_SIZE];
+    header[0..4].copy_from_slice(&TIKM_MAGIC);
+    header[4..8].copy_from_slice(&TIKM_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&checkpoint.timeline_id.as_u32().to_le_bytes());
+    header[12..16].copy_from_slice(&redo_ckpt.timeline_id.as_u32().to_le_bytes());
+    header[16..24].copy_from_slice(&checkpoint.lsn.as_u64().to_le_bytes());
+    header[24..32].copy_from_slice(&redo_ckpt.lsn.as_u64().to_le_bytes());
+    header[32..40].copy_from_slice(&timestamp.to_le_bytes());
+    header[40..48].copy_from_slice(&(chunks.len() as u64).to_le_bytes());
+    f.write_all(&header)?;
+
+    // Chunk body (sorted ascending by ChunkTag).
+    for (tag, cref) in chunks {
+        f.write_all(&tag.encode())?;
+        f.write_all(&cref.encode())?;
+    }
+
+    // Meta header: count.
+    f.write_all(&(meta.len() as u64).to_le_bytes())?;
+    // Meta body (sorted ascending by RelFork).
+    let mut entry = [0u8; META_ENTRY_SIZE];
+    for (rf, m) in meta {
+        entry.fill(0);
+        entry[0..REL_FORK_SIZE].copy_from_slice(&rf.encode());
+        entry[REL_FORK_SIZE..REL_FORK_SIZE + 4].copy_from_slice(&m.nblocks.to_le_bytes());
+        entry[REL_FORK_SIZE + 4] = m.deleted as u8;
+        f.write_all(&entry)?;
+    }
+
+    f.flush()?;
+    f.sync_all()?;
+    drop(f);
+
+    // Open the read handle on the *tmp* file before the rename. This guarantees
+    // the returned FD points at exactly the bytes just written — if a concurrent
+    // writer renames a different manifest over `path` right after, our handle
+    // (and the `Manifest` metadata built around it) stay mutually consistent.
+    // Reopening `path` after the rename would risk attaching to another writer's
+    // file while carrying this manifest's checkpoint/entry_count, corrupting
+    // lookups. The renamed inode stays alive via this FD after `tmp_path` is
+    // unlinked by the rename.
+    let file = File::open(&tmp_path)?;
+
+    fs::rename(&tmp_path, path)?;
+
+    // Best-effort directory fsync so the rename itself survives a crash.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+
+    Ok(file)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -743,18 +736,17 @@ mod tests {
         /// Serialize to the S3 wire format (`msgpack(...)`).
         ///
         /// Format: 5-tuple `(checkpoint, redo_ckpt, timestamp, chunks, meta_map)`.
-        pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
-            let entries = read_all_entries(self)?;
-            let meta_entries = read_all_meta_entries(self)?;
+        pub fn to_bytes(&self) -> Result<Vec<u8>> {
+            let entries = self.read_all_entries()?;
+            let meta_entries = self.read_all_meta_entries()?;
             let meta_map: HashMap<RelFork, RelForkMeta> = meta_entries.into_iter().collect();
-            rmp_serde::to_vec(&(
+            Ok(rmp_serde::to_vec(&(
                 self.checkpoint,
                 self.redo_ckpt,
                 self.timestamp,
                 &entries,
                 &meta_map,
-            ))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            ))?)
         }
     }
 
