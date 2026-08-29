@@ -17,7 +17,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
 
-use crate::error::{Error, Result};
+use core::error::{Error, Result};
 
 /// File under PGDATA that the PITR recovery block is written to.
 ///
