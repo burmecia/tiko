@@ -1,11 +1,9 @@
 //! Timeline subsystem types.
 //!
-//! See plan: `/Users/bolu/.claude/plans/okay-summarise-all-discussed-flickering-lark.md`
-//!
 //! Types in this module:
 //! - [`TimelineState`] / [`ActiveCheckpoint`] / [`ChunkBloom`]: consolidated
 //!   shmem state for the segment-based design. Lives inside `IoControl`.
-//! - [`TimelineSegment`] / [`SegmentCheckpoint`]: durable per-checkpoint
+//! - [`TimelineSegment`] / [`CheckpointSummary`]: durable per-checkpoint
 //!   summary stored on disk and in S3.
 
 use std::collections::{HashMap, HashSet};
@@ -53,7 +51,7 @@ pub struct Checkpoint {
 const _: () = assert!(std::mem::size_of::<Checkpoint>() == 16);
 
 impl Checkpoint {
-    pub const fn new(timeline_id: TimelineId, lsn: Lsn) -> Self {
+    pub fn new(timeline_id: TimelineId, lsn: Lsn) -> Self {
         Self { timeline_id, lsn }
     }
 
@@ -134,14 +132,14 @@ impl fmt::Display for SegmentId {
     }
 }
 
-// ── SegmentCheckpoint ───────────────────────────────────────────────────────
+// ── CheckpointSummary ───────────────────────────────────────────────────────
 
 /// Per-checkpoint summary stored inside a [`TimelineSegment`].
 ///
 /// `prev_ckpt` is the path prefix where chunks visible at `ckpt` were written
 /// — i.e. the checkpoint that was the committed head at write time.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SegmentCheckpoint {
+pub struct CheckpointSummary {
     pub ckpt: Checkpoint,
     pub prev_ckpt: Checkpoint,
     pub redo_ckpt: Checkpoint,
@@ -150,7 +148,7 @@ pub struct SegmentCheckpoint {
     pub created_at: i64,
 }
 
-impl SegmentCheckpoint {
+impl CheckpointSummary {
     pub fn new(
         ckpt: Checkpoint,
         prev_ckpt: Checkpoint,
@@ -186,7 +184,7 @@ pub struct TimelineSegment {
     magic: [u8; 4],
     version: u32,
     pub segment_id: SegmentId,
-    pub checkpoints: Vec<SegmentCheckpoint>,
+    pub checkpoints: Vec<CheckpointSummary>,
 }
 
 impl TimelineSegment {
@@ -214,7 +212,7 @@ impl TimelineSegment {
         Ok(rmp_serde::to_vec(self)?)
     }
 
-    pub fn push(&mut self, summary: SegmentCheckpoint) {
+    pub fn push(&mut self, summary: CheckpointSummary) {
         debug_assert_eq!(
             summary.ckpt.to_segment_id(),
             self.segment_id,
@@ -645,11 +643,11 @@ mod tests {
         assert_ne!(a.to_segment_id(), d.to_segment_id());
     }
 
-    // ── SegmentCheckpoint + TimelineSegment serialization ──
+    // ── CheckpointSummary + TimelineSegment serialization ──
 
     #[test]
-    fn segment_checkpoint_roundtrip() {
-        let mut s = SegmentCheckpoint::new(
+    fn checkpoint_summary_roundtrip() {
+        let mut s = CheckpointSummary::new(
             Checkpoint::new(TimelineId::new(1), Lsn::new(100)),
             Checkpoint::new(TimelineId::new(1), Lsn::new(50)),
             Checkpoint::default(),
@@ -663,7 +661,7 @@ mod tests {
         s.relforks.insert(relfork(2), RelForkMeta::new(0, true));
 
         let bytes = rmp_serde::to_vec(&s).unwrap();
-        let decoded: SegmentCheckpoint = rmp_serde::from_slice(&bytes).unwrap();
+        let decoded: CheckpointSummary = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.ckpt, s.ckpt);
         assert_eq!(decoded.prev_ckpt, s.prev_ckpt);
         assert_eq!(decoded.redo_ckpt, s.redo_ckpt);
@@ -677,7 +675,7 @@ mod tests {
         let seg_id = Checkpoint::new(tl, Lsn::new(0)).to_segment_id();
         let mut seg = TimelineSegment::new(seg_id);
 
-        let mut s = SegmentCheckpoint::new(
+        let mut s = CheckpointSummary::new(
             Checkpoint::new(tl, Lsn::new(10)),
             Checkpoint::new(tl, Lsn::new(0)),
             Checkpoint::default(),

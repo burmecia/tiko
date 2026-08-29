@@ -27,7 +27,7 @@ use pgsys::{
     timeline_id::TimelineId,
 };
 
-use super::timeline::{Checkpoint, SegmentCheckpoint, SegmentId, TimelineSegment};
+use super::timeline::{Checkpoint, CheckpointSummary, SegmentId, TimelineSegment};
 
 /// Parse a base-manifest storage key into its `Checkpoint`.
 ///
@@ -842,7 +842,7 @@ impl Store {
         Ok(())
     }
 
-    /// Build a [`SegmentCheckpoint`] from the drained drafts and append it
+    /// Build a [`CheckpointSummary`] from the drained drafts and append it
     /// to the appropriate timeline segment file (load existing or init new).
     ///
     /// Called by [`Store::run_commit_protocol`] while the timeline write
@@ -853,14 +853,14 @@ impl Store {
         prev_ckpt: Checkpoint,
         redo_ckpt: Checkpoint,
         drained: DraftFrame,
-    ) -> Result<SegmentCheckpoint> {
+    ) -> Result<CheckpointSummary> {
         let segment_id = commit_ckpt.to_segment_id();
         let mut seg = match self.load_segment(&segment_id) {
             Ok(existing) => existing,
             Err(e) if e.is_not_found() => TimelineSegment::new(segment_id),
             Err(e) => return Err(e),
         };
-        let summary = SegmentCheckpoint::new(
+        let summary = CheckpointSummary::new(
             commit_ckpt,
             prev_ckpt,
             redo_ckpt,
@@ -883,7 +883,7 @@ impl Store {
     ///
     /// Run the segment-based compactor. Picks a target checkpoint
     /// `< redo_ckpt` (or `<= head_ckpt` if `redo_ckpt` hasn't been set yet),
-    /// merges every `SegmentCheckpoint` in `(base_ckpt, target]` into the
+    /// merges every `CheckpointSummary` in `(base_ckpt, target]` into the
     /// base manifest, writes the new base, advances `base_ckpt`, and
     /// deletes segment files whose entire LSN range falls below the new
     /// `base_ckpt` (those are now fully represented in the base manifest).
@@ -919,7 +919,7 @@ impl Store {
         }
 
         let segments = self.list_segments_in_range(base_ckpt, upper_ckpt)?;
-        let mut to_apply: Vec<SegmentCheckpoint> = Vec::new();
+        let mut to_apply: Vec<CheckpointSummary> = Vec::new();
         for sid in &segments {
             let seg = self.load_segment(sid)?;
             for sc in &seg.checkpoints {
@@ -1039,7 +1039,7 @@ impl Store {
         // Fold every segment checkpoint in (base_ckpt, target] (inclusive of
         // `target`, unlike `run_compaction` which is exclusive of redo_ckpt).
         let segments = self.list_segments_in_range(base_ckpt, target)?;
-        let mut to_apply: Vec<SegmentCheckpoint> = Vec::new();
+        let mut to_apply: Vec<CheckpointSummary> = Vec::new();
         for sid in &segments {
             let seg = self.load_segment(sid)?;
             for sc in &seg.checkpoints {
@@ -1147,10 +1147,10 @@ impl Store {
             // the natural ordering of checkpoints.
             let segment_ids = self.list_all_segments()?;
 
-            // Collect most-recent ACTIVE_WINDOW_SIZE SegmentCheckpoints by
+            // Collect most-recent ACTIVE_WINDOW_SIZE CheckpointSummarys by
             // walking segments newest-first, then within each segment newest
             // checkpoint first. Stop once we have enough.
-            let mut newest_first: Vec<SegmentCheckpoint> = Vec::new();
+            let mut newest_first: Vec<CheckpointSummary> = Vec::new();
             'outer: for segment_id in segment_ids.iter().rev() {
                 let seg = self.load_segment(segment_id)?;
                 for sc in seg.checkpoints.iter().rev() {
@@ -1557,7 +1557,7 @@ impl Store {
     ///    zones) plus its on-disk spill file. All backends record into this
     ///    one shared buffer, so the drain captures the full interval in a
     ///    single pass.
-    /// 5. Build a `SegmentCheckpoint` from the drained state and append it
+    /// 5. Build a `CheckpointSummary` from the drained state and append it
     ///    to the appropriate segment file via [`Store::commit_segment`].
     /// 6. `push_active(commit_ckpt, prev_ckpt, chunks, relforks)` updates
     ///    the active window, advances `head_ckpt`, and bumps `generation`.

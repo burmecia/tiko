@@ -6,7 +6,7 @@
 //! [`crate::io::store::Store::get_meta`]) probe via [`DraftBuffer::contains_chunk`]
 //! / [`DraftBuffer::get_relfork`]. At commit time the checkpointer drains
 //! both zones plus any on-disk spill overflow and folds them into the new
-//! `SegmentCheckpoint`.
+//! `CheckpointSummary`.
 //!
 //! Layout:
 //! - [`ChunkZone`]: `CHUNK_NUM_SHARDS` sharded open-addressed hash sets of

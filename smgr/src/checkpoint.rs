@@ -10,7 +10,7 @@
 //!
 //! 1. **Segment commit** (`run_commit_protocol`): flush dirty chunks +
 //!    relfork meta to the express bucket, write-lock fence, set `redo_ckpt`,
-//!    drain the backend `DraftBuffer`, append a `SegmentCheckpoint` to the
+//!    drain the backend `DraftBuffer`, append a `CheckpointSummary` to the
 //!    timeline segment file, push the active window, advance `head_ckpt`,
 //!    and persist `DbMeta`.
 //!

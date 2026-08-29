@@ -8,7 +8,7 @@
 //!   page cache — the block cache in `cache.rs` covers the hot path).
 //!
 //! Incremental state between base manifests lives in timeline segments
-//! ([`crate::io::timeline::SegmentCheckpoint`]).
+//! ([`crate::io::timeline::CheckpointSummary`]).
 //!
 //! # TIKM file format
 //!
@@ -41,7 +41,7 @@
 //!
 //! `redo_ckpt` is the LSN from which WAL replay begins when this manifest
 //! anchors a PITR recovery. It is written by the compactor from the highest
-//! [`SegmentCheckpoint`] folded into the base.
+//! [`CheckpointSummary`] folded into the base.
 //!
 //! Both lookups (chunks and relfork meta) are O(log N) `pread` binary
 //! searches over the sorted on-disk sections — no in-memory copies.
@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
 use crate::error::{Error, Result};
-use crate::io::timeline::{Checkpoint, SegmentCheckpoint};
+use crate::io::timeline::{Checkpoint, CheckpointSummary};
 use crate::relfork::{REL_FORK_SIZE, RelForkMeta};
 
 // ── TIKM constants ──
@@ -167,7 +167,7 @@ pub(crate) struct AppliedManifest {
 /// sorted ascending by `ChunkTag`.
 pub(crate) struct Manifest {
     checkpoint: Checkpoint,
-    /// Redo checkpoint of the highest [`SegmentCheckpoint`] folded into this
+    /// Redo checkpoint of the highest [`CheckpointSummary`] folded into this
     /// base — the LSN from which WAL replay starts when this manifest is used
     /// as a PITR base backup. Default (`0/0`) on an empty/bootstrap manifest.
     redo_ckpt: Checkpoint,
@@ -436,7 +436,7 @@ impl Manifest {
         Ok(None)
     }
 
-    /// Apply a sequence of [`SegmentCheckpoint`] summaries (in
+    /// Apply a sequence of [`CheckpointSummary`] summaries (in
     /// **ascending checkpoint LSN order** — oldest first) onto `self`,
     /// updating the on-disk TIKM file in place via an atomic rename.
     ///
@@ -467,7 +467,7 @@ impl Manifest {
     /// published ahead of S3.
     pub fn apply_segments(
         &self,
-        segments: &[SegmentCheckpoint],
+        segments: &[CheckpointSummary],
         db_id: u64,
     ) -> Result<AppliedManifest> {
         debug_assert!(
@@ -778,8 +778,8 @@ mod tests {
         prev_lsn: u64,
         tags: &[ChunkTag],
         rels: &[(RelFork, RelForkMeta)],
-    ) -> SegmentCheckpoint {
-        let mut s = SegmentCheckpoint::new(
+    ) -> CheckpointSummary {
+        let mut s = CheckpointSummary::new(
             ckpt(ckpt_lsn),
             ckpt(prev_lsn),
             Checkpoint::default(),
@@ -910,9 +910,9 @@ mod tests {
         // Two segments with distinct redo_ckpt. The highest (checkpoint P =
         // s2) is the one the base must inherit.
         let mut s1 =
-            SegmentCheckpoint::new(ckpt(100), ckpt(0), ckpt(90), HashSet::new(), HashMap::new());
+            CheckpointSummary::new(ckpt(100), ckpt(0), ckpt(90), HashSet::new(), HashMap::new());
         s1.chunks.insert(tag(1, 0));
-        let mut s2 = SegmentCheckpoint::new(
+        let mut s2 = CheckpointSummary::new(
             ckpt(200),
             ckpt(100),
             ckpt(190),
