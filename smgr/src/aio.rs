@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::{io_control::IoOpKind, ops};
+use core::{io_control::IoOpKind, relfork_ops};
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 
 use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pipeline};
@@ -13,7 +13,7 @@ use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pip
 /// postmaster with worker alive, submits each entry through the worker
 /// async pipeline via `submit_and_wait_raw`. When the pipeline is unavailable
 /// (initdb, shutdown checkpoint, worker crash), OR when the IO targets a
-/// local (temp-table) buffer, performs direct `ops::read_blocks` /
+/// local (temp-table) buffer, performs direct `relfork_ops::read_blocks` /
 /// `write_blocks` calls instead.
 ///
 /// Local buffers (`is_local_buffer = true`) MUST bypass the pipeline: they
@@ -70,14 +70,14 @@ unsafe fn perform_io(
                     fork_number,
                 };
                 match op {
-                    IoOpKind::Read => ops::read_blocks(
+                    IoOpKind::Read => relfork_ops::read_blocks(
                         &rf,
                         current_block,
                         entry_nblocks,
                         entry.iov_base as *mut u8,
                     )
                     .map_err(|e| e.to_errno()),
-                    IoOpKind::Write => ops::write_blocks(
+                    IoOpKind::Write => relfork_ops::write_blocks(
                         &rf,
                         current_block,
                         entry_nblocks,

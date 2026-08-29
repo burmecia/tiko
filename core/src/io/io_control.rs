@@ -128,7 +128,7 @@ impl From<u8> for SlotState {
 ///   local cache from S3. No `buffer_ptr` needed (Tiko worker manages its own buffers).
 ///
 /// All other sync smgr functions (`s3_readv`, `s3_writev`, `s3_extend`, etc.)
-/// call `ops` directly in the backend process — they do **not** use the
+/// call `relfork_ops` directly in the backend process — they do **not** use the
 /// pipeline, because their buffers may be in backend-local memory (e.g.
 /// `PageSetChecksumCopy` palloc'd pages, `LocalBufferBlockPointers`, stack-local
 /// `PGIOAlignedBlock`) which Tiko worker cannot access.

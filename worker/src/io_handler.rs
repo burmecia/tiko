@@ -1,7 +1,7 @@
 //! I/O request processing for Tiko worker's Tokio runtime.
 //!
 //! This module receives dispatched I/O requests and performs the actual
-//! block-level I/O via `ops::read_blocks` / `ops::write_blocks`.
+//! block-level I/O via `relfork_relfork_ops::read_blocks` / `relfork_relfork_ops::write_blocks`.
 //!
 //! # Completion Path
 //!
@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use core::{
     chunk::RelFork,
     io_control::{IoControl, IoOpKind, IoWorkRequest},
-    ops,
+    relfork_ops,
 };
 use pgsys::latch::SetLatch;
 
@@ -53,19 +53,19 @@ async fn process_io_request(request: IoWorkRequest) {
     let (status, nblocks) = match slot.op {
         IoOpKind::Read => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *mut u8;
-            match ops::read_blocks(&rf, slot.block_number, slot.nblocks, buffer_ptr) {
+            match relfork_ops::read_blocks(&rf, slot.block_number, slot.nblocks, buffer_ptr) {
                 Ok(n) => (0i32, n),
                 Err(e) => (e.to_errno(), 0u32),
             }
         }
         IoOpKind::Write => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *const u8;
-            match ops::write_blocks(&rf, slot.block_number, slot.nblocks, buffer_ptr) {
+            match relfork_ops::write_blocks(&rf, slot.block_number, slot.nblocks, buffer_ptr) {
                 Ok(n) => (0i32, n),
                 Err(e) => (e.to_errno(), 0u32),
             }
         }
-        IoOpKind::Prefetch => match ops::prefetch_blocks(&rf, slot.block_number, slot.nblocks) {
+        IoOpKind::Prefetch => match relfork_ops::prefetch_blocks(&rf, slot.block_number, slot.nblocks) {
             Ok(n) => (0i32, n),
             Err(_) => (libc::EIO, 0u32),
         },

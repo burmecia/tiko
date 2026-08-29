@@ -1,4 +1,5 @@
-//! Store-backed block-level read/write operations.
+//! Store-backed relation-fork operations: block-level read/write plus fork
+//! lifecycle (`exists`/`create`/`truncate`/`delete`).
 //!
 //! Two-layer storage: **shared-memory chunk cache → S3Sim (express bucket)**.
 //! The local backing-file layer (`{DataDir}/tiko/`) has been removed.

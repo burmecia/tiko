@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::ops;
+use core::relfork_ops;
 use pgsys::{
     common::{
         DEFAULTTABLESPACE_OID, ForkNumber, GLOBALTABLESPACE_OID, INVALID_FORK_NUMBER, MAX_FORKNUM,
@@ -55,7 +55,7 @@ fn unlink_fork(rlocator: &RelFileLocatorBackend, forknum: ForkNumber) {
     let rloc = &rlocator.locator;
     let relfork = RelFork::new(rloc.spc_oid, rloc.db_oid, rloc.rel_number, forknum);
 
-    match ops::delete_fork(&relfork) {
+    match relfork_ops::delete_fork(&relfork) {
         Ok(()) => {}
         Err(err) if err.is_not_found() => {
             // Ignore ENOENT: caller may have already removed the file, or it may not exist at all.

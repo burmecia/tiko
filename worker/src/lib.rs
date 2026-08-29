@@ -3,7 +3,7 @@ pub mod log_relay;
 pub mod tasks;
 
 // Re-export engine modules (moved from worker to engine crate)
-pub use core::{cache, io_control, ops};
+pub use core::{cache, io_control, relfork_ops};
 
 // Re-export the shared store modules
 pub use core::{manifest, s3, s3_sim, storage};

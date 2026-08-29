@@ -56,10 +56,10 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
 - **crate-type matters**: `smgr` (`tikosmgr`) = `staticlib`+`rlib`, linked *into*
   postgres at build time. `worker` (`tikoworker`) = `cdylib`+`rlib`, loaded at
   runtime via `shared_preload_libraries`. `cli` produces the operator binaries.
-- **Two smgr I/O paths**: sync smgr functions call `core::ops` directly in the
+- **Two smgr I/O paths**: sync smgr functions call `core::relfork_ops` directly in the
   backend (correct because callers may pass backend-local memory the worker can't
   reach cross-process); the async path (`tiko_startreadv`) goes through the
-  shmem submit-queue to `tikoworker`, with a fallback to direct `core::ops` calls
+  shmem submit-queue to `tikoworker`, with a fallback to direct `core::relfork_ops` calls
   when the worker is unavailable (initdb, shutdown checkpoint, worker crash).
 - **PG18 is patched** with custom AIO opcodes (`PGAIO_OP_TIKO_READV`/`WRITEV`) in
   the vendored `postgres/` submodule. The submodule must be initialized.

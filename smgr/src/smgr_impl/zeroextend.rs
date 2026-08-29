@@ -1,5 +1,5 @@
 use core::chunk::RelFork;
-use core::ops;
+use core::relfork_ops;
 use pgsys::{
     common::{BLCKSZ, BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},
     logging::pg_log_error,
@@ -34,7 +34,7 @@ pub extern "C-unwind" fn tiko_zeroextend(
 
     let buf = vec![0u8; nblocks as usize * BLCKSZ];
 
-    if let Err(err) = ops::write_blocks(&relfork, blocknum, nblocks_u32, buf.as_ptr()) {
+    if let Err(err) = relfork_ops::write_blocks(&relfork, blocknum, nblocks_u32, buf.as_ptr()) {
         pg_log_error(&format!(
             "tiko_zeroextend: failed for relfork {relfork} block {blocknum} nblocks {nblocks_u32}: {err}",
         ));
