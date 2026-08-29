@@ -65,10 +65,12 @@ async fn process_io_request(request: IoWorkRequest) {
                 Err(e) => (e.to_errno(), 0u32),
             }
         }
-        IoOpKind::Prefetch => match relfork_ops::prefetch_blocks(&rf, slot.block_number, slot.nblocks) {
-            Ok(n) => (0i32, n),
-            Err(_) => (libc::EIO, 0u32),
-        },
+        IoOpKind::Prefetch => {
+            match relfork_ops::prefetch_blocks(&rf, slot.block_number, slot.nblocks) {
+                Ok(n) => (0i32, n),
+                Err(_) => (libc::EIO, 0u32),
+            }
+        }
         _ => (libc::ENOTSUP, 0u32),
     };
 

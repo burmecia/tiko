@@ -2,7 +2,6 @@
 //! lifecycle (`exists`/`create`/`truncate`/`delete`).
 //!
 //! Two-layer storage: **shared-memory chunk cache → S3Sim (express bucket)**.
-//! The local backing-file layer (`{DataDir}/tiko/`) has been removed.
 //!
 //! # Public surface
 //!

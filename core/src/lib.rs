@@ -4,9 +4,9 @@ pub mod env;
 pub mod error;
 pub mod io;
 pub mod manifest;
-pub mod relfork_ops;
 pub mod pitr;
 pub mod relfork;
+pub mod relfork_ops;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag, RelFork};
 pub use db::DbNamespace;
