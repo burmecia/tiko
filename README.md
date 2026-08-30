@@ -189,4 +189,4 @@ inside those VMs — see the tikovm repository for setup and usage.
 
 ## License
 
-Apache-2.0.
+AGPL-3.0-only.
