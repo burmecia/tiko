@@ -1,5 +1,5 @@
 use core::relfork::RelFork;
-use core::relfork_ops;
+use core::relfork::ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},
     logging::pg_log_error,
@@ -24,7 +24,7 @@ pub extern "C-unwind" fn tiko_extend(
         return;
     }
 
-    if let Err(err) = relfork_ops::write_blocks(&relfork, blocknum, 1, buffer as *const u8) {
+    if let Err(err) = ops::write_blocks(&relfork, blocknum, 1, buffer as *const u8) {
         pg_log_error(&format!(
             "tiko_extend: failed for relfork {relfork} block {blocknum}: {err}",
         ));

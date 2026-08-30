@@ -1,6 +1,6 @@
 use core::io_control::IoControl;
 use core::relfork::RelFork;
-use core::relfork_ops;
+use core::relfork::ops;
 use pgsys::{common::ForkNumber, smgr::*};
 
 /// Immediately flush dirty cache chunks for a relation fork to backing files.
@@ -15,5 +15,5 @@ pub extern "C-unwind" fn tiko_immedsync(reln: *mut SMgrRelationData, forknum: Fo
         return;
     }
     let relfork = RelFork::from_rel(reln, forknum);
-    relfork_ops::flush_dirty_for_relfork(&relfork).ok();
+    ops::flush_dirty_for_relfork(&relfork).ok();
 }

@@ -1,6 +1,6 @@
 use super::marker_path;
 use core::relfork::RelFork;
-use core::relfork_ops;
+use core::relfork::ops;
 use pgsys::{
     common::{DEFAULTTABLESPACE_OID, ForkNumber, GLOBALTABLESPACE_OID, MAIN_FORKNUM},
     logging::pg_log_error,
@@ -14,7 +14,7 @@ pub extern "C-unwind" fn tiko_create(
     is_redo: bool,
 ) {
     let relfork = RelFork::from_rel(reln, forknum);
-    match relfork_ops::create(&relfork) {
+    match ops::create(&relfork) {
         Ok(true) => {}             // newly created
         Ok(false) if is_redo => {} // exists, WAL replay — OK
         Ok(false) => {

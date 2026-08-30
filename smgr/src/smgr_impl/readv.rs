@@ -1,4 +1,4 @@
-use core::{relfork::RelFork, relfork_ops};
+use core::{relfork::{RelFork, ops}};
 use pgsys::{
     common::{BlockNumber, ForkNumber},
     logging::pg_log_error,
@@ -27,7 +27,7 @@ pub extern "C-unwind" fn tiko_readv(
     for entry in &iov {
         let run_nblocks = (entry.iov_len / pgsys::common::BLCKSZ) as u32;
 
-        if let Err(err) = relfork_ops::read_blocks(
+        if let Err(err) = ops::read_blocks(
             &relfork,
             blocknum + block_offset,
             run_nblocks,

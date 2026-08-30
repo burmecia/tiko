@@ -124,13 +124,13 @@ I/O/cache engine. Key modules:
 Implements the PG `smgr` interface (`smgr_impl/*.rs`: open, close, create,
 exists, extend, nblocks, prefetch, readv, writev, truncate, unlink, zeroextend,
 startreadv, immedsync, ...). Two I/O paths:
-- **Sync path**: calls `core::relfork_ops` (read/write blocks) directly in the
+- **Sync path**: calls `core::relfork::ops` (read/write blocks) directly in the
   backend process. Correct because sync smgr callers may pass backend-local
   memory (palloc'd pages, local buffers, stack-local aligned blocks) that the
   worker process cannot access cross-process.
 - **Async path** (`tiko_startreadv` → `aio.rs::perform_io`): uses the
   shared-memory pipeline to `tikoworker`. Falls back to direct
-  `core::relfork_ops` calls when the worker/pipeline is unavailable (initdb,
+  `core::relfork::ops` calls when the worker/pipeline is unavailable (initdb,
   shutdown checkpoint, worker crash).
 - `checkpoint.rs` — `tiko_perform_checkpoint()`: normal checkpoints flush dirty
   cache chunks; `CHECKPOINT_CAUSE_BASEBACKUP` additionally materializes a base
@@ -181,7 +181,7 @@ calls `pgaio_io_start_tiko_readv` (no `PGAIO_HF_SYNCHRONOUS` flag, so PG's IO
 worker pool picks it up, keeping the backend non-blocking). The IO worker calls
 `pgaio_io_perform_synchronously()`, which hits `smgr::aio::perform_io()` — this
 submits into the Tiko shared-memory pipeline to `tikoworker` (or falls back to
-direct `core::relfork_ops` calls when the pipeline isn't available) and waits on
+direct `core::relfork::ops` calls when the pipeline isn't available) and waits on
 the latch. Normal PG AIO completion callbacks (md validation, `BM_VALID`,
 checksums) run unmodified.
 
@@ -194,9 +194,9 @@ require PG process-local state and must only run on the main thread.
 PostgreSQL kills all `B_BG_WORKER` processes (including `tikoworker`) in
 `PM_STOP_BACKENDS`, **before** the checkpointer's shutdown checkpoint. A
 `use_pipeline()`-style guard (checks `IsUnderPostmaster` and whether the worker
-PID in shared memory is alive) falls back to direct `core::relfork_ops` calls
+PID in shared memory is alive) falls back to direct `core::relfork::ops` calls
 when the async path isn't available — initdb, shutdown checkpoint, worker crash.
-Sync smgr functions always call `core::relfork_ops` directly regardless, so
+Sync smgr functions always call `core::relfork::ops` directly regardless, so
 pages land in the shmem cache / get flushed to storage, WAL guarantees
 recoverability, and on restart the worker reconciles any cache-dirty state.
 

@@ -1,5 +1,5 @@
 use core::relfork::RelFork;
-use core::relfork_ops;
+use core::relfork::ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, in_recovery},
     logging::pg_log_error,
@@ -36,7 +36,7 @@ pub extern "C-unwind" fn tiko_truncate(
 
     let relfork = RelFork::from_rel(reln, forknum);
 
-    if let Err(err) = relfork_ops::truncate_relfork(&relfork, nblocks) {
+    if let Err(err) = ops::truncate_relfork(&relfork, nblocks) {
         pg_log_error(&format!(
             "tiko_truncate: failed for relfork {relfork} nblocks {nblocks}: {err}",
         ));

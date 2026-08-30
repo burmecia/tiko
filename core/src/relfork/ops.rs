@@ -16,11 +16,11 @@
 //! | `delete_fork` | Delete: invalidate cache + remove all S3Sim chunks |
 //! | `prefetch_blocks` | Prefetch: populate cache from S3Sim |
 
+use super::{ChunkTagIterItem, RelFork};
 use crate::{
     chunk::{CHUNK_SIZE, ChunkTag},
     error::{Error, Result},
     io_control::IoControl,
-    relfork::{ChunkTagIterItem, RelFork},
     store::Store,
 };
 use pgsys::common::{BLCKSZ, BlockNumber};

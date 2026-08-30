@@ -7,7 +7,6 @@ pub mod io;
 pub mod locator;
 pub mod manifest;
 pub mod relfork;
-pub mod relfork_ops;
 pub mod storage;
 pub mod store;
 pub mod timeline;

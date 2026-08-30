@@ -1,6 +1,6 @@
 use core::io_control::IoControl;
 use core::relfork::RelFork;
-use core::{env, local_path, relfork_ops, storage_root_path};
+use core::{env, local_path, relfork::ops, storage_root_path};
 use pgsys::{
     common::{BlockNumber, ForkNumber},
     logging::pg_log_error,
@@ -19,7 +19,7 @@ pub extern "C-unwind" fn tiko_nblocks(
 ) -> BlockNumber {
     let relfork = RelFork::from_rel(reln, forknum);
 
-    match relfork_ops::get_nblocks(&relfork) {
+    match ops::get_nblocks(&relfork) {
         Ok(n) => n,
         Err(err) => {
             // Dump env + cache state so failures (often a missing/wrong
