@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Mutex};
 
 use crate::env;
-use crate::io::timeline::Checkpoint;
+use crate::timeline::Checkpoint;
 use pgsys::Lsn;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

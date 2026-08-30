@@ -16,8 +16,8 @@ use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 use core::{
-    chunk::RelFork,
     io_control::{IoControl, IoOpKind, IoWorkRequest},
+    relfork::RelFork,
     relfork_ops,
 };
 use pgsys::latch::SetLatch;

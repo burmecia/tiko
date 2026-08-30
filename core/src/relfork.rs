@@ -1,7 +1,7 @@
 //! Relation-fork identifier: the (spc, db, rel, fork) key for a relation fork.
 
-use crate::chunk::{ChunkTag, ChunkTagIter, FNV_OFFSET, fnv1a_step};
-use pgsys::common::{BlockNumber, ForkNumber, Oid, RelFileNumber};
+use crate::chunk::{BLOCKS_PER_CHUNK, ChunkTag, FNV_OFFSET, fnv1a_step};
+use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 use pgsys::smgr::SMgrRelationData;
 use serde::{Deserialize, Serialize};
 
@@ -128,5 +128,95 @@ impl RelForkMeta {
 
     pub fn to_json_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("failed to serialize RelForkMeta")
+    }
+}
+
+/// Per-chunk context yielded by [`ChunkTagIter`].
+///
+/// All byte offsets are relative to the flat caller-supplied buffer that spans
+/// the full `[start_block, start_block+nblocks)` request.
+#[derive(Debug)]
+pub(crate) struct ChunkTagIterItem {
+    /// The chunk being processed.
+    pub tag: ChunkTag,
+    /// True when all `BLOCKS_PER_CHUNK` blocks of the chunk are covered.
+    pub is_full_chunk: bool,
+    /// First block's offset within the chunk (0..BLOCKS_PER_CHUNK).
+    pub block_offset: BlockNumber,
+    /// Byte offset of this chunk's slice in the caller's buffer.
+    pub buf_offset: usize,
+    /// One-past-the-end byte offset of this chunk's slice in the caller's buffer.
+    pub buf_end: usize,
+}
+
+/// Iterator over a contiguous block range, yielding a [`ChunkTagIterItem`] for
+/// every chunk touched, with all per-chunk offsets pre-computed.
+pub(crate) struct ChunkTagIter {
+    current: ChunkTag,
+    end_id: u32,
+    /// Next block number to process (advances chunk by chunk).
+    blkno: BlockNumber,
+    start_block: BlockNumber,
+    end_block: BlockNumber,
+}
+
+impl Iterator for ChunkTagIter {
+    type Item = ChunkTagIterItem;
+
+    fn next(&mut self) -> Option<ChunkTagIterItem> {
+        if self.current.chunk_id > self.end_id {
+            return None;
+        }
+        let tag = self.current;
+        let nblks = tag.end_block().min(self.end_block) - self.blkno + 1;
+        let block_offset = self.blkno - tag.start_block();
+        let buf_offset = (self.blkno - self.start_block) as usize * BLCKSZ;
+        let buf_end = buf_offset + nblks as usize * BLCKSZ;
+        let is_full_chunk = nblks == BLOCKS_PER_CHUNK;
+        self.blkno += nblks;
+        self.current.chunk_id += 1;
+        Some(ChunkTagIterItem {
+            tag,
+            is_full_chunk,
+            block_offset,
+            buf_offset,
+            buf_end,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.end_id + 1).saturating_sub(self.current.chunk_id) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ChunkTagIter {}
+
+impl ChunkTag {
+    /// Returns an iterator over all chunks touched by `[start_block, end_block]`
+    /// (inclusive), yielding a [`ChunkTagIterItem`] with per-chunk offsets.
+    ///
+    /// `self` must be `ChunkTag::from_block(rf, start_block)`;
+    /// `end` must be `ChunkTag::from_block(rf, end_block)`.
+    ///
+    /// # Panics
+    /// Panics in debug builds if `end.chunk_id < self.chunk_id`.
+    pub(crate) fn range(
+        self,
+        end: ChunkTag,
+        start_block: BlockNumber,
+        end_block: BlockNumber,
+    ) -> ChunkTagIter {
+        debug_assert!(
+            end.chunk_id >= self.chunk_id,
+            "end chunk must be >= start chunk"
+        );
+        ChunkTagIter {
+            current: self,
+            end_id: end.chunk_id,
+            blkno: start_block,
+            start_block,
+            end_block,
+        }
     }
 }

@@ -12,8 +12,8 @@
 
 use core::{
     env,
-    io::store::{CompactionResult, Store},
     io_control::IoControl,
+    store::{CompactionResult, Store},
 };
 use pgsys::common::recovery_in_progress;
 use std::time::Duration;

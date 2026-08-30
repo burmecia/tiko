@@ -1,4 +1,4 @@
-use core::chunk::RelFork;
+use core::relfork::RelFork;
 use core::relfork_ops;
 use pgsys::{common::ForkNumber, logging::pg_log_error, smgr::*};
 

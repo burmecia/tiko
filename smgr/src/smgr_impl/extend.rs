@@ -1,4 +1,4 @@
-use core::chunk::RelFork;
+use core::relfork::RelFork;
 use core::relfork_ops;
 use pgsys::{
     common::{BlockNumber, ForkNumber, INVALID_BLOCK_NUMBER},

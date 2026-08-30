@@ -1,5 +1,5 @@
-use core::chunk::RelFork;
 use core::io_control::IoControl;
+use core::relfork::RelFork;
 use core::relfork_ops;
 use pgsys::{common::ForkNumber, smgr::*};
 

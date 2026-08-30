@@ -19,7 +19,7 @@ pub enum Error {
     RmpSerdeDecode(#[from] rmp_serde::decode::Error),
 
     #[error("tokio mpsc try send error: {0}")]
-    TrySendError(#[from] tokio::sync::mpsc::error::TrySendError<IoWorkRequest>),
+    TrySendError(tokio::sync::mpsc::error::TrySendError<IoWorkRequest>),
 
     #[error("store not available")]
     StoreNotAvailable,

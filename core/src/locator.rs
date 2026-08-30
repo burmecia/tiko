@@ -1,5 +1,10 @@
-use super::timeline::{Checkpoint, SegmentId};
-use crate::{chunk::ChunkTag, db::DbNamespace, manifest::ChunkRef, relfork::RelFork};
+use crate::timeline::{Checkpoint, SegmentId};
+use crate::{
+    chunk::{ChunkRef, ChunkTag},
+    db::DbNamespace,
+    relfork::RelFork,
+};
+use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
 
 pub struct Locator {
@@ -160,5 +165,51 @@ impl Locator {
             self.wal_chunk_prefix(timeline_id, wal_segment),
             byte_offset
         )
+    }
+}
+
+/// Parse a base-manifest storage key into its `Checkpoint`.
+///
+/// Keys have the shape `{bases_prefix}{tl_hex}/{lsn_hex}.manifest`, where
+/// `bases_prefix` is `Locator::bases_dir()` (`{ns}/bases/`). Returns `None` for
+/// any key that doesn't match (so callers can `filter_map` over a raw listing).
+pub(crate) fn parse_base_manifest_ckpt(key: &str, bases_prefix: &str) -> Option<Checkpoint> {
+    let rel = key.strip_prefix(bases_prefix)?;
+    let (tl_hex, rest) = rel.split_once('/')?;
+    let lsn_hex = rest.strip_suffix(".manifest")?;
+    let timeline_id = TimelineId::from_hex(tl_hex).ok()?;
+    let lsn = Lsn::from_hex(lsn_hex).ok()?;
+    Some(Checkpoint::new(timeline_id, lsn))
+}
+
+#[cfg(test)]
+mod base_select_tests {
+    use super::*;
+
+    fn ckpt(tl: u32, lsn: u64) -> Checkpoint {
+        Checkpoint::new(TimelineId::new(tl), Lsn::new(lsn))
+    }
+
+    #[test]
+    fn parses_valid_key_and_rejects_others() {
+        let prefix = "12/5/bases/";
+        let key = "12/5/bases/00000001/0000000003000028.manifest";
+        assert_eq!(
+            parse_base_manifest_ckpt(key, prefix),
+            Some(ckpt(1, 0x3000028))
+        );
+
+        assert_eq!(
+            parse_base_manifest_ckpt("12/5/bases/00000001", prefix),
+            None
+        );
+        assert_eq!(
+            parse_base_manifest_ckpt("12/5/other/x.manifest", prefix),
+            None
+        );
+        assert_eq!(
+            parse_base_manifest_ckpt("12/5/bases/zz/0000000000000001.manifest", prefix),
+            None
+        );
     }
 }

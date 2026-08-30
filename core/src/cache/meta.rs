@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use super::{CHAIN_NIL, MAX_USAGE_COUNT};
 use crate::{
-    chunk::RelFork,
     error::{Error, Result},
-    io::{io_control::IoControl, store::Store, utils::rw_lock::AtomicRWLock},
-    relfork::RelForkMeta,
+    io::io_control::IoControl,
+    relfork::{RelFork, RelForkMeta},
+    store::Store,
+    utils::rw_lock::AtomicRWLock,
 };
 use pgsys::common::BlockNumber;
 

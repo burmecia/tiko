@@ -60,16 +60,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc::error::TrySendError;
 
-use super::{
-    cache::{
-        CHUNK_NUM_BUCKETS, CHUNK_NUM_SLOTS, CacheControl, ChunkSlot, META_NUM_BUCKETS,
-        META_NUM_SLOTS, MetaSlot,
-    },
-    stats::IoStats,
-    timeline::TimelineState,
-    utils::rw_lock::AtomicRWLock,
+use super::stats::IoStats;
+use crate::cache::{
+    CHUNK_NUM_BUCKETS, CHUNK_NUM_SLOTS, CacheControl, ChunkSlot, META_NUM_BUCKETS, META_NUM_SLOTS,
+    MetaSlot,
 };
 use crate::error::{Error, Result};
+use crate::timeline::TimelineState;
+use crate::utils::rw_lock::AtomicRWLock;
 use pgsys::{
     common::{BlockNumber, ForkNumber, Oid, RelFileNumber, is_under_postmaster},
     latch::{Latch, SetLatch},
@@ -151,6 +149,12 @@ pub struct IoWorkRequest {
     pub backend_id: u32,
     pub slot_index: u8,
     pub generation: u32,
+}
+
+impl From<TrySendError<IoWorkRequest>> for Error {
+    fn from(e: TrySendError<IoWorkRequest>) -> Self {
+        Error::TrySendError(e)
+    }
 }
 
 // ── IoSlot ──

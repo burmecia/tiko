@@ -1,10 +1,11 @@
 //! Fundamental chunk and relation-fork types shared across the storage layer.
 
+use pgsys::Lsn;
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::relfork::{REL_FORK_SIZE, RelFork};
+use crate::relfork::RelFork;
 
 /// Number of blocks per chunk (32 blocks = 256 KB).
 pub const BLOCKS_PER_CHUNK: u32 = 32;
@@ -109,92 +110,46 @@ impl ChunkTag {
     }
 }
 
-/// Per-chunk context yielded by [`ChunkTagIter`].
+// ── ChunkRef ──
+
+/// Reference to a specific version of a chunk stored in S3.
 ///
-/// All byte offsets are relative to the flat caller-supplied buffer that spans
-/// the full `[start_block, start_block+nblocks)` request.
-#[derive(Debug)]
-pub(crate) struct ChunkTagIterItem {
-    /// The chunk being processed.
-    pub tag: ChunkTag,
-    /// True when all `BLOCKS_PER_CHUNK` blocks of the chunk are covered.
-    pub is_full_chunk: bool,
-    /// First block's offset within the chunk (0..BLOCKS_PER_CHUNK).
-    pub block_offset: BlockNumber,
-    /// Byte offset of this chunk's slice in the caller's buffer.
-    pub buf_offset: usize,
-    /// One-past-the-end byte offset of this chunk's slice in the caller's buffer.
-    pub buf_end: usize,
+/// Note: no `#[repr(C)]` and no `size_of` assert here — `ChunkRef` is never
+/// cast to raw bytes. Its in-memory size is 24 bytes (4-byte alignment padding
+/// between `timeline_id: u32` and `lsn: u64`), while the wire encoding is 20
+/// bytes. The wire size is enforced by `encode() -> [u8; 20]`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ChunkRef {
+    /// Branch-scoped id: selects `{org}/chunks/{db_id}/` in the standard bucket.
+    pub db_id: u64,
+    /// Timeline on which this chunk version was written.
+    /// Together with `db_id` and `lsn`, uniquely identifies the S3 object:
+    /// `{org}/chunks/{db_id}/{tag}/{timeline_id:08X}/{lsn_hex}`.
+    pub timeline_id: u32,
+    /// Checkpoint LSN at which this chunk version was sealed.
+    pub lsn: Lsn,
 }
 
-/// Iterator over a contiguous block range, yielding a [`ChunkTagIterItem`] for
-/// every chunk touched, with all per-chunk offsets pre-computed.
-pub(crate) struct ChunkTagIter {
-    current: ChunkTag,
-    end_id: u32,
-    /// Next block number to process (advances chunk by chunk).
-    blkno: BlockNumber,
-    start_block: BlockNumber,
-    end_block: BlockNumber,
-}
-
-impl Iterator for ChunkTagIter {
-    type Item = ChunkTagIterItem;
-
-    fn next(&mut self) -> Option<ChunkTagIterItem> {
-        if self.current.chunk_id > self.end_id {
-            return None;
-        }
-        let tag = self.current;
-        let nblks = tag.end_block().min(self.end_block) - self.blkno + 1;
-        let block_offset = self.blkno - tag.start_block();
-        let buf_offset = (self.blkno - self.start_block) as usize * BLCKSZ;
-        let buf_end = buf_offset + nblks as usize * BLCKSZ;
-        let is_full_chunk = nblks == BLOCKS_PER_CHUNK;
-        self.blkno += nblks;
-        self.current.chunk_id += 1;
-        Some(ChunkTagIterItem {
-            tag,
-            is_full_chunk,
-            block_offset,
-            buf_offset,
-            buf_end,
-        })
+impl ChunkRef {
+    pub(crate) fn encode(&self) -> [u8; 20] {
+        let mut buf = [0u8; 20];
+        buf[0..8].copy_from_slice(&self.db_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.timeline_id.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.lsn.as_u64().to_le_bytes());
+        buf
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.end_id + 1).saturating_sub(self.current.chunk_id) as usize;
-        (remaining, Some(remaining))
-    }
-}
-
-impl ExactSizeIterator for ChunkTagIter {}
-
-impl ChunkTag {
-    /// Returns an iterator over all chunks touched by `[start_block, end_block]`
-    /// (inclusive), yielding a [`ChunkTagIterItem`] with per-chunk offsets.
-    ///
-    /// `self` must be `ChunkTag::from_block(rf, start_block)`;
-    /// `end` must be `ChunkTag::from_block(rf, end_block)`.
-    ///
-    /// # Panics
-    /// Panics in debug builds if `end.chunk_id < self.chunk_id`.
-    pub(crate) fn range(
-        self,
-        end: ChunkTag,
-        start_block: BlockNumber,
-        end_block: BlockNumber,
-    ) -> ChunkTagIter {
-        debug_assert!(
-            end.chunk_id >= self.chunk_id,
-            "end chunk must be >= start chunk"
-        );
-        ChunkTagIter {
-            current: self,
-            end_id: end.chunk_id,
-            blkno: start_block,
-            start_block,
-            end_block,
+    pub(crate) fn decode(buf: &[u8; 20]) -> Self {
+        ChunkRef {
+            db_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            timeline_id: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            lsn: Lsn::new(u64::from_le_bytes(buf[12..20].try_into().unwrap())),
         }
     }
 }
+
+/// Wire size of a serialised `ChunkRef` (u64 + u32 + u64 LE, no padding).
+pub(crate) const CHUNK_REF_SIZE: usize = 20;
+// In-memory size is 24 (4-byte padding after timeline_id:u32 before lsn:u64); wire
+// encoding is 20 (explicit encode/decode, no padding). Catches accidental layout changes.
+const _: () = assert!(std::mem::size_of::<ChunkRef>() == 24);

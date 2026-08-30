@@ -1,5 +1,5 @@
-use core::chunk::RelFork;
 use core::io_control::IoControl;
+use core::relfork::RelFork;
 use core::{env, local_path, relfork_ops, storage_root_path};
 use pgsys::{
     common::{BlockNumber, ForkNumber},

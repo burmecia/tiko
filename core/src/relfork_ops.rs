@@ -17,10 +17,11 @@
 //! | `prefetch_blocks` | Prefetch: populate cache from S3Sim |
 
 use crate::{
-    chunk::{CHUNK_SIZE, ChunkTag, ChunkTagIterItem, RelFork},
+    chunk::{CHUNK_SIZE, ChunkTag},
     error::{Error, Result},
-    io::store::Store,
     io_control::IoControl,
+    relfork::{ChunkTagIterItem, RelFork},
+    store::Store,
 };
 use pgsys::common::{BLCKSZ, BlockNumber};
 

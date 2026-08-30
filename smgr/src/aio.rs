@@ -1,4 +1,4 @@
-use core::chunk::RelFork;
+use core::relfork::RelFork;
 use core::{io_control::IoOpKind, relfork_ops};
 use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 

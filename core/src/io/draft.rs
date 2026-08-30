@@ -37,9 +37,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::ChunkTag;
 use crate::error::{Error, Result};
-use crate::io::utils::rw_lock::AtomicRWLock;
-use crate::io::utils::spin_lock::spin_lock;
 use crate::relfork::{RelFork, RelForkMeta};
+use crate::utils::rw_lock::AtomicRWLock;
+use crate::utils::spin_lock::spin_lock;
 
 /// A set of recorded chunk tags + relfork-meta updates.
 ///

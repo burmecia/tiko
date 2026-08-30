@@ -1,5 +1,5 @@
-use core::io::store::Store;
 use core::io_control::IoControl;
+use core::store::Store;
 use pgsys::{
     common::{MaxBackends, get_my_proc_number},
     logging::*,

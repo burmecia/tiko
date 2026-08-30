@@ -8,11 +8,13 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use super::{CHAIN_NIL, MAX_USAGE_COUNT};
-use crate::io::utils::rw_lock::AtomicRWLock;
+use crate::utils::rw_lock::AtomicRWLock;
 use crate::{
-    chunk::{CHUNK_SIZE, ChunkTag, RelFork},
+    chunk::{CHUNK_SIZE, ChunkTag},
     error::{Error, Result},
-    io::{io_control::IoControl, store::Store},
+    io::io_control::IoControl,
+    relfork::RelFork,
+    store::Store,
 };
 
 pub const CHUNK_NUM_SLOTS: u32 = 1024;

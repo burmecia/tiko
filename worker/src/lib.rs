@@ -13,7 +13,7 @@ mod main_loop;
 mod shmem;
 mod thread_pool;
 
-use core::io::store::Store;
+use core::store::Store;
 use pgsys::{
     bgworker::*,
     common::{FLOAT8PASSBYVAL, FUNC_MAX_ARGS, INDEX_MAX_KEYS, NAMEDATALEN},

@@ -1,5 +1,5 @@
 use super::marker_path;
-use core::chunk::RelFork;
+use core::relfork::RelFork;
 use core::relfork_ops;
 use pgsys::{
     common::{DEFAULTTABLESPACE_OID, ForkNumber, GLOBALTABLESPACE_OID, MAIN_FORKNUM},

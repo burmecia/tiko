@@ -24,8 +24,8 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::log_relay::{relay_debug1, relay_warning};
-use core::io::store::Store;
 use core::io_control::IoControl;
+use core::store::Store;
 use pgsys::common::XLOG_SEG_SIZE;
 use std::sync::atomic::Ordering;
 

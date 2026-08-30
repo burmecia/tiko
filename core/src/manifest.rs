@@ -59,12 +59,11 @@ use std::path::{Path, PathBuf};
 
 use pgsys::Lsn;
 use pgsys::timeline_id::TimelineId;
-use serde::{Deserialize, Serialize};
 
-use crate::chunk::{CHUNK_TAG_SIZE, ChunkTag, RelFork};
+use crate::chunk::{CHUNK_REF_SIZE, CHUNK_TAG_SIZE, ChunkRef, ChunkTag};
 use crate::error::{Error, Result};
-use crate::io::timeline::{Checkpoint, CheckpointSummary};
-use crate::relfork::{REL_FORK_SIZE, RelForkMeta};
+use crate::relfork::{REL_FORK_SIZE, RelFork, RelForkMeta};
+use crate::timeline::{Checkpoint, CheckpointSummary};
 
 // ── TIKM constants ──
 
@@ -92,50 +91,6 @@ type ManifestWire = (
     Vec<(ChunkTag, ChunkRef)>,
     HashMap<RelFork, RelForkMeta>,
 );
-
-// ── ChunkRef ──
-
-/// Reference to a specific version of a chunk stored in S3.
-///
-/// Note: no `#[repr(C)]` and no `size_of` assert here — `ChunkRef` is never
-/// cast to raw bytes. Its in-memory size is 24 bytes (4-byte alignment padding
-/// between `timeline_id: u32` and `lsn: u64`), while the wire encoding is 20
-/// bytes. The wire size is enforced by `encode() -> [u8; 20]`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub(crate) struct ChunkRef {
-    /// Branch-scoped id: selects `{org}/chunks/{db_id}/` in the standard bucket.
-    pub db_id: u64,
-    /// Timeline on which this chunk version was written.
-    /// Together with `db_id` and `lsn`, uniquely identifies the S3 object:
-    /// `{org}/chunks/{db_id}/{tag}/{timeline_id:08X}/{lsn_hex}`.
-    pub timeline_id: u32,
-    /// Checkpoint LSN at which this chunk version was sealed.
-    pub lsn: Lsn,
-}
-
-impl ChunkRef {
-    fn encode(&self) -> [u8; 20] {
-        let mut buf = [0u8; 20];
-        buf[0..8].copy_from_slice(&self.db_id.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.timeline_id.to_le_bytes());
-        buf[12..20].copy_from_slice(&self.lsn.as_u64().to_le_bytes());
-        buf
-    }
-
-    fn decode(buf: &[u8; 20]) -> Self {
-        ChunkRef {
-            db_id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            timeline_id: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            lsn: Lsn::new(u64::from_le_bytes(buf[12..20].try_into().unwrap())),
-        }
-    }
-}
-
-/// Wire size of a serialised `ChunkRef` (u64 + u32 + u64 LE, no padding).
-const CHUNK_REF_SIZE: usize = 20;
-// In-memory size is 24 (4-byte padding after timeline_id:u32 before lsn:u64); wire
-// encoding is 20 (explicit encode/decode, no padding). Catches accidental layout changes.
-const _: () = assert!(std::mem::size_of::<ChunkRef>() == 24);
 
 // ── AppliedManifest ──
 
@@ -727,7 +682,7 @@ fn write_tikm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::timeline::Checkpoint;
+    use crate::timeline::Checkpoint;
     use pgsys::common::ForkNumber;
     use pgsys::timeline_id::TimelineId;
     use tempfile::tempdir;

@@ -43,9 +43,8 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
 
 ## Gotchas an agent will hit
 
-- **Do NOT run `cargo clippy`** on `core`/`smgr`/`worker`/`cli`/`pgsys`. Pre-existing
-  lint errors in the hand-written FFI bindings (`pgsys`) abort the build. Verify
-  changes with `cargo build` / `cargo test` instead.
+- **`cargo clippy -p core --all-targets`** is a standard check and must stay at zero
+  warnings. `smgr`/`worker`/`cli`/`pgsys` still have pre-existing clippy warnings.
 - **`build_postgres.sh`** installs deps via `apt-get` on Linux and `brew` on
   macOS (auto-detected). On macOS it also checks for Xcode Command Line Tools.
 - **Required env vars**: `run_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/
@@ -88,29 +87,38 @@ Chunks, manifests, the object-store abstraction, and the shared-memory
 I/O/cache engine. Key modules:
 - `db.rs` — `DbNamespace { org_id, db_id }`, built from `TIKO_ORG_ID`/`TIKO_DB_ID`
   env vars. Only these two appear in storage keys.
-- `io/locator.rs` — `Locator`: builds S3 object keys under `{org}/{db}/`:
+- `locator.rs` — `Locator`: builds S3 object keys under `{org}/{db}/`:
   `chunks/...`, `bases/{tl}/{lsn}.manifest`, `backup/{tl}/{lsn}.tar.zst` (+ a
   `{lsn}.json` meta sidecar), `timeline/{segment}`,
   `wal/{tl}/{segment}[.chunks/{byte_offset:016X}]`, `db_meta.json`.
   `chunk_in_db()` addresses another `db_id` in the same org — the COW mechanism.
-- `manifest.rs` — `Manifest` (file-backed sorted TIKM manifest) and
+- `manifest.rs` — `Manifest` (file-backed sorted TIKM manifest). `chunk.rs` holds
   `ChunkRef { db_id, timeline_id, lsn }`. A chunk reference can point at a
   *parent* database's namespace, so a branch's base manifest resolves shared
   chunks straight from the parent's storage without copying.
-- `io/storage/` — `trait ObjectStorage { put, get, delete, list_prefix }`.
+- `storage/` — `trait ObjectStorage { put, get, delete, list_prefix }`.
   `s3.rs` is a `todo!()` stub (real networked S3 not implemented). `s3_sim.rs`
   (`S3Sim`) is the **active backend** — a local-filesystem simulation rooted at
   `{root_path}/s3sim`, zstd-compressing everything except `.json`/`.zst`
   objects. It is **not just a test double**: in production its root is an
   NFSv4.2-mounted S3 Files share, so this is the real storage path.
-- `io/cache/` — shared-memory write-back `ChunkCache`/`MetaCache` (256 KB
+- `cache/` — shared-memory write-back `ChunkCache`/`MetaCache` (256 KB
   chunks, per-fork nblocks and deletion state). There is **no local
   backing-file cache** anymore — reads/writes flow PG buffer → shmem cache →
   `Store` → `Storage` (S3Sim) directly on eviction/flush.
-- `io/store.rs` — `Store` ties cache + locator + storage together (`get_chunk`,
-  `patch_chunk`, `run_compaction`).
+- `store/` — `Store` ties cache + locator + storage together (`get_chunk`,
+  `patch_chunk`, `run_compaction`). Split by concern: `mod.rs` (Store lifecycle,
+  storage forwarding), `meta.rs` (relfork-meta ops), `chunk.rs` (chunk I/O),
+  `commit.rs` (commit protocol), `compaction.rs`, `backup.rs` (PITR/backup),
+  `wal.rs` (WAL-coverage analysis).
+- `timeline/` — `segment.rs` (durable types: `Checkpoint`, `SegmentId`,
+  `TimelineSegment`) and `state.rs` (shmem runtime: `TimelineState`,
+  `ActiveCheckpoint`, `ChunkBloom`, `RelforkIndex`).
+- `io/` — only io_control-related shmem/IPC: `io_control.rs` (`IoControl`, slot
+  pools, submit queue), `stats.rs`, `draft.rs` (`DraftBuffer`).
 - `env.rs` — env var parsing, incl. `TIKO_LOCAL_PATH` for the small local state
-  dir (base-manifest cache file, draft spill file — not block data).
+  dir (base-manifest cache file, draft spill file — not block data), plus
+  `storage_root_path()`/`local_path()`.
 
 ### `smgr` (crate `smgr`, lib `tikosmgr`) — storage manager interface
 Implements the PG `smgr` interface (`smgr_impl/*.rs`: open, close, create,

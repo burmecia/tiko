@@ -13,7 +13,7 @@ use crate::tasks::compactor::compactor_task;
 use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
 use core::{
     //project::{ProjectCtx, ProjectNamespace},
-    io::store::Store,
+    store::Store,
 };
 
 /// Spawn the PITR background task on the Tokio runtime.

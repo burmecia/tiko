@@ -39,8 +39,8 @@ use serde::Serialize;
 
 use core::env;
 use core::error::{Error, Result};
-use core::io::store::Store;
-use core::io::timeline::Checkpoint;
+use core::store::Store;
+use core::timeline::Checkpoint;
 use core::{DbNamespace, storage_root_path};
 
 // Standalone process (not loaded into the postmaster); `cli::pg_stubs` supplies

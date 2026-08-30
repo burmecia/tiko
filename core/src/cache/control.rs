@@ -2,9 +2,10 @@ use std::sync::atomic::AtomicU32;
 
 use super::{ChunkCache, ChunkSlot, MetaCache, MetaSlot};
 use crate::{
-    chunk::{CHUNK_SIZE, ChunkTag, RelFork},
+    chunk::{CHUNK_SIZE, ChunkTag},
     error::Result,
-    io::utils::rw_lock::AtomicRWLock,
+    relfork::RelFork,
+    utils::rw_lock::AtomicRWLock,
 };
 use pgsys::common::BlockNumber;
 

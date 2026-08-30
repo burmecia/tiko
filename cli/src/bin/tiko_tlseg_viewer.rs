@@ -4,7 +4,7 @@ use std::process::exit;
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use core::io::timeline::TimelineSegment;
+use core::timeline::TimelineSegment;
 use zstd;
 
 #[derive(Parser)]

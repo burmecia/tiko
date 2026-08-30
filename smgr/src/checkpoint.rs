@@ -30,7 +30,7 @@
 //! reproduces the same segment because the draft drain + express scan are
 //! consistent. The base manifest PUT is atomic.
 
-use core::{io::store::Store, io::timeline::Checkpoint, io_control::IoControl};
+use core::{io_control::IoControl, store::Store, timeline::Checkpoint};
 use pgsys::{Lsn, logging::*, timeline_id::TimelineId};
 
 const CHECKPOINT_CAUSE_BASEBACKUP: i32 = 0x0200;

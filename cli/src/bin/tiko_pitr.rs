@@ -36,8 +36,8 @@ use serde::Serialize;
 use cli::pitr;
 use core::env;
 use core::error::{Error, Result};
-use core::io::store::Store;
-use core::io::timeline::Checkpoint;
+use core::store::Store;
+use core::timeline::Checkpoint;
 use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
 
