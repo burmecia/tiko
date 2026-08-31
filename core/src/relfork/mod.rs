@@ -3,5 +3,5 @@
 pub mod ops;
 mod types;
 
-pub use types::{REL_FORK_SIZE, RelFork, RelForkMeta};
 pub(crate) use types::ChunkTagIterItem;
+pub use types::{REL_FORK_SIZE, RelFork, RelForkMeta};

@@ -1,8 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-#[cfg(test)]
-use pgsys::{lsn::Lsn, timeline_id::TimelineId};
-
 use super::segment::Checkpoint;
 use crate::chunk::ChunkTag;
 use crate::io::draft::DraftBuffer;
@@ -382,7 +379,7 @@ impl TimelineState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgsys::common::ForkNumber;
+    use pgsys::{common::ForkNumber, lsn::Lsn, timeline_id::TimelineId};
 
     fn tag(rel: u32, chunk_id: u32) -> ChunkTag {
         ChunkTag {

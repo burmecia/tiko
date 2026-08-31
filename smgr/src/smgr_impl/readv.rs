@@ -1,4 +1,4 @@
-use core::{relfork::{RelFork, ops}};
+use core::relfork::{RelFork, ops};
 use pgsys::{
     common::{BlockNumber, ForkNumber},
     logging::pg_log_error,

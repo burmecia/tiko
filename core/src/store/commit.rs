@@ -102,10 +102,7 @@ impl Store {
             *commit_ckpt,
             prev_ckpt,
             summary.chunks.iter().copied(),
-            summary
-                .relforks
-                .iter()
-                .map(|(rf, meta)| (*rf, *meta)),
+            summary.relforks.iter().map(|(rf, meta)| (*rf, *meta)),
         );
 
         // Update DbMeta JSON
