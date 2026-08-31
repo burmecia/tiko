@@ -101,13 +101,17 @@ pub const DRAFT_SPILL_FILE_NAME: &str = "draft.spill";
 
 // ── Slot entries ────────────────────────────────────────────────────────────
 
-const SLOT_EMPTY: u8 = 0;
-const SLOT_OCCUPIED: u8 = 1;
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Empty = 0,
+    Occupied = 1,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ChunkSlotEntry {
-    state: u8,
+    state: SlotState,
     _pad: [u8; 3],
     tag: ChunkTag,
 }
@@ -116,7 +120,7 @@ const _: () = assert!(std::mem::size_of::<ChunkSlotEntry>() == 24);
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RelForkSlotEntry {
-    state: u8,
+    state: SlotState,
     _pad: [u8; 3],
     rf: RelFork,
     meta: RelForkMeta,
@@ -147,7 +151,7 @@ impl ChunkShard {
         unsafe {
             let slots = &mut *self.slots.get();
             for s in slots.iter_mut() {
-                s.state = SLOT_EMPTY;
+                s.state = SlotState::Empty;
             }
         }
     }
@@ -163,13 +167,13 @@ impl ChunkShard {
             let idx = (start + i) % CHUNK_SHARD_CAP;
             let slot = &mut slots[idx];
             match slot.state {
-                SLOT_EMPTY => {
+                SlotState::Empty => {
                     slot.tag = tag;
-                    slot.state = SLOT_OCCUPIED;
+                    slot.state = SlotState::Occupied;
                     let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
                     return Ok(new_len as usize >= CHUNK_SHARD_WATERMARK);
                 }
-                SLOT_OCCUPIED if slot.tag == tag => return Ok(false),
+                SlotState::Occupied if slot.tag == tag => return Ok(false),
                 _ => continue,
             }
         }
@@ -184,8 +188,8 @@ impl ChunkShard {
         for i in 0..CHUNK_SHARD_CAP {
             let idx = (start + i) % CHUNK_SHARD_CAP;
             match slots[idx].state {
-                SLOT_EMPTY => return false,
-                SLOT_OCCUPIED if slots[idx].tag == *tag => return true,
+                SlotState::Empty => return false,
+                SlotState::Occupied if slots[idx].tag == *tag => return true,
                 _ => continue,
             }
         }
@@ -197,9 +201,9 @@ impl ChunkShard {
         // SAFETY: lock held.
         let slots = unsafe { &mut *self.slots.get() };
         for s in slots.iter_mut() {
-            if s.state == SLOT_OCCUPIED {
+            if s.state == SlotState::Occupied {
                 dst.insert(s.tag);
-                s.state = SLOT_EMPTY;
+                s.state = SlotState::Empty;
             }
         }
         self.len.store(0, Ordering::Relaxed);
@@ -264,7 +268,7 @@ impl RelForkZone {
         unsafe {
             let slots = &mut *self.slots.get();
             for s in slots.iter_mut() {
-                s.state = SLOT_EMPTY;
+                s.state = SlotState::Empty;
             }
         }
     }
@@ -280,14 +284,14 @@ impl RelForkZone {
             let idx = (start + i) % REL_FORK_ZONE_CAP;
             let slot = &mut slots[idx];
             match slot.state {
-                SLOT_EMPTY => {
+                SlotState::Empty => {
                     slot.rf = rf;
                     slot.meta = meta;
-                    slot.state = SLOT_OCCUPIED;
+                    slot.state = SlotState::Occupied;
                     let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
                     return Ok(new_len as usize >= REL_FORK_ZONE_WATERMARK);
                 }
-                SLOT_OCCUPIED if slot.rf == rf => {
+                SlotState::Occupied if slot.rf == rf => {
                     slot.meta = meta;
                     return Ok(false);
                 }
@@ -305,8 +309,8 @@ impl RelForkZone {
         for i in 0..REL_FORK_ZONE_CAP {
             let idx = (start + i) % REL_FORK_ZONE_CAP;
             match slots[idx].state {
-                SLOT_EMPTY => return None,
-                SLOT_OCCUPIED if slots[idx].rf == *rf => {
+                SlotState::Empty => return None,
+                SlotState::Occupied if slots[idx].rf == *rf => {
                     return Some(slots[idx].meta);
                 }
                 _ => continue,
@@ -320,9 +324,9 @@ impl RelForkZone {
         // SAFETY: lock held.
         let slots = unsafe { &mut *self.slots.get() };
         for s in slots.iter_mut() {
-            if s.state == SLOT_OCCUPIED {
+            if s.state == SlotState::Occupied {
                 dst.insert(s.rf, s.meta);
-                s.state = SLOT_EMPTY;
+                s.state = SlotState::Empty;
             }
         }
         self.len.store(0, Ordering::Relaxed);
@@ -573,7 +577,7 @@ mod tests {
         let layout = std::alloc::Layout::new::<DraftBuffer>();
         // SAFETY: `alloc_zeroed` returns a properly aligned allocation; zero
         // is a valid initial value for every field (atomics start at 0, slot
-        // bytes start at 0 = SLOT_EMPTY).
+        // bytes start at 0 = SlotState::Empty).
         unsafe {
             let raw = std::alloc::alloc_zeroed(layout) as *mut DraftBuffer;
             assert!(!raw.is_null(), "DraftBuffer allocation failed");
