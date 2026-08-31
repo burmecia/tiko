@@ -6,6 +6,7 @@
 //! - [`TimelineSegment`] / [`CheckpointSummary`]: durable per-checkpoint
 //!   summary stored on disk and in S3.
 
+pub mod draft;
 pub mod segment;
 pub mod state;
 

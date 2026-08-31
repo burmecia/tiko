@@ -113,10 +113,12 @@ I/O/cache engine. Key modules:
   `commit.rs` (commit protocol), `compaction.rs`, `backup.rs` (PITR/backup),
   `wal.rs` (WAL-coverage analysis).
 - `timeline/` — `segment.rs` (durable types: `Checkpoint`, `SegmentId`,
-  `TimelineSegment`) and `state.rs` (shmem runtime: `TimelineState`,
-  `ActiveCheckpoint`, `ChunkBloom`, `RelforkIndex`).
+  `TimelineSegment`), `state.rs` (shmem runtime: `TimelineState`,
+  `ActiveCheckpoint`, `ChunkBloom`, `RelforkIndex`), and `draft.rs`
+  (`DraftBuffer`, the per-checkpoint-interval shmem write set drained at
+  commit).
 - `io/` — only io_control-related shmem/IPC: `io_control.rs` (`IoControl`, slot
-  pools, submit queue), `stats.rs`, `draft.rs` (`DraftBuffer`).
+  pools, submit queue), `stats.rs`.
 - `env.rs` — env var parsing, incl. `TIKO_LOCAL_PATH` for the small local state
   dir (base-manifest cache file, draft spill file — not block data), plus
   `storage_root_path()`/`local_path()`.

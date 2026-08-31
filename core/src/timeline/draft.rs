@@ -2,8 +2,8 @@
 //!
 //! Two-zone hash table in shared memory that records every chunk tag and
 //! relfork-meta update written during the current PG checkpoint interval.
-//! Backends record directly; readers ([`crate::io::store::Store::get_chunk`],
-//! [`crate::io::store::Store::get_meta`]) probe via [`DraftBuffer::contains_chunk`]
+//! Backends record directly; readers ([`crate::store::Store::get_chunk`],
+//! [`crate::store::Store::get_meta`]) probe via [`DraftBuffer::contains_chunk`]
 //! / [`DraftBuffer::get_relfork`]. At commit time the checkpointer drains
 //! both zones plus any on-disk spill overflow and folds them into the new
 //! `CheckpointSummary`.
@@ -209,7 +209,7 @@ impl ChunkShard {
 }
 
 /// Sharded hash set of [`ChunkTag`]s. Presence-only — chunk data lives at the
-/// S3 head-prefix and is read by [`crate::io::store::Store::get_chunk`].
+/// S3 head-prefix and is read by [`crate::store::Store::get_chunk`].
 #[repr(C, align(128))]
 pub struct ChunkZone {
     shards: [ChunkShard; CHUNK_NUM_SHARDS],
@@ -416,7 +416,7 @@ impl DraftBuffer {
     /// Returns `true` if `tag` is in the in-memory chunk zone. If a spill has
     /// occurred since the last `drain` and `tag` is not in the in-memory
     /// zone, returns `true` conservatively rather than scanning the spill
-    /// file: the caller ([`crate::io::store::Store::get_chunk`]) treats a
+    /// file: the caller ([`crate::store::Store::get_chunk`]) treats a
     /// `true` as a hint to probe the head-prefix and falls through if the
     /// object is absent. False negatives, on the other hand, would silently
     /// skip the head-prefix probe and lose data.

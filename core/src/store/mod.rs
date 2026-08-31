@@ -1,8 +1,8 @@
 mod backup;
-mod chunk;
+mod chunk_ops;
 mod commit;
 mod compaction;
-mod meta;
+mod meta_ops;
 mod wal;
 
 pub use backup::{BackupRow, CheckpointRow, RecoveryWindow};
@@ -16,7 +16,7 @@ use crate::{
     chunk::ChunkTag,
     db::{DbMeta, DbNamespace},
     error::{Error, Result},
-    io::draft::DRAFT_SPILL_FILE_NAME,
+    timeline::draft::DRAFT_SPILL_FILE_NAME,
     io_control::IoControl,
     local_path,
     locator::Locator,

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::segment::Checkpoint;
 use crate::chunk::ChunkTag;
-use crate::io::draft::DraftBuffer;
+use crate::timeline::draft::DraftBuffer;
 use crate::relfork::{RelFork, RelForkMeta};
 use crate::utils::rw_lock::AtomicRWLock;
 

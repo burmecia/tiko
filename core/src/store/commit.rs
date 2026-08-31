@@ -1,7 +1,7 @@
 use super::Store;
 use crate::{
     error::Result,
-    io::draft::DraftFrame,
+    timeline::draft::DraftFrame,
     io_control::IoControl,
     timeline::{Checkpoint, CheckpointSummary, TimelineSegment},
 };
