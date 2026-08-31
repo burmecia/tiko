@@ -78,15 +78,12 @@ fn combined_hash(h1: u32, h2: u32, i: u32) -> u32 {
 /// `ChunkBloom` (16 KiB) stays well under 20 KiB per slot.
 pub const RELFORK_INDEX_CAP: usize = 128;
 
-/// One entry of [`RelforkIndex`]. `RelForkMeta` is inlined as primitive
-/// fields to keep the entry `Copy` and avoid a non-`Copy` field in a
-/// shmem-resident fixed-size array.
+/// One entry of [`RelforkIndex`].
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct RelforkEntry {
     pub rf: RelFork,
-    pub nblocks: u32,
-    pub deleted: bool,
+    pub meta: RelForkMeta,
     _pad: [u8; 3],
 }
 
@@ -140,8 +137,7 @@ impl RelforkIndex {
         for (i, (rf, meta)) in buf.into_iter().take(n).enumerate() {
             self.entries[i] = RelforkEntry {
                 rf,
-                nblocks: meta.nblocks,
-                deleted: meta.deleted,
+                meta,
                 _pad: [0; 3],
             };
         }
@@ -151,10 +147,7 @@ impl RelforkIndex {
     pub fn get(&self, rf: &RelFork) -> RelforkLookup {
         let slice = &self.entries[..self.len as usize];
         match slice.binary_search_by(|e| e.rf.cmp(rf)) {
-            Ok(i) => RelforkLookup::Hit(RelForkMeta {
-                nblocks: slice[i].nblocks,
-                deleted: slice[i].deleted,
-            }),
+            Ok(i) => RelforkLookup::Hit(slice[i].meta),
             Err(_) => {
                 if self.overflowed {
                     RelforkLookup::Inconclusive

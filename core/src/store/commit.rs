@@ -105,7 +105,7 @@ impl Store {
             summary
                 .relforks
                 .iter()
-                .map(|(rf, meta)| (*rf, meta.clone())),
+                .map(|(rf, meta)| (*rf, *meta)),
         );
 
         // Update DbMeta JSON

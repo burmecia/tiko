@@ -397,7 +397,7 @@ impl DraftBuffer {
     /// (last-write-wins).
     pub fn record_relfork(&self, rf: RelFork, meta: RelForkMeta, spill_path: &Path) -> Result<()> {
         loop {
-            match self.relforks.insert(rf, meta.clone()) {
+            match self.relforks.insert(rf, meta) {
                 Ok(over_watermark) => {
                     if over_watermark {
                         let _ = self.try_spill_to_file(spill_path);

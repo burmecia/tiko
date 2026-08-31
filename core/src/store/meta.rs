@@ -89,7 +89,7 @@ impl Store {
         // succeeded by then.
         let io_control = IoControl::get();
         let _timeline_guard = io_control.timeline.lock.read();
-        self.record_relfork_eviction(*rf, meta.clone());
+        self.record_relfork_eviction(*rf, *meta);
         Ok(())
     }
 

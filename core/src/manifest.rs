@@ -459,7 +459,7 @@ impl Manifest {
             }
             // Last-write-wins for relfork meta (segments oldest-first).
             for (rf, meta) in &seg.relforks {
-                new_meta.insert(*rf, meta.clone());
+                new_meta.insert(*rf, *meta);
             }
         }
         last_ts = chrono::Utc::now().timestamp().max(last_ts);
@@ -745,7 +745,7 @@ mod tests {
             s.chunks.insert(*t);
         }
         for (rf, m) in rels {
-            s.relforks.insert(*rf, m.clone());
+            s.relforks.insert(*rf, *m);
         }
         s
     }

@@ -418,7 +418,7 @@ impl Store {
                     continue;
                 }
                 if let Some(meta) = sc.relfork_meta(rf) {
-                    return Ok(Some(meta.clone()));
+                    return Ok(Some(*meta));
                 }
             }
         }
@@ -491,7 +491,7 @@ impl Store {
                     sc.ckpt,
                     sc.prev_ckpt,
                     sc.chunks.iter().copied(),
-                    sc.relforks.iter().map(|(rf, meta)| (*rf, meta.clone())),
+                    sc.relforks.iter().map(|(rf, meta)| (*rf, *meta)),
                 );
             }
 

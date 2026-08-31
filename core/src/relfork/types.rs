@@ -115,7 +115,7 @@ impl From<&ChunkTag> for RelFork {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct RelForkMeta {
     pub nblocks: u32,
     pub deleted: bool,
