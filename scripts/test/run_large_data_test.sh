@@ -21,7 +21,8 @@ if [ "$(uname)" = "Darwin" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
 TARGET_DIR="${BASE_DIR}/target"
 POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 PG_BIN_DIR="${POSTGRES_INSTALL}/bin"
