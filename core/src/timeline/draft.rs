@@ -119,11 +119,9 @@ struct RelforkSlotEntry {
     state: u8,
     _pad: [u8; 3],
     rf: RelFork,
-    nblocks: u32,
-    deleted: bool,
-    _pad2: [u8; 7],
+    meta: RelForkMeta,
 }
-const _: () = assert!(std::mem::size_of::<RelforkSlotEntry>() == 32);
+const _: () = assert!(std::mem::size_of::<RelforkSlotEntry>() == 28);
 
 // ── ChunkShard / ChunkZone ──────────────────────────────────────────────────
 
@@ -284,15 +282,13 @@ impl RelforkZone {
             match slot.state {
                 SLOT_EMPTY => {
                     slot.rf = rf;
-                    slot.nblocks = meta.nblocks;
-                    slot.deleted = meta.deleted;
+                    slot.meta = meta;
                     slot.state = SLOT_OCCUPIED;
                     let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
                     return Ok(new_len as usize >= RELFORK_ZONE_WATERMARK);
                 }
                 SLOT_OCCUPIED if slot.rf == rf => {
-                    slot.nblocks = meta.nblocks;
-                    slot.deleted = meta.deleted;
+                    slot.meta = meta;
                     return Ok(false);
                 }
                 _ => continue,
@@ -311,10 +307,7 @@ impl RelforkZone {
             match slots[idx].state {
                 SLOT_EMPTY => return None,
                 SLOT_OCCUPIED if slots[idx].rf == *rf => {
-                    return Some(RelForkMeta {
-                        nblocks: slots[idx].nblocks,
-                        deleted: slots[idx].deleted,
-                    });
+                    return Some(slots[idx].meta);
                 }
                 _ => continue,
             }
@@ -328,13 +321,7 @@ impl RelforkZone {
         let slots = unsafe { &mut *self.slots.get() };
         for s in slots.iter_mut() {
             if s.state == SLOT_OCCUPIED {
-                dst.insert(
-                    s.rf,
-                    RelForkMeta {
-                        nblocks: s.nblocks,
-                        deleted: s.deleted,
-                    },
-                );
+                dst.insert(s.rf, s.meta);
                 s.state = SLOT_EMPTY;
             }
         }
