@@ -20,10 +20,11 @@ Requires Rust 1.88+ (edition 2024). PostgreSQL 18 is a git submodule under
 
 ```bash
 ./scripts/build_postgres.sh   # build vendored/patched PG into target/pg-install (run once)
-./scripts/run_test.sh         # primary smoke test: builds smgr + PG + worker, runs make check
+./scripts/test/run_smoke_test.sh   # primary smoke test: builds smgr + PG + worker, runs make check
 ```
 
-Other suites: `run_large_data_test.sh` (large data), `run_test4.sh`, `run_pg_test.sh`
+Other suites: `run_large_data_test.sh` (large data), `run_minimal_test.sh` (minimal
+initdb/boot/write/shutdown e2e), `run_pg_test.sh`
 (PG regression), `run_pitr_test.sh` (PITR), `run_branch_test.sh` (COW branching).
 
 Individual crates:
@@ -33,7 +34,7 @@ cargo build -p smgr    # target/{debug,release}/libtikosmgr.a (staticlib+rlib)
 cargo build -p worker  # target/{debug,release}/libtikoworker.{dylib,so} (cdylib+rlib)
 ```
 
-`run_test.sh` is the **integration test** and encodes a required build order:
+`run_smoke_test.sh` is the **integration test** and encodes a required build order:
 build `smgr` (staticlib, linked into PG) → `make && make install` in `postgres/`
 → build `worker` (cdylib) → copy `libtikoworker.{dylib,so}` into
 `postgres/src/test/modules/test_tiko/worker/` → `make check` there with
@@ -47,12 +48,12 @@ Unit tests run per-crate with `cargo test -p <crate>` (e.g. `core`, `pgsys`).
   warnings. `smgr`/`worker`/`cli`/`pgsys` still have pre-existing clippy warnings.
 - **`build_postgres.sh`** installs deps via `apt-get` on Linux and `brew` on
   macOS (auto-detected). On macOS it also checks for Xcode Command Line Tools.
-- **Required env vars**: `run_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/
+- **Required env vars**: `run_smoke_test.sh` sets `TIKO_ORG_ID`/`TIKO_DB_ID`/
   `TIKO_PROJECT_ID`/`TIKO_PITR_INTERVAL_SECS`. It also `unset`s
   `TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH` (the smoke test uses defaults). In a VM
   these are provisioned by the tikovm guest image (sourced from
   `/var/lib/postgresql/tiko_env.sh`).
-- **macOS System V shmem leak**: `run_test.sh` cleans orphaned `ipcs -m` segments
+- **macOS System V shmem leak**: `run_smoke_test.sh` cleans orphaned `ipcs -m` segments
   first because macOS caps `kern.sysv.shmmni` at 32 and each killed postgres leaks
   one. If `make check` hangs/fails on shmem, clear them manually.
 
@@ -264,7 +265,7 @@ recovery.
   `options='-c tikovm_token=<jwt>'` (routed by tikovm's `hostd`). Tiko's own test
   scripts talk to Postgres directly, no proxy involved.
 - Minimum Rust **1.88, edition 2024** (no `rust-toolchain.toml`).
-- No CI workflows are defined; `./scripts/run_test.sh` is the canonical check.
+- No CI workflows are defined; `./scripts/test/run_smoke_test.sh` is the canonical check.
 
 ## Code Style & Comments
 

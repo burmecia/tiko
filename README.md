@@ -146,13 +146,13 @@ Build Postgres:
 Run the smoke test:
 
 ```bash
-./scripts/run_test.sh
+./scripts/test/run_smoke_test.sh
 ```
 
 Run the large-data test to see compute-storage separation in action:
 
 ```bash
-./scripts/run_large_data_test.sh
+./scripts/test/run_large_data_test.sh
 
 # After the run, three directories appear under the repo root:
 # - `tt/`         — the Postgres PGDATA directory (compute)
@@ -162,9 +162,9 @@ Run the large-data test to see compute-storage separation in action:
 
 Other test scripts:
 
-- `./scripts/run_pg_test.sh` — PostgreSQL regression test
-- `./scripts/run_pitr_test.sh` — PITR test
-- `./scripts/run_branch_test.sh` — branching test
+- `./scripts/test/run_pg_test.sh` — PostgreSQL regression test
+- `./scripts/test/run_pitr_test.sh` — PITR test
+- `./scripts/test/run_branch_test.sh` — branching test
 
 ### Compute layer (Firecracker microVM)
 
