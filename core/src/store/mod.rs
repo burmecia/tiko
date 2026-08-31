@@ -16,7 +16,6 @@ use crate::{
     chunk::ChunkTag,
     db::{DbMeta, DbNamespace},
     error::{Error, Result},
-    timeline::draft::DRAFT_SPILL_FILE_NAME,
     io_control::IoControl,
     local_path,
     locator::Locator,
@@ -24,6 +23,7 @@ use crate::{
     relfork::{RelFork, RelForkMeta},
     storage::Storage,
     storage_root_path,
+    timeline::draft::DRAFT_SPILL_FILE_NAME,
     timeline::{ACTIVE_WINDOW_SIZE, Checkpoint, CheckpointSummary, SegmentId, TimelineSegment},
 };
 use pgsys::{

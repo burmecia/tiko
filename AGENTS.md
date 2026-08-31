@@ -114,7 +114,7 @@ I/O/cache engine. Key modules:
   `wal.rs` (WAL-coverage analysis).
 - `timeline/` — `segment.rs` (durable types: `Checkpoint`, `SegmentId`,
   `TimelineSegment`), `state.rs` (shmem runtime: `TimelineState`,
-  `ActiveCheckpoint`, `ChunkBloom`, `RelforkIndex`), and `draft.rs`
+  `ActiveCheckpoint`, `ChunkBloom`, `RelForkIndex`), and `draft.rs`
   (`DraftBuffer`, the per-checkpoint-interval shmem write set drained at
   commit).
 - `io/` — only io_control-related shmem/IPC: `io_control.rs` (`IoControl`, slot

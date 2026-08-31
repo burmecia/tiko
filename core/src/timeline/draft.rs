@@ -11,7 +11,7 @@
 //! Layout:
 //! - [`ChunkZone`]: `CHUNK_NUM_SHARDS` sharded open-addressed hash sets of
 //!   [`ChunkTag`] (presence-only; chunk data lives at the S3 head-prefix).
-//! - [`RelforkZone`]: single open-addressed hash table of
+//! - [`RelForkZone`]: single open-addressed hash table of
 //!   [`RelFork`] → [`RelForkMeta`] (last write wins on overwrite).
 //! - Each chunk shard has its own spinlock; the relfork zone has one
 //!   spinlock. Spill drains are serialised by a global [`AtomicRWLock`].
@@ -80,9 +80,9 @@ pub const CHUNK_TOTAL_CAP: usize = CHUNK_NUM_SHARDS * CHUNK_SHARD_CAP;
 const _: () = assert!(CHUNK_SHARD_CAP.is_power_of_two());
 const _: () = assert!(CHUNK_NUM_SHARDS.is_power_of_two());
 
-/// Slot capacity of [`RelforkZone`].
-pub const RELFORK_ZONE_CAP: usize = 8192;
-const _: () = assert!(RELFORK_ZONE_CAP.is_power_of_two());
+/// Slot capacity of [`RelForkZone`].
+pub const REL_FORK_ZONE_CAP: usize = 8192;
+const _: () = assert!(REL_FORK_ZONE_CAP.is_power_of_two());
 
 /// Non-blocking spill is triggered when a shard / zone load reaches this
 /// percentage of capacity.
@@ -91,9 +91,9 @@ pub const DRAFT_SPILL_WATERMARK_PCT: u32 = 75;
 /// Per-shard watermark for [`ChunkShard`] (in slots).
 pub const CHUNK_SHARD_WATERMARK: usize = CHUNK_SHARD_CAP * DRAFT_SPILL_WATERMARK_PCT as usize / 100;
 
-/// Watermark for [`RelforkZone`] (in slots).
-pub const RELFORK_ZONE_WATERMARK: usize =
-    RELFORK_ZONE_CAP * DRAFT_SPILL_WATERMARK_PCT as usize / 100;
+/// Watermark for [`RelForkZone`] (in slots).
+pub const REL_FORK_ZONE_WATERMARK: usize =
+    REL_FORK_ZONE_CAP * DRAFT_SPILL_WATERMARK_PCT as usize / 100;
 
 /// Filename of the on-disk overflow file used by [`DraftBuffer::spill_to_file`].
 /// Lives under the tiko root path, one per cluster.
@@ -115,13 +115,13 @@ const _: () = assert!(std::mem::size_of::<ChunkSlotEntry>() == 24);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct RelforkSlotEntry {
+struct RelForkSlotEntry {
     state: u8,
     _pad: [u8; 3],
     rf: RelFork,
     meta: RelForkMeta,
 }
-const _: () = assert!(std::mem::size_of::<RelforkSlotEntry>() == 28);
+const _: () = assert!(std::mem::size_of::<RelForkSlotEntry>() == 28);
 
 // ── ChunkShard / ChunkZone ──────────────────────────────────────────────────
 
@@ -240,23 +240,23 @@ impl ChunkZone {
     }
 }
 
-// ── RelforkZone ─────────────────────────────────────────────────────────────
+// ── RelForkZone ─────────────────────────────────────────────────────────────
 
 /// Open-addressed hash table of `RelFork → RelForkMeta`. Single global
 /// spinlock. Overwriting an existing entry preserves last-write-wins
 /// semantics — required by `Store::get_meta` correctness.
 #[repr(C, align(128))]
-pub struct RelforkZone {
+pub struct RelForkZone {
     lock: AtomicU32,
     len: AtomicU32,
     _pad: [u8; 56],
-    slots: UnsafeCell<[RelforkSlotEntry; RELFORK_ZONE_CAP]>,
+    slots: UnsafeCell<[RelForkSlotEntry; REL_FORK_ZONE_CAP]>,
 }
 
 // SAFETY: all access to `slots` is gated by `lock`.
-unsafe impl Sync for RelforkZone {}
+unsafe impl Sync for RelForkZone {}
 
-impl RelforkZone {
+impl RelForkZone {
     fn init(&self) {
         self.lock.store(0, Ordering::Relaxed);
         self.len.store(0, Ordering::Relaxed);
@@ -273,11 +273,11 @@ impl RelforkZone {
     /// `Ok(over_watermark)` on insert; returns `Err(())` if the zone is full.
     fn insert(&self, rf: RelFork, meta: RelForkMeta) -> std::result::Result<bool, ()> {
         let _g = spin_lock(&self.lock);
-        let start = (rf.hash() as usize) % RELFORK_ZONE_CAP;
+        let start = (rf.hash() as usize) % REL_FORK_ZONE_CAP;
         // SAFETY: lock held.
         let slots = unsafe { &mut *self.slots.get() };
-        for i in 0..RELFORK_ZONE_CAP {
-            let idx = (start + i) % RELFORK_ZONE_CAP;
+        for i in 0..REL_FORK_ZONE_CAP {
+            let idx = (start + i) % REL_FORK_ZONE_CAP;
             let slot = &mut slots[idx];
             match slot.state {
                 SLOT_EMPTY => {
@@ -285,7 +285,7 @@ impl RelforkZone {
                     slot.meta = meta;
                     slot.state = SLOT_OCCUPIED;
                     let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
-                    return Ok(new_len as usize >= RELFORK_ZONE_WATERMARK);
+                    return Ok(new_len as usize >= REL_FORK_ZONE_WATERMARK);
                 }
                 SLOT_OCCUPIED if slot.rf == rf => {
                     slot.meta = meta;
@@ -299,11 +299,11 @@ impl RelforkZone {
 
     fn get(&self, rf: &RelFork) -> Option<RelForkMeta> {
         let _g = spin_lock(&self.lock);
-        let start = (rf.hash() as usize) % RELFORK_ZONE_CAP;
+        let start = (rf.hash() as usize) % REL_FORK_ZONE_CAP;
         // SAFETY: lock held.
         let slots = unsafe { &*self.slots.get() };
-        for i in 0..RELFORK_ZONE_CAP {
-            let idx = (start + i) % RELFORK_ZONE_CAP;
+        for i in 0..REL_FORK_ZONE_CAP {
+            let idx = (start + i) % REL_FORK_ZONE_CAP;
             match slots[idx].state {
                 SLOT_EMPTY => return None,
                 SLOT_OCCUPIED if slots[idx].rf == *rf => {
@@ -345,7 +345,7 @@ pub struct DraftBuffer {
     /// occurred since the last commit.
     has_spilled: AtomicBool,
     chunks: ChunkZone,
-    relforks: RelforkZone,
+    relforks: RelForkZone,
 }
 
 // SAFETY: every field is internally synchronised.

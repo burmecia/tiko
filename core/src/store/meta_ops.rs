@@ -3,7 +3,7 @@ use crate::{
     error::{Error, Result},
     io_control::IoControl,
     relfork::{RelFork, RelForkMeta},
-    timeline::{Checkpoint, RelforkLookup},
+    timeline::{Checkpoint, RelForkLookup},
 };
 use pgsys::common::BlockNumber;
 
@@ -38,9 +38,9 @@ impl Store {
             for ac in timeline.iter_active() {
                 oldest_active_ckpt = Some(ac.ckpt);
                 match ac.relfork_index.get(rf) {
-                    RelforkLookup::Hit(meta) => return Ok(meta),
-                    RelforkLookup::DefinitiveMiss => continue,
-                    RelforkLookup::Inconclusive => break,
+                    RelForkLookup::Hit(meta) => return Ok(meta),
+                    RelForkLookup::DefinitiveMiss => continue,
+                    RelForkLookup::Inconclusive => break,
                 }
             }
 
@@ -49,7 +49,7 @@ impl Store {
             //      is K and we need K's segment file (it may carry the rf
             //      even though K's inline index didn't expose it). Active
             //      checkpoints newer than K reported DefinitiveMiss, and
-            //      since a non-overflowed `RelforkIndex` mirrors its
+            //      since a non-overflowed `RelForkIndex` mirrors its
             //      segment's relfork map exactly, their segments don't
             //      carry the rf either — no need to re-read them.
             //    - If every active checkpoint reported DefinitiveMiss, the

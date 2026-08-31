@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::segment::Checkpoint;
 use crate::chunk::ChunkTag;
-use crate::timeline::draft::DraftBuffer;
 use crate::relfork::{RelFork, RelForkMeta};
+use crate::timeline::draft::DraftBuffer;
 use crate::utils::rw_lock::AtomicRWLock;
 
 /// Number of recent checkpoints kept fully indexed in the shmem active window.
@@ -68,25 +68,25 @@ fn combined_hash(h1: u32, h2: u32, i: u32) -> u32 {
         .wrapping_add(i.wrapping_mul(i))
 }
 
-// ── RelforkIndex ────────────────────────────────────────────────────────────
+// ── RelForkIndex ────────────────────────────────────────────────────────────
 
 /// Maximum number of relforks indexed per active-checkpoint inline index.
-/// Sized so the index footprint (`RELFORK_INDEX_CAP × 24 B` = 3 KiB) plus
+/// Sized so the index footprint (`REL_FORK_INDEX_CAP × 24 B` = 3 KiB) plus
 /// `ChunkBloom` (16 KiB) stays well under 20 KiB per slot.
-pub const RELFORK_INDEX_CAP: usize = 128;
+pub const REL_FORK_INDEX_CAP: usize = 128;
 
-/// One entry of [`RelforkIndex`].
+/// One entry of [`RelForkIndex`].
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct RelforkEntry {
+pub struct RelForkEntry {
     pub rf: RelFork,
     pub meta: RelForkMeta,
     _pad: [u8; 3],
 }
 
-/// Result of probing a single [`RelforkIndex`].
+/// Result of probing a single [`RelForkIndex`].
 #[derive(Debug)]
-pub enum RelforkLookup {
+pub enum RelForkLookup {
     /// The relfork was modified in this checkpoint; here is its meta.
     Hit(RelForkMeta),
     /// The relfork was definitely not modified in this checkpoint.
@@ -99,21 +99,21 @@ pub enum RelforkLookup {
 
 /// Sorted inline index of [`RelFork`] → [`RelForkMeta`] for one active
 /// checkpoint. Replaces an on-disk segment GET for the common case where
-/// fewer than [`RELFORK_INDEX_CAP`] relforks were touched in the checkpoint.
+/// fewer than [`REL_FORK_INDEX_CAP`] relforks were touched in the checkpoint.
 ///
 /// Lookup is binary-search over the sorted prefix `entries[..len]`. If the
-/// originating checkpoint touched more than [`RELFORK_INDEX_CAP`] relforks,
+/// originating checkpoint touched more than [`REL_FORK_INDEX_CAP`] relforks,
 /// `overflowed` is set and a miss on the inline index is *inconclusive* —
 /// the read path must fall through to the segment file.
 #[repr(C)]
-pub struct RelforkIndex {
+pub struct RelForkIndex {
     len: u32,
     overflowed: bool,
     _pad: [u8; 3],
-    entries: [RelforkEntry; RELFORK_INDEX_CAP],
+    entries: [RelForkEntry; REL_FORK_INDEX_CAP],
 }
 
-impl RelforkIndex {
+impl RelForkIndex {
     pub fn clear(&mut self) {
         self.len = 0;
         self.overflowed = false;
@@ -123,16 +123,16 @@ impl RelforkIndex {
     /// resolved by the caller (the commit-protocol drain uses a
     /// `HashMap<RelFork, RelForkMeta>`, so each `RelFork` appears at most
     /// once). Entries are sorted by `RelFork`'s natural order; if the input
-    /// exceeds [`RELFORK_INDEX_CAP`], the index is marked `overflowed` and
-    /// keeps the first `RELFORK_INDEX_CAP` sorted entries.
+    /// exceeds [`REL_FORK_INDEX_CAP`], the index is marked `overflowed` and
+    /// keeps the first `REL_FORK_INDEX_CAP` sorted entries.
     pub fn populate(&mut self, relforks: impl IntoIterator<Item = (RelFork, RelForkMeta)>) {
         let mut buf: Vec<(RelFork, RelForkMeta)> = relforks.into_iter().collect();
         buf.sort_unstable_by_key(|a| a.0);
 
-        self.overflowed = buf.len() > RELFORK_INDEX_CAP;
-        let n = buf.len().min(RELFORK_INDEX_CAP);
+        self.overflowed = buf.len() > REL_FORK_INDEX_CAP;
+        let n = buf.len().min(REL_FORK_INDEX_CAP);
         for (i, (rf, meta)) in buf.into_iter().take(n).enumerate() {
-            self.entries[i] = RelforkEntry {
+            self.entries[i] = RelForkEntry {
                 rf,
                 meta,
                 _pad: [0; 3],
@@ -141,15 +141,15 @@ impl RelforkIndex {
         self.len = n as u32;
     }
 
-    pub fn get(&self, rf: &RelFork) -> RelforkLookup {
+    pub fn get(&self, rf: &RelFork) -> RelForkLookup {
         let slice = &self.entries[..self.len as usize];
         match slice.binary_search_by(|e| e.rf.cmp(rf)) {
-            Ok(i) => RelforkLookup::Hit(slice[i].meta),
+            Ok(i) => RelForkLookup::Hit(slice[i].meta),
             Err(_) => {
                 if self.overflowed {
-                    RelforkLookup::Inconclusive
+                    RelForkLookup::Inconclusive
                 } else {
-                    RelforkLookup::DefinitiveMiss
+                    RelForkLookup::DefinitiveMiss
                 }
             }
         }
@@ -166,7 +166,7 @@ pub struct ActiveCheckpoint {
     pub ckpt: Checkpoint,
     pub prev_ckpt: Checkpoint,
     pub chunk_bloom: ChunkBloom,
-    pub relfork_index: RelforkIndex,
+    pub relfork_index: RelForkIndex,
 }
 
 impl ActiveCheckpoint {
@@ -602,12 +602,12 @@ mod tests {
         );
     }
 
-    // ── RelforkIndex ──
+    // ── RelForkIndex ──
 
-    fn new_relfork_index() -> Box<RelforkIndex> {
-        let layout = std::alloc::Layout::new::<RelforkIndex>();
+    fn new_relfork_index() -> Box<RelForkIndex> {
+        let layout = std::alloc::Layout::new::<RelForkIndex>();
         unsafe {
-            let raw = std::alloc::alloc_zeroed(layout) as *mut RelforkIndex;
+            let raw = std::alloc::alloc_zeroed(layout) as *mut RelForkIndex;
             (*raw).clear();
             Box::from_raw(raw)
         }
@@ -623,18 +623,18 @@ mod tests {
         ]);
 
         match idx.get(&relfork(2)) {
-            RelforkLookup::Hit(m) => {
+            RelForkLookup::Hit(m) => {
                 assert_eq!(m.nblocks, 64);
                 assert!(!m.deleted);
             }
             other => panic!("expected hit, got {other:?}"),
         }
         match idx.get(&relfork(3)) {
-            RelforkLookup::Hit(m) => assert!(m.deleted),
+            RelForkLookup::Hit(m) => assert!(m.deleted),
             other => panic!("expected hit, got {other:?}"),
         }
         match idx.get(&relfork(99)) {
-            RelforkLookup::DefinitiveMiss => {}
+            RelForkLookup::DefinitiveMiss => {}
             other => panic!("expected definitive miss, got {other:?}"),
         }
     }
@@ -642,22 +642,22 @@ mod tests {
     #[test]
     fn relfork_index_overflow_returns_inconclusive_on_miss() {
         let mut idx = new_relfork_index();
-        let entries: Vec<_> = (0..(RELFORK_INDEX_CAP as u32 + 5))
+        let entries: Vec<_> = (0..(REL_FORK_INDEX_CAP as u32 + 5))
             .map(|i| (relfork(i), RelForkMeta::new(i, false)))
             .collect();
         idx.populate(entries);
 
-        // Sorted-keep retains the first RELFORK_INDEX_CAP rels by RelFork
+        // Sorted-keep retains the first REL_FORK_INDEX_CAP rels by RelFork
         // order. With our `relfork(i)` helper, rel_number == i, so rels
         // 0..CAP are kept and CAP..CAP+5 are dropped.
         match idx.get(&relfork(0)) {
-            RelforkLookup::Hit(m) => assert_eq!(m.nblocks, 0),
+            RelForkLookup::Hit(m) => assert_eq!(m.nblocks, 0),
             other => panic!("expected hit for kept entry, got {other:?}"),
         }
         // The dropped rel was in the input but not in the kept window —
         // lookup must be Inconclusive, not DefinitiveMiss.
-        match idx.get(&relfork(RELFORK_INDEX_CAP as u32 + 1)) {
-            RelforkLookup::Inconclusive => {}
+        match idx.get(&relfork(REL_FORK_INDEX_CAP as u32 + 1)) {
+            RelForkLookup::Inconclusive => {}
             other => panic!("expected inconclusive, got {other:?}"),
         }
     }
@@ -666,11 +666,11 @@ mod tests {
     fn relfork_index_clear_resets_state() {
         let mut idx = new_relfork_index();
         idx.populate([(relfork(1), RelForkMeta::new(10, false))]);
-        assert!(matches!(idx.get(&relfork(1)), RelforkLookup::Hit(_)));
+        assert!(matches!(idx.get(&relfork(1)), RelForkLookup::Hit(_)));
         idx.clear();
         assert!(matches!(
             idx.get(&relfork(1)),
-            RelforkLookup::DefinitiveMiss
+            RelForkLookup::DefinitiveMiss
         ));
     }
 

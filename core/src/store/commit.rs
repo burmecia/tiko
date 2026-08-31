@@ -1,8 +1,8 @@
 use super::Store;
 use crate::{
     error::Result,
-    timeline::draft::DraftFrame,
     io_control::IoControl,
+    timeline::draft::DraftFrame,
     timeline::{Checkpoint, CheckpointSummary, TimelineSegment},
 };
 use pgsys::logging::pg_log_debug1;

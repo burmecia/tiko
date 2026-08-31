@@ -784,7 +784,7 @@ mod tests {
         let r20 = base.lookup(&tag(2, 0)).unwrap().unwrap();
         assert_eq!(r20.lsn.as_u64(), 100);
 
-        // Relfork meta: rf(1) overwritten by s2 → 48 blocks; rf(2) only in s2.
+        // RelFork meta: rf(1) overwritten by s2 → 48 blocks; rf(2) only in s2.
         assert_eq!(
             base.lookup_relfork_meta(&rf(1)).unwrap().unwrap().nblocks,
             48
