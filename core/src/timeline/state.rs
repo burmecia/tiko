@@ -206,9 +206,7 @@ impl ActiveCheckpoint {
 
 // ── TimelineState ───────────────────────────────────────────────────────────
 
-/// Consolidated shmem state for the timeline subsystem. Designed to replace
-/// the legacy `CheckpointQueue` (in this file) and `CkptHistory` (in
-/// `core/src/checkpoints.rs`) once later stages of the refactor land.
+/// Consolidated shmem state for the timeline subsystem.
 ///
 /// Layout discipline: all mutable fields except `generation` are protected by
 /// `lock`. `generation` is bumped (Release) on every commit; backends read it
@@ -273,8 +271,8 @@ impl TimelineState {
     }
 
     /// Push a new active-window entry. Caller must hold `lock.write()` —
-    /// this method takes `&self` and casts internally, matching the
-    /// `CheckpointQueue::push` convention for shmem-resident types.
+    /// this method takes `&self` and casts internally, the standard
+    /// convention for shmem-resident types.
     /// Bumps `generation` (Release) on success; updates `head_ckpt`.
     pub fn push_active(
         &self,
