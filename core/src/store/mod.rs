@@ -23,7 +23,7 @@ use crate::{
     relfork::{RelFork, RelForkMeta},
     storage::Storage,
     storage_root_path,
-    timeline::draft::DRAFT_SPILL_FILE_NAME,
+    timeline::draft::{DRAFT_SPILL_FILE_NAME, SpillFile},
     timeline::{ACTIVE_WINDOW_SIZE, Checkpoint, CheckpointSummary, SegmentId, TimelineSegment},
 };
 use pgsys::{
@@ -58,7 +58,7 @@ pub struct Store {
     local_root: PathBuf,
     /// On-disk overflow file for the centralized shmem [`DraftBuffer`].
     /// One per cluster at `{tiko_root}/draft.spill`.
-    draft_spill_path: PathBuf,
+    draft_spill: SpillFile,
 }
 
 impl Store {
@@ -142,14 +142,14 @@ impl Store {
             }
         };
 
-        let draft_spill_path = local_root.join(DRAFT_SPILL_FILE_NAME);
+        let draft_spill = SpillFile::new(local_root.join(DRAFT_SPILL_FILE_NAME));
         let store = Store {
             ns,
             lctr,
             base_manifest: Mutex::new(Arc::new(initial)),
             storage,
             local_root,
-            draft_spill_path,
+            draft_spill,
         };
 
         let _ = STORE.set(store); // ignore duplicate init attempts
@@ -277,7 +277,7 @@ impl Store {
         if let Err(e) = io_control
             .timeline
             .draft
-            .record_chunk(tag, &self.draft_spill_path)
+            .record_chunk(tag, &self.draft_spill)
         {
             pg_log_warning(format!("tiko: failed to record chunk eviction: {e}"));
         }
@@ -290,7 +290,7 @@ impl Store {
         if let Err(e) = io_control
             .timeline
             .draft
-            .record_relfork(rf, meta, &self.draft_spill_path)
+            .record_relfork(rf, meta, &self.draft_spill)
         {
             pg_log_warning(format!("tiko: failed to record relfork eviction: {e}"));
         }

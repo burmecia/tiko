@@ -66,6 +66,9 @@ impl Store {
     ///    single pass.
     /// 5. Build a `CheckpointSummary` from the drained state and append it
     ///    to the appropriate segment file via [`Store::commit_segment`].
+    ///    Only once that PUT is durable does `commit_drain` discard the
+    ///    spill file — a failure before that point retries with the same
+    ///    drained contents.
     /// 6. `push_active(commit_ckpt, prev_ckpt, chunks, relforks)` updates
     ///    the active window, advances `head_ckpt`, and bumps `generation`.
     /// 7. Update the `DbMeta` JSON on storage to record the new checkpoint.
@@ -95,7 +98,9 @@ impl Store {
         timeline.set_redo_ckpt(*redo_ckpt);
 
         // Drain the centralized shmem draft ring + its on-disk spill file.
-        let drained = timeline.draft.drain(&self.draft_spill_path)?;
+        // Non-destructive: the spill file survives until the segment PUT is
+        // durable, so a failed commit retries with the same contents.
+        let drained = timeline.draft.drain(&self.draft_spill)?;
         let summary = self.commit_segment(*commit_ckpt, prev_ckpt, *redo_ckpt, drained)?;
 
         timeline.push_active(
@@ -104,6 +109,9 @@ impl Store {
             summary.chunks.iter().copied(),
             summary.relforks.iter().map(|(rf, meta)| (*rf, *meta)),
         );
+
+        // Segment is durable; discard the drained draft.
+        timeline.draft.commit_drain(&self.draft_spill)?;
 
         // Update DbMeta JSON
         self.update_db_meta(commit_ckpt)?;

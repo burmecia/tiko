@@ -21,7 +21,7 @@ impl Store {
             // 1. Live interval: shmem draft buffer is the sole source of
             //    truth for uncommitted writes. Falls back to the spill file
             //    transparently if the in-memory zone has been drained.
-            if let Some(meta) = timeline.draft.get_relfork(rf, &self.draft_spill_path)? {
+            if let Some(meta) = timeline.draft.get_relfork(rf, &self.draft_spill)? {
                 return Ok(meta);
             }
 

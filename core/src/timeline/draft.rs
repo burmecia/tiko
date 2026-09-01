@@ -30,7 +30,7 @@ use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -207,22 +207,38 @@ impl ChunkShard {
         }
     }
 
-    /// Clear slots whose tag is in `collected`. Exact because the caller
-    /// holds the exclusive spill lock from collect to clear: no occupied
-    /// slot can be emptied in between, so concurrent inserts only claim
-    /// still-empty slots and never duplicate a collected tag.
+    /// Remove slots whose tag is in `collected`, then rebuild the shard.
+    /// Exact because the caller holds the exclusive spill lock from collect
+    /// to clear: no occupied slot can be emptied in between, so concurrent
+    /// inserts only claim still-empty slots and never duplicate a collected
+    /// tag. Rebuild (rather than in-place clearing) keeps probe chains
+    /// intact: entries inserted after collection may sit behind collected
+    /// slots, and clearing those in place would cut their chains.
     fn clear_collected(&self, collected: &HashSet<ChunkTag>) {
         let _g = spin_lock(&self.lock);
         // SAFETY: lock held.
         let slots = unsafe { &mut *self.slots.get() };
-        let mut cleared = 0u32;
+        let mut kept: Vec<ChunkTag> = Vec::new();
         for s in slots.iter_mut() {
-            if s.state == SlotState::Occupied && collected.contains(&s.tag) {
+            if s.state == SlotState::Occupied {
+                if !collected.contains(&s.tag) {
+                    kept.push(s.tag);
+                }
                 s.state = SlotState::Empty;
-                cleared += 1;
             }
         }
-        self.len.fetch_sub(cleared, Ordering::Relaxed);
+        for tag in &kept {
+            let start = (tag.hash() as usize) % CHUNK_SHARD_CAP;
+            for i in 0..CHUNK_SHARD_CAP {
+                let slot = &mut slots[(start + i) % CHUNK_SHARD_CAP];
+                if slot.state == SlotState::Empty {
+                    slot.tag = *tag;
+                    slot.state = SlotState::Occupied;
+                    break;
+                }
+            }
+        }
+        self.len.store(kept.len() as u32, Ordering::Relaxed);
     }
 }
 
@@ -352,21 +368,36 @@ impl RelForkZone {
         }
     }
 
-    /// Clear slots collected into `collected`, but only if the meta is
-    /// unchanged since collection — a concurrent overwrite must survive
-    /// (last-write-wins).
+    /// Remove slots collected into `collected` (skipping entries whose meta
+    /// changed since collection — a concurrent overwrite must survive,
+    /// last-write-wins), then rebuild the zone so probe chains of surviving
+    /// entries stay intact (see [`ChunkShard::clear_collected`]).
     fn clear_collected(&self, collected: &HashMap<RelFork, RelForkMeta>) {
         let _g = spin_lock(&self.lock);
         // SAFETY: lock held.
         let slots = unsafe { &mut *self.slots.get() };
-        let mut cleared = 0u32;
+        let mut kept: Vec<(RelFork, RelForkMeta)> = Vec::new();
         for s in slots.iter_mut() {
-            if s.state == SlotState::Occupied && collected.get(&s.rf) == Some(&s.meta) {
+            if s.state == SlotState::Occupied {
+                if collected.get(&s.rf) != Some(&s.meta) {
+                    kept.push((s.rf, s.meta));
+                }
                 s.state = SlotState::Empty;
-                cleared += 1;
             }
         }
-        self.len.fetch_sub(cleared, Ordering::Relaxed);
+        for (rf, meta) in &kept {
+            let start = (rf.hash() as usize) % REL_FORK_ZONE_CAP;
+            for i in 0..REL_FORK_ZONE_CAP {
+                let slot = &mut slots[(start + i) % REL_FORK_ZONE_CAP];
+                if slot.state == SlotState::Empty {
+                    slot.rf = *rf;
+                    slot.meta = *meta;
+                    slot.state = SlotState::Occupied;
+                    break;
+                }
+            }
+        }
+        self.len.store(kept.len() as u32, Ordering::Relaxed);
     }
 }
 
@@ -379,8 +410,8 @@ pub struct DraftBuffer {
     spill_lock: AtomicRWLock,
     /// Bumped on each successful spill. Exposed for tests / debug.
     pub spill_seq: AtomicU64,
-    /// Set at the start of every spill (entries stay in memory until the
-    /// frame is durably appended, so readers never lose sight of them);
+    /// Set once a spill frame is durably appended (before the collected
+    /// slots are cleared, so readers never lose sight of an entry);
     /// cleared by `drain` (at commit). Used by [`Self::contains_chunk`] to return
     /// conservative-yes and by [`Self::get_relfork`] to gate the spill-file
     /// scan — avoids touching the file on lookup hot paths when no spill has
@@ -405,18 +436,18 @@ impl DraftBuffer {
     }
 
     /// Record an evicted chunk tag (presence-only; idempotent).
-    pub fn record_chunk(&self, tag: ChunkTag, spill_path: &Path) -> Result<()> {
+    pub fn record_chunk(&self, tag: ChunkTag, spill: &SpillFile) -> Result<()> {
         loop {
             match self.chunks.insert(tag) {
                 Ok(over_watermark) => {
                     if over_watermark {
-                        let _ = self.try_spill_to_file(spill_path);
+                        let _ = self.try_spill_to_file(spill);
                     }
                     return Ok(());
                 }
                 Err(()) => {
                     // Shard full → blocking spill, then retry.
-                    self.spill_to_file(spill_path)?;
+                    self.spill_to_file(spill)?;
                 }
             }
         }
@@ -424,17 +455,17 @@ impl DraftBuffer {
 
     /// Record a relfork-meta update. Same `rf` overwrites the existing entry
     /// (last-write-wins).
-    pub fn record_relfork(&self, rf: RelFork, meta: RelForkMeta, spill_path: &Path) -> Result<()> {
+    pub fn record_relfork(&self, rf: RelFork, meta: RelForkMeta, spill: &SpillFile) -> Result<()> {
         loop {
             match self.relforks.insert(rf, meta) {
                 Ok(over_watermark) => {
                     if over_watermark {
-                        let _ = self.try_spill_to_file(spill_path);
+                        let _ = self.try_spill_to_file(spill);
                     }
                     return Ok(());
                 }
                 Err(()) => {
-                    self.spill_to_file(spill_path)?;
+                    self.spill_to_file(spill)?;
                 }
             }
         }
@@ -462,44 +493,40 @@ impl DraftBuffer {
     /// in-memory zone, the spill file is scanned for the most recent write.
     /// Frames in the spill file are merged in file order (oldest → newest),
     /// so last-write-wins is preserved across spill boundaries.
-    pub fn get_relfork(&self, rf: &RelFork, spill_path: &Path) -> Result<Option<RelForkMeta>> {
+    pub fn get_relfork(&self, rf: &RelFork, spill: &SpillFile) -> Result<Option<RelForkMeta>> {
         if let Some(meta) = self.relforks.get(rf) {
             return Ok(Some(meta));
         }
         if !self.has_spilled.load(Ordering::Acquire) {
             return Ok(None);
         }
-        // Read guard: `has_spilled` is set before the spill's append, so a
-        // spill may be mid-append here; scanning without the guard could hit
-        // a partially written frame.
+        // Read guard: a later spill may be mid-append while this flag is
+        // still set from an earlier one; scanning without the guard could
+        // hit a partially written frame.
         let _guard = self.spill_lock.read();
-        let merged = read_spill_file(spill_path)?;
+        let merged = spill.read()?;
         Ok(merged.relforks.get(rf).cloned())
     }
 
     /// Blocking spill: drains both zones into a single spill frame.
-    pub fn spill_to_file(&self, spill_path: &Path) -> Result<()> {
+    pub fn spill_to_file(&self, spill: &SpillFile) -> Result<()> {
         let _guard = self.spill_lock.write();
-        self.spill_locked(spill_path)
+        self.spill_locked(spill)
     }
 
     /// Non-blocking spill. Returns `Ok(true)` if the spill ran, `Ok(false)`
     /// if another spill is already in progress.
-    pub fn try_spill_to_file(&self, spill_path: &Path) -> Result<bool> {
+    pub fn try_spill_to_file(&self, spill: &SpillFile) -> Result<bool> {
         match self.spill_lock.try_write() {
             Some(_guard) => {
-                self.spill_locked(spill_path)?;
+                self.spill_locked(spill)?;
                 Ok(true)
             }
             None => Ok(false),
         }
     }
 
-    fn spill_locked(&self, spill_path: &Path) -> Result<()> {
-        // Set before collecting: an entry being spilled stays in memory until
-        // the append below succeeds, so readers always see it — either in the
-        // zones or, once cleared, via this flag (conservative-yes / file scan).
-        self.has_spilled.store(true, Ordering::Release);
+    fn spill_locked(&self, spill: &SpillFile) -> Result<()> {
         let mut frame = DraftFrame::default();
         self.chunks.collect_into(&mut frame.chunks);
         self.relforks.collect_into(&mut frame.relforks);
@@ -508,7 +535,11 @@ impl DraftBuffer {
         }
         // On error nothing was cleared — the entries stay in memory, no
         // rollback needed.
-        append_spill_frame(spill_path, &frame)?;
+        spill.append_frame(&frame)?;
+        // Set after the append but before clearing: entries are visible in
+        // the zones until now, and in the file once this flag is up — a
+        // reader never loses sight of them.
+        self.has_spilled.store(true, Ordering::Release);
         self.chunks.clear_collected(&frame.chunks);
         self.relforks.clear_collected(&frame.relforks);
         self.spill_seq.fetch_add(1, Ordering::Release);
@@ -516,68 +547,140 @@ impl DraftBuffer {
     }
 
     /// Drain everything: in-memory zones + spill file → merged [`DraftFrame`].
-    /// After this call the buffer is empty and the spill file is gone.
+    ///
+    /// Non-destructive: the spill file is kept so a failed commit can be
+    /// retried — the re-run re-merges the same file (plus any new in-memory
+    /// entries, which are prefix-consistent because `head_ckpt` cannot have
+    /// advanced while the caller's commit was unfinished). Call
+    /// [`Self::commit_drain`] only after the drained frame is durably
+    /// committed.
     ///
     /// Caller must hold an external mutual-exclusion guard (typically
     /// `timeline.lock.write()`) so no producer can race in.
-    pub fn drain(&self, spill_path: &Path) -> Result<DraftFrame> {
-        self.spill_to_file(spill_path)?;
-        let merged = read_spill_file(spill_path)?;
-        delete_spill_file(spill_path)?;
+    pub fn drain(&self, spill: &SpillFile) -> Result<DraftFrame> {
+        self.spill_to_file(spill)?;
+        spill.read()
+    }
+
+    /// Discard the drained state after it has been durably committed.
+    pub fn commit_drain(&self, spill: &SpillFile) -> Result<()> {
+        spill.delete_durable()?;
         self.has_spilled.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+// ── SpillFile ───────────────────────────────────────────────────────────────
+
+/// On-disk overflow file for [`DraftBuffer`]. Owns the frame format and all
+/// durability rules (staging-file rename, file + directory fsync).
+///
+/// Per-process handle holding a heap `PathBuf` — must never be stored in
+/// shared memory; [`DraftBuffer`] methods take it by reference instead.
+pub struct SpillFile {
+    path: PathBuf,
+}
+
+impl SpillFile {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Append a frame by rewriting the file: copy the current contents into
+    /// a sibling staging file, append the new frame, fsync, then atomically
+    /// rename over the live file. A crash or write error mid-append can only
+    /// leave a stale staging file behind — the live file is always a
+    /// complete generation, never a torn tail that would poison every later
+    /// read.
+    fn append_frame(&self, frame: &DraftFrame) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = rmp_serde::to_vec(frame)?;
+        let staging = self.staging_path();
+        {
+            let mut out = File::create(&staging)?;
+            match File::open(&self.path) {
+                Ok(mut old) => {
+                    std::io::copy(&mut old, &mut out)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+            out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            out.write_all(&bytes)?;
+            out.sync_all()?;
+        }
+        std::fs::rename(&staging, &self.path)?;
+        self.sync_parent_dir()
+    }
+
+    /// Merge all frames in file order (oldest → newest). A missing file
+    /// reads as an empty frame.
+    fn read(&self) -> Result<DraftFrame> {
+        let mut file = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DraftFrame::default());
+            }
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let mut merged = DraftFrame::default();
+        loop {
+            let mut len_buf = [0u8; 4];
+            match file.read(&mut len_buf)? {
+                0 => break,
+                n if n < 4 => {
+                    return Err(Error::invalid_data(format!(
+                        "truncated draft.spill frame length: got {n} bytes"
+                    )));
+                }
+                _ => {}
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut bytes = vec![0u8; len];
+            file.read_exact(&mut bytes)?;
+            let frame: DraftFrame = rmp_serde::from_slice(&bytes)?;
+            merged.merge_frame(frame);
+        }
         Ok(merged)
     }
-}
 
-// ── Spill file I/O ──────────────────────────────────────────────────────────
-
-fn append_spill_frame(path: &Path, frame: &DraftFrame) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let bytes = rmp_serde::to_vec(frame)?;
-    let len = bytes.len() as u32;
-    file.write_all(&len.to_le_bytes())?;
-    file.write_all(&bytes)?;
-    file.flush()?;
-    Ok(())
-}
-
-fn read_spill_file(path: &Path) -> Result<DraftFrame> {
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DraftFrame::default());
+    /// Delete the file and fsync the parent dir so the removal survives an
+    /// OS crash — a resurrected file would be re-merged by the next drain
+    /// under an advanced head_ckpt. Falls back to truncation (which merges
+    /// as an empty frame) if removal fails.
+    fn delete_durable(&self) -> Result<()> {
+        if let Err(del_err) = self.delete() {
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .map_err(|_| del_err)?;
         }
-        Err(e) => return Err(Error::Io(e)),
-    };
-    let mut merged = DraftFrame::default();
-    loop {
-        let mut len_buf = [0u8; 4];
-        match file.read(&mut len_buf)? {
-            0 => break,
-            n if n < 4 => {
-                return Err(Error::invalid_data(format!(
-                    "truncated draft.spill frame length: got {n} bytes"
-                )));
-            }
-            _ => {}
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes)?;
-        let frame: DraftFrame = rmp_serde::from_slice(&bytes)?;
-        merged.merge_frame(frame);
+        self.sync_parent_dir()
     }
-    Ok(merged)
-}
 
-fn delete_spill_file(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::Io(e)),
+    fn delete(&self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    fn staging_path(&self) -> PathBuf {
+        let mut name = self.path.file_name().unwrap_or_default().to_owned();
+        name.push(".tmp");
+        self.path.with_file_name(name)
+    }
+
+    /// fsync the parent directory so a rename / removal is durable.
+    fn sync_parent_dir(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 
@@ -635,10 +738,112 @@ mod tests {
         }
     }
 
+    /// Zeroed + init'd heap allocation; valid for every zone type since zero
+    /// is a valid initial state for all fields.
+    ///
+    /// # Safety
+    /// `T` must be valid in the all-zero-bytes state and idempotently
+    /// `init`-able (holds for `ChunkShard` / `RelForkZone`).
+    unsafe fn new_zeroed<T: Sized>(init: impl Fn(&T)) -> Box<T> {
+        unsafe {
+            let raw = std::alloc::alloc_zeroed(std::alloc::Layout::new::<T>()) as *mut T;
+            assert!(!raw.is_null());
+            init(&*raw);
+            Box::from_raw(raw)
+        }
+    }
+
+    /// Find `n` chunk_ids whose tags share a home slot in a shard, forming
+    /// one deterministic probe chain.
+    fn colliding_chunk_ids(n: usize) -> Vec<u32> {
+        let mut by_home: HashMap<usize, Vec<u32>> = HashMap::new();
+        for c in 0..100_000u32 {
+            let home = (tag(9, c).hash() as usize) % CHUNK_SHARD_CAP;
+            let group = by_home.entry(home).or_default();
+            group.push(c);
+            if group.len() == n {
+                return group.clone();
+            }
+        }
+        panic!("no {n}-way collision found");
+    }
+
+    /// Same for relforks in the relfork zone.
+    fn colliding_rel_ids(n: usize) -> Vec<u32> {
+        let mut by_home: HashMap<usize, Vec<u32>> = HashMap::new();
+        for r in 0..100_000u32 {
+            let home = (rf(r).hash() as usize) % REL_FORK_ZONE_CAP;
+            let group = by_home.entry(home).or_default();
+            group.push(r);
+            if group.len() == n {
+                return group.clone();
+            }
+        }
+        panic!("no {n}-way collision found");
+    }
+
+    #[test]
+    fn chunk_shard_clear_collected_keeps_probe_chains() {
+        // a, b, c share a home slot: a occupies it, b and c sit right behind
+        // it on the probe chain. Clearing a in place would cut b and c off.
+        let ids = colliding_chunk_ids(3);
+        let (a, b, c) = (tag(9, ids[0]), tag(9, ids[1]), tag(9, ids[2]));
+
+        let shard = unsafe { new_zeroed::<ChunkShard>(|s| s.init()) };
+        shard.insert(a).unwrap();
+        shard.insert(b).unwrap();
+        shard.insert(c).unwrap();
+
+        let collected: HashSet<ChunkTag> = [a].into_iter().collect();
+        shard.clear_collected(&collected);
+
+        assert!(!shard.contains(&a));
+        assert!(shard.contains(&b), "probe chain cut at b");
+        assert!(shard.contains(&c), "probe chain cut at c");
+        assert_eq!(shard.len.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn relfork_zone_clear_collected_keeps_probe_chains() {
+        let ids = colliding_rel_ids(3);
+        let (a, b, c) = (rf(ids[0]), rf(ids[1]), rf(ids[2]));
+
+        let zone = unsafe { new_zeroed::<RelForkZone>(|z| z.init()) };
+        zone.insert(a, meta(1)).unwrap();
+        zone.insert(b, meta(2)).unwrap();
+        zone.insert(c, meta(3)).unwrap();
+
+        let collected: HashMap<RelFork, RelForkMeta> = [(a, meta(1))].into_iter().collect();
+        zone.clear_collected(&collected);
+
+        assert!(zone.get(&a).is_none());
+        assert_eq!(zone.get(&b).unwrap().nblocks, 2, "probe chain cut at b");
+        assert_eq!(zone.get(&c).unwrap().nblocks, 3, "probe chain cut at c");
+        assert_eq!(zone.len.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn relfork_zone_clear_collected_keeps_newer_meta() {
+        // Collected with meta(1), then overwritten with meta(999) before the
+        // clear: the newer write must survive (last-write-wins).
+        let zone = unsafe { new_zeroed::<RelForkZone>(|z| z.init()) };
+        zone.insert(rf(1), meta(1)).unwrap();
+        zone.insert(rf(2), meta(2)).unwrap();
+
+        let collected: HashMap<RelFork, RelForkMeta> = [(rf(1), meta(1))].into_iter().collect();
+        zone.insert(rf(1), meta(999)).unwrap();
+        zone.clear_collected(&collected);
+
+        assert_eq!(zone.get(&rf(1)).unwrap().nblocks, 999);
+        assert_eq!(zone.get(&rf(2)).unwrap().nblocks, 2);
+        assert_eq!(zone.len.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn draft_buffer_single_producer_drain_roundtrip() {
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         for c in 0..50u32 {
@@ -654,13 +859,66 @@ mod tests {
         }
         assert_eq!(merged.relforks.get(&rf(1)).unwrap().nblocks, 32);
         assert_eq!(merged.relforks.get(&rf(2)).unwrap().nblocks, 48);
-        assert!(!spill.exists(), "drain should remove the spill file");
+        buf.commit_drain(&spill).unwrap();
+        assert!(
+            !spill_path.exists(),
+            "commit_drain should remove the spill file"
+        );
+    }
+
+    #[test]
+    fn draft_buffer_drain_is_non_destructive_until_commit() {
+        let dir = tempdir().unwrap();
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
+        let buf = new_buffer();
+
+        buf.record_chunk(tag(1, 0), &spill).unwrap();
+        buf.record_relfork(rf(1), meta(32), &spill).unwrap();
+
+        // A failed commit is retried by re-draining: the re-run must
+        // reproduce the same frame.
+        let first = buf.drain(&spill).unwrap();
+        assert!(spill_path.exists(), "drain must keep the spill file");
+        let second = buf.drain(&spill).unwrap();
+        assert_eq!(first.chunks, second.chunks);
+        assert_eq!(first.relforks, second.relforks);
+
+        // Entries recorded between the failed attempt and the retry are
+        // picked up too.
+        buf.record_chunk(tag(1, 1), &spill).unwrap();
+        let third = buf.drain(&spill).unwrap();
+        assert_eq!(third.chunks.len(), 2);
+
+        buf.commit_drain(&spill).unwrap();
+        assert!(!spill_path.exists());
+        let empty = buf.drain(&spill).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn draft_buffer_spill_survives_stale_tmp_file() {
+        // Simulates a crash mid-append: a garbage tmp file is left behind,
+        // the live file untouched. The next spill must overwrite it cleanly.
+        let dir = tempdir().unwrap();
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
+        std::fs::write(spill.staging_path(), b"garbage").unwrap();
+
+        let buf = new_buffer();
+        buf.record_relfork(rf(1), meta(32), &spill).unwrap();
+        buf.spill_to_file(&spill).unwrap();
+
+        assert!(!spill.staging_path().exists(), "tmp should be renamed away");
+        let merged = buf.drain(&spill).unwrap();
+        assert_eq!(merged.relforks.get(&rf(1)).unwrap().nblocks, 32);
     }
 
     #[test]
     fn draft_buffer_relfork_last_write_wins() {
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         buf.record_relfork(rf(7), meta(10), &spill).unwrap();
@@ -677,7 +935,8 @@ mod tests {
     #[test]
     fn draft_buffer_spill_on_full() {
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         // Write 2× the total capacity. With uniform hash distribution
@@ -702,7 +961,8 @@ mod tests {
     #[test]
     fn draft_buffer_spill_on_watermark_drains_zones() {
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         // Write enough chunks to be confident that at least one shard
@@ -714,7 +974,7 @@ mod tests {
         }
         assert!(buf.spill_seq.load(Ordering::Acquire) >= 1);
         assert!(
-            spill.exists(),
+            spill_path.exists(),
             "spill file should exist after watermark spill"
         );
 
@@ -727,7 +987,8 @@ mod tests {
         // Force multiple spill frames and confirm last-write-wins still
         // holds when the same RelFork is updated across spill boundaries.
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         buf.record_relfork(rf(99), meta(10), &spill).unwrap();
@@ -747,7 +1008,8 @@ mod tests {
     #[test]
     fn draft_buffer_get_relfork_returns_recorded_meta() {
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         buf.record_relfork(rf(1), meta(32), &spill).unwrap();
@@ -772,7 +1034,8 @@ mod tests {
     #[test]
     fn draft_buffer_get_relfork_overwrite_returns_latest() {
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         buf.record_relfork(rf(5), meta(10), &spill).unwrap();
@@ -792,7 +1055,8 @@ mod tests {
     #[test]
     fn draft_buffer_contains_chunk_returns_true_for_recorded_tag() {
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         buf.record_chunk(tag(1, 0), &spill).unwrap();
@@ -812,14 +1076,18 @@ mod tests {
         // Store::get_chunk's fall-through); `get_relfork` scans the spill
         // file because it must return the correct meta value.
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         buf.record_chunk(tag(4, 0), &spill).unwrap();
         buf.record_relfork(rf(9), meta(100), &spill).unwrap();
         buf.spill_to_file(&spill).unwrap();
 
-        assert!(spill.exists(), "spill file must exist after explicit spill");
+        assert!(
+            spill_path.exists(),
+            "spill file must exist after explicit spill"
+        );
         assert!(
             buf.contains_chunk(&tag(4, 0)),
             "recorded chunk must still be visible (conservative-yes after spill)",
@@ -837,18 +1105,19 @@ mod tests {
         const PER_THREAD: u32 = 5_000;
 
         let dir = tempdir().unwrap();
-        let spill = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
         let buf = new_buffer();
 
         std::thread::scope(|s| {
             for t in 0..THREADS {
                 let buf_ref: &DraftBuffer = &buf;
-                let spill_path: &Path = &spill;
+                let spill_ref: &SpillFile = &spill;
                 s.spawn(move || {
                     for i in 0..PER_THREAD {
                         // Thread `t`, chunk i — unique tag per (t, i).
                         buf_ref
-                            .record_chunk(tag(t, i), spill_path)
+                            .record_chunk(tag(t, i), spill_ref)
                             .expect("record_chunk");
                     }
                 });
