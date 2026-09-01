@@ -196,17 +196,33 @@ impl ChunkShard {
         false
     }
 
-    fn drain_into(&self, dst: &mut HashSet<ChunkTag>) {
+    fn collect_into(&self, dst: &mut HashSet<ChunkTag>) {
+        let _g = spin_lock(&self.lock);
+        // SAFETY: lock held.
+        let slots = unsafe { &*self.slots.get() };
+        for s in slots.iter() {
+            if s.state == SlotState::Occupied {
+                dst.insert(s.tag);
+            }
+        }
+    }
+
+    /// Clear slots whose tag is in `collected`. Exact because the caller
+    /// holds the exclusive spill lock from collect to clear: no occupied
+    /// slot can be emptied in between, so concurrent inserts only claim
+    /// still-empty slots and never duplicate a collected tag.
+    fn clear_collected(&self, collected: &HashSet<ChunkTag>) {
         let _g = spin_lock(&self.lock);
         // SAFETY: lock held.
         let slots = unsafe { &mut *self.slots.get() };
+        let mut cleared = 0u32;
         for s in slots.iter_mut() {
-            if s.state == SlotState::Occupied {
-                dst.insert(s.tag);
+            if s.state == SlotState::Occupied && collected.contains(&s.tag) {
                 s.state = SlotState::Empty;
+                cleared += 1;
             }
         }
-        self.len.store(0, Ordering::Relaxed);
+        self.len.fetch_sub(cleared, Ordering::Relaxed);
     }
 }
 
@@ -237,9 +253,15 @@ impl ChunkZone {
         self.shard_for(tag).contains(tag)
     }
 
-    fn drain_into(&self, dst: &mut HashSet<ChunkTag>) {
+    fn collect_into(&self, dst: &mut HashSet<ChunkTag>) {
         for shard in self.shards.iter() {
-            shard.drain_into(dst);
+            shard.collect_into(dst);
+        }
+    }
+
+    fn clear_collected(&self, collected: &HashSet<ChunkTag>) {
+        for shard in self.shards.iter() {
+            shard.clear_collected(collected);
         }
     }
 }
@@ -319,17 +341,32 @@ impl RelForkZone {
         None
     }
 
-    fn drain_into(&self, dst: &mut HashMap<RelFork, RelForkMeta>) {
+    fn collect_into(&self, dst: &mut HashMap<RelFork, RelForkMeta>) {
+        let _g = spin_lock(&self.lock);
+        // SAFETY: lock held.
+        let slots = unsafe { &*self.slots.get() };
+        for s in slots.iter() {
+            if s.state == SlotState::Occupied {
+                dst.insert(s.rf, s.meta);
+            }
+        }
+    }
+
+    /// Clear slots collected into `collected`, but only if the meta is
+    /// unchanged since collection — a concurrent overwrite must survive
+    /// (last-write-wins).
+    fn clear_collected(&self, collected: &HashMap<RelFork, RelForkMeta>) {
         let _g = spin_lock(&self.lock);
         // SAFETY: lock held.
         let slots = unsafe { &mut *self.slots.get() };
+        let mut cleared = 0u32;
         for s in slots.iter_mut() {
-            if s.state == SlotState::Occupied {
-                dst.insert(s.rf, s.meta);
+            if s.state == SlotState::Occupied && collected.get(&s.rf) == Some(&s.meta) {
                 s.state = SlotState::Empty;
+                cleared += 1;
             }
         }
-        self.len.store(0, Ordering::Relaxed);
+        self.len.fetch_sub(cleared, Ordering::Relaxed);
     }
 }
 
@@ -342,8 +379,9 @@ pub struct DraftBuffer {
     spill_lock: AtomicRWLock,
     /// Bumped on each successful spill. Exposed for tests / debug.
     pub spill_seq: AtomicU64,
-    /// Set on each spill drain (when a frame is appended); cleared by `drain`
-    /// (at commit). Used by [`Self::contains_chunk`] to return
+    /// Set at the start of every spill (entries stay in memory until the
+    /// frame is durably appended, so readers never lose sight of them);
+    /// cleared by `drain` (at commit). Used by [`Self::contains_chunk`] to return
     /// conservative-yes and by [`Self::get_relfork`] to gate the spill-file
     /// scan — avoids touching the file on lookup hot paths when no spill has
     /// occurred since the last commit.
@@ -431,6 +469,10 @@ impl DraftBuffer {
         if !self.has_spilled.load(Ordering::Acquire) {
             return Ok(None);
         }
+        // Read guard: `has_spilled` is set before the spill's append, so a
+        // spill may be mid-append here; scanning without the guard could hit
+        // a partially written frame.
+        let _guard = self.spill_lock.read();
         let merged = read_spill_file(spill_path)?;
         Ok(merged.relforks.get(rf).cloned())
     }
@@ -454,14 +496,21 @@ impl DraftBuffer {
     }
 
     fn spill_locked(&self, spill_path: &Path) -> Result<()> {
+        // Set before collecting: an entry being spilled stays in memory until
+        // the append below succeeds, so readers always see it — either in the
+        // zones or, once cleared, via this flag (conservative-yes / file scan).
+        self.has_spilled.store(true, Ordering::Release);
         let mut frame = DraftFrame::default();
-        self.chunks.drain_into(&mut frame.chunks);
-        self.relforks.drain_into(&mut frame.relforks);
+        self.chunks.collect_into(&mut frame.chunks);
+        self.relforks.collect_into(&mut frame.relforks);
         if frame.is_empty() {
             return Ok(());
         }
+        // On error nothing was cleared — the entries stay in memory, no
+        // rollback needed.
         append_spill_frame(spill_path, &frame)?;
-        self.has_spilled.store(true, Ordering::Release);
+        self.chunks.clear_collected(&frame.chunks);
+        self.relforks.clear_collected(&frame.relforks);
         self.spill_seq.fetch_add(1, Ordering::Release);
         Ok(())
     }
