@@ -99,6 +99,12 @@ pub const REL_FORK_ZONE_WATERMARK: usize =
 /// Lives under the tiko root path, one per cluster.
 pub const DRAFT_SPILL_FILE_NAME: &str = "draft.spill";
 
+/// Upper bound for one serialized spill frame. A legit frame holds at most
+/// `CHUNK_TOTAL_CAP + REL_FORK_ZONE_CAP` entries (well under 2 MiB
+/// serialized); the cap exists so a corrupt length prefix can't trigger a
+/// huge allocation before the read fails.
+const MAX_SPILL_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 // ── Slot entries ────────────────────────────────────────────────────────────
 
 #[repr(u8)]
@@ -638,6 +644,11 @@ impl SpillFile {
                 _ => {}
             }
             let len = u32::from_le_bytes(len_buf) as usize;
+            if len > MAX_SPILL_FRAME_LEN {
+                return Err(Error::invalid_data(format!(
+                    "draft.spill frame length {len} exceeds cap {MAX_SPILL_FRAME_LEN}"
+                )));
+            }
             let mut bytes = vec![0u8; len];
             file.read_exact(&mut bytes)?;
             let frame: DraftFrame = rmp_serde::from_slice(&bytes)?;
@@ -912,6 +923,51 @@ mod tests {
         assert!(!spill.staging_path().exists(), "tmp should be renamed away");
         let merged = buf.drain(&spill).unwrap();
         assert_eq!(merged.relforks.get(&rf(1)).unwrap().nblocks, 32);
+    }
+
+    #[test]
+    fn draft_buffer_drain_rejects_corrupt_spill_file() {
+        // With copy-append-rename a corrupt live file means genuine on-disk
+        // corruption; reads must fail loudly, not silently skip data.
+        let dir = tempdir().unwrap();
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
+        let buf = new_buffer();
+
+        // Truncated frame length (< 4 bytes).
+        std::fs::write(&spill_path, b"ab").unwrap();
+        assert!(buf.drain(&spill).is_err());
+
+        // Valid length, short body.
+        let mut bad = 10u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(b"abc");
+        std::fs::write(&spill_path, &bad).unwrap();
+        assert!(buf.drain(&spill).is_err());
+
+        // Valid length, body that isn't a DraftFrame.
+        let mut bad = 3u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(&[0xff, 0xff, 0xff]);
+        std::fs::write(&spill_path, &bad).unwrap();
+        assert!(buf.drain(&spill).is_err());
+
+        // Absurd length: rejected by the sanity cap before any allocation.
+        std::fs::write(&spill_path, u32::MAX.to_le_bytes()).unwrap();
+        assert!(buf.drain(&spill).is_err());
+    }
+
+    #[test]
+    fn draft_buffer_commit_drain_without_spill_file() {
+        // Nothing recorded, no spill file: drain reads empty and
+        // commit_drain's delete tolerates the missing file.
+        let dir = tempdir().unwrap();
+        let spill_path = dir.path().join(DRAFT_SPILL_FILE_NAME);
+        let spill = SpillFile::new(spill_path.clone());
+        let buf = new_buffer();
+
+        let merged = buf.drain(&spill).unwrap();
+        assert!(merged.is_empty());
+        buf.commit_drain(&spill).unwrap();
+        assert!(!spill_path.exists());
     }
 
     #[test]
