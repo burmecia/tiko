@@ -1,3 +1,20 @@
+//! Durable timeline segment format.
+//!
+//! A segment file records what each checkpoint wrote: one ordered
+//! [`CheckpointSummary`] per checkpoint, covering a fixed 256 MB LSN range
+//! (`TIMELINE_SEGMENT_LSN_RANGE`) of a single timeline. Segments are keyed in
+//! storage as `{ns}/timeline/{tl}/{index:016X}.segment` with
+//! `index = lsn / RANGE` (see `locator.rs`), and serialized with MessagePack
+//! behind a `TLSG` magic + version header.
+//!
+//! `prev_ckpt` in each summary is the chunk path prefix in effect at write
+//! time; readers resolve chunks via that prefix, not the closing checkpoint.
+//!
+//! Written by the commit protocol (`store/commit.rs`, one read-modify-write
+//! per checkpoint), read by the backend segment-scan fallback and by the
+//! compactor (`store/compaction.rs`), which folds superseded segments into a
+//! new base manifest and deletes them.
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -338,5 +355,119 @@ mod tests {
         // The matching case is exercised in `timeline_segment_roundtrip_*`;
         // we just assert the matching id case constructs OK here.
         assert_eq!(seg.checkpoints.len(), 0);
+    }
+
+    // ── Display / ordering ──
+
+    #[test]
+    fn checkpoint_display_and_total_order() {
+        let ckpt = Checkpoint::new(TimelineId::new(0x3A), Lsn::new(0xDEADBEEF));
+        assert_eq!(ckpt.to_string(), "3A-0/DEADBEEF");
+
+        // Total order is (timeline_id, lsn): timeline dominates.
+        let a = Checkpoint::new(TimelineId::new(1), Lsn::new(u64::MAX));
+        let b = Checkpoint::new(TimelineId::new(2), Lsn::new(0));
+        assert!(a < b);
+    }
+
+    #[test]
+    fn segment_id_display_format() {
+        let s = SegmentId {
+            timeline_id: TimelineId::new(0x3A),
+            index: 0x42,
+        };
+        assert_eq!(s.to_string(), "0000003A-0000000000000042");
+    }
+
+    // ── SegmentId::overlaps_range ──
+
+    #[test]
+    fn segment_overlaps_range_same_timeline() {
+        let tl = TimelineId::new(1);
+        let at = |lsn: u64| Checkpoint::new(tl, Lsn::new(lsn));
+        let r = TIMELINE_SEGMENT_LSN_RANGE;
+        // Segment 1 covers [R, 2R).
+        let seg = Checkpoint::new(tl, Lsn::new(r)).to_segment_id();
+
+        // Range inside segment; segment inside range.
+        assert!(seg.overlaps_range(at(r + 1), at(2 * r - 2)));
+        assert!(seg.overlaps_range(at(0), at(2 * r)));
+        // Closed-interval boundary touches.
+        assert!(seg.overlaps_range(at(2 * r - 1), at(3 * r)));
+        assert!(seg.overlaps_range(at(0), at(r)));
+        // Strictly below / above.
+        assert!(!seg.overlaps_range(at(0), at(r - 1)));
+        assert!(!seg.overlaps_range(at(2 * r), at(3 * r)));
+    }
+
+    #[test]
+    fn segment_overlaps_range_across_timelines() {
+        let at = |tl: u32, lsn: u64| Checkpoint::new(TimelineId::new(tl), Lsn::new(lsn));
+        let seg = |tl: u32, index: u64| SegmentId {
+            timeline_id: TimelineId::new(tl),
+            index,
+        };
+        let r = TIMELINE_SEGMENT_LSN_RANGE;
+        let low = at(2, 5 * r);
+        let high = at(4, 3 * r);
+
+        // Any segment on a timeline strictly inside the range overlaps.
+        assert!(seg(3, 0).overlaps_range(low, high));
+        assert!(seg(3, 99).overlaps_range(low, high));
+        // On the boundary timelines, coverage must reach the bound LSN.
+        assert!(seg(2, 5).overlaps_range(low, high));
+        assert!(!seg(2, 3).overlaps_range(low, high));
+        assert!(seg(4, 3).overlaps_range(low, high));
+        assert!(!seg(4, 4).overlaps_range(low, high));
+        // Timelines outside the range never overlap.
+        assert!(!seg(1, 0).overlaps_range(low, high));
+        assert!(!seg(5, 0).overlaps_range(low, high));
+    }
+
+    // ── TimelineSegment / CheckpointSummary edge cases ──
+
+    #[test]
+    fn timeline_segment_rejects_unsupported_version() {
+        let tl = TimelineId::new(1);
+        let mut seg = TimelineSegment::new(Checkpoint::new(tl, Lsn::new(0)).to_segment_id());
+        seg.version = TIMELINE_SEGMENT_VERSION + 1;
+        let bytes = seg.to_bytes().unwrap();
+        assert!(TimelineSegment::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn timeline_segment_push_preserves_commit_order() {
+        let tl = TimelineId::new(1);
+        let mut seg = TimelineSegment::new(Checkpoint::new(tl, Lsn::new(0)).to_segment_id());
+        for lsn in [10u64, 20, 30] {
+            seg.push(CheckpointSummary::new(
+                Checkpoint::new(tl, Lsn::new(lsn)),
+                Checkpoint::default(),
+                Checkpoint::default(),
+                HashSet::new(),
+                HashMap::new(),
+            ));
+        }
+        let decoded = TimelineSegment::from_bytes(&seg.to_bytes().unwrap()).unwrap();
+        let lsns: Vec<u64> = decoded
+            .checkpoints
+            .iter()
+            .map(|s| s.ckpt.lsn.as_u64())
+            .collect();
+        assert_eq!(lsns, [10, 20, 30]);
+    }
+
+    #[test]
+    fn checkpoint_summary_lookup_misses() {
+        let s = CheckpointSummary::new(
+            Checkpoint::default(),
+            Checkpoint::default(),
+            Checkpoint::default(),
+            HashSet::new(),
+            HashMap::new(),
+        );
+        assert!(!s.contains_chunk(&tag(9, 9)));
+        assert!(s.relfork_meta(&relfork(9)).is_none());
+        assert!(s.created_at > 0);
     }
 }
