@@ -137,8 +137,11 @@ startreadv, immedsync, ...). Two I/O paths:
   shutdown checkpoint, worker crash).
 - `checkpoint.rs` — `tiko_perform_checkpoint()`: normal checkpoints flush dirty
   cache chunks; `CHECKPOINT_CAUSE_BASEBACKUP` additionally materializes a base
-  manifest at that LSN (paired with `tiko_pitr backup`); shutdown checkpoints
-  fold everything into the base manifest inline.
+  manifest at that LSN (paired with `tiko_pitr backup`) by publishing a
+  `compaction_request` in shmem and waiting on its latch — the worker's
+  compactor task executes it; the checkpointer runs compaction locally only as
+  an escape hatch (worker dead/timeout/error). Shutdown checkpoints fold
+  everything into the base manifest inline.
 
 ### `worker` (crate `worker`, lib `tikoworker`) — background worker process
 Loaded via `shared_preload_libraries`. `_PG_init` registers a background worker
@@ -155,10 +158,12 @@ running `main_loop`. Structure:
   physical streaming-replication protocol over a Unix socket (hand-rolled wire
   protocol; `tokio-postgres` lacks `CopyBoth`), uploading 256 KiB WAL chunk
   objects near-realtime and sealing full segments on switch.
-- **`tasks/compactor.rs`** — folds superseded timeline segments into a new base
-  manifest and deletes the now-redundant segment objects. This is the only
-  GC-like behavior: **no chunk/WAL/orphan GC exists**, and no org deletion
-  mechanism (the old `org.rs` soft-delete module was removed).
+- **`tasks/compactor.rs`** — the sole routine compaction executor: folds
+  superseded timeline segments into a new base manifest and deletes the
+  now-redundant segment objects, both on a periodic tick and on basebackup
+  requests relayed from `main_loop` (`TimelineState::compaction_request`).
+  This is the only GC-like behavior: **no chunk/WAL/orphan GC exists**, and no
+  org deletion mechanism (the old `org.rs` soft-delete module was removed).
 
 ### Shared Memory IPC & Slot State Machine
 An `IoControl`-style shared struct lives in PG shared memory. Per-backend slot

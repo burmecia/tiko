@@ -22,6 +22,7 @@ use pgsys::{
 };
 
 use crate::io_handler;
+use crate::tasks::compactor::CompactionRequestMsg;
 use crate::thread_pool;
 
 /// Global flags for managing worker lifecycle and configuration
@@ -87,7 +88,10 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
 
     // Spawn the compactor background task now that the runtime and ProjectCtx are initialised.
-    thread_pool::spawn_compactor_task();
+    // The main loop relays basebackup compaction requests from the shmem slot
+    // (`TimelineState::compaction_request`) into this channel.
+    let (compaction_req_tx, compaction_req_rx) = tokio::sync::mpsc::channel(4);
+    thread_pool::spawn_compactor_task(compaction_req_rx);
 
     // Spawn WAL streaming task.
     thread_pool::spawn_wal_receiver_task();
@@ -107,6 +111,11 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     let mut loop_count = 0u64;
     let mut requests_processed = 0u64;
 
+    // Last compaction-request generation forwarded to the compactor task.
+    // The shmem slot stays pending until the compactor completes it, so
+    // dedupe here to avoid queueing duplicates on every loop iteration.
+    let mut last_compaction_gen = 0u64;
+
     pg_log_info("tiko: initialized and entering main loop");
 
     // Main event loop
@@ -123,6 +132,22 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         match io_control.poll_submit_queue(|request| dispatcher.send_work(request)) {
             Ok(dispatched) => requests_processed += dispatched,
             Err(_) => break, // fatal: dispatcher disconnected
+        }
+
+        // Relay a pending basebackup compaction request to the compactor task.
+        if let Some(pending) = io_control.timeline.pending_compaction_request()
+            && pending.generation != last_compaction_gen
+            && compaction_req_tx
+                .try_send(CompactionRequestMsg {
+                    generation: pending.generation,
+                    target: pending.target,
+                    requester_latch: pending.requester_latch,
+                })
+                .is_ok()
+        {
+            // On channel-full the generation stays unrecorded, so the
+            // request is retried on the next loop iteration.
+            last_compaction_gen = pending.generation;
         }
 
         // Periodic logging

@@ -13,6 +13,7 @@ pub extern "C-unwind" fn tiko_init() {
         // Initialize wait event identifiers for Tiko I/O operations
         crate::WAIT_EVENT_TIKO_IO_READ = new_wait_event(c"TikoIORead".as_ptr());
         crate::WAIT_EVENT_TIKO_IO_WRITE = new_wait_event(c"TikoIOWrite".as_ptr());
+        crate::WAIT_EVENT_TIKO_COMPACTION = new_wait_event(c"TikoCompaction".as_ptr());
     }
 
     unsafe {

@@ -8,8 +8,9 @@
 
 use pgsys::logging::*;
 use std::sync::{Once, OnceLock};
+use tokio::sync::mpsc;
 
-use crate::tasks::compactor::compactor_task;
+use crate::tasks::compactor::{CompactionRequestMsg, compactor_task};
 use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
 use core::{
     //project::{ProjectCtx, ProjectNamespace},
@@ -23,8 +24,9 @@ use core::{
 /// - `Store` has not been initialised.
 ///
 /// Call this from `worker_main` after both `init_tokio_runtime` and
-/// `init_project_ctx` have completed.
-pub(crate) fn spawn_compactor_task() {
+/// `init_project_ctx` have completed. `req_rx` carries basebackup compaction
+/// requests relayed by the main loop.
+pub(crate) fn spawn_compactor_task(req_rx: mpsc::Receiver<CompactionRequestMsg>) {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_compactor_task called before runtime init; skipping");
         return;
@@ -35,7 +37,7 @@ pub(crate) fn spawn_compactor_task() {
         return;
     };
 
-    runtime.spawn(compactor_task(store));
+    runtime.spawn(compactor_task(store, req_rx));
 }
 
 /// Spawn the WAL receiver task on the Tokio runtime.

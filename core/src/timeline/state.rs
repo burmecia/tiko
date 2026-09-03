@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use pgsys::{lsn::Lsn, timeline_id::TimelineId};
+
 use super::segment::Checkpoint;
 use crate::chunk::ChunkTag;
 use crate::relfork::{RelFork, RelForkMeta};
@@ -194,13 +196,75 @@ impl ActiveCheckpoint {
     }
 }
 
+// ── CompactionRequest ───────────────────────────────────────────────────────
+
+/// Compaction completed successfully.
+pub const COMPACTION_STATUS_OK: u32 = 0;
+/// The worker-side compaction run returned an error.
+pub const COMPACTION_STATUS_ERROR: u32 = 1;
+
+/// Single-slot basebackup→worker compaction request in shared memory.
+///
+/// The tikoworker compactor is the sole routine compactor; a basebackup
+/// checkpointer that needs a base manifest at its checkpoint LSN publishes a
+/// request here and waits on its own latch instead of running compaction
+/// itself. Publication uses generation counters: the requester writes the
+/// payload with `Relaxed` stores and publishes with a `Release` bump of
+/// `request_gen`; the worker pairs an `Acquire` load of `request_gen` with
+/// `Relaxed` payload reads and completes with `status` (`Relaxed`) followed
+/// by a `Release` store to `done_gen`.
+///
+/// Invariant: at most one request is outstanding. Guaranteed structurally —
+/// `CreateCheckPoint` is serialised by PG's CheckpointLock and the requester
+/// waits for completion before returning.
+#[repr(C)]
+pub struct CompactionRequest {
+    /// Bumped by the requester to publish a request (payload written first).
+    request_gen: AtomicU64,
+    /// Set to the completed generation by the worker (payload `status` first).
+    done_gen: AtomicU64,
+    /// Compact through this checkpoint (inclusive).
+    target_timeline: AtomicU32,
+    target_lsn: AtomicU64,
+    /// Requester's latch as a pointer value; the worker SetLatches it on
+    /// completion. A spurious set on a recycled latch is harmless.
+    requester_latch: AtomicU64,
+    /// `COMPACTION_STATUS_*`; valid once `done_gen` reaches the request gen.
+    status: AtomicU32,
+}
+
+impl CompactionRequest {
+    fn init(&self) {
+        self.request_gen.store(0, Ordering::Relaxed);
+        self.done_gen.store(0, Ordering::Relaxed);
+        self.target_timeline.store(0, Ordering::Relaxed);
+        self.target_lsn.store(0, Ordering::Relaxed);
+        self.requester_latch.store(0, Ordering::Relaxed);
+        self.status.store(0, Ordering::Relaxed);
+    }
+}
+
+/// A pending compaction request observed by the worker.
+#[derive(Clone, Copy)]
+pub struct PendingCompaction {
+    /// Generation to pass back to [`TimelineState::complete_compaction`].
+    pub generation: u64,
+    /// Checkpoint to compact through (inclusive).
+    pub target: Checkpoint,
+    /// Requester's latch (pointer value) to SetLatch on completion.
+    pub requester_latch: u64,
+}
+
 // ── TimelineState ───────────────────────────────────────────────────────────
 
 /// Consolidated shmem state for the timeline subsystem.
 ///
-/// Layout discipline: all mutable fields except `generation` are protected by
-/// `lock`. `generation` is bumped (Release) on every commit; backends read it
-/// lock-free (Acquire) to decide whether to refresh their local snapshot.
+/// Layout discipline: the plain checkpoint fields and `active_window` are
+/// protected by `lock`. `generation`, `hydrated`, `draft` and
+/// `compaction_request` are internally synchronised and safe to access
+/// lock-free. `generation` is bumped (Release) on every commit; backends
+/// read it lock-free (Acquire) to decide whether to refresh their local
+/// snapshot.
 ///
 /// Invariant: `base_ckpt < redo_ckpt <= head_ckpt`.
 ///
@@ -229,16 +293,10 @@ pub struct TimelineState {
     /// `lock.read()`; the checkpointer drains it under `lock.write()` as
     /// part of the commit fence.
     pub draft: DraftBuffer,
-    /// Set by the checkpointer during a `CHECKPOINT_CAUSE_BASEBACKUP`
-    /// checkpoint so the background compactor skips its tick. The
-    /// checkpointer then runs compaction itself (after draining any
-    /// in-flight compactor run, see `compaction_in_progress`) to form a
-    /// base manifest at the basebackup LSN without racing the compactor.
-    pub compaction_paused: AtomicBool,
-    /// Bumped by any caller around an in-flight `run_compaction` so a
-    /// pausing checkpointer can `drain_compaction()` (spin until zero)
-    /// before running its own compaction.
-    pub compaction_in_progress: AtomicU32,
+    /// Basebackup compaction request slot: the checkpointer publishes a
+    /// compact-through request here and the tikoworker compactor executes it
+    /// (the worker is the sole routine compactor). See [`CompactionRequest`].
+    pub compaction_request: CompactionRequest,
 }
 
 impl TimelineState {
@@ -256,8 +314,7 @@ impl TimelineState {
             slot.reset();
         }
         self.draft.init();
-        self.compaction_paused.store(false, Ordering::Relaxed);
-        self.compaction_in_progress.store(0, Ordering::Relaxed);
+        self.compaction_request.init();
     }
 
     /// Push a new active-window entry. Caller must hold `lock.write()` —
@@ -309,56 +366,75 @@ impl TimelineState {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    // ── Basebackup compaction coordination ───────────────────────────────
+    // ── Basebackup compaction requests ─────────────────────────────────────
     //
-    // The checkpointer's `CHECKPOINT_CAUSE_BASEBACKUP` path wants to run
-    // compaction itself to form a base manifest at the basebackup LSN.
-    // Mutual exclusion with the background compactor:
-    //   1. Checkpointer: `pause_compaction()` (store), then
-    //      `drain_compaction()` — spin until `compaction_in_progress` is 0.
-    //   2. Compactor: `begin_compaction()` (bump) FIRST, then checks
-    //      `is_compaction_paused()` and backs off if set.
-    // Ordering argument: either the compactor's bump precedes the
-    // checkpointer's drain read (drain waits for the compactor to finish),
-    // or the pause store precedes the compactor's flag load (it backs off).
-    // Checking the flag before bumping would leave a window where both run.
-    //   3. The checkpointer wraps its own compaction in begin/end too, so
-    //      any concurrent drainer observes it.
+    // The tikoworker compactor is the sole routine compaction executor. A
+    // basebackup checkpointer needing a base manifest at its checkpoint LSN
+    // publishes a request and waits on its latch; the worker's compactor task
+    // runs `run_compaction_through` and completes the request. No mutual
+    // exclusion is needed between the two: only the worker ever compacts.
+    // Escape hatches (worker dead / request timed out) fall back to running
+    // compaction in the checkpointer, which is safe because
+    // `run_compaction*` re-checks `base_ckpt` under the write lock and
+    // discards raced runs.
 
-    /// Request the background compactor to skip its ticks. Process-local
-    /// shmem flag; safe to call from any process sharing `IoControl`.
-    pub fn pause_compaction(&self) {
-        self.compaction_paused.store(true, Ordering::Release);
+    /// Publish a compaction request for `target`. Returns the generation to
+    /// poll with [`Self::compaction_result`]. Caller must then SetLatch the
+    /// worker latch to wake the compactor promptly.
+    ///
+    /// At most one request may be outstanding (see [`CompactionRequest`]).
+    pub fn request_compaction(&self, target: Checkpoint, requester_latch: u64) -> u64 {
+        let req = &self.compaction_request;
+        req.target_timeline
+            .store(target.timeline_id.as_u32(), Ordering::Relaxed);
+        req.target_lsn.store(target.lsn.as_u64(), Ordering::Relaxed);
+        req.requester_latch
+            .store(requester_latch, Ordering::Relaxed);
+        req.status.store(0, Ordering::Relaxed);
+        // Release publishes the payload above.
+        req.request_gen.fetch_add(1, Ordering::Release) + 1
     }
 
-    /// Clear the pause flag. Cheap to call unconditionally.
-    pub fn resume_compaction(&self) {
-        self.compaction_paused.store(false, Ordering::Release);
+    /// Worker side: observe the pending request, if any. Double-reads
+    /// `request_gen` so a torn read can only delay the request to the next
+    /// poll, never mix fields from two generations.
+    pub fn pending_compaction_request(&self) -> Option<PendingCompaction> {
+        let req = &self.compaction_request;
+        let generation = req.request_gen.load(Ordering::Acquire);
+        if generation == req.done_gen.load(Ordering::Acquire) {
+            return None;
+        }
+        let pending = PendingCompaction {
+            generation,
+            target: Checkpoint::new(
+                TimelineId::new(req.target_timeline.load(Ordering::Relaxed)),
+                Lsn::new(req.target_lsn.load(Ordering::Relaxed)),
+            ),
+            requester_latch: req.requester_latch.load(Ordering::Relaxed),
+        };
+        if req.request_gen.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        Some(pending)
     }
 
-    /// Whether the background compactor should skip its current tick.
-    pub fn is_compaction_paused(&self) -> bool {
-        self.compaction_paused.load(Ordering::Acquire)
+    /// Worker side: mark `generation` complete. The caller SetLatches
+    /// `requester_latch` afterwards to wake the waiting requester.
+    pub fn complete_compaction(&self, generation: u64, status: u32) {
+        let req = &self.compaction_request;
+        req.status.store(status, Ordering::Relaxed);
+        // Release publishes `status`.
+        req.done_gen.store(generation, Ordering::Release);
     }
 
-    /// Record the start of a compaction run. Callers MUST pair this with
-    /// [`end_compaction`], and MUST bump before checking
-    /// [`Self::is_compaction_paused`] — see the section comment above.
-    pub fn begin_compaction(&self) {
-        self.compaction_in_progress.fetch_add(1, Ordering::Release);
-    }
-
-    /// Record the end of a `run_compaction` call.
-    pub fn end_compaction(&self) {
-        self.compaction_in_progress.fetch_sub(1, Ordering::Release);
-    }
-
-    /// Spin until no `run_compaction` is in flight. Bounded by the compactor
-    /// interval; a crashed compactor leaves the counter at 0 (the `begin`/
-    /// `end` pair is tight around the synchronous `run_compaction`).
-    pub fn drain_compaction(&self) {
-        while self.compaction_in_progress.load(Ordering::Acquire) > 0 {
-            std::hint::spin_loop();
+    /// Requester side: the completion status once `generation` has been
+    /// serviced.
+    pub fn compaction_result(&self, generation: u64) -> Option<u32> {
+        let req = &self.compaction_request;
+        if req.done_gen.load(Ordering::Acquire) == generation {
+            Some(req.status.load(Ordering::Relaxed))
+        } else {
+            None
         }
     }
 
@@ -684,5 +760,43 @@ mod tests {
             assert!(entry.chunk_bloom.maybe_contains(t));
         }
         assert!(!entry.chunk_bloom.maybe_contains(&tag(99, 99)));
+    }
+
+    // ── CompactionRequest ──
+
+    #[test]
+    fn compaction_request_round_trip() {
+        let s = new_timeline_state();
+        assert!(s.pending_compaction_request().is_none());
+        assert!(s.compaction_result(1).is_none());
+
+        let generation = s.request_compaction(ckpt(500), 0xDEAD);
+        assert_eq!(generation, 1);
+
+        let pending = s.pending_compaction_request().expect("request pending");
+        assert_eq!(pending.generation, 1);
+        assert_eq!(pending.target, ckpt(500));
+        assert_eq!(pending.requester_latch, 0xDEAD);
+        // Still pending until completed.
+        assert!(s.compaction_result(1).is_none());
+
+        s.complete_compaction(1, COMPACTION_STATUS_OK);
+        assert!(s.pending_compaction_request().is_none());
+        assert_eq!(s.compaction_result(1), Some(COMPACTION_STATUS_OK));
+    }
+
+    #[test]
+    fn compaction_request_generations_are_monotonic() {
+        let s = new_timeline_state();
+        let g1 = s.request_compaction(ckpt(100), 1);
+        s.complete_compaction(g1, COMPACTION_STATUS_OK);
+        let g2 = s.request_compaction(ckpt(200), 2);
+        assert_eq!(g2, g1 + 1);
+        // The previous generation stays complete; the new one is pending.
+        assert_eq!(s.compaction_result(g1), Some(COMPACTION_STATUS_OK));
+        assert!(s.compaction_result(g2).is_none());
+
+        s.complete_compaction(g2, COMPACTION_STATUS_ERROR);
+        assert_eq!(s.compaction_result(g2), Some(COMPACTION_STATUS_ERROR));
     }
 }

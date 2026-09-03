@@ -16,9 +16,12 @@
 //!
 //! 2. **Basebackups** (`CHECKPOINT_CAUSE_BASEBACKUP`): materialise a base
 //!    manifest at the checkpoint LSN so `tiko_pitr` can pair the (small)
-//!    `pg_basebackup` tarball with the chunk-ref map at the same LSN. To
-//!    avoid racing the background compactor, the checkpointer pauses it,
-//!    drains any in-flight run, then runs `run_compaction` itself.
+//!    `pg_basebackup` tarball with the chunk-ref map at the same LSN. The
+//!    checkpointer delegates to the tikoworker compactor — the sole routine
+//!    compaction executor — via a shmem request slot and waits on its own
+//!    latch; it runs compaction locally only as an escape hatch (worker dead,
+//!    request timed out, or worker-side error), which is race-safe because
+//!    `run_compaction*` re-checks `base_ckpt` under the timeline write lock.
 //!
 //! 3. **Shutdown**: fold accumulated segments into the base manifest inline.
 //!    The Tiko bgworker is killed in `PM_STOP_BACKENDS` before the shutdown
@@ -30,8 +33,21 @@
 //! reproduces the same segment because the draft drain + express scan are
 //! consistent. The base manifest PUT is atomic.
 
-use core::{io_control::IoControl, store::Store, timeline::Checkpoint};
-use pgsys::{Lsn, logging::*, timeline_id::TimelineId};
+use core::{
+    io_control::IoControl,
+    store::Store,
+    timeline::{COMPACTION_STATUS_OK, Checkpoint},
+};
+use pgsys::{
+    Lsn,
+    latch::{
+        Latch, MyLatch, ResetLatch, SetLatch, WL_EXIT_ON_PM_DEATH, WL_LATCH_SET, WL_TIMEOUT,
+        WaitLatch,
+    },
+    logging::*,
+    timeline_id::TimelineId,
+};
+use std::sync::atomic::Ordering;
 
 const CHECKPOINT_CAUSE_BASEBACKUP: i32 = 0x0200;
 
@@ -89,44 +105,67 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
     }
 }
 
-/// Run `run_compaction` to materialise a base manifest at the just-committed
-/// checkpoint LSN, coordinating with the background compactor via the shmem
-/// pause flag + in-progress counter so the two can't run in parallel.
+/// Materialise a base manifest at the just-committed checkpoint LSN by
+/// delegating to the tikoworker compactor — publish a `compaction_request`
+/// in shmem, wake the worker, and wait on our own latch.
 ///
-/// Sequence: `pause_compaction` → `drain_compaction` (wait for any in-flight
-/// background run) → `run_compaction` → `resume_compaction`. If `IoControl`
-/// is unavailable (very early startup), coordination is skipped and
-/// `run_compaction` is called directly (it self-skips in that case).
-/// Run `run_compaction_through(commit_ckpt)` to materialise a base manifest AT
-/// the basebackup checkpoint LSN, coordinating with the background compactor
-/// via the shmem pause flag + in-progress counter so the two can't run in
-/// parallel.
-///
-/// Sequence: `pause_compaction` → `drain_compaction` (wait for any in-flight
-/// background run) → `run_compaction_through` → `resume_compaction`. If
-/// `IoControl` is unavailable (very early startup), coordination is skipped
-/// and the compaction is called directly (it self-skips in that case).
+/// Escape hatches all fall back to running `run_compaction_through` locally:
+/// `IoControl` unavailable (very early startup), worker dead, request timed
+/// out, or worker-side error. Local runs are race-safe: compaction re-checks
+/// `base_ckpt` under the timeline write lock and discards duplicate runs.
 fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
-    if let Some(io_control) = IoControl::try_get() {
-        io_control.timeline.pause_compaction();
-        // Ensure the flag is always cleared, even if the compaction errors.
-        let result = (|| {
-            io_control.timeline.drain_compaction();
-            // Bump the counter around our own run so any concurrent
-            // drainer observes it (and to match the protocol the compactor
-            // follows: begin before checking the pause flag).
-            io_control.timeline.begin_compaction();
-            let r = store.run_compaction_through(commit_ckpt);
-            io_control.timeline.end_compaction();
-            r
-        })();
-        io_control.timeline.resume_compaction();
-        if let Err(e) = result {
-            pg_log_warning(format!(
-                "tiko: tiko_perform_checkpoint: basebackup compaction failed: {e}"
-            ));
+    if let Some(io_control) = IoControl::try_get()
+        && io_control.is_worker_alive()
+    {
+        let generation = io_control
+            .timeline
+            .request_compaction(commit_ckpt, unsafe { MyLatch } as u64);
+        let worker_latch = io_control.worker_latch.load(Ordering::Acquire) as *mut Latch;
+        if !worker_latch.is_null() {
+            unsafe { SetLatch(worker_latch) };
         }
-    } else if let Err(e) = store.run_compaction_through(commit_ckpt) {
+
+        // Wait for completion: latch wake or a 1s poll tick.
+        const TIMEOUT_SECS: u32 = 300;
+        let mut waited_secs = 0u32;
+        let outcome = loop {
+            unsafe { ResetLatch(MyLatch) };
+            if let Some(status) = io_control.timeline.compaction_result(generation) {
+                break Some(status);
+            }
+            if !io_control.is_worker_alive() {
+                pg_log_warning(
+                    "tiko: worker died while servicing compaction request; running locally",
+                );
+                break None;
+            }
+            waited_secs += 1;
+            if waited_secs >= TIMEOUT_SECS {
+                pg_log_warning(format!(
+                    "tiko: timed out waiting for basebackup compaction at {commit_ckpt}; running locally"
+                ));
+                break None;
+            }
+            unsafe {
+                WaitLatch(
+                    MyLatch,
+                    WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                    1000,
+                    crate::WAIT_EVENT_TIKO_COMPACTION,
+                );
+            }
+        };
+
+        match outcome {
+            Some(COMPACTION_STATUS_OK) => return,
+            Some(status) => pg_log_warning(format!(
+                "tiko: worker-side basebackup compaction failed (status {status}); running locally"
+            )),
+            None => {}
+        }
+    }
+
+    if let Err(e) = store.run_compaction_through(commit_ckpt) {
         pg_log_warning(format!(
             "tiko: tiko_perform_checkpoint: basebackup compaction failed: {e}"
         ));
