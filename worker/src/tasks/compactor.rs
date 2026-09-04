@@ -106,7 +106,8 @@ fn serve_compaction_request(store: &'static Store, req: CompactionRequestMsg) {
     if let Some(io_control) = IoControl::try_get() {
         io_control
             .timeline
-            .complete_compaction(req.generation, status);
+            .compaction_request
+            .complete(req.generation, status);
     }
     if req.requester_latch != 0 {
         // SAFETY: the requester published its own live latch; a SetLatch on

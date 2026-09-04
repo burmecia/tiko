@@ -119,7 +119,8 @@ fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
     {
         let generation = io_control
             .timeline
-            .request_compaction(commit_ckpt, unsafe { MyLatch } as u64);
+            .compaction_request
+            .publish(commit_ckpt, unsafe { MyLatch } as u64);
         let worker_latch = io_control.worker_latch.load(Ordering::Acquire) as *mut Latch;
         if !worker_latch.is_null() {
             unsafe { SetLatch(worker_latch) };
@@ -130,7 +131,7 @@ fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
         let mut waited_secs = 0u32;
         let outcome = loop {
             unsafe { ResetLatch(MyLatch) };
-            if let Some(status) = io_control.timeline.compaction_result(generation) {
+            if let Some(status) = io_control.timeline.compaction_request.result(generation) {
                 break Some(status);
             }
             if !io_control.is_worker_alive() {

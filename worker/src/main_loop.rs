@@ -135,7 +135,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         }
 
         // Relay a pending basebackup compaction request to the compactor task.
-        if let Some(pending) = io_control.timeline.pending_compaction_request()
+        if let Some(pending) = io_control.timeline.compaction_request.pending()
             && pending.generation != last_compaction_gen
             && compaction_req_tx
                 .try_send(CompactionRequestMsg {
