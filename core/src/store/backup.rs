@@ -7,7 +7,7 @@ use super::wal::is_base_usable;
 use crate::{
     db::DbNamespace,
     error::{Error, Result},
-    locator::{Locator, parse_base_manifest_ckpt},
+    locator::Locator,
     manifest::Manifest,
     timeline::Checkpoint,
 };
@@ -223,11 +223,10 @@ impl Store {
     /// `Manifest::from_bytes` → `write_tikm`) means a crash never leaves a
     /// partial file.
     pub fn materialize_base_manifest_at(&self, ckpt: Checkpoint) -> Result<()> {
-        let prefix = self.lctr.bases_dir();
-        let keys = self.storage_list_prefix(&prefix)?;
+        let keys = self.storage_list_prefix(&self.lctr.bases_dir())?;
         let target_base = keys
             .iter()
-            .filter_map(|k| parse_base_manifest_ckpt(k, &prefix))
+            .filter_map(|k| self.lctr.parse_base_manifest(k))
             .filter(|c| *c <= ckpt)
             .max_by_key(|c| *c)
             .ok_or_else(|| {
@@ -267,13 +266,11 @@ impl Store {
         branch_ns: DbNamespace,
         ckpt: Checkpoint,
     ) -> Result<()> {
-        let parent_ns = DbNamespace::new(self.ns.org_id, parent_db_id);
-        let parent_lctr = Locator::new(parent_ns);
-        let prefix = parent_lctr.bases_dir();
-        let keys = self.storage_list_prefix(&prefix)?;
+        let parent_lctr = self.lctr.for_db(parent_db_id);
+        let keys = self.storage_list_prefix(&parent_lctr.bases_dir())?;
         let target_base = keys
             .iter()
-            .filter_map(|k| parse_base_manifest_ckpt(k, &prefix))
+            .filter_map(|k| parent_lctr.parse_base_manifest(k))
             .filter(|c| *c <= ckpt)
             .max_by_key(|c| *c)
             .ok_or_else(|| {

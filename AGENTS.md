@@ -92,7 +92,8 @@ I/O/cache engine. Key modules:
   `chunks/...`, `bases/{tl}/{lsn}.manifest`, `backup/{tl}/{lsn}.tar.zst` (+ a
   `{lsn}.json` meta sidecar), `timeline/{segment}`,
   `wal/{tl}/{segment}[.chunks/{byte_offset:016X}]`, `db_meta.json`.
-  `chunk_in_db()` addresses another `db_id` in the same org — the COW mechanism.
+  `for_db()` derives a locator addressing another `db_id` in the same org —
+  the COW mechanism.
 - `manifest.rs` — `Manifest` (file-backed sorted TIKM manifest). `chunk.rs` holds
   `ChunkRef { db_id, timeline_id, lsn }`. A chunk reference can point at a
   *parent* database's namespace, so a branch's base manifest resolves shared

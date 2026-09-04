@@ -398,7 +398,7 @@ impl Manifest {
     /// - For each chunk in `segment.chunks`, the resulting `ChunkRef` points
     ///   to the same checkpoint prefix used at write time
     ///   (`segment.prev_ckpt`), matching the S3 layout consumed by
-    ///   [`crate::io::locator::Locator::chunk_base`].
+    ///   [`crate::locator::Locator::chunk_base`].
     /// - On conflict (same `ChunkTag` appears in multiple segments), the
     ///   higher-LSN `ChunkRef` wins.
     /// - `meta_map` entries are last-write-wins by iteration order; segments
