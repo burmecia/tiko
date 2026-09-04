@@ -12,6 +12,7 @@ use std::{fmt, sync::Mutex};
 
 use crate::chunk::{ChunkRef, ChunkTag};
 use crate::env;
+use crate::error::Result;
 use crate::relfork::RelFork;
 use crate::timeline::{Checkpoint, SegmentId};
 use pgsys::Lsn;
@@ -28,10 +29,10 @@ impl DbNamespace {
         Self { org_id, db_id }
     }
 
-    pub(crate) fn new_from_env() -> Self {
-        let org_id = env::read_u64(env::ENV_ORG_ID);
-        let db_id = env::read_u64(env::ENV_DB_ID);
-        DbNamespace::new(org_id, db_id)
+    pub(crate) fn new_from_env() -> Result<Self> {
+        let org_id = env::read_u64(env::ENV_ORG_ID)?;
+        let db_id = env::read_u64(env::ENV_DB_ID)?;
+        Ok(DbNamespace::new(org_id, db_id))
     }
 }
 

@@ -5,13 +5,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::{
     chunk::ChunkTag,
     db::{DbMeta, DbNamespace},
+    env,
     error::{Error, Result},
     io_control::IoControl,
-    local_path,
     manifest::Manifest,
     relfork::{RelFork, RelForkMeta},
     storage::Storage,
-    storage_root_path,
     timeline::draft::{DRAFT_SPILL_FILE_NAME, SpillFile},
     timeline::{ACTIVE_WINDOW_SIZE, Checkpoint, CheckpointSummary, SegmentId, TimelineSegment},
 };
@@ -82,12 +81,13 @@ impl Store {
             return Ok(store);
         }
 
+        let ns = DbNamespace::new_from_env()?;
+
         // Storage root is SHARED across databases (the remote object store);
         // local_root is PER-DATABASE (cache/state files that must not collide
         // between parent and branch).
-        let storage_root = storage_root_path();
-        let local_root = local_path();
-        let ns = DbNamespace::new_from_env();
+        let storage_root = env::storage_root_path();
+        let local_root = env::local_path();
         let storage = Storage::new(&storage_root);
 
         // Local fast path: reuse the on-disk TIKM file if a previous
@@ -155,6 +155,23 @@ impl Store {
         Ok(store)
     }
 
+    /// Return a `'static` reference to the global `Store`.
+    ///
+    /// # Panics
+    /// Panics if `Store::init` has not been called.
+    pub fn get() -> &'static Self {
+        STORE
+            .get()
+            .expect("Store::get() called before Store::init()")
+    }
+
+    /// Return the global `Store`, or `None` if not yet initialised.
+    pub fn try_get() -> Result<&'static Self> {
+        STORE.get().ok_or(Error::StoreNotAvailable)
+    }
+
+    // ── Base manifest methods ──────────────────────────────────────
+
     /// Return a snapshot of the current base manifest, fresh w.r.t. the
     /// shmem `timeline.base_ckpt`. Fast path: one `Mutex` lock + `Arc::clone`.
     /// Slow path (compactor has advanced `base_ckpt` since our last load):
@@ -165,7 +182,7 @@ impl Store {
             .map(|c| c.timeline.base_ckpt)
             .unwrap_or_default();
 
-        let mut guard = self.base_manifest.lock().unwrap();
+        let mut guard = self.base_manifest.lock()?;
         if guard.checkpoint() != target {
             *guard = Arc::new(self.load_manifest_at(target)?);
         }
@@ -201,21 +218,6 @@ impl Store {
         let key = self.ns.base_manifest(&ckpt);
         let bytes = self.storage.get(&key)?;
         Manifest::from_bytes(&bytes, &self.local_root)
-    }
-
-    /// Return a `'static` reference to the global `Store`.
-    ///
-    /// # Panics
-    /// Panics if `Store::init` has not been called.
-    pub fn get() -> &'static Self {
-        STORE
-            .get()
-            .expect("Store::get() called before Store::init()")
-    }
-
-    /// Return the global `Store`, or `None` if not yet initialised.
-    pub fn try_get() -> Result<&'static Self> {
-        STORE.get().ok_or(Error::StoreNotAvailable)
     }
 
     // ── Primitive forwarding methods ──────────────────────────────────────
@@ -453,6 +455,20 @@ impl Store {
         // checkpoints after promote.
         let in_recovery = data_dir_path().join("recovery.signal").exists();
 
+        // Recover base_ckpt from the loaded base manifest (if any). The
+        // manifest carries its own `Checkpoint`. Fresh clusters (no segments,
+        // no base) leave base_ckpt at default. Read from the cached snapshot
+        // directly — shmem base_ckpt isn't yet populated, so we can't go
+        // through `base_manifest()`. In PITR recovery this is the installed
+        // backup manifest, so base_ckpt = the anchor. Must run before the
+        // fallible segment scan below: a scan failure would otherwise leave
+        // base_ckpt at default while our cached manifest is newer, and the
+        // next `base_manifest()` call would downgrade to an empty manifest.
+        let base_ckpt = self.base_manifest.lock()?.checkpoint();
+        if base_ckpt != Checkpoint::default() {
+            io_control.timeline.set_base_ckpt(base_ckpt);
+        }
+
         if !in_recovery {
             // Normal startup: populate the active window with the newest
             // checkpoints so the read path can short-circuit segment scans.
@@ -493,17 +509,6 @@ impl Store {
             } else {
                 pg_log_info("tiko: hydrated timeline state: no existing segments");
             }
-        }
-
-        // Recover base_ckpt from the loaded base manifest (if any). The
-        // manifest carries its own `Checkpoint`. Fresh clusters (no segments,
-        // no base) leave base_ckpt at default. Read from the cached snapshot
-        // directly — this runs once at hydration and shmem base_ckpt isn't yet
-        // populated, so we can't go through `base_manifest()`. In PITR recovery
-        // this is the installed backup-L_b manifest, so base_ckpt = the anchor.
-        let base_ckpt = self.base_manifest.lock().unwrap().checkpoint();
-        if base_ckpt != Checkpoint::default() {
-            io_control.timeline.set_base_ckpt(base_ckpt);
         }
 
         if in_recovery {

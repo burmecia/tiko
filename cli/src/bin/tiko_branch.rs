@@ -345,7 +345,7 @@ fn run_backup(args: &BackupArgs) -> Result<()> {
 /// quiesced for `tiko_branch restart`.
 fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
     // A branch shares the parent's org; only db_id differs.
-    let org_id = env::read_u64(env::ENV_ORG_ID);
+    let org_id = env::read_u64(env::ENV_ORG_ID)?;
     let branch_ns = DbNamespace::new(org_id, branch.db_id);
     let branch_local = branch
         .local_path
@@ -496,7 +496,7 @@ fn start_branch_pg(
     let storage_root_abs = cwd.join(storage_root_path());
     let branch_local_abs = cwd.join(local_path);
 
-    let org_id = env::read_u64(env::ENV_ORG_ID);
+    let org_id = env::read_u64(env::ENV_ORG_ID)?;
     let status = Command::new(pg_ctl)
         .arg("start")
         .arg("-D")

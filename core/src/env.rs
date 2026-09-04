@@ -1,6 +1,8 @@
 use std::env;
 use std::path::PathBuf;
 
+use crate::error::{Error, Result};
+
 /// Shared (remote) storage root — the storage tree all databases in a
 /// deployment share. S3Sim local filesystem now; real S3-compatible storage
 /// later. Parent and branch databases set this identically so a branch can
@@ -19,11 +21,11 @@ pub const ENV_DB_ID: &str = "TIKO_DB_ID";
 /// Environment variable for how often the compactor worker should materialize a new base manifest, in seconds (default: 3600).
 pub const ENV_COMPACT_INTERVAL_SECS: &str = "TIKO_COMPACT_INTERVAL_SECS";
 
-pub fn read_u64(name: &str) -> u64 {
+pub fn read_u64(name: &str) -> Result<u64> {
     env::var(name)
-        .unwrap_or_else(|_| panic!("Environment variable {name} must be set"))
+        .map_err(|_| Error::other(format!("environment variable {name} must be set")))?
         .parse()
-        .unwrap_or_else(|_| panic!("Environment variable {name} must be a valid u64"))
+        .map_err(|_| Error::other(format!("environment variable {name} must be a valid u64")))
 }
 
 pub fn read_u64_or(name: &str, default: u64) -> u64 {

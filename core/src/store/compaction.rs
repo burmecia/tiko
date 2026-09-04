@@ -122,7 +122,7 @@ impl Store {
 
         // Swap the fresh Manifest in so this process's next
         // `base_manifest()` call short-circuits instead of re-loading.
-        *self.base_manifest.lock().unwrap() = new_manifest;
+        *self.base_manifest.lock()? = new_manifest;
 
         // Delete segment files whose entire LSN range is now covered by the
         // base manifest. The segment that contains `new_base_ckpt` itself
@@ -225,7 +225,7 @@ impl Store {
             io_control.timeline.set_base_ckpt(new_base_ckpt);
             new_manifest
         };
-        *self.base_manifest.lock().unwrap() = new_manifest;
+        *self.base_manifest.lock()? = new_manifest;
 
         // Delete superseded segment files entirely below the new base.
         let new_base_seg = new_base_ckpt.to_segment_id();

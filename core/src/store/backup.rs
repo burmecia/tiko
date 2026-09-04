@@ -239,7 +239,7 @@ impl Store {
         let manifest = Manifest::from_bytes(&bytes, &self.local_root)?;
         // Keep this process's cached snapshot in sync (harmless in the CLI,
         // which exits after this call; required if ever called in-process).
-        *self.base_manifest.lock().unwrap() = Arc::new(manifest);
+        *self.base_manifest.lock()? = Arc::new(manifest);
         Ok(())
     }
 

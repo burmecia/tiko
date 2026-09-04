@@ -32,6 +32,12 @@ pub enum Error {
     Other(String),
 }
 
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        Error::Other(e.to_string())
+    }
+}
+
 impl Error {
     pub fn not_found(msg: impl Into<String>) -> Self {
         Error::Io(IoError::new(IoErrorKind::NotFound, msg.into()))
