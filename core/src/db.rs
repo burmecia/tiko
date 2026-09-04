@@ -1,3 +1,12 @@
+//! Database namespace and object-storage key layout.
+//!
+//! [`DbNamespace`] (`{org}/{db}`, built from `TIKO_ORG_ID`/`TIKO_DB_ID`) is
+//! the root of every storage key and carries the single definition of the key
+//! layout — only `org_id` and `db_id` ever appear in keys, and `for_db`
+//! derives a sibling namespace in the same org (the COW mechanism). [`DbMeta`]
+//! is the `db_meta.json` sidecar tracking the database's latest checkpoint
+//! and branch lineage.
+
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Mutex};
 
