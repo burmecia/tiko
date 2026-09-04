@@ -4,7 +4,7 @@
 //! [`CheckpointSummary`] per checkpoint, covering a fixed 256 MB LSN range
 //! (`TIMELINE_SEGMENT_LSN_RANGE`) of a single timeline. Segments are keyed in
 //! storage as `{ns}/timeline/{tl}/{index:016X}.segment` with
-//! `index = lsn / RANGE` (see `locator.rs`), and serialized with MessagePack
+//! `index = lsn / RANGE` (see `db.rs`), and serialized with MessagePack
 //! behind a `TLSG` magic + version header.
 //!
 //! `prev_ckpt` in each summary is the chunk path prefix in effect at write

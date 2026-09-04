@@ -38,7 +38,7 @@ impl Store {
         // Write `segment` to storage (overwriting any previous version at the
         // same key). Subsequent commits in the same segment LSN range will
         // re-read this file and append to it.
-        let key = self.lctr.timeline_segment(&segment_id);
+        let key = self.ns.timeline_segment(&segment_id);
         let bytes = seg.to_bytes()?;
         self.storage.put(&key, &bytes)?;
 

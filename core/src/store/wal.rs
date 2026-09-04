@@ -94,7 +94,7 @@ impl Store {
     /// segment's last chunk for its byte length when that segment is partial.
     pub(super) fn archived_wal_run(&self, timeline: TimelineId) -> Result<(u64, u64)> {
         let seg = XLOG_SEG_SIZE as u64;
-        let prefix = self.lctr.wal_timeline_dir(timeline);
+        let prefix = self.ns.wal_timeline_dir(timeline);
         let keys = match self.storage_list_prefix(&prefix) {
             Ok(k) => k,
             Err(e) if e.is_not_found() => Vec::new(),
@@ -149,7 +149,7 @@ impl Store {
                 // missing last chunk falls back to `max_off` (len 0).
                 let max_off = acc.max_off.unwrap_or(0);
                 let name = format!("{}{:016X}", timeline.to_hex(), seg_no);
-                let chunk_key = self.lctr.wal_chunk_key(timeline, &name, max_off);
+                let chunk_key = self.ns.wal_chunk_key(timeline, &name, max_off);
                 let last_len = match self.storage_get(&chunk_key) {
                     Ok(b) => b.len() as u64,
                     Err(_) => 0,

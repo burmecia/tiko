@@ -7,7 +7,6 @@ use super::wal::is_base_usable;
 use crate::{
     db::DbNamespace,
     error::{Error, Result},
-    locator::Locator,
     manifest::Manifest,
     timeline::Checkpoint,
 };
@@ -75,7 +74,7 @@ impl Store {
     pub fn delete_all_segments(&self) -> Result<()> {
         let ids = self.list_all_segments()?;
         for sid in ids {
-            let key = self.lctr.timeline_segment(&sid);
+            let key = self.ns.timeline_segment(&sid);
             match self.storage_delete(&key) {
                 Ok(_) => {}
                 Err(e) if e.is_not_found() => {}
@@ -120,7 +119,7 @@ impl Store {
         created_at: i64,
         tar_bytes: &[u8],
     ) -> Result<()> {
-        let tar_key = self.lctr.backup_object(&ckpt);
+        let tar_key = self.ns.backup_object(&ckpt);
         self.storage_put(&tar_key, tar_bytes)?;
 
         let meta = BackupMeta {
@@ -131,14 +130,14 @@ impl Store {
         };
         let meta_bytes = serde_json::to_vec(&meta)
             .map_err(|e| Error::other(format!("failed to serialize backup meta: {e}")))?;
-        self.storage_put(&self.lctr.backup_meta(&ckpt), &meta_bytes)?;
+        self.storage_put(&self.ns.backup_meta(&ckpt), &meta_bytes)?;
         Ok(())
     }
 
     /// List every base backup on storage, parsed into [`BackupRow`]s (read from
     /// the `.json` sidecars) and sorted ascending by checkpoint.
     pub fn list_backups(&self) -> Result<Vec<BackupRow>> {
-        let prefix = self.lctr.backup_dir();
+        let prefix = self.ns.backup_dir();
         let keys = match self.storage_list_prefix(&prefix) {
             Ok(k) => k,
             Err(e) if e.is_not_found() => return Ok(Vec::new()),
@@ -183,7 +182,7 @@ impl Store {
             .ok_or_else(|| {
                 Error::other(format!("no base backup at or before checkpoint {target}"))
             })?;
-        let bytes = self.storage_get(&self.lctr.backup_object(&ckpt))?;
+        let bytes = self.storage_get(&self.ns.backup_object(&ckpt))?;
         Ok((ckpt, bytes))
     }
 
@@ -205,7 +204,7 @@ impl Store {
                     "no base backup at or before time {target_ts} on timeline {timeline}"
                 ))
             })?;
-        let bytes = self.storage_get(&self.lctr.backup_object(&ckpt))?;
+        let bytes = self.storage_get(&self.ns.backup_object(&ckpt))?;
         Ok((ckpt, bytes))
     }
 
@@ -223,10 +222,10 @@ impl Store {
     /// `Manifest::from_bytes` → `write_tikm`) means a crash never leaves a
     /// partial file.
     pub fn materialize_base_manifest_at(&self, ckpt: Checkpoint) -> Result<()> {
-        let keys = self.storage_list_prefix(&self.lctr.bases_dir())?;
+        let keys = self.storage_list_prefix(&self.ns.bases_dir())?;
         let target_base = keys
             .iter()
-            .filter_map(|k| self.lctr.parse_base_manifest(k))
+            .filter_map(|k| self.ns.parse_base_manifest(k))
             .filter(|c| *c <= ckpt)
             .max_by_key(|c| *c)
             .ok_or_else(|| {
@@ -234,7 +233,7 @@ impl Store {
                     "no base manifest at or before {ckpt} to anchor recovery"
                 ))
             })?;
-        let key = self.lctr.base_manifest(&target_base);
+        let key = self.ns.base_manifest(&target_base);
         let bytes = self.storage_get(&key)?;
         // `from_bytes` writes the TIKM at `local_root/base_manifest.tikm`.
         let manifest = Manifest::from_bytes(&bytes, &self.local_root)?;
@@ -266,11 +265,11 @@ impl Store {
         branch_ns: DbNamespace,
         ckpt: Checkpoint,
     ) -> Result<()> {
-        let parent_lctr = self.lctr.for_db(parent_db_id);
-        let keys = self.storage_list_prefix(&parent_lctr.bases_dir())?;
+        let parent_ns = self.ns.for_db(parent_db_id);
+        let keys = self.storage_list_prefix(&parent_ns.bases_dir())?;
         let target_base = keys
             .iter()
-            .filter_map(|k| parent_lctr.parse_base_manifest(k))
+            .filter_map(|k| parent_ns.parse_base_manifest(k))
             .filter(|c| *c <= ckpt)
             .max_by_key(|c| *c)
             .ok_or_else(|| {
@@ -279,10 +278,9 @@ impl Store {
                 ))
             })?;
 
-        let parent_key = parent_lctr.base_manifest(&target_base);
+        let parent_key = parent_ns.base_manifest(&target_base);
         let bytes = self.storage_get(&parent_key)?;
-        let branch_lctr = Locator::new(branch_ns);
-        let branch_key = branch_lctr.base_manifest(&target_base);
+        let branch_key = branch_ns.base_manifest(&target_base);
         self.storage_put(&branch_key, &bytes)
     }
 

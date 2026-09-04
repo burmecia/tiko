@@ -70,7 +70,7 @@ fn restore(store: &Store, args: &Args) -> Result<Outcome> {
         return Ok(Outcome::NotFound);
     };
     let name = args.wal_filename.as_str();
-    let loc = store.locator();
+    let loc = store.namespace();
 
     // 1. Prefer the sealed (complete) segment object.
     let seg_key = loc.wal_segment(timeline_id, name);

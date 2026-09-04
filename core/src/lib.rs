@@ -4,7 +4,6 @@ mod db;
 pub mod env;
 pub mod error;
 pub mod io;
-pub mod locator;
 pub mod manifest;
 pub mod relfork;
 pub mod storage;

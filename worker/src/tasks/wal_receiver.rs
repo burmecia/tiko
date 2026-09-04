@@ -364,7 +364,7 @@ async fn handle_xlogdata(
             let offset = state.chunks_uploaded;
             let slice = state.buf[offset..offset + CHUNK_BYTES].to_vec();
             let name = wal_seg_name(timeline_id, state.seg_no);
-            let key = sim.locator().wal_chunk_key(timeline_id, &name, offset);
+            let key = sim.namespace().wal_chunk_key(timeline_id, &name, offset);
             state.chunk_tasks.spawn(async move {
                 tokio::task::spawn_blocking(move || sim.storage_put(&key, &slice))
                     .await
@@ -418,7 +418,7 @@ async fn seal_segment(
         // 2. Zero-pad to XLOG_SEG_SIZE and PUT the sealed segment.
         state.buf.resize(XLOG_SEG_SIZE, 0);
         let sealed = state.buf;
-        let seg_key = sim.locator().wal_segment(timeline_id, &name);
+        let seg_key = sim.namespace().wal_segment(timeline_id, &name);
         let name_log = name.clone();
         tokio::task::spawn_blocking(move || sim.storage_put(&seg_key, &sealed))
             .await
@@ -429,7 +429,7 @@ async fn seal_segment(
 
         // Best-effort compaction: delete chunk objects (fire-and-forget).
         // Stranded chunks are harmless — tiko_restore prefers the sealed object.
-        let chunk_prefix = sim.locator().wal_chunk_prefix(timeline_id, &name);
+        let chunk_prefix = sim.namespace().wal_chunk_prefix(timeline_id, &name);
         tokio::task::spawn_blocking(move || {
             let _ = sim.storage_delete(&chunk_prefix);
         });
@@ -521,7 +521,7 @@ async fn flush_tail_now(
     let name = wal_seg_name(timeline_id, state.seg_no);
     let offset = state.chunks_uploaded;
     let tail = state.buf[offset..].to_vec();
-    let key = sim.locator().wal_chunk_key(timeline_id, &name, offset);
+    let key = sim.namespace().wal_chunk_key(timeline_id, &name, offset);
     tokio::task::spawn_blocking(move || sim.storage_put(&key, &tail))
         .await
         .map_err(|e| format!("checkpoint tail flush spawn_blocking panicked for {name}: {e}"))?
@@ -549,7 +549,7 @@ async fn join_chunks_and_flush_tail(
     if state.buf.len() > chunks_uploaded {
         let tail = state.buf[chunks_uploaded..].to_vec();
         let tail_key = sim
-            .locator()
+            .namespace()
             .wal_chunk_key(timeline_id, name, chunks_uploaded);
         tokio::task::spawn_blocking(move || sim.storage_put(&tail_key, &tail))
             .await

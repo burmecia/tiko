@@ -8,7 +8,6 @@ use crate::{
     error::{Error, Result},
     io_control::IoControl,
     local_path,
-    locator::Locator,
     manifest::Manifest,
     relfork::{RelFork, RelForkMeta},
     storage::Storage,
@@ -31,7 +30,6 @@ static STORE: OnceLock<Store> = OnceLock::new();
 /// - A process-global singleton (`init` / `get` / `try_get`).
 pub struct Store {
     pub(super) ns: DbNamespace,
-    pub(super) lctr: Locator,
     /// Current base-manifest snapshot. Readers grab an `Arc<Manifest>` under
     /// the `Mutex` (briefly) and use it lock-free. The `Manifest` is
     /// immutable; the compactor produces a fresh one via
@@ -50,15 +48,15 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn locator(&self) -> &Locator {
-        &self.lctr
+    pub fn namespace(&self) -> &DbNamespace {
+        &self.ns
     }
 
     /// Update the DbMeta JSON object on storage with the latest checkpoint
     /// LSN. Internal helper called from [`Store::run_commit_protocol`].
     pub(super) fn update_db_meta(&self, ckpt: &Checkpoint) -> Result<()> {
         let db = DbMeta::new(self.ns.clone());
-        let key = self.lctr.db_meta();
+        let key = self.ns.db_meta();
 
         // Load existing DbMeta if it exists.
         match self.storage.get(&key) {
@@ -90,7 +88,6 @@ impl Store {
         let storage_root = storage_root_path();
         let local_root = local_path();
         let ns = DbNamespace::new_from_env();
-        let lctr = Locator::new(ns.clone());
         let storage = Storage::new(&storage_root);
 
         // Local fast path: reuse the on-disk TIKM file if a previous
@@ -111,7 +108,7 @@ impl Store {
                 manifest
             }
             Err(_) => {
-                let mut bases = storage.list_prefix(&lctr.bases_dir())?;
+                let mut bases = storage.list_prefix(&ns.bases_dir())?;
                 bases.sort_unstable();
                 if let Some(key) = bases.last() {
                     let bytes = storage.get(key)?;
@@ -133,7 +130,6 @@ impl Store {
         let draft_spill = SpillFile::new(local_root.join(DRAFT_SPILL_FILE_NAME));
         let store = Store {
             ns,
-            lctr,
             base_manifest: Mutex::new(Arc::new(initial)),
             storage,
             local_root,
@@ -202,7 +198,7 @@ impl Store {
 
         // S3 fallback. `Manifest::from_bytes` materialises the local TIKM
         // file as a side effect (also via tmp + rename inside `write_tikm`).
-        let key = self.lctr.base_manifest(&ckpt);
+        let key = self.ns.base_manifest(&ckpt);
         let bytes = self.storage.get(&key)?;
         Manifest::from_bytes(&bytes, &self.local_root)
     }
@@ -291,7 +287,7 @@ impl Store {
     /// natural derived order). Returns an empty vec if the directory does
     /// not exist yet.
     pub(super) fn list_all_segments(&self) -> Result<Vec<SegmentId>> {
-        let prefix = self.lctr.timeline_segments_dir();
+        let prefix = self.ns.timeline_segments_dir();
         let keys = match self.storage.list_prefix(&prefix) {
             Ok(k) => k,
             Err(e) if e.is_not_found() => return Ok(Vec::new()),
@@ -327,8 +323,13 @@ impl Store {
     /// Try to read the chunk for `tag` at the prefix derived from `ckpt`.
     /// Returns `Ok(true)` on hit (data copied into `dst`), `Ok(false)` on
     /// not-found, propagates other storage errors.
-    pub(super) fn try_read_chunk_at(&self, tag: &ChunkTag, ckpt: &Checkpoint, dst: &mut [u8]) -> Result<bool> {
-        let key = self.lctr.chunk(tag, ckpt);
+    pub(super) fn try_read_chunk_at(
+        &self,
+        tag: &ChunkTag,
+        ckpt: &Checkpoint,
+        dst: &mut [u8],
+    ) -> Result<bool> {
+        let key = self.ns.chunk(tag, ckpt);
         match self.storage.get(&key) {
             Ok(data) => {
                 dst.copy_from_slice(&data);
@@ -343,7 +344,7 @@ impl Store {
     /// `Ok(None)` if no segment file exists (e.g. that LSN range hasn't been
     /// committed to yet).
     pub(super) fn load_segment(&self, segment_id: &SegmentId) -> Result<TimelineSegment> {
-        let key = self.lctr.timeline_segment(segment_id);
+        let key = self.ns.timeline_segment(segment_id);
         let seg_bytes = self.storage.get(&key)?;
         TimelineSegment::from_bytes(&seg_bytes)
     }

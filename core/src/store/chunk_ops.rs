@@ -58,7 +58,7 @@ impl Store {
         // 4. Base manifest fallback.
         let chunk_ref = self.base_manifest()?.lookup(tag)?;
         if let Some(chunk_ref) = chunk_ref {
-            let key = self.lctr.chunk_base(tag, &chunk_ref);
+            let key = self.ns.chunk_base(tag, &chunk_ref);
             let src = self.storage_get(&key)?;
             dst.copy_from_slice(&src);
             return Ok(());
@@ -87,7 +87,7 @@ impl Store {
         let _timeline_guard = io_control.timeline.lock.read();
 
         let head_ckpt = io_control.timeline.head_ckpt;
-        let key = self.lctr.chunk(tag, &head_ckpt);
+        let key = self.ns.chunk(tag, &head_ckpt);
 
         if is_full_chunk {
             self.storage_put(&key, data)?;

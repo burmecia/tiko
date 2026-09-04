@@ -104,7 +104,7 @@ impl Store {
         //      until they drop their `Arc`.
         let current = self.base_manifest()?;
         let new_base_ckpt = to_apply.last().unwrap().ckpt;
-        let key = self.lctr.base_manifest(&new_base_ckpt);
+        let key = self.ns.base_manifest(&new_base_ckpt);
 
         let applied = current.apply_segments(&to_apply, self.ns.db_id)?;
         self.storage.put(&key, &applied.bytes)?;
@@ -132,7 +132,7 @@ impl Store {
         // catches superseded segments from older timelines.
         let new_base_seg = new_base_ckpt.to_segment_id();
         for sid in segments.iter().take_while(|s| **s < new_base_seg) {
-            let seg_key = self.lctr.timeline_segment(sid);
+            let seg_key = self.ns.timeline_segment(sid);
             match self.storage.delete(&seg_key) {
                 Ok(_) => {}
                 Err(e) if e.is_not_found() => {}
@@ -207,7 +207,7 @@ impl Store {
         let applied = current.apply_segments(&to_apply, self.ns.db_id)?;
         // Key/header/base_ckpt all at `applied.checkpoint` for consistency.
         let new_base_ckpt = applied.checkpoint;
-        let key = self.lctr.base_manifest(&new_base_ckpt);
+        let key = self.ns.base_manifest(&new_base_ckpt);
         self.storage.put(&key, &applied.bytes)?;
 
         // Same protocol as `run_compaction`: re-check `base_ckpt` and
@@ -230,7 +230,7 @@ impl Store {
         // Delete superseded segment files entirely below the new base.
         let new_base_seg = new_base_ckpt.to_segment_id();
         for sid in segments.iter().take_while(|s| **s < new_base_seg) {
-            let seg_key = self.lctr.timeline_segment(sid);
+            let seg_key = self.ns.timeline_segment(sid);
             match self.storage.delete(&seg_key) {
                 Ok(_) => {}
                 Err(e) if e.is_not_found() => {}
