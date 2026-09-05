@@ -27,10 +27,14 @@ TARGET_DIR="${BASE_DIR}/target"
 POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 PG_BIN_DIR="${POSTGRES_INSTALL}/bin"
 PG_LIB_DIR="${POSTGRES_INSTALL}/lib/postgresql"
-TEST_DIR="${BASE_DIR}/tt"
+TEST_WORK_DIR="${TARGET_DIR}/test/large"
+TEST_DIR="${TEST_WORK_DIR}/tt"
+LOG_FILE="${TEST_WORK_DIR}/log.log"
 
-export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"
-export TIKO_LOCAL_PATH="${BASE_DIR}/tiko_local"
+export TIKO_STORAGE_ROOT="${TEST_WORK_DIR}/tiko_root"
+export TIKO_LOCAL_PATH="${TEST_WORK_DIR}/tiko_local"
+
+rm -rf "${TEST_WORK_DIR}"
 
 echo "Building Tiko smgr..."
 if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr) >/dev/null; then
@@ -68,10 +72,10 @@ DUPLICATES="${TIKO_TEST_DATA_DUPLICATES:-500}"
 # data rows DUPLICATES times, regenerating order_id to avoid PK conflicts if
 # needed downstream.
 SAMPLE_CSV="${SCRIPT_DIR}/test_data/ecommerce_dataset_small.csv"
-LARGE_CSV="${BASE_DIR}/target/ecommerce_dataset_large.csv"
+LARGE_CSV="${TEST_WORK_DIR}/ecommerce_dataset_large.csv"
 
 echo "Generating large dataset (${DUPLICATES}x sample rows)..."
-mkdir -p "${BASE_DIR}/target"
+mkdir -p "${TEST_WORK_DIR}"
 # Write header
 head -1 "${SAMPLE_CSV}" > "${LARGE_CSV}"
 # Write data rows DUPLICATES times
@@ -81,16 +85,15 @@ done
 ROW_COUNT=$(($(wc -l < "${LARGE_CSV}") - 1))
 echo "Generated ${LARGE_CSV} with ${ROW_COUNT} data rows"
 
-rm -rf "${TEST_DIR}" "${BASE_DIR}/log.log" "${TIKO_STORAGE_ROOT}" "${TIKO_LOCAL_PATH}"
 $PG_BIN_DIR/initdb -D "${TEST_DIR}"
 cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
 echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" -w start
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" -w start
 
 $PG_BIN_DIR/psql -d postgres -v csvfile="'${LARGE_CSV}'" -f "${SCRIPT_DIR}/load_data.sql"
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" -w stop
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" -w stop
 
 echo
 echo "Test run completed. 🎉"

@@ -33,16 +33,17 @@ TARGET_DIR="${BASE_DIR}/target"
 PG_BIN_DIR="${TARGET_DIR}/pg-install/bin"
 PG_LIB_DIR="${TARGET_DIR}/pg-install/lib/postgresql"
 TIKO_BIN_DIR="${TARGET_DIR}/debug"
-TEST_DIR="${BASE_DIR}/tt"
-BRANCH_DIR="${BASE_DIR}/tt_branch"
-PARENT_LOCAL_DIR="${BASE_DIR}/tt_local"
-BRANCH_LOCAL_DIR="${BASE_DIR}/tt_branch_local"
+TEST_WORK_DIR="${TARGET_DIR}/test/branch"
+TEST_DIR="${TEST_WORK_DIR}/tt"
+BRANCH_DIR="${TEST_WORK_DIR}/tt_branch"
+PARENT_LOCAL_DIR="${TEST_WORK_DIR}/tt_local"
+BRANCH_LOCAL_DIR="${TEST_WORK_DIR}/tt_branch_local"
 
 export PATH="${PG_BIN_DIR}":$PATH
 
 # Shared storage root OUTSIDE both PGDATAs so parent + branch share one tree
 # (required for copy-on-write: the branch reads the parent's chunks in place).
-export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"
+export TIKO_STORAGE_ROOT="${TEST_WORK_DIR}/tiko_root"
 
 echo "Building Tiko smgr + worker + cli..."
 if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr -p worker -p cli) >/dev/null; then
@@ -63,13 +64,14 @@ if [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
 fi
 
 # Fresh parent cluster + shared storage root.
-TIKO_PACK="${BASE_DIR}/tt_branch_pack.tar.zst"
-rm -rf "${TEST_DIR}" "${BRANCH_DIR}" "${TIKO_PACK}" "${TIKO_STORAGE_ROOT}" "${BASE_DIR}/parent.log" "${PARENT_LOCAL_DIR}" "${BRANCH_LOCAL_DIR}"
+TIKO_PACK="${TEST_WORK_DIR}/branch_pack.tar.zst"
+rm -rf "${TEST_WORK_DIR}"
+mkdir -p "${TEST_WORK_DIR}"
 TIKO_LOCAL_PATH="${PARENT_LOCAL_DIR}" $PG_BIN_DIR/initdb -D "${TEST_DIR}" --auth=trust --no-instructions
 cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
 echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
-TIKO_LOCAL_PATH="${PARENT_LOCAL_DIR}" $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/parent.log" start -w
+TIKO_LOCAL_PATH="${PARENT_LOCAL_DIR}" $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${TEST_WORK_DIR}/parent.log" start -w
 
 # 1. Seed the parent with data spanning several pages, then checkpoint.
 $PG_BIN_DIR/psql -p 5432 -d postgres -c \

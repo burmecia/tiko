@@ -32,13 +32,18 @@ POSTGRES_INSTALL="${TARGET_DIR}/pg-install"
 PG_BIN_DIR="${POSTGRES_INSTALL}/bin"
 PG_LIB_DIR="${POSTGRES_INSTALL}/lib/postgresql"
 TIKO_BIN_DIR="${TARGET_DIR}/debug"
-TEST_DIR="${BASE_DIR}/tt"
+TEST_WORK_DIR="${TARGET_DIR}/test/pitr"
+TEST_DIR="${TEST_WORK_DIR}/tt"
+LOG_FILE="${TEST_WORK_DIR}/log.log"
 
 export PATH="${PG_BIN_DIR}":$PATH
 
 # Keep the Tiko storage root OUTSIDE PGDATA so it survives PGDATA wipe/restore.
-# Per-db local cache (base_manifest.tikm etc.) defaults to $PGDATA/tiko.
-export TIKO_STORAGE_ROOT="${BASE_DIR}/tiko_root"
+# Set the per-db local cache explicitly too: the tiko_pitr CLI runs standalone
+# (no real DataDir), so an unset TIKO_LOCAL_PATH would fall back to ./tiko
+# relative to the caller's cwd instead of matching the server's path.
+export TIKO_STORAGE_ROOT="${TEST_WORK_DIR}/tiko_root"
+export TIKO_LOCAL_PATH="${TEST_WORK_DIR}/tiko_local"
 
 echo "Building Tiko smgr..."
 if ! (cargo build --manifest-path "${BASE_DIR}/Cargo.toml" -p smgr) >/dev/null; then
@@ -63,15 +68,16 @@ elif [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
 fi
 
 # Fresh cluster + fresh Tiko storage root.
-rm -rf "${TEST_DIR}" "${TIKO_STORAGE_ROOT}" "${BASE_DIR}/log.log" "${BASE_DIR}/recovery.out"
+rm -rf "${TEST_WORK_DIR}"
+mkdir -p "${TEST_WORK_DIR}"
 $PG_BIN_DIR/initdb -D "${TEST_DIR}" --auth=trust --no-instructions
 cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
 echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
 # Stop any postgres that might still own port 5432 / the tt data dir.
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" stop -m fast -w 2>/dev/null || true
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null || true
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" start -w
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" start -w
 
 # 1. Seed the table BEFORE the backup with enough rows to span several pages,
 #    then checkpoint so they land in a segment.
@@ -121,7 +127,7 @@ done
 if [ "$window_ready" != "1" ]; then
   echo "PITR FAILED: recoverable window never became available" >&2
   "${TIKO_BIN_DIR}/tiko_pitr" list >&2
-  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" stop -m fast -w 2>/dev/null || true
+  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null || true
   exit 1
 fi
 
@@ -134,10 +140,10 @@ echo "--- tiko_pitr list ---"
 #    replays WAL, promotes, and then STOPS the db. `restart` brings it back up
 #    so the verification queries below can connect.
 echo "--- tiko_pitr recover --lsn ${TARGET_LSN} ---"
-"${TIKO_BIN_DIR}/tiko_pitr" recover --pgdata "${TEST_DIR}" --pg-ctl "${PG_BIN_DIR}/pg_ctl" --log-file "${BASE_DIR}/log.log" --lsn "${TARGET_LSN}"
+"${TIKO_BIN_DIR}/tiko_pitr" recover --pgdata "${TEST_DIR}" --pg-ctl "${PG_BIN_DIR}/pg_ctl" --log-file "${LOG_FILE}" --lsn "${TARGET_LSN}"
 
 echo "--- tiko_pitr restart ---"
-"${TIKO_BIN_DIR}/tiko_pitr" restart --pgdata "${TEST_DIR}" --pg-ctl "${PG_BIN_DIR}/pg_ctl" --log-file "${BASE_DIR}/log.log"
+"${TIKO_BIN_DIR}/tiko_pitr" restart --pgdata "${TEST_DIR}" --pg-ctl "${PG_BIN_DIR}/pg_ctl" --log-file "${LOG_FILE}"
 
 # 6. Verify the recovered state.
 #    - count = 201: the 200 pre-backup rows (read via the base manifest) + the
@@ -152,17 +158,17 @@ ID50=$($PG_BIN_DIR/psql -d postgres -Atqc "select data from pitr_test where id=5
 echo "row count: ${COUNT}; id=50 data: '${ID50}'"
 if [ "${COUNT}" != "201" ]; then
   echo "PITR FAILED: expected 201 rows, got ${COUNT}" >&2
-  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" stop -m fast -w 2>/dev/null || true
+  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null || true
   exit 1
 fi
 if [ "${ID50}" != "orig" ]; then
   echo "PITR FAILED: id=50 should be 'orig' (post-target UPDATE must not be visible), got '${ID50}'" >&2
-  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" stop -m fast -w 2>/dev/null || true
+  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null || true
   exit 1
 fi
 
 # Cleanup.
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" stop -m fast -w
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w
 
 echo
 echo "PITR test passed. ✅"

@@ -154,7 +154,7 @@ Run the large-data test to see compute-storage separation in action:
 ```bash
 ./scripts/test/run_large_data_test.sh
 
-# After the run, three directories appear under the repo root:
+# After the run, everything lands under target/test/large/:
 # - `tt/`         — the Postgres PGDATA directory (compute)
 # - `tiko_root/`  — simulated S3-compatible remote storage (storage)
 # - `tiko_local/` — local cache, base manifest, and other per-DB state

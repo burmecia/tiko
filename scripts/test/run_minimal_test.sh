@@ -58,19 +58,22 @@ if [ -f "${TARGET_DIR}/debug/libtikoworker.so" ]; then
     cp "${TARGET_DIR}/debug/libtikoworker.so" "${PG_LIB_DIR}"
 fi
 
-TEST_DIR="${BASE_DIR}/tt"
-rm -rf "${TEST_DIR}" "${BASE_DIR}/log.log"
+TEST_WORK_DIR="${TARGET_DIR}/test/minimal"
+TEST_DIR="${TEST_WORK_DIR}/tt"
+LOG_FILE="${TEST_WORK_DIR}/log.log"
+rm -rf "${TEST_WORK_DIR}"
+mkdir -p "${TEST_WORK_DIR}"
 $PG_BIN_DIR/initdb -D "${TEST_DIR}"
 cp "${SCRIPT_DIR}/postgresql.tiko.conf" "${TEST_DIR}/postgresql.tiko.conf"
 echo "include_if_exists='postgresql.tiko.conf'" >> "${TEST_DIR}/postgresql.conf"
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" -w start
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" -w start
 
 $PG_BIN_DIR/psql -d postgres -c "create temp table tt(a int);create index idx_tt on tt(a);insert into tt values(123);select * from tt;"
 
 sleep 2
 
-$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${BASE_DIR}/log.log" -w stop
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" -w stop
 
 echo
 echo "Test run completed. 🎉"
