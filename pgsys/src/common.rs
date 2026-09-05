@@ -38,6 +38,9 @@ pub const BLCKSZ: usize = 8192;
 /// PostgreSQL default WAL segment size in bytes
 pub const XLOG_SEG_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// Recovery signal file in PGDATA (access/xlog.h: RECOVERY_SIGNAL_FILE).
+pub const RECOVERY_SIGNAL_FILE: &str = "recovery.signal";
+
 /// PostgreSQL ProcNumber type (typedef int ProcNumber).
 ///
 /// This is a dense index into the PGPROC array (0..MaxBackends+NUM_AUXILIARY_PROCS-1),

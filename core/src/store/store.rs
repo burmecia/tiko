@@ -15,7 +15,7 @@ use crate::{
     timeline::{ACTIVE_WINDOW_SIZE, Checkpoint, CheckpointSummary, SegmentId, TimelineSegment},
 };
 use pgsys::{
-    common::data_dir_path,
+    common::{RECOVERY_SIGNAL_FILE, data_dir_path},
     logging::{pg_log_debug1, pg_log_debug2, pg_log_info, pg_log_warning},
 };
 
@@ -376,11 +376,11 @@ impl Store {
         let segments = self.list_segments_in_range(low_ckpt, high_ckpt_excl)?;
         for sid in segments.iter().rev() {
             let seg = self.load_segment(sid)?;
-            for sc in seg.checkpoints.iter().rev() {
-                if sc.ckpt < low_ckpt || sc.ckpt >= high_ckpt_excl {
+            for cs in seg.checkpoints.iter().rev() {
+                if cs.ckpt < low_ckpt || cs.ckpt >= high_ckpt_excl {
                     continue;
                 }
-                if sc.contains_chunk(tag) && self.try_read_chunk_at(tag, &sc.prev_ckpt, dst)? {
+                if cs.contains_chunk(tag) && self.try_read_chunk_at(tag, &cs.prev_ckpt, dst)? {
                     return Ok(true);
                 }
             }
@@ -404,11 +404,11 @@ impl Store {
         let segments = self.list_segments_in_range(low_ckpt, high_ckpt)?;
         for sid in segments.iter().rev() {
             let seg = self.load_segment(sid)?;
-            for sc in seg.checkpoints.iter().rev() {
-                if sc.ckpt < low_ckpt || sc.ckpt > high_ckpt {
+            for cs in seg.checkpoints.iter().rev() {
+                if cs.ckpt < low_ckpt || cs.ckpt > high_ckpt {
                     continue;
                 }
-                if let Some(meta) = sc.relfork_meta(rf) {
+                if let Some(meta) = cs.relfork_meta(rf) {
                     return Ok(Some(*meta));
                 }
             }
@@ -429,16 +429,18 @@ impl Store {
             None => return Ok(()),
         };
 
+        let timeline = &io_control.timeline;
+
         // Fast-path: someone else already hydrated.
-        if io_control.timeline.hydrated.load(Ordering::Acquire) {
+        if timeline.hydrated.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        let _write_guard = io_control.timeline.lock.write();
+        let _write_guard = timeline.lock.write();
 
         // Double-check under the lock — another process may have raced us
         // through the fast-path window.
-        if io_control.timeline.hydrated.load(Ordering::Relaxed) {
+        if timeline.hydrated.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -453,7 +455,7 @@ impl Store {
         // anchor version). Reads go through the base manifest; the active
         // window starts empty and fills only with the new timeline's
         // checkpoints after promote.
-        let in_recovery = data_dir_path().join("recovery.signal").exists();
+        let in_recovery = data_dir_path().join(RECOVERY_SIGNAL_FILE).exists();
 
         // Recover base_ckpt from the loaded base manifest (if any). The
         // manifest carries its own `Checkpoint`. Fresh clusters (no segments,
@@ -466,10 +468,14 @@ impl Store {
         // next `base_manifest()` call would downgrade to an empty manifest.
         let base_ckpt = self.base_manifest.lock()?.checkpoint();
         if base_ckpt != Checkpoint::default() {
-            io_control.timeline.set_base_ckpt(base_ckpt);
+            timeline.set_base_ckpt(base_ckpt);
         }
 
-        if !in_recovery {
+        if in_recovery {
+            pg_log_info(format!(
+                "tiko: PITR recovery — active-window hydration skipped; reads anchor on base manifest at {base_ckpt}"
+            ));
+        } else {
             // Normal startup: populate the active window with the newest
             // checkpoints so the read path can short-circuit segment scans.
             // `list_all_segments` sorts ascending by `(timeline_id, index)`,
@@ -482,8 +488,8 @@ impl Store {
             let mut newest_first: Vec<CheckpointSummary> = Vec::new();
             'outer: for segment_id in segment_ids.iter().rev() {
                 let seg = self.load_segment(segment_id)?;
-                for sc in seg.checkpoints.iter().rev() {
-                    newest_first.push(sc.clone());
+                for cs in seg.checkpoints.iter().rev() {
+                    newest_first.push(cs.clone());
                     if newest_first.len() >= ACTIVE_WINDOW_SIZE {
                         break 'outer;
                     }
@@ -491,12 +497,12 @@ impl Store {
             }
 
             // Replay oldest-first so the ring buffer ends up newest-at-front.
-            for sc in newest_first.iter().rev() {
-                io_control.timeline.push_active(
-                    sc.ckpt,
-                    sc.prev_ckpt,
-                    sc.chunks.iter().copied(),
-                    sc.relforks.iter().map(|(rf, meta)| (*rf, *meta)),
+            for cs in newest_first.iter().rev() {
+                timeline.push_active(
+                    cs.ckpt,
+                    cs.prev_ckpt,
+                    cs.chunks.iter().copied(),
+                    cs.relforks.iter().map(|(rf, meta)| (*rf, *meta)),
                 );
             }
 
@@ -511,13 +517,7 @@ impl Store {
             }
         }
 
-        if in_recovery {
-            pg_log_info(format!(
-                "tiko: PITR recovery — active-window hydration skipped; reads anchor on base manifest at {base_ckpt}"
-            ));
-        }
-
-        io_control.timeline.hydrated.store(true, Ordering::Release);
+        timeline.hydrated.store(true, Ordering::Release);
         Ok(())
     }
 }

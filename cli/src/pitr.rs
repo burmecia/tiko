@@ -237,6 +237,7 @@ fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pgsys::common::RECOVERY_SIGNAL_FILE;
 
     #[test]
     fn pitr_conf_round_trips_through_remove() {
@@ -340,12 +341,12 @@ mod tests {
 
         // Mutate PGDATA as a recovery run would.
         fs::write(pgdata.join("global/pg_control"), b"MUTATED").unwrap();
-        fs::write(pgdata.join("recovery.signal"), b"").unwrap();
+        fs::write(pgdata.join(RECOVERY_SIGNAL_FILE), b"").unwrap();
 
         restore_dir(&bak, &pgdata, "tiko").unwrap();
         assert_eq!(fs::read(pgdata.join("global/pg_control")).unwrap(), b"orig");
         assert!(
-            !pgdata.join("recovery.signal").exists(),
+            !pgdata.join(RECOVERY_SIGNAL_FILE).exists(),
             "restore must drop new files"
         );
         assert!(

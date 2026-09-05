@@ -38,6 +38,7 @@ use core::env;
 use core::error::{Error, Result};
 use core::store::Store;
 use core::timeline::Checkpoint;
+use pgsys::common::RECOVERY_SIGNAL_FILE;
 use pgsys::lsn::Lsn;
 use pgsys::timeline_id::TimelineId;
 
@@ -443,7 +444,7 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
     match outcome {
         Ok(()) => {
             pitr::remove_recovery_conf(&conf)?;
-            let _ = std::fs::remove_file(pgdata.join("recovery.signal"));
+            let _ = std::fs::remove_file(pgdata.join(RECOVERY_SIGNAL_FILE));
             let _ = std::fs::remove_dir_all(&backup);
             eprintln!(
                 "tiko_pitr: recovery to {target_label} complete; database promoted and stopped \
@@ -542,7 +543,7 @@ fn recover_inner(
     store.delete_all_segments()?;
 
     pitr::write_pitr_recovery_conf(conf, timeline, target, tiko_restore, true)?;
-    std::fs::write(pgdata.join("recovery.signal"), b"")?;
+    std::fs::write(pgdata.join(RECOVERY_SIGNAL_FILE), b"")?;
 
     // Start in the background and poll until promotion. With
     // recovery_target_action='promote', postgres does not exit on its own; it
