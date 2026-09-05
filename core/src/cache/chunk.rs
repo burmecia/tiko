@@ -308,9 +308,10 @@ impl ChunkCache {
         }
     }
 
-    /// Write `data` into the chunk identified by `tag` at `block_offset`.
+    /// Write `data` into the chunk identified by `tag`, starting at block
+    /// index `block_idx` within the chunk.
     ///
-    /// When `block_offset == 0 && data.len() == CHUNK_SIZE` the chunk is
+    /// When `block_idx == 0 && data.len() == CHUNK_SIZE` the chunk is
     /// overwritten wholesale (no read needed). Otherwise an atomic
     /// read-merge-write is performed under a single `io_lock` hold so
     /// concurrent partial writes to the same chunk cannot lose each other's
@@ -323,10 +324,10 @@ impl ChunkCache {
     /// fetch). On a partial-chunk cache miss the full chunk is fetched from
     /// the store; if the chunk does not exist yet (write beyond EOF / hole
     /// fill), it is treated as all-zeros before the patch is applied.
-    pub(super) fn patch_chunk(&self, tag: &ChunkTag, block_offset: u32, data: &[u8]) -> Result<()> {
+    pub(super) fn patch_chunk(&self, tag: &ChunkTag, block_idx: u32, data: &[u8]) -> Result<()> {
         debug_assert!(!data.is_empty());
         debug_assert_eq!(data.len() % BLCKSZ, 0);
-        let byte_offset = block_offset as usize * BLCKSZ;
+        let byte_offset = block_idx as usize * BLCKSZ;
         debug_assert!(byte_offset + data.len() <= CHUNK_SIZE);
         let is_full_chunk = byte_offset == 0 && data.len() == CHUNK_SIZE;
 

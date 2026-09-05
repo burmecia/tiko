@@ -68,7 +68,7 @@ impl Store {
             return Ok(meta);
         }
 
-        Err(Error::not_found("relfork not found"))
+        Err(Error::not_found("relfork not found in storage"))
     }
 
     pub(crate) fn put_meta(&self, rf: &RelFork, meta: &RelForkMeta) -> Result<()> {
@@ -93,19 +93,20 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn get_nblocks(&self, rf: &RelFork) -> Result<BlockNumber> {
+    fn get_live_meta(&self, rf: &RelFork) -> Result<RelForkMeta> {
         let meta = self.get_meta(rf)?;
         if meta.deleted {
             return Err(Error::not_found("relfork is deleted"));
         }
-        Ok(meta.nblocks)
+        Ok(meta)
+    }
+
+    pub(crate) fn get_nblocks(&self, rf: &RelFork) -> Result<BlockNumber> {
+        Ok(self.get_live_meta(rf)?.nblocks)
     }
 
     pub(crate) fn put_nblocks(&self, rf: &RelFork, nblocks: BlockNumber) -> Result<()> {
-        let mut meta = self.get_meta(rf)?;
-        if meta.deleted {
-            return Err(Error::not_found("relfork is deleted"));
-        }
+        let mut meta = self.get_live_meta(rf)?;
         meta.nblocks = nblocks;
         self.put_meta(rf, &meta)
     }
@@ -129,10 +130,7 @@ impl Store {
     }
 
     pub(crate) fn delete_relfork(&self, rf: &RelFork) -> Result<()> {
-        let mut meta = self.get_meta(rf)?;
-        if meta.deleted {
-            return Err(Error::not_found("relfork is deleted"));
-        }
+        let mut meta = self.get_live_meta(rf)?;
         meta.deleted = true;
         self.put_meta(rf, &meta)
     }

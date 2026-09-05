@@ -122,7 +122,7 @@ fn get_chunk_merge(
         let temp_buf = &mut vec![0u8; CHUNK_SIZE];
         get_chunk(&chunk_item.tag, temp_buf)?;
 
-        let offset = chunk_item.block_offset as usize * BLCKSZ;
+        let offset = chunk_item.block_idx as usize * BLCKSZ;
         dst.copy_from_slice(&temp_buf[offset..offset + dst.len()]);
     }
     Ok(())
@@ -209,11 +209,11 @@ pub fn write_blocks(
         if IoControl::cache_is_available() {
             // patch_chunk handles both full-chunk overwrites and partial-chunk
             // atomic RMWs under io_lock.
-            IoControl::get_cache().patch_chunk(&item.tag, item.block_offset, chunk_data)?;
+            IoControl::get_cache().patch_chunk(&item.tag, item.block_idx, chunk_data)?;
         } else {
             // Cache-unavailable path (initdb): single-threaded, so no io_lock
             // is needed. Do the read-merge-write inline.
-            Store::get().patch_chunk(&item.tag, item.block_offset, chunk_data)?;
+            Store::get().patch_chunk(&item.tag, item.block_idx, chunk_data)?;
         }
     }
 

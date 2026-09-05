@@ -67,11 +67,11 @@ impl Store {
         Err(Error::not_found("chunk not found in storage"))
     }
 
-    pub(crate) fn patch_chunk(&self, tag: &ChunkTag, block_offset: u32, data: &[u8]) -> Result<()> {
+    pub(crate) fn patch_chunk(&self, tag: &ChunkTag, block_idx: u32, data: &[u8]) -> Result<()> {
         debug_assert!(!data.is_empty());
         debug_assert_eq!(data.len() % BLCKSZ, 0);
 
-        let byte_offset = block_offset as usize * BLCKSZ;
+        let byte_offset = block_idx as usize * BLCKSZ;
         debug_assert!(byte_offset + data.len() <= CHUNK_SIZE);
 
         let is_full_chunk = byte_offset == 0 && data.len() == CHUNK_SIZE;
@@ -84,9 +84,10 @@ impl Store {
         // `IoControl::get()` is always valid here: `tiko_init` ran via
         // `smgrinit` for every mode that can call `patch_chunk`.
         let io_control = IoControl::get();
-        let _timeline_guard = io_control.timeline.lock.read();
+        let timeline = &io_control.timeline;
+        let _timeline_guard = timeline.lock.read();
 
-        let head_ckpt = io_control.timeline.head_ckpt;
+        let head_ckpt = timeline.head_ckpt;
         let key = self.ns.chunk(tag, &head_ckpt);
 
         if is_full_chunk {
@@ -102,7 +103,9 @@ impl Store {
             self.storage_put(&key, &merged)?;
         };
 
+        // Record the chunk into the draft buffer
         self.record_chunk_eviction(*tag);
+
         Ok(())
     }
 }

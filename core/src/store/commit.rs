@@ -26,14 +26,14 @@ impl Store {
             Err(e) if e.is_not_found() => TimelineSegment::new(segment_id),
             Err(e) => return Err(e),
         };
-        let summary = CheckpointSummary::new(
+        let cs = CheckpointSummary::new(
             commit_ckpt,
             prev_ckpt,
             redo_ckpt,
             drained.chunks,
             drained.relforks,
         );
-        seg.push(summary.clone());
+        seg.push(cs.clone());
 
         // Write `segment` to storage (overwriting any previous version at the
         // same key). Subsequent commits in the same segment LSN range will
@@ -42,7 +42,7 @@ impl Store {
         let bytes = seg.to_bytes()?;
         self.storage.put(&key, &bytes)?;
 
-        Ok(summary)
+        Ok(cs)
     }
 
     /// Run the segment-based commit protocol — entry point called by the
@@ -91,23 +91,23 @@ impl Store {
         // 2. Acquire the write lock. Waits for all in-flight read-lock
         //    holders (the flush above, concurrent backend evictions) to
         //    drain.
-        let _write_guard = io_control.timeline.lock.write();
-
-        let prev_ckpt = io_control.timeline.head_ckpt;
         let timeline = &io_control.timeline;
+        let _write_guard = timeline.lock.write();
+
+        let prev_ckpt = timeline.head_ckpt;
         timeline.set_redo_ckpt(*redo_ckpt);
 
         // Drain the centralized shmem draft ring + its on-disk spill file.
         // Non-destructive: the spill file survives until the segment PUT is
         // durable, so a failed commit retries with the same contents.
         let drained = timeline.draft.drain(&self.draft_spill)?;
-        let summary = self.commit_segment(*commit_ckpt, prev_ckpt, *redo_ckpt, drained)?;
+        let cs = self.commit_segment(*commit_ckpt, prev_ckpt, *redo_ckpt, drained)?;
 
         timeline.push_active(
             *commit_ckpt,
             prev_ckpt,
-            summary.chunks.iter().copied(),
-            summary.relforks.iter().map(|(rf, meta)| (*rf, *meta)),
+            cs.chunks.iter().copied(),
+            cs.relforks.iter().map(|(rf, meta)| (*rf, *meta)),
         );
 
         // Segment is durable; discard the drained draft.
@@ -118,8 +118,8 @@ impl Store {
 
         pg_log_debug1(format!(
             "tiko: run_commit_protocol at {commit_ckpt}: prev={prev_ckpt} chunks={} relforks={}",
-            summary.chunks.len(),
-            summary.relforks.len(),
+            cs.chunks.len(),
+            cs.relforks.len(),
         ));
 
         Ok(())

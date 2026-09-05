@@ -81,8 +81,8 @@ impl CacheControl {
     }
 
     /// Partial-chunk atomic RMW — see `ChunkCache::patch_chunk`.
-    pub(crate) fn patch_chunk(&self, tag: &ChunkTag, block_offset: u32, data: &[u8]) -> Result<()> {
-        self.chunk_cache.patch_chunk(tag, block_offset, data)
+    pub(crate) fn patch_chunk(&self, tag: &ChunkTag, block_idx: u32, data: &[u8]) -> Result<()> {
+        self.chunk_cache.patch_chunk(tag, block_idx, data)
     }
 
     // ----- new flush interface -----

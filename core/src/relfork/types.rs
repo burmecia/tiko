@@ -141,8 +141,8 @@ pub(crate) struct ChunkTagIterItem {
     pub tag: ChunkTag,
     /// True when all `BLOCKS_PER_CHUNK` blocks of the chunk are covered.
     pub is_full_chunk: bool,
-    /// First block's offset within the chunk (0..BLOCKS_PER_CHUNK).
-    pub block_offset: BlockNumber,
+    /// Index of the first block within the chunk (0..BLOCKS_PER_CHUNK).
+    pub block_idx: BlockNumber,
     /// Byte offset of this chunk's slice in the caller's buffer.
     pub buf_offset: usize,
     /// One-past-the-end byte offset of this chunk's slice in the caller's buffer.
@@ -169,7 +169,7 @@ impl Iterator for ChunkTagIter {
         }
         let tag = self.current;
         let nblks = tag.end_block().min(self.end_block) - self.blkno + 1;
-        let block_offset = self.blkno - tag.start_block();
+        let block_idx = self.blkno - tag.start_block();
         let buf_offset = (self.blkno - self.start_block) as usize * BLCKSZ;
         let buf_end = buf_offset + nblks as usize * BLCKSZ;
         let is_full_chunk = nblks == BLOCKS_PER_CHUNK;
@@ -178,7 +178,7 @@ impl Iterator for ChunkTagIter {
         Some(ChunkTagIterItem {
             tag,
             is_full_chunk,
-            block_offset,
+            block_idx,
             buf_offset,
             buf_end,
         })

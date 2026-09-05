@@ -518,6 +518,7 @@ impl Store {
         }
 
         timeline.hydrated.store(true, Ordering::Release);
+
         Ok(())
     }
 }
