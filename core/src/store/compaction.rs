@@ -73,20 +73,19 @@ impl Store {
     /// never has to consult "future" segments (which would leak post-target
     /// state).
     ///
-    /// The manifest is keyed/headered at `applied.checkpoint` (the highest
-    /// folded checkpoint that actually changed data, ≤ `target`), keeping the
-    /// storage key, TIKM header and shmem `base_ckpt` consistent. If the
-    /// backup's own segment had no dirty data, `applied.checkpoint` is the
-    /// previous checkpoint — which already represents the backup's state, so
-    /// `materialize_base_manifest_at(target)` still resolves correctly.
+    /// The manifest is keyed/headered at the highest folded checkpoint
+    /// (≤ `target`; normally the backup's own commit summary), so the
+    /// storage key, TIKM header and shmem `base_ckpt` always agree and
+    /// `materialize_base_manifest_at(target)` resolves it via "newest key
+    /// ≤ target".
     pub fn run_compaction_through(&self, target: Checkpoint) -> Result<CompactionResult> {
         self.compact_impl(target, true)
     }
 
     // Shared fold-and-publish body. `inclusive` (basebackup) includes `upper`
-    // itself and keys the new base at `applied.checkpoint` (highest summary
-    // that changed data); exclusive (tick) stops below `upper` and keys at
-    // the last summary in range.
+    // itself; exclusive (tick) stops below `upper`. Both key the new base at
+    // `applied.checkpoint` — the last folded summary — so the storage key,
+    // TIKM header and shmem `base_ckpt` always agree.
     fn compact_impl(&self, upper: Checkpoint, inclusive: bool) -> Result<CompactionResult> {
         let io_control = match IoControl::try_get() {
             Some(c) => c,
@@ -148,11 +147,7 @@ impl Store {
         //      until they drop their `Arc`.
         let current = self.base_manifest()?;
         let applied = current.apply_segments(&to_apply, self.ns.db_id)?;
-        let new_base_ckpt = if inclusive {
-            applied.checkpoint
-        } else {
-            to_apply.last().unwrap().ckpt
-        };
+        let new_base_ckpt = applied.checkpoint;
         let key = self.ns.base_manifest(&new_base_ckpt);
         self.storage.put(&key, &applied.bytes)?;
 
@@ -165,6 +160,7 @@ impl Store {
                 return Ok(CompactionResult::Raced);
             }
             let new_manifest = Arc::new(current.commit_applied(applied)?);
+            debug_assert_eq!(new_manifest.checkpoint(), new_base_ckpt);
             timeline.set_base_ckpt(new_base_ckpt);
             new_manifest
         };

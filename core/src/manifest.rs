@@ -404,8 +404,10 @@ impl Manifest {
     /// - `meta_map` entries are last-write-wins by iteration order; segments
     ///   are processed in the order given, so the newest segment's
     ///   `RelForkMeta` per relfork wins.
-    /// - `checkpoint_lsn` and `timestamp` advance to the newest non-empty
-    ///   segment-checkpoint's values.
+    /// - `checkpoint` advances to the newest segment checkpoint — empty
+    ///   summaries included, so the header agrees with the S3 key and the
+    ///   shmem `base_ckpt` the compactor publishes. `timestamp` advances to
+    ///   the current time.
     /// - An empty `segments` slice is a no-op.
     ///
     /// Compute the merged manifest from `segments` applied on top of `self`.
@@ -443,12 +445,12 @@ impl Manifest {
             .unwrap_or(self.redo_ckpt);
         let mut combined: Vec<(ChunkTag, ChunkRef)> = Vec::new();
         let mut new_meta: HashMap<RelFork, RelForkMeta> = HashMap::new();
-        let mut last_ckpt = self.checkpoint;
+        // Advance to the last in-range checkpoint even when it changed no
+        // data — the compactor keys the S3 object and shmem `base_ckpt` at
+        // the same value, and all three must agree.
+        let last_ckpt = segments.last().map(|s| s.ckpt).unwrap_or(self.checkpoint);
         let mut last_ts = self.timestamp;
         for seg in segments {
-            if !seg.chunks.is_empty() || !seg.relforks.is_empty() {
-                last_ckpt = seg.ckpt;
-            }
             let cref = ChunkRef {
                 db_id,
                 timeline_id: seg.prev_ckpt.timeline_id.as_u32(),
@@ -891,6 +893,42 @@ mod tests {
         // Survives open_local (reads the header from the TIKM file).
         let reopened = Manifest::open_local(dir2.path()).unwrap();
         assert_eq!(reopened.redo_ckpt.lsn.as_u64(), 190);
+    }
+
+    #[test]
+    fn apply_segments_checkpoint_advances_past_empty_tail() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        let s1 = segment(100, 0, &[tag(1, 0)], &[]);
+        let s2 = segment(200, 100, &[], &[]); // empty summary
+        let applied = base.apply_segments(&[s1, s2], 34).unwrap();
+
+        // The header advances to the last in-range checkpoint even though it
+        // changed nothing — the S3 key and shmem `base_ckpt` use that value.
+        assert_eq!(applied.checkpoint, ckpt(200));
+        let base = base.commit_applied(applied).unwrap();
+        assert_eq!(base.checkpoint(), ckpt(200));
+        assert!(base.lookup(&tag(1, 0)).unwrap().is_some());
+
+        let reopened = Manifest::open_local(dir.path()).unwrap();
+        assert_eq!(reopened.checkpoint(), ckpt(200));
+    }
+
+    #[test]
+    fn apply_segments_all_empty_still_advances_checkpoint() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        let applied = base
+            .apply_segments(
+                &[segment(100, 0, &[], &[]), segment(200, 100, &[], &[])],
+                34,
+            )
+            .unwrap();
+        assert_eq!(applied.checkpoint, ckpt(200));
+        assert!(applied.chunks.is_empty());
+        assert!(applied.meta.is_empty());
     }
 
     #[test]

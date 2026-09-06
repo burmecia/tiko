@@ -212,15 +212,14 @@ impl Store {
     /// `ckpt`: download the newest base manifest at or before `ckpt` and write
     /// it as the live TIKM cache file.
     ///
-    /// The basebackup checkpoint's own segment sits a little above the base
-    /// manifest produced by compaction (compaction folds strictly below the
-    /// checkpoint's redo), so the manifest at *exactly* `ckpt` may not exist.
-    /// The newest manifest `<= ckpt` is the correct anchor: the recovering smgr
-    /// seeds `base_ckpt` from it and supplements with the segments above it
-    /// (including the backup checkpoint's own segment) to resolve chunks at the
-    /// backup LSN. The atomic publish (per-PID tmp + rename inside
-    /// `Manifest::from_bytes` → `write_tikm`) means a crash never leaves a
-    /// partial file.
+    /// The basebackup compaction folds through `ckpt` inclusive and keys the
+    /// manifest at the highest folded checkpoint (`<= ckpt`, normally `ckpt`
+    /// itself), so the newest manifest `<= ckpt` is the correct anchor: the
+    /// recovering smgr seeds `base_ckpt` from it and resolves everything at
+    /// the backup LSN from the manifest alone (pre-recovery segments are
+    /// deleted — see [`Self::delete_all_segments`]). The atomic publish
+    /// (per-PID tmp + rename inside [`Manifest::from_bytes`] → `write_tikm`)
+    /// means a crash never leaves a partial file.
     pub fn materialize_base_manifest_at(&self, ckpt: Checkpoint) -> Result<()> {
         let keys = self.storage_list_prefix(&self.ns.bases_dir())?;
         let target_base = keys
@@ -256,9 +255,9 @@ impl Store {
     /// chunk versions (carrying `db_id = branch_db_id`) when it dirties them.
     ///
     /// `ckpt` is typically the `CHECKPOINT_CAUSE_BASEBACKUP` checkpoint; the
-    /// manifest may be keyed slightly below it (if the basebackup segment had
-    /// no dirty data, `run_compaction_through` keys at the previous checkpoint
-    /// — which represents the same state).
+    /// manifest is keyed at the highest folded checkpoint `<= ckpt` (normally
+    /// `ckpt` itself), and the "newest key `<= ckpt`" selection below resolves
+    /// it either way.
     pub fn seed_branch_base_manifest(
         &self,
         parent_db_id: u64,
