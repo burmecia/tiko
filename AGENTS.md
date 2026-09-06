@@ -265,6 +265,12 @@ recovery.
 - Tokio worker threads may touch shmem atomics, `memcpy` buffers, do I/O, and
   `SetLatch` — they must **not** call `ConditionVariable*`, `LWLock*`,
   `ereport`/`elog`, or `palloc`/`pfree` (those are PG process-local).
+- `pgsys::logging::pg_log*` is thread-aware: direct `elog` on the process's
+  marked PG thread, queued for later emission from any other thread (the
+  tikoworker main loop drains the queue via `drain_relay`). tikoworker marks
+  its main thread with `mark_pg_thread()` at `worker_main` entry, before the
+  Tokio runtime starts. Raw `ereport`/`elog` FFI remains forbidden off the
+  PG thread.
 - Hook chaining: always save and call the `prev_*_hook` before installing your own.
 
 ## Notes that differ from defaults

@@ -59,6 +59,11 @@ static mut WAIT_EVENT_TIKO_WORKER_MAIN: u32 = 0;
 /// Main event loop for worker
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
+    // Designate this as the elog-safe PG thread BEFORE any Tokio threads are
+    // spawned — pg_log_* from those threads relays here instead of calling
+    // elog off-thread (UB).
+    mark_pg_thread();
+
     pg_log_info("tiko: main loop starting");
 
     setup_signal_handlers();
@@ -127,6 +132,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
 
         // Forward any log messages queued by Tokio threads.
         log_relay::drain(&log_rx);
+        drain_relay();
 
         // Pop from submit queue and dispatch to Tokio
         match io_control.poll_submit_queue(|request| dispatcher.send_work(request)) {
@@ -166,6 +172,9 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         // Wait for new work or timeout
         wait_for_work();
     }
+
+    // Flush anything relayed during the final iterations.
+    drain_relay();
 
     io_control.stats.log_summary();
     pg_log_info(&format!(
