@@ -23,6 +23,11 @@ impl Lsn {
         self.0
     }
 
+    #[inline(always)]
+    pub const fn is_invalid(self) -> bool {
+        self.0 == Self::INVALID.0
+    }
+
     /// Format as fixed-width uppercase hex (`{:016X}`), suitable for PITR/S3 key suffixes.
     #[inline]
     pub fn to_hex(self) -> String {
