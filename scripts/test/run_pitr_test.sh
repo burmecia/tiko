@@ -3,6 +3,8 @@
 # PITR end-to-end test: take a pg_basebackup, mutate, recover to a target LSN,
 # and verify the recovered state (base-backup rows via the smgr cache-miss path
 # + WAL-replayed rows). Exercises the full tiko_pitr backup/recover flow.
+# Step 7 is a regression test for the compaction fold across the recovery
+# boundary: recovered data must survive folding + active-window eviction.
 
 set -e  # Exit on any error
 
@@ -13,6 +15,8 @@ ipcs -m | awk "/$(whoami)/"'{print $2}' | xargs ipcrm -m 2>/dev/null || true
 unset TIKO_STORAGE_ROOT TIKO_LOCAL_PATH
 export TIKO_ORG_ID="12"
 export TIKO_DB_ID="34"
+# Fast compactor tick so step 7 can wait for a fold instead of sleeping 60s.
+export TIKO_COMPACT_INTERVAL_SECS="2"
 
 # Pin the macOS deployment target to the SDK's major version (e.g. "26.0").
 # Without this, the Rust `cc` crate (zstd-sys and other C deps compiled into
@@ -79,8 +83,12 @@ $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null
 
 $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" start -w
 
-# 1. Seed the table BEFORE the backup with enough rows to span several pages,
-#    then checkpoint so they land in a segment.
+# 1. Checkpoint once first so the cluster head advances past the genesis
+#    prefix (1-0/0): the table's chunks then land at a prefix with LSN > 0,
+#    so the backup's base manifest references them with LSN > 0. Step 7's
+#    fold regression depends on this — a chunk referenced at the genesis
+#    prefix is overwritten in place by replay, masking a stale fold.
+$PG_BIN_DIR/psql -d postgres -c "checkpoint;"
 $PG_BIN_DIR/psql -d postgres -c \
   "create table pitr_test(id int, data text); insert into pitr_test select g, 'orig' from generate_series(1,200) g; checkpoint;"
 sleep 2
@@ -163,6 +171,55 @@ if [ "${COUNT}" != "201" ]; then
 fi
 if [ "${ID50}" != "orig" ]; then
   echo "PITR FAILED: id=50 should be 'orig' (post-target UPDATE must not be visible), got '${ID50}'" >&2
+  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null || true
+  exit 1
+fi
+
+# 7. Regression: recovered data must survive compaction folding + active-window
+#    eviction. The replay/promote summaries carry refs at the seeded write
+#    prefix; the old bug (LSN-only fold + genesis-prefix head) folded them
+#    BELOW the anchor's refs, so once the summaries aged out of the 64-entry
+#    active window the recovered rows silently reverted to the anchor version.
+#    Post-recovery rows go into a NEW table so pitr_test's chunks stay
+#    untouched (a rewrite would mask a stale fold by re-winning the merge).
+#    70 checkpoints push the recovery summaries out of the active window; the
+#    compactor tick folds them; a restart then clears shmem so reads resolve
+#    purely from the folded base manifest.
+echo "--- fold regression: post-recovery writes + window eviction ---"
+$PG_BIN_DIR/psql -d postgres -c \
+  "create table post_recovery(id int); insert into post_recovery select g from generate_series(1,10) g; checkpoint;"
+FOLD_MARK=$($PG_BIN_DIR/psql -d postgres -Atqc \
+  "select upper(lpad(to_hex(((pg_current_wal_lsn() - '0/0'::pg_lsn))::bigint), 16, '0'))")
+for _ in $(seq 1 70); do
+  $PG_BIN_DIR/psql -d postgres -c "checkpoint;" >/dev/null
+done
+
+echo "--- waiting for compaction past ${FOLD_MARK} ---"
+folded=0
+for _ in $(seq 1 60); do
+  newest=$(ls "${TIKO_STORAGE_ROOT}/s3sim/12/34/bases/00000002/" 2>/dev/null \
+    | sed -n 's/^\([0-9A-F]*\)\.manifest$/\1/p' | sort | tail -1)
+  if [ -n "${newest}" ] && [[ ! "${newest}" < "${FOLD_MARK}" ]]; then
+    folded=1
+    break
+  fi
+  sleep 1
+done
+if [ "${folded}" != "1" ]; then
+  echo "PITR FAILED: compactor never folded past ${FOLD_MARK}" >&2
+  $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null || true
+  exit 1
+fi
+
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w
+$PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" start -w
+
+echo "--- re-verify after fold + restart ---"
+COUNT2=$($PG_BIN_DIR/psql -d postgres -Atqc "select count(*) from pitr_test")
+POST=$($PG_BIN_DIR/psql -d postgres -Atqc "select count(*) from post_recovery")
+echo "pitr_test rows: ${COUNT2} (want 201); post_recovery rows: ${POST} (want 10)"
+if [ "${COUNT2}" != "201" ] || [ "${POST}" != "10" ]; then
+  echo "PITR FAILED: recovered data did not survive compaction folding (stale fold reverted it)" >&2
   $PG_BIN_DIR/pg_ctl -D "${TEST_DIR}" -l "${LOG_FILE}" stop -m fast -w 2>/dev/null || true
   exit 1
 fi

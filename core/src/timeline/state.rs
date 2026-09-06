@@ -144,7 +144,10 @@ impl ActiveCheckpoint {
 /// read it lock-free (Acquire) to decide whether to refresh their local
 /// snapshot.
 ///
-/// Invariant: `base_ckpt < redo_ckpt <= head_ckpt`.
+/// Invariant: `base_ckpt < redo_ckpt <= head_ckpt`. At boot, hydration may
+/// seed `redo_ckpt`/`head_ckpt` to `base_ckpt` when the active window
+/// legitimately starts empty (PITR recovery, branch boot), so equality
+/// holds until the first commit.
 ///
 /// `lock` fences all checkpoint-interval mutations: it serialises advances
 /// to `head_ckpt` / `active_window` against `draft` drains. Read-lock
@@ -230,6 +233,19 @@ impl TimelineState {
             let me = self as *const Self as *mut Self;
             (*me).redo_ckpt = redo_ckpt;
         }
+    }
+
+    /// Set `head_ckpt`. Caller must hold `lock.write()`. Used by startup
+    /// hydration to seed the write prefix when the active window starts
+    /// empty above a non-empty base (PITR recovery, branch boot). Same
+    /// `&self` convention as [`push_active`].
+    pub fn set_head_ckpt(&self, head_ckpt: Checkpoint) {
+        // SAFETY: caller holds the exclusive write lock.
+        unsafe {
+            let me = self as *const Self as *mut Self;
+            (*me).head_ckpt = head_ckpt;
+        }
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Set `base_ckpt`. Caller must hold `lock.write()`. Used by the

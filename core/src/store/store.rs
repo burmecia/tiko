@@ -517,6 +517,31 @@ impl Store {
             }
         }
 
+        // The active window legitimately starts empty above a non-empty base
+        // in two cases: PITR recovery (hydration deliberately skipped; the
+        // segments above the anchor were deleted by `tiko_pitr recover`) and
+        // a branch boot (fresh namespace holding only the seeded parent
+        // manifest). Seed head/redo to the base checkpoint so the first
+        // interval's chunks land at a prefix that (a) holds no
+        // manifest-referenced objects and (b) wins the compaction fold
+        // against every anchor ref: checkpoint LSNs strictly increase
+        // (`ProcLastRecPtr`), so every ref in the base manifest sits
+        // strictly below `base_ckpt` in the `(timeline_id, lsn)` fold order.
+        // Without this, head would stay at the default `1-0/0`, recycling
+        // the genesis prefix; the folded refs would then lose to the
+        // anchor's higher-LSN refs and recovered data would silently revert
+        // once the summary ages out of the active window.
+        // A failed segment scan above propagates instead of seeding: with
+        // pending segments above the base, no seed prefix is provably
+        // collision-free.
+        if base_ckpt != Checkpoint::default() && timeline.head_ckpt == Checkpoint::default() {
+            timeline.set_head_ckpt(base_ckpt);
+            timeline.set_redo_ckpt(base_ckpt);
+            pg_log_info(format!(
+                "tiko: seeded empty timeline head/redo at base checkpoint {base_ckpt}"
+            ));
+        }
+
         timeline.hydrated.store(true, Ordering::Release);
 
         Ok(())

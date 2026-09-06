@@ -61,9 +61,9 @@ pub async fn compactor_task(
             _ = interval.tick() => {
                 // While the cluster is in archive/crash recovery the base manifest is
                 // the PITR anchor — the compactor must not touch state. (It would be a
-                // no-op anyway: head_ckpt stays at default until the end-of-recovery
-                // checkpoint and the pre-recovery segments are deleted, so
-                // `run_compaction` would return `NoNewSegments`. Skip explicitly for
+                // no-op anyway: head/redo stay seeded at the base checkpoint until the
+                // end-of-recovery checkpoint and the pre-recovery segments are deleted,
+                // so `run_compaction` would return `NoNewSegments`. Skip explicitly for
                 // clarity and defense-in-depth.) Resumes automatically once recovery
                 // finishes (promote).
                 if recovery_in_progress() {

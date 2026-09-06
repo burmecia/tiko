@@ -399,8 +399,14 @@ impl Manifest {
     ///   to the same checkpoint prefix used at write time
     ///   (`segment.prev_ckpt`), matching the S3 layout consumed by
     ///   [`crate::DbNamespace::chunk_base`].
-    /// - On conflict (same `ChunkTag` appears in multiple segments), the
-    ///   higher-LSN `ChunkRef` wins.
+    /// - On conflict (same `ChunkTag` appears in multiple segments, or in a
+    ///   segment and the base), the `ChunkRef` with the higher
+    ///   `(timeline_id, lsn)` wins — the same total order as [`Checkpoint`].
+    ///   Write prefixes advance monotonically in this order (checkpoint LSNs
+    ///   strictly increase, and a post-recovery timeline is always higher),
+    ///   so the newest write wins even when the new timeline's LSNs are
+    ///   lower than the discarded old timeline's (recovery to an earlier
+    ///   point). A bare LSN comparison would resurrect the old version.
     /// - `meta_map` entries are last-write-wins by iteration order; segments
     ///   are processed in the order given, so the newest segment's
     ///   `RelForkMeta` per relfork wins.
@@ -466,8 +472,12 @@ impl Manifest {
         }
         last_ts = chrono::Utc::now().timestamp().max(last_ts);
 
-        // 2. Sort by (tag asc, lsn desc); dedup keeping the highest-LSN entry.
-        combined.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.lsn.cmp(&a.1.lsn)));
+        // 2. Sort by (tag asc, (timeline_id, lsn) desc); dedup keeps the
+        //    newest entry in Checkpoint order.
+        combined.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| (b.1.timeline_id, b.1.lsn).cmp(&(a.1.timeline_id, a.1.lsn)))
+        });
         combined.dedup_by_key(|(tag, _)| *tag);
 
         // 3. Two-pointer merge of existing base chunks + new combined.
@@ -487,7 +497,9 @@ impl Manifest {
                     ci += 1;
                 }
                 Ordering::Equal => {
-                    if combined[ci].1.lsn > base_entries[bi].1.lsn {
+                    if (combined[ci].1.timeline_id, combined[ci].1.lsn)
+                        > (base_entries[bi].1.timeline_id, base_entries[bi].1.lsn)
+                    {
                         output.push(combined[ci]);
                     } else {
                         output.push(base_entries[bi]);
@@ -730,6 +742,24 @@ mod tests {
         Checkpoint::new(TimelineId::new(1), Lsn::new(lsn))
     }
 
+    fn ckpt_tl(tl: u32, lsn: u64) -> Checkpoint {
+        Checkpoint::new(TimelineId::new(tl), Lsn::new(lsn))
+    }
+
+    fn segment_at(ckpt: Checkpoint, prev_ckpt: Checkpoint, tags: &[ChunkTag]) -> CheckpointSummary {
+        let mut s = CheckpointSummary::new(
+            ckpt,
+            prev_ckpt,
+            Checkpoint::default(),
+            HashSet::new(),
+            HashMap::new(),
+        );
+        for t in tags {
+            s.chunks.insert(*t);
+        }
+        s
+    }
+
     fn segment(
         ckpt_lsn: u64,
         prev_lsn: u64,
@@ -929,6 +959,65 @@ mod tests {
         assert_eq!(applied.checkpoint, ckpt(200));
         assert!(applied.chunks.is_empty());
         assert!(applied.meta.is_empty());
+    }
+
+    #[test]
+    fn apply_segments_newer_timeline_wins_despite_lower_lsn() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        // Anchor: tag sealed on timeline 1 at LSN 100.
+        let applied = base
+            .apply_segments(&[segment_at(ckpt(200), ckpt(100), &[tag(1, 0)])], 34)
+            .unwrap();
+        let base = base.commit_applied(applied).unwrap();
+        let r = base.lookup(&tag(1, 0)).unwrap().unwrap();
+        assert_eq!((r.timeline_id, r.lsn.as_u64()), (1, 100));
+
+        // Recovery rewound below LSN 100; the new timeline 2 rewrote the
+        // chunk at LSN 60. The new-timeline ref is the newest write and
+        // must win despite the lower LSN — recovery targets sit below the
+        // old timeline's head by construction.
+        let s2 = segment_at(ckpt_tl(2, 80), ckpt_tl(2, 60), &[tag(1, 0)]);
+        let applied = base.apply_segments(&[s2], 34).unwrap();
+        let base = base.commit_applied(applied).unwrap();
+        let r = base.lookup(&tag(1, 0)).unwrap().unwrap();
+        assert_eq!((r.timeline_id, r.lsn.as_u64()), (2, 60));
+    }
+
+    #[test]
+    fn apply_segments_dedup_prefers_newer_timeline() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        // Same tag written on timeline 1, then again on timeline 2 at a
+        // lower LSN (post-recovery LSNs restart below the old head). The
+        // timeline-2 write happened later and must win the dedup.
+        let s1 = segment_at(ckpt_tl(1, 200), ckpt_tl(1, 150), &[tag(1, 0)]);
+        let s2 = segment_at(ckpt_tl(2, 80), ckpt_tl(2, 60), &[tag(1, 0)]);
+        let applied = base.apply_segments(&[s1, s2], 34).unwrap();
+
+        assert_eq!(applied.chunks.len(), 1);
+        let (_, r) = applied.chunks[0];
+        assert_eq!((r.timeline_id, r.lsn.as_u64()), (2, 60));
+    }
+
+    #[test]
+    fn apply_segments_same_timeline_higher_lsn_still_wins() {
+        let dir = tempdir().unwrap();
+        let base = Manifest::empty(dir.path()).unwrap();
+
+        let applied = base
+            .apply_segments(&[segment_at(ckpt(200), ckpt(100), &[tag(1, 0)])], 34)
+            .unwrap();
+        let base = base.commit_applied(applied).unwrap();
+
+        // Same timeline, higher LSN: unchanged behaviour.
+        let s2 = segment_at(ckpt(300), ckpt(150), &[tag(1, 0)]);
+        let applied = base.apply_segments(&[s2], 34).unwrap();
+        let base = base.commit_applied(applied).unwrap();
+        let r = base.lookup(&tag(1, 0)).unwrap().unwrap();
+        assert_eq!((r.timeline_id, r.lsn.as_u64()), (1, 150));
     }
 
     #[test]
