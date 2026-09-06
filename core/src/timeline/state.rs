@@ -138,21 +138,24 @@ impl ActiveCheckpoint {
 /// Consolidated shmem state for the timeline subsystem.
 ///
 /// Layout discipline: the plain checkpoint fields and `active_window` are
-/// protected by `lock`. `generation`, `hydrated`, `draft` and
-/// `compaction_request` are internally synchronised and safe to access
-/// lock-free. `generation` is bumped (Release) on every commit; backends
-/// read it lock-free (Acquire) to decide whether to refresh their local
-/// snapshot.
+/// mutated under `lock.write()` and read lock-free via the `generation`
+/// seqlock — [`Self::read_seq_begin`] / [`Self::read_seq_validate`] bracket
+/// a snapshot, and any overlapping mutation forces a retry. Seqlock
+/// sections cover only shmem writes (microseconds), never I/O, so retries
+/// are rare and cheap. `hydrated`, `draft` and `compaction_request` are
+/// internally synchronised and safe to access lock-free.
 ///
 /// Invariant: `base_ckpt < redo_ckpt <= head_ckpt`. At boot, hydration may
 /// seed `redo_ckpt`/`head_ckpt` to `base_ckpt` when the active window
 /// legitimately starts empty (PITR recovery, branch boot), so equality
 /// holds until the first commit.
 ///
-/// `lock` fences all checkpoint-interval mutations: it serialises advances
-/// to `head_ckpt` / `active_window` against `draft` drains. Read-lock
-/// holders may mutate `draft` (its own per-shard spinlocks handle producer
-/// concurrency); only the write-lock holder may drain it.
+/// `lock` fences checkpoint-interval *production*: producers record into
+/// `draft` under `lock.read()` (its per-shard spinlocks handle producer
+/// concurrency); only the committer may drain it, under `lock.write()`.
+/// Pure readers never take `lock`. A process dying mid-mutation leaves
+/// `generation` odd and spins readers forever — the same wedge class as
+/// dying with `lock` held (the two are being addressed together).
 #[repr(C)]
 pub struct TimelineState {
     pub(crate) lock: AtomicRWLock,
@@ -198,10 +201,53 @@ impl TimelineState {
         self.compaction_request.init();
     }
 
+    // ── Seqlock (lock-free reads) ──
+
+    /// Begin a lock-free read of the checkpoint fields + active window.
+    /// Spins while a mutation is in progress. Pair every read with
+    /// [`Self::read_seq_validate`]; on `false` discard and retry.
+    pub fn read_seq_begin(&self) -> u64 {
+        loop {
+            let g = self.generation.load(Ordering::Acquire);
+            if g & 1 == 0 {
+                return g;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// True iff no mutation overlapped the read that started at `seq`.
+    pub fn read_seq_validate(&self, seq: u64) -> bool {
+        // Keep the snapshot reads ahead of this load.
+        std::sync::atomic::fence(Ordering::Acquire);
+        self.generation.load(Ordering::Relaxed) == seq
+    }
+
+    /// Lock-free consistent read of `base_ckpt`.
+    pub fn base_ckpt_snapshot(&self) -> Checkpoint {
+        loop {
+            let seq = self.read_seq_begin();
+            let ckpt = self.base_ckpt;
+            if self.read_seq_validate(seq) {
+                return ckpt;
+            }
+        }
+    }
+
+    // Seqlock write side. Callers must hold `lock.write()`; the begin/end
+    // bumps make `generation` odd while mutating and even when stable.
+    fn write_seq_begin(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn write_seq_end(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Push a new active-window entry. Caller must hold `lock.write()` —
     /// this method takes `&self` and casts internally, the standard
     /// convention for shmem-resident types.
-    /// Bumps `generation` (Release) on success; updates `head_ckpt`.
+    /// Updates `head_ckpt`; brackets the mutation with the seqlock.
     pub fn push_active(
         &self,
         ckpt: Checkpoint,
@@ -209,8 +255,11 @@ impl TimelineState {
         chunks: impl IntoIterator<Item = ChunkTag>,
         relforks: impl IntoIterator<Item = (RelFork, RelForkMeta)>,
     ) {
+        self.write_seq_begin();
         // SAFETY: caller holds the exclusive write lock on `self.lock`, so
-        // there are no concurrent readers or writers of any field below.
+        // there are no concurrent writers. Lock-free readers may observe a
+        // torn entry mid-populate; every field is plain data (no invalid
+        // bit patterns) and the seqlock makes them retry.
         unsafe {
             let me = self as *const Self as *mut Self;
             let head = (*me).active_head as usize;
@@ -222,17 +271,20 @@ impl TimelineState {
             }
             (*me).head_ckpt = ckpt;
         }
-        self.generation.fetch_add(1, Ordering::Release);
+        self.write_seq_end();
     }
 
     /// Set `redo_ckpt`. Caller must hold `lock.write()`. Same `&self`
     /// convention as [`push_active`].
     pub fn set_redo_ckpt(&self, redo_ckpt: Checkpoint) {
-        // SAFETY: caller holds the exclusive write lock.
+        self.write_seq_begin();
+        // SAFETY: caller holds the exclusive write lock; seqlock readers
+        // retry (see push_active).
         unsafe {
             let me = self as *const Self as *mut Self;
             (*me).redo_ckpt = redo_ckpt;
         }
+        self.write_seq_end();
     }
 
     /// Set `head_ckpt`. Caller must hold `lock.write()`. Used by startup
@@ -240,28 +292,34 @@ impl TimelineState {
     /// empty above a non-empty base (PITR recovery, branch boot). Same
     /// `&self` convention as [`push_active`].
     pub fn set_head_ckpt(&self, head_ckpt: Checkpoint) {
-        // SAFETY: caller holds the exclusive write lock.
+        self.write_seq_begin();
+        // SAFETY: caller holds the exclusive write lock; seqlock readers
+        // retry (see push_active).
         unsafe {
             let me = self as *const Self as *mut Self;
             (*me).head_ckpt = head_ckpt;
         }
-        self.generation.fetch_add(1, Ordering::Release);
+        self.write_seq_end();
     }
 
     /// Set `base_ckpt`. Caller must hold `lock.write()`. Used by the
     /// compactor to advance the base point and by startup hydration to
     /// recover the value from the base manifest.
     pub fn set_base_ckpt(&self, base_ckpt: Checkpoint) {
-        // SAFETY: caller holds the exclusive write lock.
+        self.write_seq_begin();
+        // SAFETY: caller holds the exclusive write lock; seqlock readers
+        // retry (see push_active).
         unsafe {
             let me = self as *const Self as *mut Self;
             (*me).base_ckpt = base_ckpt;
         }
-        self.generation.fetch_add(1, Ordering::Release);
+        self.write_seq_end();
     }
 
-    /// Iterate active-window entries newest-first. Caller must hold a read
-    /// (or write) lock.
+    /// Iterate active-window entries newest-first. Caller must either hold
+    /// a lock guard or be inside the seqlock read protocol
+    /// ([`Self::read_seq_begin`] / [`Self::read_seq_validate`]) — torn
+    /// entries are possible mid-populate and are discarded by the retry.
     pub fn iter_active(&self) -> impl Iterator<Item = &ActiveCheckpoint> {
         let count = self.active_count as usize;
         let head = self.active_head as usize;
@@ -360,12 +418,81 @@ mod tests {
         s.push_active(ckpt(100), ckpt(0), [tag(1, 0)], std::iter::empty());
         assert_eq!(s.head_ckpt, ckpt(100));
         assert_eq!(s.active_count, 1);
-        assert_eq!(s.generation.load(Ordering::Relaxed), 1);
+        // Seqlock: begin + end per mutation; even means stable.
+        assert_eq!(s.generation.load(Ordering::Relaxed), 2);
 
         s.push_active(ckpt(200), ckpt(100), [tag(2, 0)], std::iter::empty());
         assert_eq!(s.head_ckpt, ckpt(200));
         assert_eq!(s.active_count, 2);
-        assert_eq!(s.generation.load(Ordering::Relaxed), 2);
+        assert_eq!(s.generation.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn timeline_state_seqlock_detects_mutations() {
+        let s = new_timeline_state();
+
+        let seq = s.read_seq_begin();
+        assert!(s.read_seq_validate(seq), "no mutation — must validate");
+
+        s.push_active(ckpt(100), ckpt(0), [tag(1, 0)], std::iter::empty());
+        assert!(
+            !s.read_seq_validate(seq),
+            "a mutation since seq must invalidate it"
+        );
+
+        let seq2 = s.read_seq_begin();
+        assert_eq!(seq2 % 2, 0, "begin always returns an even generation");
+        assert!(s.read_seq_validate(seq2));
+
+        // base_ckpt_snapshot returns a consistent value across mutations.
+        s.set_base_ckpt(ckpt(50));
+        assert_eq!(s.base_ckpt_snapshot(), ckpt(50));
+    }
+
+    #[test]
+    fn timeline_state_seqlock_concurrent_reader_writer() {
+        // Leak to get &'static (TimelineState is Sync but not Send).
+        let s: &'static TimelineState = Box::leak(new_timeline_state());
+        let writer = std::thread::spawn(move || {
+            // Single writer — exclusivity the write lock would provide.
+            for i in 1..=2_000u64 {
+                s.push_active(
+                    ckpt(i * 100),
+                    ckpt((i - 1) * 100),
+                    [tag(1, 0)],
+                    std::iter::empty(),
+                );
+            }
+        });
+
+        let reader = std::thread::spawn(move || {
+            let mut validated = 0;
+            while validated < 200 {
+                let seq = s.read_seq_begin();
+                let head = s.head_ckpt;
+                let walk: Vec<(u64, u64)> = s
+                    .iter_active()
+                    .map(|ac| (ac.ckpt.lsn.as_u64(), ac.prev_ckpt.lsn.as_u64()))
+                    .collect();
+                if !s.read_seq_validate(seq) {
+                    continue; // overlapped a mutation — discard
+                }
+                validated += 1;
+                if let Some(&(newest, _)) = walk.first() {
+                    assert_eq!(
+                        head.lsn.as_u64(),
+                        newest,
+                        "head must equal the newest entry"
+                    );
+                }
+                for w in walk.windows(2) {
+                    assert!(w[0].0 > w[1].0, "walk must be strictly newest-first");
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 
     #[test]

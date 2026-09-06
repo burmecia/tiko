@@ -178,8 +178,10 @@ impl Store {
     /// reload from S3 inside the lock so concurrent reloaders serialise on
     /// the local TIKM file write.
     pub(crate) fn base_manifest(&self) -> Result<Arc<Manifest>> {
+        // Seqlock-consistent read: a torn `base_ckpt` mid-compaction would
+        // make us load a manifest key that doesn't exist.
         let target = IoControl::try_get()
-            .map(|c| c.timeline.base_ckpt)
+            .map(|c| c.timeline.base_ckpt_snapshot())
             .unwrap_or_default();
 
         let mut guard = self.base_manifest.lock()?;

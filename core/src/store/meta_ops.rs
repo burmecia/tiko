@@ -12,63 +12,79 @@ impl Store {
 
     pub(crate) fn get_meta(&self, rf: &RelFork) -> Result<RelForkMeta> {
         if let Some(io_control) = IoControl::try_get() {
-            let _guard = io_control.timeline.lock.read();
-
+            // Lock-free read under the seqlock, same protocol as
+            // `Store::get_chunk`: retry the probe if a commit/compaction
+            // mutated the timeline state mid-probe.
             let timeline = &io_control.timeline;
-            let head_ckpt = timeline.head_ckpt;
-            let base_ckpt = timeline.base_ckpt;
-
-            // 1. Live interval: shmem draft buffer is the sole source of
-            //    truth for uncommitted writes. Falls back to the spill file
-            //    transparently if the in-memory zone has been drained.
-            if let Some(meta) = timeline.draft.get_relfork(rf, &self.draft_spill)? {
-                return Ok(meta);
-            }
-
-            // 2. Active window newest → oldest, gated by inline relfork index.
-            //    A `Hit` returns directly; a `DefinitiveMiss` means the relfork
-            //    was not touched in that checkpoint (safe to skip).
-            //    An `Inconclusive` (index overflowed) means the relfork *may*
-            //    have been written in this checkpoint — we must stop the
-            //    in-memory walk and let the segment scan find the truth.
-            //    Continuing past an Inconclusive would risk returning a stale
-            //    `Hit` from an older active checkpoint while a newer write
-            //    sits unread in the overflowed checkpoint's segment file.
-            let mut oldest_active_ckpt: Option<Checkpoint> = None;
-            for ac in timeline.iter_active() {
-                oldest_active_ckpt = Some(ac.ckpt);
-                match ac.relfork_index.get(rf) {
-                    RelForkLookup::Hit(meta) => return Ok(meta),
-                    RelForkLookup::DefinitiveMiss => continue,
-                    RelForkLookup::Inconclusive => break,
+            loop {
+                let seq = timeline.read_seq_begin();
+                let found = self.get_meta_probe(io_control, rf)?;
+                if timeline.read_seq_validate(seq) {
+                    if let Some(meta) = found {
+                        return Ok(meta);
+                    }
+                    break;
                 }
-            }
-
-            // 3. Segment scan up to `oldest_active_ckpt` inclusive.
-            //    - If the loop broke on Inconclusive at K, `oldest_active_ckpt`
-            //      is K and we need K's segment file (it may carry the rf
-            //      even though K's inline index didn't expose it). Active
-            //      checkpoints newer than K reported DefinitiveMiss, and
-            //      since a non-overflowed `RelForkIndex` mirrors its
-            //      segment's relfork map exactly, their segments don't
-            //      carry the rf either — no need to re-read them.
-            //    - If every active checkpoint reported DefinitiveMiss, the
-            //      loop ran to completion and `oldest_active_ckpt` is the
-            //      oldest active checkpoint. Its segment will be
-            //      re-confirmed empty by the segment scan, which then
-            //      continues down to `base_ckpt`.
-            let seg_top_ckpt = oldest_active_ckpt.unwrap_or(head_ckpt);
-            if let Some(meta) = self.read_relfork_from_segments(rf, base_ckpt, seg_top_ckpt)? {
-                return Ok(meta);
             }
         }
 
-        // 3. Base manifest fallback.
+        // Base manifest fallback.
         if let Some(meta) = self.base_manifest()?.lookup_relfork_meta(rf)? {
             return Ok(meta);
         }
 
         Err(Error::not_found("relfork not found in storage"))
+    }
+
+    /// Probe the draft, active window, and on-disk segments for `rf`'s
+    /// latest meta. Callers must wrap this in the seqlock retry loop (see
+    /// [`get_meta`]) or hold the timeline lock.
+    fn get_meta_probe(&self, io_control: &IoControl, rf: &RelFork) -> Result<Option<RelForkMeta>> {
+        let timeline = &io_control.timeline;
+        let head_ckpt = timeline.head_ckpt;
+        let base_ckpt = timeline.base_ckpt;
+
+        // 1. Live interval: shmem draft buffer is the sole source of
+        //    truth for uncommitted writes. Falls back to the spill file
+        //    transparently if the in-memory zone has been drained.
+        if let Some(meta) = timeline.draft.get_relfork(rf, &self.draft_spill)? {
+            return Ok(Some(meta));
+        }
+
+        // 2. Active window newest → oldest, gated by inline relfork index.
+        //    A `Hit` returns directly; a `DefinitiveMiss` means the relfork
+        //    was not touched in that checkpoint (safe to skip).
+        //    An `Inconclusive` (index overflowed) means the relfork *may*
+        //    have been written in this checkpoint — we must stop the
+        //    in-memory walk and let the segment scan find the truth.
+        //    Continuing past an Inconclusive would risk returning a stale
+        //    `Hit` from an older active checkpoint while a newer write
+        //    sits unread in the overflowed checkpoint's segment file.
+        let mut oldest_active_ckpt: Option<Checkpoint> = None;
+        for ac in timeline.iter_active() {
+            oldest_active_ckpt = Some(ac.ckpt);
+            match ac.relfork_index.get(rf) {
+                RelForkLookup::Hit(meta) => return Ok(Some(meta)),
+                RelForkLookup::DefinitiveMiss => continue,
+                RelForkLookup::Inconclusive => break,
+            }
+        }
+
+        // 3. Segment scan up to `oldest_active_ckpt` inclusive.
+        //    - If the loop broke on Inconclusive at K, `oldest_active_ckpt`
+        //      is K and we need K's segment file (it may carry the rf
+        //      even though K's inline index didn't expose it). Active
+        //      checkpoints newer than K reported DefinitiveMiss, and
+        //      since a non-overflowed `RelForkIndex` mirrors its
+        //      segment's relfork map exactly, their segments don't
+        //      carry the rf either — no need to re-read them.
+        //    - If every active checkpoint reported DefinitiveMiss, the
+        //      loop ran to completion and `oldest_active_ckpt` is the
+        //      oldest active checkpoint. Its segment will be
+        //      re-confirmed empty by the segment scan, which then
+        //      continues down to `base_ckpt`.
+        let seg_top_ckpt = oldest_active_ckpt.unwrap_or(head_ckpt);
+        self.read_relfork_from_segments(rf, base_ckpt, seg_top_ckpt)
     }
 
     pub(crate) fn put_meta(&self, rf: &RelFork, meta: &RelForkMeta) -> Result<()> {

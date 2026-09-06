@@ -57,8 +57,10 @@ impl Store {
     ///    deletes the head segment (the boundary segment straddling
     ///    `base_ckpt` is always retained).
     /// 3. Acquire `timeline.lock.write()`. This is the fence: it blocks
-    ///    until every in-flight reader (the flush above, plus any
-    ///    concurrent backend evictions) has dropped its read lock.
+    ///    until every in-flight producer (the flush above, plus any
+    ///    concurrent backend evictions recording into the draft) has
+    ///    dropped its read lock. Pure readers (`get_chunk`/`get_meta`)
+    ///    are lock-free via the `generation` seqlock and not fenced.
     /// 4. Under the lock: capture `prev_ckpt = head_ckpt`, set `redo_ckpt`,
     ///    drain the cluster-wide shmem [`DraftBuffer`] (plus its on-disk
     ///    spill file), append a `CheckpointSummary` to the pre-loaded

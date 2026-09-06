@@ -15,8 +15,22 @@ impl Store {
 
         match IoControl::try_get() {
             Some(io_control) => {
-                let _guard = io_control.timeline.lock.read();
-                self.get_chunk_locked(io_control, tag, dst)
+                // Lock-free read: snapshot the timeline state via the
+                // seqlock and retry the probe if a commit/compaction
+                // mutated it mid-probe. Seqlock sections cover only shmem
+                // writes (µs), never I/O, so retries are rare.
+                let timeline = &io_control.timeline;
+                loop {
+                    let seq = timeline.read_seq_begin();
+                    let found = self.get_chunk_probe(io_control, tag, dst)?;
+                    if timeline.read_seq_validate(seq) {
+                        if found {
+                            return Ok(());
+                        }
+                        break;
+                    }
+                }
+                self.get_chunk_from_base(tag, dst)
             }
             // No shmem (very early startup): the base manifest is the only
             // readable state.
@@ -24,17 +38,17 @@ impl Store {
         }
     }
 
-    /// [`get_chunk`] with the timeline lock already held (read or write).
-    /// Callers holding a guard must use this: a nested `lock.read()` has no
-    /// recursion exemption — it spins while a writer is pending, and the
-    /// writer spins waiting for this caller's own outstanding read count,
-    /// so the process deadlocks against itself.
-    fn get_chunk_locked(
+    /// Probe the head prefix, active window, and on-disk segments for
+    /// `tag`. Returns `Ok(true)` on a hit (data copied into `dst`).
+    /// Callers must wrap this in the seqlock retry loop (see [`get_chunk`])
+    /// or hold the timeline lock — a torn snapshot could otherwise miss
+    /// data that is actually present.
+    fn get_chunk_probe(
         &self,
         io_control: &IoControl,
         tag: &ChunkTag,
         dst: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let timeline = &io_control.timeline;
 
         let head_ckpt = timeline.head_ckpt;
@@ -49,7 +63,7 @@ impl Store {
         //    impossible (a recorded chunk is either in-memory or in the
         //    spill file, and `contains_chunk` returns true in both cases).
         if timeline.draft.contains_chunk(tag) && self.try_read_chunk_at(tag, &head_ckpt, dst)? {
-            return Ok(());
+            return Ok(true);
         }
 
         // 2. Active window newest → oldest, gated by Bloom filter. Bloom
@@ -62,7 +76,7 @@ impl Store {
                 continue;
             }
             if self.try_read_chunk_at(tag, &ac.prev_ckpt, dst)? {
-                return Ok(());
+                return Ok(true);
             }
         }
 
@@ -71,10 +85,10 @@ impl Store {
         //    probed via the active-window Bloom walk above.
         let seg_top_ckpt = oldest_active_ckpt.unwrap_or(head_ckpt);
         if self.read_chunk_from_segments(tag, base_ckpt, seg_top_ckpt, dst)? {
-            return Ok(());
+            return Ok(true);
         }
 
-        self.get_chunk_from_base(tag, dst)
+        Ok(false)
     }
 
     /// Base-manifest fallback: the chunk's last folded version.
@@ -100,9 +114,11 @@ impl Store {
         let is_full_chunk = byte_offset == 0 && data.len() == CHUNK_SIZE;
 
         // Eviction-flush path: hold the timeline read lock across
-        // (read head_ckpt → PUT → record into draft). The checkpointer
-        // flushes dirty cache state *before* acquiring its write lock,
-        // so this read lock never re-enters from the commit side.
+        // (read head_ckpt → PUT → record into draft) so the commit's write
+        // lock fences its drain against this producer (see
+        // `Store::run_commit_protocol`). The checkpointer flushes dirty
+        // cache state *before* acquiring its write lock, so this read lock
+        // never re-enters from the commit side.
         //
         // `IoControl::get()` is always valid here: `tiko_init` ran via
         // `smgrinit` for every mode that can call `patch_chunk`.
@@ -117,9 +133,8 @@ impl Store {
             self.storage_put(&key, data)?;
         } else {
             let mut merged = vec![0u8; CHUNK_SIZE];
-            // The read guard is already held; `get_chunk` would re-acquire
-            // it and self-deadlock against a pending writer.
-            match self.get_chunk_locked(io_control, tag, &mut merged) {
+            // `get_chunk` is lock-free (seqlock) — safe under the guard.
+            match self.get_chunk(tag, &mut merged) {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {} // chunk absent → treat as zeros
                 Err(e) => return Err(e),
