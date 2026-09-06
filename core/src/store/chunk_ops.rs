@@ -13,49 +13,72 @@ impl Store {
     pub(crate) fn get_chunk(&self, tag: &ChunkTag, dst: &mut [u8]) -> Result<()> {
         debug_assert_eq!(dst.len(), CHUNK_SIZE);
 
-        if let Some(io_control) = IoControl::try_get() {
-            let _guard = io_control.timeline.lock.read();
-            let timeline = &io_control.timeline;
-
-            let head_ckpt = timeline.head_ckpt;
-            let base_ckpt = timeline.base_ckpt;
-
-            // 1. Probe the current head prefix only if the draft buffer
-            //    reports the tag is recorded for this interval. Without this
-            //    gate, every `get_chunk` would speculatively GET head-prefix
-            //    even when the chunk wasn't touched in this interval.
-            //    `contains_chunk` is conservative — false positives degrade
-            //    to the legacy speculative-GET behavior; false negatives are
-            //    impossible (a recorded chunk is either in-memory or in the
-            //    spill file, and `contains_chunk` returns true in both cases).
-            if timeline.draft.contains_chunk(tag) && self.try_read_chunk_at(tag, &head_ckpt, dst)? {
-                return Ok(());
+        match IoControl::try_get() {
+            Some(io_control) => {
+                let _guard = io_control.timeline.lock.read();
+                self.get_chunk_locked(io_control, tag, dst)
             }
+            // No shmem (very early startup): the base manifest is the only
+            // readable state.
+            None => self.get_chunk_from_base(tag, dst),
+        }
+    }
 
-            // 2. Active window newest → oldest, gated by Bloom filter. Bloom
-            //    false positives fall through to the next entry; false
-            //    negatives are impossible.
-            let mut oldest_active_ckpt: Option<Checkpoint> = None;
-            for ac in timeline.iter_active() {
-                oldest_active_ckpt = Some(ac.ckpt);
-                if !ac.chunk_bloom.maybe_contains(tag) {
-                    continue;
-                }
-                if self.try_read_chunk_at(tag, &ac.prev_ckpt, dst)? {
-                    return Ok(());
-                }
+    /// [`get_chunk`] with the timeline lock already held (read or write).
+    /// Callers holding a guard must use this: a nested `lock.read()` has no
+    /// recursion exemption — it spins while a writer is pending, and the
+    /// writer spins waiting for this caller's own outstanding read count,
+    /// so the process deadlocks against itself.
+    fn get_chunk_locked(
+        &self,
+        io_control: &IoControl,
+        tag: &ChunkTag,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let timeline = &io_control.timeline;
+
+        let head_ckpt = timeline.head_ckpt;
+        let base_ckpt = timeline.base_ckpt;
+
+        // 1. Probe the current head prefix only if the draft buffer
+        //    reports the tag is recorded for this interval. Without this
+        //    gate, every `get_chunk` would speculatively GET head-prefix
+        //    even when the chunk wasn't touched in this interval.
+        //    `contains_chunk` is conservative — false positives degrade
+        //    to the legacy speculative-GET behavior; false negatives are
+        //    impossible (a recorded chunk is either in-memory or in the
+        //    spill file, and `contains_chunk` returns true in both cases).
+        if timeline.draft.contains_chunk(tag) && self.try_read_chunk_at(tag, &head_ckpt, dst)? {
+            return Ok(());
+        }
+
+        // 2. Active window newest → oldest, gated by Bloom filter. Bloom
+        //    false positives fall through to the next entry; false
+        //    negatives are impossible.
+        let mut oldest_active_ckpt: Option<Checkpoint> = None;
+        for ac in timeline.iter_active() {
+            oldest_active_ckpt = Some(ac.ckpt);
+            if !ac.chunk_bloom.maybe_contains(tag) {
+                continue;
             }
-
-            // 3. On-disk segments below the active window, down to base_ckpt.
-            //    `oldest_active_ckpt` is exclusive — its data was already
-            //    probed via the active-window Bloom walk above.
-            let seg_top_ckpt = oldest_active_ckpt.unwrap_or(head_ckpt);
-            if self.read_chunk_from_segments(tag, base_ckpt, seg_top_ckpt, dst)? {
+            if self.try_read_chunk_at(tag, &ac.prev_ckpt, dst)? {
                 return Ok(());
             }
         }
 
-        // 4. Base manifest fallback.
+        // 3. On-disk segments below the active window, down to base_ckpt.
+        //    `oldest_active_ckpt` is exclusive — its data was already
+        //    probed via the active-window Bloom walk above.
+        let seg_top_ckpt = oldest_active_ckpt.unwrap_or(head_ckpt);
+        if self.read_chunk_from_segments(tag, base_ckpt, seg_top_ckpt, dst)? {
+            return Ok(());
+        }
+
+        self.get_chunk_from_base(tag, dst)
+    }
+
+    /// Base-manifest fallback: the chunk's last folded version.
+    fn get_chunk_from_base(&self, tag: &ChunkTag, dst: &mut [u8]) -> Result<()> {
         let chunk_ref = self.base_manifest()?.lookup(tag)?;
         if let Some(chunk_ref) = chunk_ref {
             let key = self.ns.chunk_base(tag, &chunk_ref);
@@ -94,7 +117,9 @@ impl Store {
             self.storage_put(&key, data)?;
         } else {
             let mut merged = vec![0u8; CHUNK_SIZE];
-            match self.get_chunk(tag, &mut merged) {
+            // The read guard is already held; `get_chunk` would re-acquire
+            // it and self-deadlock against a pending writer.
+            match self.get_chunk_locked(io_control, tag, &mut merged) {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {} // chunk absent → treat as zeros
                 Err(e) => return Err(e),
