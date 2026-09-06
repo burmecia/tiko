@@ -113,6 +113,9 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
 /// `IoControl` unavailable (very early startup), worker dead, request timed
 /// out, or worker-side error. Local runs are race-safe: compaction re-checks
 /// `base_ckpt` under the timeline write lock and discards duplicate runs.
+/// Either way, `run_compaction_through` retries raced runs and verifies the
+/// result covers the target checkpoint, so an `Ok` from either executor
+/// certifies a complete anchor; `Err` means the anchor is incomplete.
 fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
     if let Some(io_control) = IoControl::try_get()
         && io_control.is_worker_alive()
@@ -167,8 +170,8 @@ fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
     }
 
     if let Err(e) = store.run_compaction_through(commit_ckpt) {
-        pg_log_warning(format!(
-            "tiko: tiko_perform_checkpoint: basebackup compaction failed: {e}"
+        pg_log_error(&format!(
+            "tiko: tiko_perform_checkpoint: basebackup compaction failed at {commit_ckpt}: {e} — this backup's anchor manifest may be incomplete"
         ));
     }
 }

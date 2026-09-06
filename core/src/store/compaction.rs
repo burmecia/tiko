@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::Store;
 use crate::{
-    error::Result,
+    error::{Error, Result},
     io_control::IoControl,
     timeline::{Checkpoint, CheckpointSummary},
 };
@@ -17,7 +17,9 @@ pub enum CompactionResult {
     /// No segment checkpoints exist in the eligible range yet.
     NoNewSegments,
     /// Another compactor advanced `base_ckpt` while we were preparing the
-    /// new base manifest; our work was discarded.
+    /// new base manifest; our work was discarded. Says nothing about how far
+    /// the winner advanced — callers needing a specific coverage point must
+    /// re-check (see [`Store::run_compaction_through`]).
     Raced,
     /// Successfully applied `count` segment checkpoints and advanced
     /// `base_ckpt` to `new_base_ckpt`.
@@ -78,8 +80,38 @@ impl Store {
     /// storage key, TIKM header and shmem `base_ckpt` always agree and
     /// `materialize_base_manifest_at(target)` resolves it via "newest key
     /// ≤ target".
+    /// The anchor is only useful if it COVERS `target`, so this verifies
+    /// coverage before returning: a `Raced` run is retried (the winner may
+    /// have folded to a lower checkpoint — e.g. a tick bounded by redo), and
+    /// any outcome that still leaves `base_ckpt < target` is an error.
+    /// Bounded retries suffice: head/redo are frozen while the basebackup
+    /// checkpoint is in progress, so a lower-upper racer can win at most
+    /// once before the retry applies.
     pub fn run_compaction_through(&self, target: Checkpoint) -> Result<CompactionResult> {
-        self.compact_impl(target, true)
+        const MAX_RACES: u32 = 3;
+        let mut races = 0;
+        loop {
+            let result = self.compact_impl(target, true)?;
+            let base_now = IoControl::try_get().map(|c| {
+                let _guard = c.timeline.lock.read();
+                c.timeline.base_ckpt
+            });
+            // None: no shmem state to verify against (initdb/single-user).
+            let covered = base_now.is_none_or(|b| b >= target);
+            match result {
+                CompactionResult::Raced if !covered && races < MAX_RACES => {
+                    races += 1;
+                    continue;
+                }
+                _ if covered => return Ok(result),
+                _ => {
+                    return Err(Error::other(format!(
+                        "compaction through {target} incomplete: base_ckpt {} does not cover the target",
+                        base_now.unwrap_or_default()
+                    )));
+                }
+            }
+        }
     }
 
     // Shared fold-and-publish body. `inclusive` (basebackup) includes `upper`
