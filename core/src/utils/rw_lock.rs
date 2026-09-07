@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use crate::utils::watchdog::SpinWatch;
+
 /// Spin-based atomic reader-writer lock for hash table partitions.
 /// Lives in PG shared memory. Used instead of PG LWLocks because Tokio
 /// threads also access the hash table and LWLocks require per-process state.
@@ -12,9 +14,15 @@ use std::sync::atomic::{AtomicI32, Ordering};
 /// The WRITER_PENDING bit prevents new readers from entering while a writer
 /// is waiting for existing readers to drain, eliminating writer starvation
 /// under sustained read traffic.
+///
+/// `owner_pid` names the write holder so the wedge watchdog
+/// ([`crate::utils::watchdog`]) in the spin loops can liveness-check it: a
+/// dead holder escalates to a PANIC/crash-restart rather than spinning
+/// forever.
 #[repr(C)]
 pub(crate) struct AtomicRWLock {
     state: AtomicI32,
+    owner_pid: AtomicI32,
 }
 
 const EXCLUSIVE: i32 = -1;
@@ -41,16 +49,29 @@ pub(crate) struct WriteGuard<'a> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
+        self.lock.owner_pid.store(0, Ordering::Relaxed);
         self.lock.state.store(0, Ordering::Release);
     }
+}
+
+fn current_pid() -> i32 {
+    unsafe { libc::getpid() }
 }
 
 impl AtomicRWLock {
     pub(crate) fn init(&self) {
         self.state.store(0, Ordering::Relaxed);
+        self.owner_pid.store(0, Ordering::Relaxed);
+    }
+
+    /// PID of the write holder, 0 when not write-locked (or a momentary
+    /// window between acquisition and the store — spinners re-check).
+    pub(crate) fn owner_pid(&self) -> i32 {
+        self.owner_pid.load(Ordering::Relaxed)
     }
 
     pub(crate) fn read(&self) -> ReadGuard<'_> {
+        let mut watch = SpinWatch::new();
         loop {
             let s = self.state.load(Ordering::Relaxed);
             // Only attempt CAS when not write-locked and no writer is pending.
@@ -63,6 +84,7 @@ impl AtomicRWLock {
             {
                 break;
             }
+            watch.tick("AtomicRWLock read", self.owner_pid());
             std::hint::spin_loop();
         }
 
@@ -70,6 +92,7 @@ impl AtomicRWLock {
     }
 
     pub(crate) fn write(&self) -> WriteGuard<'_> {
+        let mut watch = SpinWatch::new();
         loop {
             // Fast path: unlocked → exclusive.
             if self
@@ -84,6 +107,7 @@ impl AtomicRWLock {
 
             if s == EXCLUSIVE {
                 // Another writer holds the lock.
+                watch.tick("AtomicRWLock write", self.owner_pid());
                 std::hint::spin_loop();
                 continue;
             }
@@ -115,9 +139,12 @@ impl AtomicRWLock {
                 break;
             }
 
+            // Stuck here means readers never drained — no owner to name.
+            watch.tick("AtomicRWLock write (reader drain)", 0);
             std::hint::spin_loop();
         }
 
+        self.owner_pid.store(current_pid(), Ordering::Relaxed);
         WriteGuard { lock: self }
     }
 
@@ -134,6 +161,7 @@ impl AtomicRWLock {
             .compare_exchange(0, EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            self.owner_pid.store(current_pid(), Ordering::Relaxed);
             Some(WriteGuard { lock: self })
         } else {
             None
@@ -149,6 +177,7 @@ mod tests {
     fn new_lock() -> AtomicRWLock {
         let lock = AtomicRWLock {
             state: AtomicI32::new(0),
+            owner_pid: AtomicI32::new(0),
         };
         lock.init();
         lock
@@ -266,6 +295,28 @@ mod tests {
             assert_eq!(lock.state.load(Ordering::Relaxed), EXCLUSIVE);
         }
         assert_eq!(lock.state.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn write_lock_tracks_owner_pid() {
+        let lock = new_lock();
+        assert_eq!(lock.owner_pid(), 0);
+        {
+            let _guard = lock.write();
+            assert_eq!(lock.owner_pid(), unsafe { libc::getpid() });
+        }
+        assert_eq!(lock.owner_pid(), 0, "drop clears the owner");
+    }
+
+    #[test]
+    fn try_write_tracks_owner_pid() {
+        let lock = new_lock();
+        {
+            let guard = lock.try_write().expect("uncontended try_write");
+            assert_eq!(lock.owner_pid(), unsafe { libc::getpid() });
+            drop(guard);
+        }
+        assert_eq!(lock.owner_pid(), 0);
     }
 
     #[test]

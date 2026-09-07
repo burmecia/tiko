@@ -47,12 +47,12 @@
 //! BackendSlotPool[MaxBackends-1]
 //! ChunkSlot[0..1024]          ← cache chunk slot metadata (~36 KB)
 //! AtomicU32[0..2048]          ← cache bucket heads (~8 KB)
-//! AtomicRWLock[0..2048]       ← cache bucket locks (~8 KB, one per bucket)
-//! AtomicRWLock[0..1024]       ← per-slot I/O locks (~4 KB, one per chunk slot)
+//! AtomicRWLock[0..2048]       ← cache bucket locks (~16 KB, one per bucket)
+//! AtomicRWLock[0..1024]       ← per-slot I/O locks (~8 KB, one per chunk slot)
 //! MetaSlot[0..1024]           ← fork metadata table (~28 KB)
 //! AtomicU32[0..2048]          ← fork meta bucket heads (~8 KB)
-//! AtomicRWLock[0..2048]       ← fork meta bucket locks (~8 KB)
-//! AtomicRWLock[0..1024]       ← per-slot I/O locks (~4 KB, one per meta slot)
+//! AtomicRWLock[0..2048]       ← fork meta bucket locks (~16 KB)
+//! AtomicRWLock[0..1024]       ← per-slot I/O locks (~8 KB, one per meta slot)
 //! ```
 
 use std::mem::{align_of, size_of};

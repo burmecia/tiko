@@ -19,3 +19,10 @@ pub use io::io_control;
 pub use relfork::RelFork;
 pub use storage::{s3, s3_sim};
 pub use store::Store;
+
+// Test-binary stand-in for the postmaster-provided elog wrapper (same role
+// as cli's `pg_stubs.rs`): lock/watchdog code reachable from unit tests
+// references it, and without a definition the test binary fails to link.
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn rust_pg_log(_elevel: std::ffi::c_int, _message: *const std::ffi::c_char) {}

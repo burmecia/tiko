@@ -7,6 +7,7 @@ use crate::relfork::{RelFork, RelForkMeta};
 use crate::timeline::draft::DraftBuffer;
 use crate::utils::bloom::ChunkBloom;
 use crate::utils::rw_lock::AtomicRWLock;
+use crate::utils::watchdog::SpinWatch;
 
 /// Number of recent checkpoints kept fully indexed in the shmem active window.
 pub const ACTIVE_WINDOW_SIZE: usize = 64;
@@ -153,9 +154,11 @@ impl ActiveCheckpoint {
 /// `lock` fences checkpoint-interval *production*: producers record into
 /// `draft` under `lock.read()` (its per-shard spinlocks handle producer
 /// concurrency); only the committer may drain it, under `lock.write()`.
-/// Pure readers never take `lock`. A process dying mid-mutation leaves
-/// `generation` odd and spins readers forever — the same wedge class as
-/// dying with `lock` held (the two are being addressed together).
+/// Pure readers never take `lock`. A process dying with `lock` held or
+/// mid-mutation (`generation` left odd) used to wedge every spinner
+/// forever; both spins now carry the wedge watchdog
+/// ([`crate::utils::watchdog`]), which escalates a dead holder to a
+/// PANIC/crash-restart that reinitialises shmem.
 #[repr(C)]
 pub struct TimelineState {
     pub(crate) lock: AtomicRWLock,
@@ -204,14 +207,19 @@ impl TimelineState {
     // ── Seqlock (lock-free reads) ──
 
     /// Begin a lock-free read of the checkpoint fields + active window.
-    /// Spins while a mutation is in progress. Pair every read with
-    /// [`Self::read_seq_validate`]; on `false` discard and retry.
+    /// Spins while a mutation is in progress — a process dying mid-mutation
+    /// leaves `generation` odd forever, so the spin carries the wedge
+    /// watchdog ([`crate::utils::watchdog`]); the writer is identifiable via
+    /// `lock`'s owner PID. Pair every read with [`Self::read_seq_validate`];
+    /// on `false` discard and retry.
     pub fn read_seq_begin(&self) -> u64 {
+        let mut watch = SpinWatch::new();
         loop {
             let g = self.generation.load(Ordering::Acquire);
             if g & 1 == 0 {
                 return g;
             }
+            watch.tick("TimelineState seqlock", self.lock.owner_pid());
             std::hint::spin_loop();
         }
     }

@@ -177,6 +177,17 @@ Slot lifecycle: `Free → Filling → Submitted → InProgress → Completed →
 publishes (release store), worker claims for processing (CAS), Tokio marks
 complete and sets the backend's latch, backend releases back to its pool.
 
+The shmem `AtomicRWLock`s (cache/meta bucket + I/O locks, `TimelineState.lock`,
+`DraftBuffer.spill_lock`) and the `TimelineState.generation` seqlock carry a
+wedge watchdog (`core/src/utils/watchdog.rs`): every spin loop tracks the
+write-lock owner's PID and escalates a dead holder (30 s) or a stuck one
+(10 min) to PANIC — directly on a PG thread, or via a poison flag the
+tikoworker main loop polls and PANICs on (Tokio threads can't elog). There is
+no self-release: interrupted critical sections aren't idempotent, so the
+postmaster crash-restart (shmem reinit + hydration + first commit's draft
+drain) is the recovery path — the same posture PG takes for a dead LWLock
+holder.
+
 ### PG18 AIO Integration
 The vendored `postgres/` submodule is patched with custom AIO opcodes
 `PGAIO_OP_TIKO_READV` / `PGAIO_OP_TIKO_WRITEV`

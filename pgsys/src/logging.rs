@@ -9,7 +9,8 @@
 //! the queue via [`drain_relay`] (the tikoworker main loop calls it every
 //! iteration). With no thread marked, `pg_log` is always direct — correct for
 //! single-threaded backends/checkpointer and for CLI binaries (where
-//! `rust_pg_log` is a no-op stub).
+//! `rust_pg_log` is a no-op stub). Levels pass through verbatim, so a relayed
+//! PANIC aborts the process when the PG thread drains it.
 
 use std::collections::VecDeque;
 use std::ffi::{CString, c_int};
@@ -27,6 +28,8 @@ pub const INFO: c_int = 17; // Informational message
 pub const NOTICE: c_int = 18; // Notice message
 pub const WARNING: c_int = 19; // Warning message
 pub const ERROR: c_int = 21; // Error message
+pub const FATAL: c_int = 22; // Fatal error (terminates the session/process)
+pub const PANIC: c_int = 23; // Panic (aborts the process; postmaster crash-restarts the cluster)
 
 // PostgreSQL logging function wrapper
 // We define a C wrapper function that will be implemented in PostgreSQL C code
@@ -51,7 +54,11 @@ pub fn mark_pg_thread() {
     let _ = PG_THREAD.set(std::thread::current().id());
 }
 
-fn on_pg_thread() -> bool {
+/// True when the calling thread is this process's elog-safe PG thread. An
+/// unmarked process (single-threaded backends, CLI binaries) treats every
+/// thread as safe. Public for crash-escalation paths that must know whether
+/// `elog(PANIC)` applies here or has to be relayed to the PG thread.
+pub fn on_pg_thread() -> bool {
     match PG_THREAD.get() {
         Some(id) => *id == std::thread::current().id(),
         None => true,
