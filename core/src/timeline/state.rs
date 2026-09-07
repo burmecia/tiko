@@ -6,8 +6,7 @@ use crate::chunk::ChunkTag;
 use crate::relfork::{RelFork, RelForkMeta};
 use crate::timeline::draft::DraftBuffer;
 use crate::utils::bloom::ChunkBloom;
-use crate::utils::rw_lock::AtomicRWLock;
-use crate::utils::watchdog::SpinWatch;
+use crate::utils::rw_lock::{AtomicRWLock, SpinWatch};
 
 /// Number of recent checkpoints kept fully indexed in the shmem active window.
 pub const ACTIVE_WINDOW_SIZE: usize = 64;
@@ -156,9 +155,8 @@ impl ActiveCheckpoint {
 /// concurrency); only the committer may drain it, under `lock.write()`.
 /// Pure readers never take `lock`. A process dying with `lock` held or
 /// mid-mutation (`generation` left odd) used to wedge every spinner
-/// forever; both spins now carry the wedge watchdog
-/// ([`crate::utils::watchdog`]), which escalates a dead holder to a
-/// PANIC/crash-restart that reinitialises shmem.
+/// forever; both spins now carry the wedge watchdog ([`SpinWatch`]), which
+/// escalates a dead holder to a PANIC/crash-restart that reinitialises shmem.
 #[repr(C)]
 pub struct TimelineState {
     pub(crate) lock: AtomicRWLock,
@@ -209,7 +207,7 @@ impl TimelineState {
     /// Begin a lock-free read of the checkpoint fields + active window.
     /// Spins while a mutation is in progress — a process dying mid-mutation
     /// leaves `generation` odd forever, so the spin carries the wedge
-    /// watchdog ([`crate::utils::watchdog`]); the writer is identifiable via
+    /// watchdog ([`SpinWatch`]); the writer is identifiable via
     /// `lock`'s owner PID. Pair every read with [`Self::read_seq_validate`];
     /// on `false` discard and retry.
     pub fn read_seq_begin(&self) -> u64 {

@@ -137,7 +137,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         // A Tokio thread that found a wedged shmem lock poisons the worker
         // (it cannot elog itself). PANIC here on the PG thread so the
         // postmaster crash-restarts and reinitialises shared memory.
-        if let Some(msg) = core::utils::watchdog::take_poison() {
+        if let Some(msg) = core::utils::rw_lock::take_poison() {
             pg_log(PANIC, msg);
         }
 

@@ -179,7 +179,7 @@ complete and sets the backend's latch, backend releases back to its pool.
 
 The shmem `AtomicRWLock`s (cache/meta bucket + I/O locks, `TimelineState.lock`,
 `DraftBuffer.spill_lock`) and the `TimelineState.generation` seqlock carry a
-wedge watchdog (`core/src/utils/watchdog.rs`): every spin loop tracks the
+wedge watchdog (`core/src/utils/rw_lock.rs`): every spin loop tracks the
 write-lock owner's PID and escalates a dead holder (30 s) or a stuck one
 (10 min) to PANIC — directly on a PG thread, or via a poison flag the
 tikoworker main loop polls and PANICs on (Tokio threads can't elog). There is
