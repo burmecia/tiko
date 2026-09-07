@@ -2,8 +2,8 @@ use super::Store;
 use crate::error::{Error, Result};
 use pgsys::{common::XLOG_SEG_SIZE, timeline_id::TimelineId};
 
-/// One WAL segment's coverage on a timeline, in absolute LSN. `full` = a sealed
-/// segment covering its entire `XLOG_SEG_SIZE` range.
+// One WAL segment's coverage on a timeline, in absolute LSN. `full` = a sealed
+// segment covering its entire `XLOG_SEG_SIZE` range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegEntry {
     seg_no: u64,
@@ -12,12 +12,12 @@ struct SegEntry {
     full: bool,
 }
 
-/// Parse a WAL object key under `wal_prefix` (= `{ns}/wal/{tl}/`) into its
-/// segment number and, for chunk objects, the chunk byte offset.
-///
-/// Sealed segment: `{wal_prefix}{segname}`                      → (seg_no, None)
-/// Chunk:          `{wal_prefix}{segname}.chunks/{offset:016X}` → (seg_no, Some(offset))
-/// `segname` is 24 hex chars; `seg_no` is hex chars [8..24). `None` for non-matches.
+// Parse a WAL object key under `wal_prefix` (= `{ns}/wal/{tl}/`) into its
+// segment number and, for chunk objects, the chunk byte offset.
+//
+// Sealed segment: `{wal_prefix}{segname}`                      → (seg_no, None)
+// Chunk:          `{wal_prefix}{segname}.chunks/{offset:016X}` → (seg_no, Some(offset))
+// `segname` is 24 hex chars; `seg_no` is hex chars [8..24). `None` for non-matches.
 fn parse_wal_key(key: &str, wal_prefix: &str) -> Option<(u64, Option<usize>)> {
     let rel = key.strip_prefix(wal_prefix)?;
     if let Some((segname, offpart)) = rel.split_once(".chunks/") {
@@ -36,16 +36,16 @@ fn parse_wal_key(key: &str, wal_prefix: &str) -> Option<(u64, Option<usize>)> {
     }
 }
 
-/// Compute the contiguous archived-WAL run that reaches the highest segment in
-/// `entries`. Returns `(w_lo, w_hi)` absolute LSN, or `None` if empty.
-///
-/// The highest segment anchors the run end (`w_hi`). The run extends down
-/// through consecutive segments whose coverage is contiguous: `cur` must cover
-/// from its own segment start (no mid-segment front gap inside `cur`), and the
-/// next-lower segment's coverage end (`hi`) must reach `cur`'s segment start.
-/// Both sealed segments and chunks-only segments qualify — the streaming WAL
-/// receiver writes chunks contiguously, so a chunks-only segment whose `hi`
-/// reaches the next segment's boundary is fully covered up to that point.
+// Compute the contiguous archived-WAL run that reaches the highest segment in
+// `entries`. Returns `(w_lo, w_hi)` absolute LSN, or `None` if empty.
+//
+// The highest segment anchors the run end (`w_hi`). The run extends down
+// through consecutive segments whose coverage is contiguous: `cur` must cover
+// from its own segment start (no mid-segment front gap inside `cur`), and the
+// next-lower segment's coverage end (`hi`) must reach `cur`'s segment start.
+// Both sealed segments and chunks-only segments qualify — the streaming WAL
+// receiver writes chunks contiguously, so a chunks-only segment whose `hi`
+// reaches the next segment's boundary is fully covered up to that point.
 fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
     let seg = XLOG_SEG_SIZE as u64;
     let mut sorted: Vec<SegEntry> = entries.to_vec();
@@ -171,7 +171,7 @@ impl Store {
 
 #[cfg(test)]
 mod wal_coverage_tests {
-    use super::{SegEntry, is_base_usable, parse_wal_key, wal_contiguous_run};
+    use super::{is_base_usable, parse_wal_key, wal_contiguous_run, SegEntry};
     use pgsys::common::XLOG_SEG_SIZE;
 
     const SEG: u64 = XLOG_SEG_SIZE as u64;
