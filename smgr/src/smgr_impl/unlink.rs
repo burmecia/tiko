@@ -61,7 +61,7 @@ fn unlink_fork(rlocator: &RelFileLocatorBackend, forknum: ForkNumber) {
             // Ignore ENOENT: caller may have already removed the file, or it may not exist at all.
         }
         Err(err) => {
-            pg_log_warning(&format!("tiko_unlink: failed for relfork {relfork}: {err}",));
+            pg_log_warning(format!("tiko_unlink: failed for relfork {relfork}: {err}",));
         }
     }
 }

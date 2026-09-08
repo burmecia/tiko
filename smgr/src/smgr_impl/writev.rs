@@ -34,7 +34,7 @@ pub extern "C-unwind" fn tiko_writev(
             run_nblocks,
             entry.iov_base as *const u8,
         ) {
-            pg_log_error(&format!(
+            pg_log_error(format!(
                 "tiko_writev: failed for relfork {relfork} block {blocknum} nblocks {run_nblocks}: {err}",
                 blocknum = blocknum + block_offset,
             ));

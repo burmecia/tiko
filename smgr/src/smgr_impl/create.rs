@@ -18,10 +18,10 @@ pub extern "C-unwind" fn tiko_create(
         Ok(true) => {}             // newly created
         Ok(false) if is_redo => {} // exists, WAL replay — OK
         Ok(false) => {
-            pg_log_error(&format!("tiko_create: relfork already exists {relfork}",));
+            pg_log_error(format!("tiko_create: relfork already exists {relfork}",));
         }
         Err(err) => {
-            pg_log_error(&format!("tiko_create: failed for relfork {relfork}: {err}",));
+            pg_log_error(format!("tiko_create: failed for relfork {relfork}: {err}",));
         }
     }
 
@@ -40,7 +40,7 @@ pub extern "C-unwind" fn tiko_create(
         // Create the zero-byte marker file.
         let path = marker_path(loc.spc_oid, loc.db_oid, loc.rel_number);
         if let Err(err) = std::fs::File::create(&path) {
-            pg_log_error(&format!(
+            pg_log_error(format!(
                 "tiko_create: failed to create tablespace marker {path:?}: {err}"
             ));
         }

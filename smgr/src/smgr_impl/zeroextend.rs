@@ -25,7 +25,7 @@ pub extern "C-unwind" fn tiko_zeroextend(
 
     // Check for overflow: matches mdzeroextend's boundary check
     if (blocknum as u64) + (nblocks_u32 as u64) >= INVALID_BLOCK_NUMBER as u64 {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko_zeroextend: cannot extend relfork {relfork} beyond block {} (requested {} + {})",
             INVALID_BLOCK_NUMBER, blocknum, nblocks_u32
         ));
@@ -35,7 +35,7 @@ pub extern "C-unwind" fn tiko_zeroextend(
     let buf = vec![0u8; nblocks as usize * BLCKSZ];
 
     if let Err(err) = ops::write_blocks(&relfork, blocknum, nblocks_u32, buf.as_ptr()) {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko_zeroextend: failed for relfork {relfork} block {blocknum} nblocks {nblocks_u32}: {err}",
         ));
     }

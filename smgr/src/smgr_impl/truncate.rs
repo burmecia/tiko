@@ -24,7 +24,7 @@ pub extern "C-unwind" fn tiko_truncate(
         if in_recovery() {
             return;
         }
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko_truncate: cannot truncate to {} blocks, only {} blocks now",
             nblocks, old_blocks
         ));
@@ -37,7 +37,7 @@ pub extern "C-unwind" fn tiko_truncate(
     let relfork = RelFork::from_rel(reln, forknum);
 
     if let Err(err) = ops::truncate_relfork(&relfork, nblocks) {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko_truncate: failed for relfork {relfork} nblocks {nblocks}: {err}",
         ));
     }

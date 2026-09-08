@@ -29,12 +29,12 @@ pub extern "C-unwind" fn tiko_init() {
         let pool = control.backend_pool(proc_num);
         pool.attach();
 
-        pg_log_debug2(&format!("tiko_init: backend {} pool attached", proc_num));
+        pg_log_debug2(format!("tiko_init: backend {} pool attached", proc_num));
     }
 
     // Initialize Store — needed for both initdb and normal run. Also hydrates
     // the timeline state from existing segments on its first call.
     if let Err(e) = Store::init() {
-        pg_log_warning(&format!("tiko_init: Store::init failed: {e}"));
+        pg_log_warning(format!("tiko_init: Store::init failed: {e}"));
     }
 }

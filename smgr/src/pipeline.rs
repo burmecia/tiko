@@ -34,6 +34,7 @@ pub struct IoResult {
 /// # Safety
 /// Caller must ensure `reln` is a valid PG SMgrRelation pointer and
 /// `buffer_ptr` points to a valid PG buffer page.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn submit_and_wait(
     op: IoOpKind,
     reln: *mut SMgrRelationData,
@@ -61,7 +62,7 @@ pub unsafe fn submit_and_wait(
         match result {
             Ok(io_result) => Some(io_result),
             Err(errno) => {
-                pg_log_error(&format!(
+                pg_log_error(format!(
                     "{}({}): I/O failed for rel {} fork {} block {}: errno {}",
                     label,
                     get_my_proc_number(),
@@ -83,6 +84,7 @@ pub unsafe fn submit_and_wait(
 /// **MUST NOT call `pg_log_error`** — this function may be called from within
 /// `pgaio_io_perform_synchronously`'s `START_CRIT_SECTION()`, where `elog(ERROR)`
 /// escalates to PANIC. Uses `pg_log_warning` for diagnostics instead.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn submit_and_wait_raw(
     op: IoOpKind,
     spc_oid: Oid,
@@ -106,7 +108,7 @@ pub(crate) unsafe fn submit_and_wait_raw(
                 break idx;
             }
             if !control.is_worker_alive() {
-                pg_log_warning(&format!(
+                pg_log_warning(format!(
                     "{}({}): worker is not running, cannot process I/O",
                     label, proc_num
                 ));
@@ -142,7 +144,7 @@ pub(crate) unsafe fn submit_and_wait_raw(
         while !control.submit_queue.push(proc_num as u32, slot_idx as u8) {
             if !control.is_worker_alive() {
                 pool.release(slot_idx);
-                pg_log_warning(&format!(
+                pg_log_warning(format!(
                     "{}({}): worker died while waiting to submit",
                     label, proc_num
                 ));
@@ -166,7 +168,7 @@ pub(crate) unsafe fn submit_and_wait_raw(
             SetLatch(worker_latch);
         }
 
-        pg_log_debug2(&format!(
+        pg_log_debug2(format!(
             "{}({}): submitted {:?} for rel {} fork {} block {} nblocks {}",
             label, proc_num, op, rel_number, forknum, blocknum, nblocks
         ));
@@ -179,7 +181,7 @@ pub(crate) unsafe fn submit_and_wait_raw(
             }
             if !control.is_worker_alive() {
                 pool.release(slot_idx);
-                pg_log_warning(&format!(
+                pg_log_warning(format!(
                     "{}({}): worker died while waiting for I/O completion",
                     label, proc_num
                 ));
@@ -197,7 +199,7 @@ pub(crate) unsafe fn submit_and_wait_raw(
         let result_status = slot.result_status.load(Ordering::Acquire);
         let result_nblocks = slot.result_nblocks.load(Ordering::Acquire);
         if result_status != 0 {
-            pg_log_warning(&format!(
+            pg_log_warning(format!(
                 "{}({}): I/O error for rel {} block {}: status {}, nblocks {}",
                 label, proc_num, rel_number, blocknum, result_status, result_nblocks
             ));
@@ -206,7 +208,7 @@ pub(crate) unsafe fn submit_and_wait_raw(
         // 8. Release slot back to pool (Completed → Free + set free bit)
         pool.release(slot_idx);
 
-        pg_log_debug2(&format!(
+        pg_log_debug2(format!(
             "{}({}): completed {:?} for rel {} block {} nblocks {}, result: (status {}, nblocks {}), slot {} released",
             label,
             proc_num,

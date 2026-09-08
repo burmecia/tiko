@@ -24,6 +24,7 @@ use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pip
 /// "unexpected zero page" error on the next B-tree read.
 ///
 /// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
+#[allow(clippy::too_many_arguments)]
 unsafe fn perform_io(
     op: IoOpKind,
     iov: *mut pgsys::aio::IoVec,

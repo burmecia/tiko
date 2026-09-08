@@ -75,7 +75,7 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
 
     // Commit the interval's dirty state into a timeline segment.
     if let Err(e) = store.run_commit_protocol(&ckpt, &redo_ckpt) {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko: tiko_perform_checkpoint: run_commit_protocol failed at {ckpt}, redo {redo_ckpt}: {e}"
         ));
     }
@@ -96,12 +96,10 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
     // `CompactionResult::Raced` detection inside `run_compaction`. Failure
     // is non-fatal — shutdown still completes; the next startup picks up
     // the extra segments via the normal hydrate path.
-    if is_shutdown {
-        if let Err(e) = store.run_compaction() {
-            pg_log_warning(format!(
-                "tiko: tiko_perform_checkpoint: shutdown compaction failed: {e}"
-            ));
-        }
+    if is_shutdown && let Err(e) = store.run_compaction() {
+        pg_log_warning(format!(
+            "tiko: tiko_perform_checkpoint: shutdown compaction failed: {e}"
+        ));
     }
 }
 
@@ -170,7 +168,7 @@ fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
     }
 
     if let Err(e) = store.run_compaction_through(commit_ckpt) {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko: tiko_perform_checkpoint: basebackup compaction failed at {commit_ckpt}: {e} — this backup's anchor manifest may be incomplete"
         ));
     }

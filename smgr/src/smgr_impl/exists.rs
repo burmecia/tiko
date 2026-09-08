@@ -8,7 +8,7 @@ pub extern "C-unwind" fn tiko_exists(reln: *mut SMgrRelationData, forknum: ForkN
     match ops::exists(&relfork) {
         Ok(exists) => exists,
         Err(err) => {
-            pg_log_error(&format!("tiko_exists: failed for relfork {relfork}: {err}",));
+            pg_log_error(format!("tiko_exists: failed for relfork {relfork}: {err}",));
             false
         }
     }

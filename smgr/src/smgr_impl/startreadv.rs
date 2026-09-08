@@ -19,7 +19,7 @@ pub extern "C-unwind" fn tiko_startreadv(
     unsafe {
         let loc = &(*reln).smgr_rlocator.locator;
         let proc_num = get_my_proc_number();
-        logging::pg_log_debug2(&format!(
+        logging::pg_log_debug2(format!(
             "tiko_startreadv({}): rel {} fork {} block {} nblocks {}",
             proc_num, loc.rel_number, forknum, blocknum, nblocks
         ));

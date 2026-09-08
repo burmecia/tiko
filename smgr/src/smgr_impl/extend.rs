@@ -17,7 +17,7 @@ pub extern "C-unwind" fn tiko_extend(
     let relfork = RelFork::from_rel(reln, forknum);
 
     if blocknum == INVALID_BLOCK_NUMBER {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko_extend: cannot extend relfork {relfork} beyond {} blocks",
             INVALID_BLOCK_NUMBER
         ));
@@ -25,7 +25,7 @@ pub extern "C-unwind" fn tiko_extend(
     }
 
     if let Err(err) = ops::write_blocks(&relfork, blocknum, 1, buffer as *const u8) {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko_extend: failed for relfork {relfork} block {blocknum}: {err}",
         ));
     }
