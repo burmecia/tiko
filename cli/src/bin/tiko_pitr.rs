@@ -36,7 +36,7 @@ use serde::Serialize;
 use cli::pitr;
 use core::env;
 use core::error::{Error, Result};
-use core::store::Store;
+use core::store::{BackupRow, RecoveryWindow, Store};
 use core::timeline::Checkpoint;
 use pgsys::common::RECOVERY_SIGNAL_FILE;
 use pgsys::lsn::Lsn;
@@ -180,6 +180,17 @@ struct BackupDto {
     redo_lsn: String,
 }
 
+impl From<&BackupRow> for BackupDto {
+    fn from(b: &BackupRow) -> Self {
+        Self {
+            created_at: fmt_unix_ts(b.created_at),
+            timeline: b.ckpt.timeline_id.to_hex(),
+            checkpoint_lsn: b.ckpt.lsn.to_pg_string(),
+            redo_lsn: b.redo_ckpt.lsn.to_pg_string(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct WindowDto {
     timeline: String,
@@ -191,6 +202,18 @@ struct WindowDto {
     earliest_lsn: String,
     /// PostgreSQL `X/Y` latest recoverable LSN.
     latest_lsn: String,
+}
+
+impl From<&RecoveryWindow> for WindowDto {
+    fn from(w: &RecoveryWindow) -> Self {
+        Self {
+            timeline: w.timeline.to_hex(),
+            earliest_ts: fmt_unix_ts(w.earliest_ts),
+            latest_ts: fmt_unix_ts(w.latest_ts),
+            earliest_lsn: w.earliest_ckpt.lsn.to_pg_string(),
+            latest_lsn: w.latest_lsn.to_pg_string(),
+        }
+    }
 }
 
 /// `backup` response: coordinates of the just-uploaded base backup.
@@ -245,30 +268,13 @@ fn run_list(store: &Store) -> Result<()> {
     // All base backups, newest-first (across every timeline).
     let mut backups = store.list_backups()?;
     backups.sort_by(|a, b| b.ckpt.cmp(&a.ckpt));
-    let backups_dto: Vec<BackupDto> = backups
-        .iter()
-        .map(|b| BackupDto {
-            created_at: fmt_unix_ts(b.created_at),
-            timeline: b.ckpt.timeline_id.to_hex(),
-            checkpoint_lsn: b.ckpt.lsn.to_pg_string(),
-            redo_lsn: b.redo_ckpt.lsn.to_pg_string(),
-        })
-        .collect();
+    let backups_dto: Vec<BackupDto> = backups.iter().map(Into::into).collect();
 
     // The single recoverable window [earliest backup, WAL head]. Best-effort:
     // `list` still shows the backups above even when WAL coverage isn't
     // available yet (e.g. right after a backup, before the WAL tail archives).
     let (window, window_error) = match store.recovery_window() {
-        Ok(w) => (
-            Some(WindowDto {
-                timeline: w.timeline.to_hex(),
-                earliest_ts: fmt_unix_ts(w.earliest_ts),
-                latest_ts: fmt_unix_ts(w.latest_ts),
-                earliest_lsn: w.earliest_ckpt.lsn.to_pg_string(),
-                latest_lsn: w.latest_lsn.to_pg_string(),
-            }),
-            None,
-        ),
+        Ok(w) => (Some(WindowDto::from(&w)), None),
         Err(e) => (None, Some(e.to_string())),
     };
 
