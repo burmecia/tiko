@@ -211,6 +211,25 @@ impl Store {
         Ok((ckpt, bytes))
     }
 
+    // Newest base-manifest key `<= ckpt` in `ns`, or an error if none exists.
+    fn newest_base_manifest_at_or_before(
+        &self,
+        ns: &DbNamespace,
+        ckpt: Checkpoint,
+    ) -> Result<Checkpoint> {
+        let keys = self.storage_list_prefix(&ns.bases_dir())?;
+        keys.iter()
+            .filter_map(|k| ns.parse_base_manifest(k))
+            .filter(|c| *c <= ckpt)
+            .max_by_key(|c| *c)
+            .ok_or_else(|| {
+                Error::other(format!(
+                    "no base manifest at or before {ckpt} in db_id={} to anchor recovery",
+                    ns.db_id
+                ))
+            })
+    }
+
     /// Install the live `$TIKO_ROOT/base_manifest.tikm` for recovering to
     /// `ckpt`: download the newest base manifest at or before `ckpt` and write
     /// it as the live TIKM cache file.
@@ -224,17 +243,7 @@ impl Store {
     /// (per-PID tmp + rename inside [`Manifest::from_bytes`] → `write_tikm`)
     /// means a crash never leaves a partial file.
     pub fn materialize_base_manifest_at(&self, ckpt: Checkpoint) -> Result<()> {
-        let keys = self.storage_list_prefix(&self.ns.bases_dir())?;
-        let target_base = keys
-            .iter()
-            .filter_map(|k| self.ns.parse_base_manifest(k))
-            .filter(|c| *c <= ckpt)
-            .max_by_key(|c| *c)
-            .ok_or_else(|| {
-                Error::other(format!(
-                    "no base manifest at or before {ckpt} to anchor recovery"
-                ))
-            })?;
+        let target_base = self.newest_base_manifest_at_or_before(&self.ns, ckpt)?;
         let key = self.ns.base_manifest(&target_base);
         let bytes = self.storage_get(&key)?;
         // `from_bytes` writes the TIKM at `local_root/base_manifest.tikm`.
@@ -268,17 +277,7 @@ impl Store {
         ckpt: Checkpoint,
     ) -> Result<()> {
         let parent_ns = self.ns.for_db(parent_db_id);
-        let keys = self.storage_list_prefix(&parent_ns.bases_dir())?;
-        let target_base = keys
-            .iter()
-            .filter_map(|k| parent_ns.parse_base_manifest(k))
-            .filter(|c| *c <= ckpt)
-            .max_by_key(|c| *c)
-            .ok_or_else(|| {
-                Error::other(format!(
-                    "no base manifest at or before {ckpt} in parent db_id={parent_db_id} to seed the branch"
-                ))
-            })?;
+        let target_base = self.newest_base_manifest_at_or_before(&parent_ns, ckpt)?;
 
         let parent_key = parent_ns.base_manifest(&target_base);
         let bytes = self.storage_get(&parent_key)?;
@@ -325,7 +324,7 @@ impl Store {
         let latest_lsn = run.hi;
         let latest_ts = rows
             .iter()
-            .filter(|r| r.ckpt.lsn <= run.hi)
+            .filter(|r| r.ckpt.timeline_id == timeline && r.ckpt.lsn <= run.hi)
             .map(|r| r.created_at)
             .max()
             .unwrap_or(earliest_ts);
