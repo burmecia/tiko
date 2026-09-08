@@ -8,7 +8,7 @@ use crate::{
     db::DbNamespace,
     error::{Error, Result},
     manifest::Manifest,
-    timeline::Checkpoint,
+    timeline::{Checkpoint, CheckpointSummary},
 };
 use pgsys::{logging::pg_log_warning, lsn::Lsn, timeline_id::TimelineId};
 
@@ -20,6 +20,17 @@ pub struct CheckpointRow {
     pub redo_ckpt: Checkpoint,
     pub created_at: i64,
     pub n_chunks: usize,
+}
+
+impl From<&CheckpointSummary> for CheckpointRow {
+    fn from(sc: &CheckpointSummary) -> Self {
+        Self {
+            ckpt: sc.ckpt,
+            redo_ckpt: sc.redo_ckpt,
+            created_at: sc.created_at,
+            n_chunks: sc.chunks.len(),
+        }
+    }
 }
 
 /// One row returned by [`Store::list_backups`] — a base backup taken via
@@ -94,14 +105,7 @@ impl Store {
         let mut rows: Vec<CheckpointRow> = Vec::new();
         for sid in &segment_ids {
             let seg = self.load_segment(sid)?;
-            for sc in &seg.checkpoints {
-                rows.push(CheckpointRow {
-                    ckpt: sc.ckpt,
-                    redo_ckpt: sc.redo_ckpt,
-                    created_at: sc.created_at,
-                    n_chunks: sc.chunks.len(),
-                });
-            }
+            rows.extend(seg.checkpoints.iter().map(Into::into));
         }
         rows.sort_by_key(|r| (r.created_at, r.ckpt));
         Ok(rows)
@@ -308,7 +312,7 @@ impl Store {
 
         let chosen = backups
             .into_iter()
-            .find(|b| is_base_usable(b.ckpt.lsn.as_u64(), b.redo_ckpt.lsn.as_u64(), w_lo, w_hi))
+            .find(|b| is_base_usable(b.ckpt.lsn, b.redo_ckpt.lsn, w_lo, w_hi))
             .ok_or_else(|| {
                 Error::other("no base backup's WAL is archived; nothing is recoverable yet")
             })?;
@@ -319,10 +323,10 @@ impl Store {
         //    If no checkpoint sits at/below w_hi the time window collapses to
         //    `earliest_ts` (never over-promises); the LSN window can still be
         //    wider than the time window in that edge.
-        let latest_lsn = Lsn::new(w_hi);
+        let latest_lsn = w_hi;
         let latest_ts = rows
             .iter()
-            .filter(|r| r.ckpt.lsn.as_u64() <= w_hi)
+            .filter(|r| r.ckpt.lsn <= w_hi)
             .map(|r| r.created_at)
             .max()
             .unwrap_or(earliest_ts);

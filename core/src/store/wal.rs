@@ -1,14 +1,15 @@
 use super::Store;
 use crate::error::{Error, Result};
-use pgsys::{common::XLOG_SEG_SIZE, timeline_id::TimelineId};
+use pgsys::{common::XLOG_SEG_SIZE, lsn::Lsn, timeline_id::TimelineId};
+use std::collections::BTreeMap;
 
 // One WAL segment's coverage on a timeline, in absolute LSN. `full` = a sealed
 // segment covering its entire `XLOG_SEG_SIZE` range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegEntry {
     seg_no: u64,
-    lo: u64,
-    hi: u64,
+    lo: Lsn,
+    hi: Lsn,
     full: bool,
 }
 
@@ -46,8 +47,8 @@ fn parse_wal_key(key: &str, wal_prefix: &str) -> Option<(u64, Option<usize>)> {
 // Both sealed segments and chunks-only segments qualify — the streaming WAL
 // receiver writes chunks contiguously, so a chunks-only segment whose `hi`
 // reaches the next segment's boundary is fully covered up to that point.
-fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
-    let seg = XLOG_SEG_SIZE as u64;
+fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(Lsn, Lsn)> {
+    let seg_size = XLOG_SEG_SIZE as u64;
     let mut sorted: Vec<SegEntry> = entries.to_vec();
     sorted.sort_unstable_by_key(|e| std::cmp::Reverse(e.seg_no)); // descending
     let top = *sorted.first()?;
@@ -62,7 +63,7 @@ fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
         }
         // Can only extend below if `cur` covers from its own segment start
         // (no mid-segment front gap inside `cur`).
-        if cur.lo != cur.seg_no * seg {
+        if cur.lo != Lsn::new(cur.seg_no * seg_size) {
             break;
         }
         let Some(next) = sorted.get(idx).copied() else {
@@ -83,7 +84,7 @@ fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(u64, u64)> {
 /// A base manifest is usable as a PITR anchor if its recovery WAL fits inside
 /// the contiguous archived run `[w_lo, w_hi]`: the replay start (`redo`) must be
 /// archived, and its checkpoint record must be within coverage.
-pub(super) fn is_base_usable(ckpt_lsn: u64, redo_lsn: u64, w_lo: u64, w_hi: u64) -> bool {
+pub(super) fn is_base_usable(ckpt_lsn: Lsn, redo_lsn: Lsn, w_lo: Lsn, w_hi: Lsn) -> bool {
     redo_lsn >= w_lo && ckpt_lsn <= w_hi
 }
 
@@ -92,10 +93,10 @@ impl Store {
     /// `timeline`, reaching the highest archived segment. Lists `{ns}/wal/{tl}/`,
     /// classifies sealed segments vs partial chunks, and GETs the highest
     /// segment's last chunk for its byte length when that segment is partial.
-    pub(super) fn archived_wal_run(&self, timeline: TimelineId) -> Result<(u64, u64)> {
-        let seg = XLOG_SEG_SIZE as u64;
+    pub(super) fn archived_wal_run(&self, timeline: TimelineId) -> Result<(Lsn, Lsn)> {
+        let seg_size = XLOG_SEG_SIZE as u64;
         let prefix = self.ns.wal_timeline_dir(timeline);
-        let keys = match self.storage_list_prefix(&prefix) {
+        let wal_keys = match self.storage_list_prefix(&prefix) {
             Ok(k) => k,
             Err(e) if e.is_not_found() => Vec::new(),
             Err(e) => return Err(e),
@@ -106,9 +107,9 @@ impl Store {
             min_off: Option<usize>,
             max_off: Option<usize>,
         }
-        let mut segs: std::collections::BTreeMap<u64, Acc> = std::collections::BTreeMap::new();
-        for key in &keys {
-            let Some((seg_no, off)) = parse_wal_key(key, &prefix) else {
+        let mut segs: BTreeMap<u64, Acc> = BTreeMap::new();
+        for wal_key in &wal_keys {
+            let Some((seg_no, off)) = parse_wal_key(wal_key, &prefix) else {
                 continue;
             };
             let acc = segs.entry(seg_no).or_insert(Acc {
@@ -136,13 +137,13 @@ impl Store {
                 // Sealed is authoritative even if leftover chunks exist.
                 entries.push(SegEntry {
                     seg_no,
-                    lo: seg_no * seg,
-                    hi: (seg_no + 1) * seg,
+                    lo: Lsn::new(seg_no * seg_size),
+                    hi: Lsn::new((seg_no + 1) * seg_size),
                     full: true,
                 });
             } else {
                 let min_off = acc.min_off.unwrap_or(0);
-                let lo = seg_no * seg + min_off as u64;
+                let lo = Lsn::new(seg_no * seg_size + min_off as u64);
                 // Compute the coverage end (hi) for EVERY chunks-only segment
                 // (not just the highest) so chunks-only segments can bridge the
                 // contiguous run. hi needs the length of the last chunk; a
@@ -154,7 +155,7 @@ impl Store {
                     Ok(b) => b.len() as u64,
                     Err(_) => 0,
                 };
-                let hi = seg_no * seg + max_off as u64 + last_len;
+                let hi = Lsn::new(seg_no * seg_size + max_off as u64 + last_len);
                 entries.push(SegEntry {
                     seg_no,
                     lo,
@@ -171,16 +172,17 @@ impl Store {
 
 #[cfg(test)]
 mod wal_coverage_tests {
-    use super::{is_base_usable, parse_wal_key, wal_contiguous_run, SegEntry};
+    use super::{SegEntry, is_base_usable, parse_wal_key, wal_contiguous_run};
     use pgsys::common::XLOG_SEG_SIZE;
+    use pgsys::lsn::Lsn;
 
     const SEG: u64 = XLOG_SEG_SIZE as u64;
 
     fn sealed(seg_no: u64) -> SegEntry {
         SegEntry {
             seg_no,
-            lo: seg_no * SEG,
-            hi: (seg_no + 1) * SEG,
+            lo: Lsn::new(seg_no * SEG),
+            hi: Lsn::new((seg_no + 1) * SEG),
             full: true,
         }
     }
@@ -206,32 +208,38 @@ mod wal_coverage_tests {
     #[test]
     fn contiguous_run_sealed_chain() {
         let entries = vec![sealed(0), sealed(1), sealed(2)];
-        assert_eq!(wal_contiguous_run(&entries), Some((0, 3 * SEG)));
+        assert_eq!(
+            wal_contiguous_run(&entries),
+            Some((Lsn::new(0), Lsn::new(3 * SEG)))
+        );
     }
 
     #[test]
     fn contiguous_run_partial_top_over_sealed() {
         let top = SegEntry {
             seg_no: 2,
-            lo: 2 * SEG,
-            hi: 2 * SEG + 0x500,
+            lo: Lsn::new(2 * SEG),
+            hi: Lsn::new(2 * SEG + 0x500),
             full: false,
         };
         let entries = vec![sealed(0), sealed(1), top];
-        assert_eq!(wal_contiguous_run(&entries), Some((0, 2 * SEG + 0x500)));
+        assert_eq!(
+            wal_contiguous_run(&entries),
+            Some((Lsn::new(0), Lsn::new(2 * SEG + 0x500)))
+        );
     }
 
     #[test]
     fn contiguous_run_midsegment_start_no_extend() {
         let top = SegEntry {
             seg_no: 2,
-            lo: 2 * SEG + 0x1F898,
-            hi: 2 * SEG + 0x5F898,
+            lo: Lsn::new(2 * SEG + 0x1F898),
+            hi: Lsn::new(2 * SEG + 0x5F898),
             full: false,
         };
         assert_eq!(
             wal_contiguous_run(&[top]),
-            Some((2 * SEG + 0x1F898, 2 * SEG + 0x5F898))
+            Some((Lsn::new(2 * SEG + 0x1F898), Lsn::new(2 * SEG + 0x5F898)))
         );
     }
 
@@ -243,45 +251,48 @@ mod wal_coverage_tests {
         // seg2's mid-stream start.
         let seg4 = SegEntry {
             seg_no: 4,
-            lo: 4 * SEG,
-            hi: 4 * SEG + 0x500,
+            lo: Lsn::new(4 * SEG),
+            hi: Lsn::new(4 * SEG + 0x500),
             full: false,
         };
         let seg3 = SegEntry {
             seg_no: 3,
-            lo: 3 * SEG,
-            hi: 4 * SEG, // reaches the seg4 boundary
+            lo: Lsn::new(3 * SEG),
+            hi: Lsn::new(4 * SEG), // reaches the seg4 boundary
             full: false,
         };
         let seg2 = SegEntry {
             seg_no: 2,
-            lo: 2 * SEG + 0x41EE8, // mid-stream start
-            hi: 3 * SEG,           // reaches the seg3 boundary
+            lo: Lsn::new(2 * SEG + 0x41EE8), // mid-stream start
+            hi: Lsn::new(3 * SEG),           // reaches the seg3 boundary
             full: false,
         };
         assert_eq!(
             wal_contiguous_run(&[seg2, seg3, seg4]),
-            Some((2 * SEG + 0x41EE8, 4 * SEG + 0x500))
+            Some((Lsn::new(2 * SEG + 0x41EE8), Lsn::new(4 * SEG + 0x500)))
         );
 
         // A chunks-only segment that does NOT reach the boundary must stop the
         // walk (gap between seg3's end and seg4's start).
         let seg3_short = SegEntry {
             seg_no: 3,
-            lo: 3 * SEG,
-            hi: 4 * SEG - 1,
+            lo: Lsn::new(3 * SEG),
+            hi: Lsn::new(4 * SEG - 1),
             full: false,
         };
         assert_eq!(
             wal_contiguous_run(&[seg3_short, seg4]),
-            Some((4 * SEG, 4 * SEG + 0x500))
+            Some((Lsn::new(4 * SEG), Lsn::new(4 * SEG + 0x500)))
         );
     }
 
     #[test]
     fn contiguous_run_gap_stops_walk() {
         let entries = vec![sealed(1), sealed(3)];
-        assert_eq!(wal_contiguous_run(&entries), Some((3 * SEG, 4 * SEG)));
+        assert_eq!(
+            wal_contiguous_run(&entries),
+            Some((Lsn::new(3 * SEG), Lsn::new(4 * SEG)))
+        );
     }
 
     #[test]
@@ -291,8 +302,23 @@ mod wal_coverage_tests {
 
     #[test]
     fn base_usability() {
-        assert!(is_base_usable(150, 120, 100, 200));
-        assert!(!is_base_usable(150, 90, 100, 200));
-        assert!(!is_base_usable(250, 120, 100, 200));
+        assert!(is_base_usable(
+            Lsn::new(150),
+            Lsn::new(120),
+            Lsn::new(100),
+            Lsn::new(200)
+        ));
+        assert!(!is_base_usable(
+            Lsn::new(150),
+            Lsn::new(90),
+            Lsn::new(100),
+            Lsn::new(200)
+        ));
+        assert!(!is_base_usable(
+            Lsn::new(250),
+            Lsn::new(120),
+            Lsn::new(100),
+            Lsn::new(200)
+        ));
     }
 }
