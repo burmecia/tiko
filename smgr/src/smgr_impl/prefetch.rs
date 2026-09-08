@@ -4,7 +4,7 @@ use pgsys::{
     smgr::*,
 };
 
-use crate::{pipeline, use_pipeline};
+use crate::{pipeline, utils::use_pipeline};
 
 /// Initiate asynchronous prefetch of blocks.
 ///

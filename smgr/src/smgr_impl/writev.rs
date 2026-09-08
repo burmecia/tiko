@@ -1,11 +1,11 @@
-use core::relfork::{RelFork, ops};
+use core::relfork::{ops, RelFork};
 use pgsys::{
-    common::{BLCKSZ, BlockNumber, ForkNumber},
+    common::{BlockNumber, ForkNumber, BLCKSZ},
     logging::pg_log_error,
     smgr::*,
 };
 
-use crate::buffers;
+use crate::utils;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_writev(
@@ -22,7 +22,7 @@ pub extern "C-unwind" fn tiko_writev(
     }
 
     let relfork = RelFork::from_rel(reln, forknum);
-    let iov = unsafe { buffers::buffers_to_iov(buffers, nblocks) };
+    let iov = unsafe { utils::buffers_to_iov(buffers, nblocks) };
 
     let mut block_offset: u32 = 0;
     for entry in &iov {

@@ -1,11 +1,11 @@
 use pgsys::{
     aio::*,
-    common::{BlockNumber, ForkNumber, get_my_proc_number},
+    common::{get_my_proc_number, BlockNumber, ForkNumber},
     logging,
     smgr::*,
 };
 
-use crate::buffers;
+use crate::utils;
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_startreadv(
@@ -25,7 +25,7 @@ pub extern "C-unwind" fn tiko_startreadv(
         ));
 
         // 1. Coalesce adjacent buffers into contiguous runs
-        let coalesced = buffers::buffers_to_iov(buffers as *const *const _, nblocks);
+        let coalesced = utils::buffers_to_iov(buffers as *const *const _, nblocks);
 
         // 2. Copy coalesced iovecs into PG shared memory iov array
         let mut iov: *mut IoVec = std::ptr::null_mut();
