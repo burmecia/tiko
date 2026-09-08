@@ -34,12 +34,20 @@ unsafe fn perform_io(
     rel_number: RelFileNumber,
     fork_number: ForkNumber,
     block_number: BlockNumber,
-    _nblocks: i32,
+    nblocks: i32,
     is_local_buffer: bool,
     wait_event: u32,
     label: &str,
 ) -> isize {
     unsafe {
+        // The whole byte/block accounting below is derived from the iov
+        // entries; PG's declared nblocks must agree with them.
+        let mut iov_nblocks: u32 = 0;
+        for i in 0..iov_length as usize {
+            iov_nblocks += ((*iov.add(i)).iov_len / BLCKSZ) as u32;
+        }
+        assert_eq!(iov_nblocks, nblocks as u32);
+
         let mut current_block = block_number;
 
         for i in 0..iov_length as usize {
