@@ -1,8 +1,8 @@
 use core::relfork::RelFork;
 use core::{io_control::IoOpKind, relfork::ops};
-use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
+use pgsys::common::{BlockNumber, ForkNumber, Oid, RelFileNumber, BLCKSZ};
 
-use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pipeline};
+use crate::{pipeline, use_pipeline, WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE};
 
 /// Common implementation for AIO read/write.
 ///
@@ -23,7 +23,7 @@ use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pip
 /// the backend's local buffer zero — producing the
 /// "unexpected zero page" error on the next B-tree read.
 ///
-/// Returns `nblocks * BLCKSZ` on success, or `-errno` on failure.
+/// Returns `nblocks * BLCKSZ` on success, or `-1` with `errno` set on failure.
 #[allow(clippy::too_many_arguments)]
 unsafe fn perform_io(
     op: IoOpKind,
@@ -98,7 +98,11 @@ unsafe fn perform_io(
                     if blocks_done > 0 {
                         return (blocks_done as isize) * (BLCKSZ as isize);
                     }
-                    return -(errno as isize);
+                    // Match pg_preadv semantics: the AIO caller (aio_io.c)
+                    // derives the errno from the thread's errno when the
+                    // result is negative, discarding the returned value.
+                    *libc::__errno_location() = errno;
+                    return -1;
                 }
             }
         }
