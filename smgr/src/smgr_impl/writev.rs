@@ -1,6 +1,6 @@
-use core::relfork::{ops, RelFork};
+use core::relfork::{RelFork, ops};
 use pgsys::{
-    common::{BlockNumber, ForkNumber, BLCKSZ},
+    common::{BLCKSZ, BlockNumber, ForkNumber},
     logging::pg_log_error,
     smgr::*,
 };

@@ -1,9 +1,9 @@
 use core::relfork::RelFork;
 use core::{io_control::IoOpKind, relfork::ops};
-use pgsys::common::{BlockNumber, ForkNumber, Oid, RelFileNumber, BLCKSZ};
+use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 
 use crate::utils::use_pipeline;
-use crate::{pipeline, WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE};
+use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline};
 
 /// Common implementation for AIO read/write.
 ///

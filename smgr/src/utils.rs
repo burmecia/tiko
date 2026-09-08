@@ -8,7 +8,7 @@
 use core::io_control::IoControl;
 use pgsys::{
     aio::IoVec,
-    common::{BlockNumber, BLCKSZ},
+    common::{BLCKSZ, BlockNumber},
 };
 
 /// Whether to use the worker async pipeline for I/O.

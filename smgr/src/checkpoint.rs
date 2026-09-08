@@ -41,14 +41,17 @@ use core::{
 use pgsys::{
     Lsn,
     latch::{
-        Latch, MyLatch, ResetLatch, SetLatch, WL_EXIT_ON_PM_DEATH, WL_LATCH_SET, WL_TIMEOUT,
-        WaitLatch,
+        Latch, MyLatch, ResetLatch, SetLatch, WL_EXIT_ON_PM_DEATH, WL_LATCH_SET,
+        WL_POSTMASTER_DEATH, WL_TIMEOUT, WaitLatch,
     },
     logging::*,
     timeline_id::TimelineId,
 };
 use std::sync::atomic::Ordering;
 
+/// Tiko-specific checkpoint flag bit (mirrors `CHECKPOINT_CAUSE_BASEBACKUP`
+/// in the patched `xlog.h`), set by pg_basebackup before it streams: signals
+/// the checkpointer to also materialize a base manifest at this LSN.
 const CHECKPOINT_CAUSE_BASEBACKUP: i32 = 0x0200;
 
 /// Called from Postgres `CreateCheckPoint()`.
@@ -60,8 +63,9 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
     flags: i32,
     is_shutdown: bool,
 ) {
-    let ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(checkpoint_lsn));
-    let redo_ckpt = Checkpoint::new(TimelineId::new(timeline_id), Lsn::new(redo_lsn));
+    let tl_id = TimelineId::new(timeline_id);
+    let ckpt = Checkpoint::new(tl_id, Lsn::new(checkpoint_lsn));
+    let redo_ckpt = Checkpoint::new(tl_id, Lsn::new(redo_lsn));
     let is_basebackup = (flags & CHECKPOINT_CAUSE_BASEBACKUP) != 0;
 
     pg_log_info(format!(
@@ -127,7 +131,9 @@ fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
             unsafe { SetLatch(worker_latch) };
         }
 
-        // Wait for completion: latch wake or a 1s poll tick.
+        // Wait for completion: latch wake or a 1s poll tick. The timeout
+        // budget counts only full 1s waits (WL_TIMEOUT returns), so other
+        // activity setting our latch cannot burn it down spuriously.
         const TIMEOUT_SECS: u32 = 300;
         let mut waited_secs = 0u32;
         let outcome = loop {
@@ -141,20 +147,28 @@ fn run_basebackup_compaction(store: &Store, commit_ckpt: Checkpoint) {
                 );
                 break None;
             }
-            waited_secs += 1;
-            if waited_secs >= TIMEOUT_SECS {
-                pg_log_warning(format!(
-                    "tiko: timed out waiting for basebackup compaction at {commit_ckpt}; running locally"
-                ));
-                break None;
-            }
-            unsafe {
+            let woken = unsafe {
                 WaitLatch(
                     MyLatch,
                     WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
                     1000,
                     crate::WAIT_EVENT_TIKO_COMPACTION,
+                )
+            };
+            if woken & WL_POSTMASTER_DEATH != 0 {
+                pg_log_warning(
+                    "tiko: postmaster died while waiting for basebackup compaction; running locally",
                 );
+                break None;
+            }
+            if woken & WL_TIMEOUT != 0 {
+                waited_secs += 1;
+                if waited_secs >= TIMEOUT_SECS {
+                    pg_log_warning(format!(
+                        "tiko: timed out waiting for basebackup compaction at {commit_ckpt}; running locally"
+                    ));
+                    break None;
+                }
             }
         };
 

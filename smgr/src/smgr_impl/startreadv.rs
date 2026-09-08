@@ -1,6 +1,6 @@
 use pgsys::{
     aio::*,
-    common::{get_my_proc_number, BlockNumber, ForkNumber},
+    common::{BlockNumber, ForkNumber, get_my_proc_number},
     logging,
     smgr::*,
 };
