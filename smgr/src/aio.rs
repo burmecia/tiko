@@ -1,8 +1,8 @@
 use core::relfork::RelFork;
 use core::{io_control::IoOpKind, relfork::ops};
-use pgsys::common::{BlockNumber, ForkNumber, Oid, RelFileNumber, BLCKSZ};
+use pgsys::common::{BLCKSZ, BlockNumber, ForkNumber, Oid, RelFileNumber};
 
-use crate::{pipeline, use_pipeline, WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE};
+use crate::{WAIT_EVENT_TIKO_IO_READ, WAIT_EVENT_TIKO_IO_WRITE, pipeline, use_pipeline};
 
 /// Common implementation for AIO read/write.
 ///
@@ -91,7 +91,13 @@ unsafe fn perform_io(
 
             match result {
                 Ok(result_nblocks) => {
-                    current_block += result_nblocks;
+                    // Short I/O (EOF clip): return partial like pg_preadv;
+                    // continuing would misalign the remaining entries' base block.
+                    if result_nblocks < entry_nblocks {
+                        let blocks_done = current_block - block_number + result_nblocks;
+                        return (blocks_done as isize) * (BLCKSZ as isize);
+                    }
+                    current_block += entry_nblocks;
                 }
                 Err(errno) => {
                     let blocks_done = current_block - block_number;
