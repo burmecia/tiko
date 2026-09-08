@@ -36,6 +36,7 @@ pub const GLOBALTABLESPACE_OID: Oid = 1664;
 pub const BLCKSZ: usize = 8192;
 
 /// PostgreSQL default WAL segment size in bytes
+/// TODO: hardcoded for now; should be read dynamically in the future
 pub const XLOG_SEG_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
 /// Recovery signal file in PGDATA (access/xlog.h: RECOVERY_SIGNAL_FILE).

@@ -95,7 +95,7 @@ impl Store {
     /// segment's last chunk for its byte length when that segment is partial.
     pub(super) fn archived_wal_run(&self, timeline: TimelineId) -> Result<(Lsn, Lsn)> {
         let seg_size = XLOG_SEG_SIZE as u64;
-        let prefix = self.ns.wal_timeline_dir(timeline);
+        let prefix = self.ns.wal_segments_prefix(timeline);
         let wal_keys = match self.storage_list_prefix(&prefix) {
             Ok(k) => k,
             Err(e) if e.is_not_found() => Vec::new(),

@@ -155,13 +155,13 @@ impl DbNamespace {
     // ── WAL keys ────────────────────────────
 
     /// Listing prefix for one timeline's WAL objects: `{ns}/wal/{tl:08X}/`.
-    pub(crate) fn wal_timeline_dir(&self, timeline_id: TimelineId) -> String {
+    pub(crate) fn wal_segments_prefix(&self, timeline_id: TimelineId) -> String {
         format!("{ns}/wal/{tl}/", ns = self, tl = timeline_id.to_hex())
     }
 
     /// Storage key for a sealed WAL segment: `{ns}/wal/{tl}/{wal_segment}`.
     pub fn wal_segment(&self, timeline_id: TimelineId, wal_segment: &str) -> String {
-        format!("{}{}", self.wal_timeline_dir(timeline_id), wal_segment)
+        format!("{}{}", self.wal_segments_prefix(timeline_id), wal_segment)
     }
 
     /// Prefix for all 256 KiB chunk objects belonging to one in-flight segment:
@@ -171,7 +171,7 @@ impl DbNamespace {
     pub fn wal_chunk_prefix(&self, timeline_id: TimelineId, wal_segment: &str) -> String {
         format!(
             "{}{}.chunks/",
-            self.wal_timeline_dir(timeline_id),
+            self.wal_segments_prefix(timeline_id),
             wal_segment
         )
     }
