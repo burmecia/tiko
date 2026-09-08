@@ -13,6 +13,10 @@ struct SegEntry {
     full: bool,
 }
 
+// Highest WAL segment number whose end LSN still fits a u64. The top value is
+// rejected so `(seg_no + 1) * XLOG_SEG_SIZE` cannot overflow.
+const MAX_SEG_NO: u64 = u64::MAX / XLOG_SEG_SIZE as u64;
+
 // Parse a WAL object key under `wal_prefix` (= `{ns}/wal/{tl}/`) into its
 // segment number and, for chunk objects, the chunk byte offset.
 //
@@ -27,12 +31,20 @@ fn parse_wal_key(key: &str, wal_prefix: &str) -> Option<(u64, Option<usize>)> {
         }
         let seg_no = u64::from_str_radix(&segname[8..24], 16).ok()?;
         let off = usize::from_str_radix(offpart, 16).ok()?;
+        // Chunks are keyed by their byte offset inside the segment, so an
+        // out-of-range offset means a foreign object.
+        if seg_no >= MAX_SEG_NO || off >= XLOG_SEG_SIZE {
+            return None;
+        }
         Some((seg_no, Some(off)))
     } else {
         if rel.len() != 24 || !rel.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let seg_no = u64::from_str_radix(&rel[8..24], 16).ok()?;
+        if seg_no >= MAX_SEG_NO {
+            return None;
+        }
         Some((seg_no, None))
     }
 }
@@ -82,10 +94,11 @@ fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(Lsn, Lsn)> {
 }
 
 /// A base manifest is usable as a PITR anchor if its recovery WAL fits inside
-/// the contiguous archived run `[w_lo, w_hi]`: the replay start (`redo`) must be
-/// archived, and its checkpoint record must be within coverage.
+/// the contiguous archived run `[w_lo, w_hi)`: the replay start (`redo`) must be
+/// archived, and the checkpoint record must begin below `w_hi`, the first
+/// uncovered byte.
 pub(super) fn is_base_usable(ckpt_lsn: Lsn, redo_lsn: Lsn, w_lo: Lsn, w_hi: Lsn) -> bool {
-    redo_lsn >= w_lo && ckpt_lsn <= w_hi
+    redo_lsn >= w_lo && ckpt_lsn < w_hi
 }
 
 impl Store {
@@ -206,6 +219,36 @@ mod wal_coverage_tests {
     }
 
     #[test]
+    fn parse_wal_key_rejects_out_of_range() {
+        let p = "12/34/wal/00000001/";
+        // seg_no whose end LSN would overflow u64.
+        assert_eq!(
+            parse_wal_key("12/34/wal/00000001/00000001000000FFFFFFFFFF", p),
+            None
+        );
+        // Highest accepted seg_no.
+        assert_eq!(
+            parse_wal_key("12/34/wal/00000001/00000001000000FFFFFFFFFE", p),
+            Some((0xFF_FFFF_FFFE, None))
+        );
+        // Chunk offset at/past the segment end.
+        assert_eq!(
+            parse_wal_key(
+                "12/34/wal/00000001/000000010000000000000002.chunks/0000000001000000",
+                p
+            ),
+            None
+        );
+        assert_eq!(
+            parse_wal_key(
+                "12/34/wal/00000001/000000010000000000000002.chunks/0000000000FFFFFF",
+                p
+            ),
+            Some((2, Some(0xFF_FFFF)))
+        );
+    }
+
+    #[test]
     fn contiguous_run_sealed_chain() {
         let entries = vec![sealed(0), sealed(1), sealed(2)];
         assert_eq!(
@@ -316,6 +359,19 @@ mod wal_coverage_tests {
         ));
         assert!(!is_base_usable(
             Lsn::new(250),
+            Lsn::new(120),
+            Lsn::new(100),
+            Lsn::new(200)
+        ));
+        // ckpt == w_hi: the record begins at the first uncovered byte.
+        assert!(!is_base_usable(
+            Lsn::new(200),
+            Lsn::new(120),
+            Lsn::new(100),
+            Lsn::new(200)
+        ));
+        assert!(is_base_usable(
+            Lsn::new(199),
             Lsn::new(120),
             Lsn::new(100),
             Lsn::new(200)

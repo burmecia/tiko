@@ -17,10 +17,13 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::ObjectStorage;
 use crate::error::Result;
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ── S3Sim ─────────────────────────────────────────────────────────────────
 
@@ -42,17 +45,37 @@ impl S3Sim {
 // ── ObjectStorage impl ──────────────────────────────────────────────────────────
 
 impl ObjectStorage for S3Sim {
+    // Stage under `.tmp/` (outside every listed key prefix, same filesystem)
+    // and rename, so readers never observe a partial object; fsync file and
+    // directory so a power loss can't leave one either.
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let path = self.root.join(key);
         ensure_parent(&path)?;
-        let mut f = File::create(&path)?;
-        if skip_compression(&path) {
-            f.write_all(data)?;
-        } else {
-            let compressed = zstd::encode_all(data, 1).map_err(io::Error::other)?;
-            f.write_all(&compressed)?;
+        let tmp = self.root.join(".tmp").join(format!(
+            "{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_parent(&tmp)?;
+        let result = (|| {
+            let mut f = File::create(&tmp)?;
+            if skip_compression(&path) {
+                f.write_all(data)?;
+            } else {
+                let compressed = zstd::encode_all(data, 1).map_err(io::Error::other)?;
+                f.write_all(&compressed)?;
+            }
+            f.sync_all()?;
+            fs::rename(&tmp, &path)?;
+            if let Some(parent) = path.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
         }
-        Ok(())
+        result
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {

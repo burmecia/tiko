@@ -80,7 +80,14 @@ fn restore(store: &Store, args: &Args) -> Result<Outcome> {
             return Ok(Outcome::Restored);
         }
         Err(e) if e.is_not_found() => {} // fall through to chunk assembly
-        Err(e) => return Err(e),
+        Err(e) => {
+            // Unreadable sealed object (crash-truncated, decode failure): fall
+            // back to the chunks, which compaction deletes only after the
+            // sealed PUT has completed.
+            eprintln!(
+                "tiko_restore: cannot read sealed segment {seg_key} ({e}); falling back to chunks"
+            );
+        }
     }
 
     // 2. Fall back to assembling the segment from its 256 KiB chunks.
