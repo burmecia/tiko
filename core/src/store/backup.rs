@@ -3,7 +3,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::Store;
-use super::wal::is_base_usable;
 use crate::{
     db::DbNamespace,
     error::{Error, Result},
@@ -301,7 +300,7 @@ impl Store {
         let timeline = newest.ckpt.timeline_id;
 
         // 2. Contiguous archived-WAL run for this timeline.
-        let (w_lo, w_hi) = self.archived_wal_run(timeline)?;
+        let run = self.archived_wal_run(timeline)?;
 
         // 3. Earliest usable base backup: ascending by checkpoint, first whose
         //    recovery WAL is inside the archived run. PITR anchors on
@@ -312,7 +311,7 @@ impl Store {
 
         let chosen = backups
             .into_iter()
-            .find(|b| is_base_usable(b.ckpt.lsn, b.redo_ckpt.lsn, w_lo, w_hi))
+            .find(|b| run.covers(b.redo_ckpt.lsn, b.ckpt.lsn))
             .ok_or_else(|| {
                 Error::other("no base backup's WAL is archived; nothing is recoverable yet")
             })?;
@@ -320,13 +319,13 @@ impl Store {
         let earliest_ts = chosen.created_at;
 
         // 4. Latest: run end, and the newest checkpoint time within the run.
-        //    If no checkpoint sits at/below w_hi the time window collapses to
+        //    If no checkpoint sits at/below run.hi the time window collapses to
         //    `earliest_ts` (never over-promises); the LSN window can still be
         //    wider than the time window in that edge.
-        let latest_lsn = w_hi;
+        let latest_lsn = run.hi;
         let latest_ts = rows
             .iter()
-            .filter(|r| r.ckpt.lsn <= w_hi)
+            .filter(|r| r.ckpt.lsn <= run.hi)
             .map(|r| r.created_at)
             .max()
             .unwrap_or(earliest_ts);

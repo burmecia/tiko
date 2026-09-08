@@ -3,6 +3,10 @@ use crate::error::{Error, Result};
 use pgsys::{common::XLOG_SEG_SIZE, lsn::Lsn, timeline_id::TimelineId};
 use std::collections::BTreeMap;
 
+// Highest WAL segment number whose end LSN still fits a u64. The top value is
+// rejected so `(seg_no + 1) * XLOG_SEG_SIZE` cannot overflow.
+const MAX_SEG_NO: u64 = u64::MAX / XLOG_SEG_SIZE as u64;
+
 // One WAL segment's coverage on a timeline, in absolute LSN. `full` = a sealed
 // segment covering its entire `XLOG_SEG_SIZE` range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,9 +17,22 @@ struct SegEntry {
     full: bool,
 }
 
-// Highest WAL segment number whose end LSN still fits a u64. The top value is
-// rejected so `(seg_no + 1) * XLOG_SEG_SIZE` cannot overflow.
-const MAX_SEG_NO: u64 = u64::MAX / XLOG_SEG_SIZE as u64;
+/// A contiguous archived-WAL run `[lo, hi)` on one timeline, reaching the
+/// highest archived segment. `hi` is the first uncovered byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WalRun {
+    pub lo: Lsn,
+    pub hi: Lsn,
+}
+
+impl WalRun {
+    /// A base backup is usable as a PITR anchor if its recovery WAL fits
+    /// inside the run: the replay start (`redo`) must be archived, and the
+    /// checkpoint record must begin below `hi`, the first uncovered byte.
+    pub(super) fn covers(&self, redo: Lsn, ckpt: Lsn) -> bool {
+        redo >= self.lo && ckpt < self.hi
+    }
+}
 
 // Parse a WAL object key under `wal_prefix` (= `{ns}/wal/{tl}/`) into its
 // segment number and, for chunk objects, the chunk byte offset.
@@ -50,16 +67,16 @@ fn parse_wal_key(key: &str, wal_prefix: &str) -> Option<(u64, Option<usize>)> {
 }
 
 // Compute the contiguous archived-WAL run that reaches the highest segment in
-// `entries`. Returns `(w_lo, w_hi)` absolute LSN, or `None` if empty.
+// `entries`, or `None` if empty.
 //
-// The highest segment anchors the run end (`w_hi`). The run extends down
+// The highest segment anchors the run end (`hi`). The run extends down
 // through consecutive segments whose coverage is contiguous: `cur` must cover
 // from its own segment start (no mid-segment front gap inside `cur`), and the
 // next-lower segment's coverage end (`hi`) must reach `cur`'s segment start.
 // Both sealed segments and chunks-only segments qualify — the streaming WAL
 // receiver writes chunks contiguously, so a chunks-only segment whose `hi`
 // reaches the next segment's boundary is fully covered up to that point.
-fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(Lsn, Lsn)> {
+fn wal_contiguous_run(entries: &[SegEntry]) -> Option<WalRun> {
     let seg_size = XLOG_SEG_SIZE as u64;
     let mut sorted: Vec<SegEntry> = entries.to_vec();
     sorted.sort_unstable_by_key(|e| std::cmp::Reverse(e.seg_no)); // descending
@@ -90,23 +107,15 @@ fn wal_contiguous_run(entries: &[SegEntry]) -> Option<(Lsn, Lsn)> {
         cur = next;
         idx += 1;
     }
-    Some((w_lo, w_hi))
-}
-
-/// A base manifest is usable as a PITR anchor if its recovery WAL fits inside
-/// the contiguous archived run `[w_lo, w_hi)`: the replay start (`redo`) must be
-/// archived, and the checkpoint record must begin below `w_hi`, the first
-/// uncovered byte.
-pub(super) fn is_base_usable(ckpt_lsn: Lsn, redo_lsn: Lsn, w_lo: Lsn, w_hi: Lsn) -> bool {
-    redo_lsn >= w_lo && ckpt_lsn < w_hi
+    Some(WalRun { lo: w_lo, hi: w_hi })
 }
 
 impl Store {
-    /// Compute the contiguous archived-WAL run `[w_lo, w_hi]` (absolute LSN) for
-    /// `timeline`, reaching the highest archived segment. Lists `{ns}/wal/{tl}/`,
-    /// classifies sealed segments vs partial chunks, and GETs the highest
-    /// segment's last chunk for its byte length when that segment is partial.
-    pub(super) fn archived_wal_run(&self, timeline: TimelineId) -> Result<(Lsn, Lsn)> {
+    /// Compute the contiguous archived-WAL run for `timeline`, reaching the
+    /// highest archived segment. Lists `{ns}/wal/{tl}/`, classifies sealed
+    /// segments vs partial chunks, and GETs the highest segment's last chunk
+    /// for its byte length when that segment is partial.
+    pub(super) fn archived_wal_run(&self, timeline: TimelineId) -> Result<WalRun> {
         let seg_size = XLOG_SEG_SIZE as u64;
         let prefix = self.ns.wal_segments_prefix(timeline);
         let wal_keys = match self.storage_list_prefix(&prefix) {
@@ -185,7 +194,7 @@ impl Store {
 
 #[cfg(test)]
 mod wal_coverage_tests {
-    use super::{SegEntry, is_base_usable, parse_wal_key, wal_contiguous_run};
+    use super::{SegEntry, WalRun, parse_wal_key, wal_contiguous_run};
     use pgsys::common::XLOG_SEG_SIZE;
     use pgsys::lsn::Lsn;
 
@@ -253,7 +262,10 @@ mod wal_coverage_tests {
         let entries = vec![sealed(0), sealed(1), sealed(2)];
         assert_eq!(
             wal_contiguous_run(&entries),
-            Some((Lsn::new(0), Lsn::new(3 * SEG)))
+            Some(WalRun {
+                lo: Lsn::new(0),
+                hi: Lsn::new(3 * SEG)
+            })
         );
     }
 
@@ -268,7 +280,10 @@ mod wal_coverage_tests {
         let entries = vec![sealed(0), sealed(1), top];
         assert_eq!(
             wal_contiguous_run(&entries),
-            Some((Lsn::new(0), Lsn::new(2 * SEG + 0x500)))
+            Some(WalRun {
+                lo: Lsn::new(0),
+                hi: Lsn::new(2 * SEG + 0x500)
+            })
         );
     }
 
@@ -282,7 +297,10 @@ mod wal_coverage_tests {
         };
         assert_eq!(
             wal_contiguous_run(&[top]),
-            Some((Lsn::new(2 * SEG + 0x1F898), Lsn::new(2 * SEG + 0x5F898)))
+            Some(WalRun {
+                lo: Lsn::new(2 * SEG + 0x1F898),
+                hi: Lsn::new(2 * SEG + 0x5F898)
+            })
         );
     }
 
@@ -312,7 +330,10 @@ mod wal_coverage_tests {
         };
         assert_eq!(
             wal_contiguous_run(&[seg2, seg3, seg4]),
-            Some((Lsn::new(2 * SEG + 0x41EE8), Lsn::new(4 * SEG + 0x500)))
+            Some(WalRun {
+                lo: Lsn::new(2 * SEG + 0x41EE8),
+                hi: Lsn::new(4 * SEG + 0x500)
+            })
         );
 
         // A chunks-only segment that does NOT reach the boundary must stop the
@@ -325,7 +346,10 @@ mod wal_coverage_tests {
         };
         assert_eq!(
             wal_contiguous_run(&[seg3_short, seg4]),
-            Some((Lsn::new(4 * SEG), Lsn::new(4 * SEG + 0x500)))
+            Some(WalRun {
+                lo: Lsn::new(4 * SEG),
+                hi: Lsn::new(4 * SEG + 0x500)
+            })
         );
     }
 
@@ -334,7 +358,10 @@ mod wal_coverage_tests {
         let entries = vec![sealed(1), sealed(3)];
         assert_eq!(
             wal_contiguous_run(&entries),
-            Some((Lsn::new(3 * SEG), Lsn::new(4 * SEG)))
+            Some(WalRun {
+                lo: Lsn::new(3 * SEG),
+                hi: Lsn::new(4 * SEG)
+            })
         );
     }
 
@@ -344,37 +371,16 @@ mod wal_coverage_tests {
     }
 
     #[test]
-    fn base_usability() {
-        assert!(is_base_usable(
-            Lsn::new(150),
-            Lsn::new(120),
-            Lsn::new(100),
-            Lsn::new(200)
-        ));
-        assert!(!is_base_usable(
-            Lsn::new(150),
-            Lsn::new(90),
-            Lsn::new(100),
-            Lsn::new(200)
-        ));
-        assert!(!is_base_usable(
-            Lsn::new(250),
-            Lsn::new(120),
-            Lsn::new(100),
-            Lsn::new(200)
-        ));
-        // ckpt == w_hi: the record begins at the first uncovered byte.
-        assert!(!is_base_usable(
-            Lsn::new(200),
-            Lsn::new(120),
-            Lsn::new(100),
-            Lsn::new(200)
-        ));
-        assert!(is_base_usable(
-            Lsn::new(199),
-            Lsn::new(120),
-            Lsn::new(100),
-            Lsn::new(200)
-        ));
+    fn wal_run_covers() {
+        let run = WalRun {
+            lo: Lsn::new(100),
+            hi: Lsn::new(200),
+        };
+        assert!(run.covers(Lsn::new(120), Lsn::new(150)));
+        assert!(!run.covers(Lsn::new(90), Lsn::new(150)));
+        assert!(!run.covers(Lsn::new(120), Lsn::new(250)));
+        // ckpt == hi: the record begins at the first uncovered byte.
+        assert!(!run.covers(Lsn::new(120), Lsn::new(200)));
+        assert!(run.covers(Lsn::new(120), Lsn::new(199)));
     }
 }
