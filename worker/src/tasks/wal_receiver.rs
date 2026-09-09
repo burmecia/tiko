@@ -123,7 +123,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // ── Core streaming loop ───────────────────────────────────────────────────────
 
 async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Result<(), BoxError> {
-    let params = parse_connstr(&config.connstr);
+    let params = parse_connstr(config.connstr);
 
     // ── Connect ───────────────────────────────────────────────────────────────
     let socket_path = unix_socket_path(&params)?;
@@ -334,12 +334,11 @@ async fn handle_xlogdata(
         let piece = &wal_data[off..off + piece_len];
 
         // Segment switch: seal the old segment before starting a new one.
-        if let Some(state) = cur_seg.as_ref() {
-            if state.seg_no != seg_no {
+        if let Some(state) = cur_seg.as_ref()
+            && state.seg_no != seg_no {
                 let old = cur_seg.take().unwrap();
                 seal_segment(old, sim, timeline_id, confirmed_lsn, conn).await?;
             }
-        }
         if cur_seg.is_none() {
             let mut s = SegState::new(seg_no);
             if seg_offset > 0 {

@@ -156,7 +156,7 @@ pub(crate) fn init_tokio_runtime_with_config(
         {
             Ok(runtime) => {
                 let _ = TOKIO_RUNTIME.set(runtime);
-                pg_log_info(&format!(
+                pg_log_info(format!(
                     "tiko: Tokio runtime initialized ({} workers, {} blocking)",
                     config.worker_threads, config.blocking_threads
                 ));

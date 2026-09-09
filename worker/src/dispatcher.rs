@@ -21,7 +21,7 @@ impl Dispatcher {
     pub fn new(work_queue_size: usize) -> (Self, mpsc::Receiver<IoWorkRequest>) {
         let (work_sender, work_receiver) = mpsc::channel(work_queue_size);
 
-        pg_log_debug2(&format!(
+        pg_log_debug2(format!(
             "tiko: dispatcher created with work_queue_size={}",
             work_queue_size,
         ));

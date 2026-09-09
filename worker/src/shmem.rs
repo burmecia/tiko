@@ -25,7 +25,7 @@ pub extern "C" fn worker_shmem_request() {
         let size = IoControl::shmem_size(max_backends);
         RequestAddinShmemSpace(size);
 
-        pg_log_debug1(&format!(
+        pg_log_debug1(format!(
             "tiko: requested {} bytes shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
             size,
             max_backends,
@@ -45,7 +45,7 @@ pub extern "C" fn worker_shmem_startup() {
         let max_backends = (MaxBackends + NUM_AUXILIARY_PROCS) as usize;
         IoControl::init_or_attach(max_backends);
 
-        pg_log_debug1(&format!(
+        pg_log_debug1(format!(
             "tiko: initialized shared memory ({} backend pools, cache {} chunk slots + hash + locks)",
             max_backends,
             core::cache::CHUNK_NUM_SLOTS

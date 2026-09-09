@@ -46,7 +46,7 @@ async fn process_io_request(request: IoWorkRequest) {
     let pool = control.backend_pool(request.backend_id as i32);
     let slot = pool.slot(request.slot_index as usize);
 
-    let (status, nblocks) = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(&slot))) {
+    let (status, nblocks) = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(slot))) {
         Ok(result) => result,
         Err(_) => (libc::EIO, 0u32),
     };

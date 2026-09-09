@@ -79,7 +79,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
 
     // Initialize Tokio runtime for async I/O
     if let Err(e) = thread_pool::init_tokio_runtime() {
-        pg_log_error(&format!(
+        pg_log_error(format!(
             "tiko: failed to initialize Tokio runtime: {:?}",
             e
         ));
@@ -164,15 +164,15 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         }
 
         // Periodic logging
-        if loop_count % 4 == 0 {
-            pg_log_debug3(&format!(
+        if loop_count.is_multiple_of(4) {
+            pg_log_debug3(format!(
                 "tiko: loop_count={}, requests={}",
                 loop_count, requests_processed
             ));
         }
 
         // Log cache stats periodically (every 10000 loops)
-        if loop_count % 10000 == 0 {
+        if loop_count.is_multiple_of(10000) {
             io_control.stats.log_summary();
         }
 
@@ -184,7 +184,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     drain_relay();
 
     io_control.stats.log_summary();
-    pg_log_info(&format!(
+    pg_log_info(format!(
         "tiko: shutting down (io_loops={}, io_requests={})",
         loop_count, requests_processed
     ));

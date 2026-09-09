@@ -36,7 +36,7 @@ pub fn relay_log(elevel: i32, msg: impl Into<String>) {
     let msg = msg.into();
     if let Some(tx) = LOG_TX.get() {
         match tx.try_send((elevel, msg.clone())) {
-            Ok(()) => return,
+            Ok(()) => (),
             Err(TrySendError::Full(_)) => {
                 eprintln!("tiko: log_relay: channel full, dropping to stderr: {msg}");
             }
