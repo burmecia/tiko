@@ -30,11 +30,20 @@ static CONFIG_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 /// Handle SIGTERM (shutdown request from postmaster)
 extern "C" fn handle_sigterm(_: c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    wake_main_loop();
 }
 
 /// Handle SIGHUP (config reload request)
 extern "C" fn handle_sighup(_: c_int) {
     CONFIG_RELOAD_PENDING.store(true, Ordering::Release);
+    wake_main_loop();
+}
+
+/// Wake the main loop so the latch wait returns immediately instead of
+/// after its timeout. SetLatch only writes to the self-pipe, so it is safe
+/// from a signal handler.
+extern "C" fn wake_main_loop() {
+    unsafe { SetLatch(MyLatch) };
 }
 
 /// Initialize signal handlers
