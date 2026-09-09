@@ -84,10 +84,11 @@ pub extern "C-unwind" fn tiko_perform_checkpoint(
         ));
     }
 
-    // Basebackup checkpoint: form a base manifest at the checkpoint LSN, with
-    // the background compactor paused + drained so we don't race it. The base
-    // manifest pairs with the pg_basebackup tarball uploaded by
-    // `tiko_pitr backup` to anchor PITR at this LSN.
+    // Basebackup checkpoint: form a base manifest at the checkpoint LSN. The
+    // tikoworker compactor is the sole routine executor and serialises this
+    // request behind any in-flight tick compaction, so no racing runs start
+    // while we wait. The base manifest pairs with the pg_basebackup tarball
+    // uploaded by `tiko_pitr backup` to anchor PITR at this LSN.
     if is_basebackup {
         run_basebackup_compaction(store, ckpt);
     }
