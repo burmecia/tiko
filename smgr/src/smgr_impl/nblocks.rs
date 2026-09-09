@@ -7,11 +7,12 @@ use pgsys::{
     smgr::*,
 };
 
-/// Get the number of blocks stored in a relation fork.
+/// Get the number of blocks in a relation fork.
 ///
-/// Returns `max(nblocks, cache_max)` — the backing file may lag behind
-/// the cache under the write-back policy, so we must also check the cache for
-/// blocks that have been written but not yet evicted to the S3-sim file.
+/// Reads from the shared-memory meta cache, which tracks every write that
+/// extended the fork (including dirty chunks not yet committed/evicted).
+/// Falls back to the committed store state when the cache is unavailable
+/// (e.g. initdb).
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn tiko_nblocks(
     reln: *mut SMgrRelationData,

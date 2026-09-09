@@ -1,6 +1,6 @@
 use pgsys::{
     aio::*,
-    common::{BlockNumber, ForkNumber, get_my_proc_number},
+    common::{get_my_proc_number, BlockNumber, ForkNumber},
     logging,
     smgr::*,
 };
@@ -30,7 +30,13 @@ pub extern "C-unwind" fn tiko_startreadv(
         // 2. Copy coalesced iovecs into PG shared memory iov array
         let mut iov: *mut IoVec = std::ptr::null_mut();
         let max_iovcnt = pgaio_io_get_iovec(ioh, &mut iov);
-        assert!((coalesced.len() as i32) <= max_iovcnt);
+        if (coalesced.len() as i32) > max_iovcnt {
+            // pg_log_error is elog(ERROR): longjmps, never returns
+            logging::pg_log_error(format!(
+                "tiko_startreadv({}): rel {} fork {} block {} needs {} iov entries, PG AIO allows {}",
+                proc_num, loc.rel_number, forknum, blocknum, coalesced.len(), max_iovcnt,
+            ));
+        }
         for (j, entry) in coalesced.iter().enumerate() {
             let pg_entry = &mut *iov.add(j);
             pg_entry.iov_base = entry.iov_base;

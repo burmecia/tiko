@@ -13,7 +13,7 @@
 //! PANIC aborts the process when the PG thread drains it.
 
 use std::collections::VecDeque;
-use std::ffi::{CString, c_int};
+use std::ffi::{c_int, CString};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 
@@ -143,6 +143,10 @@ pub fn pg_log_warning(message: impl AsRef<str>) {
     pg_log(WARNING, message);
 }
 
+/// Log at ERROR severity. Like C `elog(ERROR, ...)`, this **longjmps to the
+/// innermost PG_CATCH and never returns** — any code after a call is
+/// unreachable. Do not add "fallback"/"return on error" paths after calling
+/// this; use `pg_log_warning` or a `Result` if execution must continue.
 #[inline(always)]
 pub fn pg_log_error(message: impl AsRef<str>) {
     pg_log(ERROR, message);
