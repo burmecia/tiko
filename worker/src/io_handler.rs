@@ -7,16 +7,21 @@
 //!
 //! After I/O completes on a Tokio thread:
 //! 1. Write result fields to the slot (`result_status`, `result_nblocks`)
-//! 2. Mark slot completed (`mark_completed()` — Release fence)
+//! 2. Mark slot completed (`try_mark_completed()` — CAS InProgress → Completed)
 //! 3. Call `SetLatch(owner_latch)` to wake the backend directly
 //!
 //! This eliminates the harvest step — Tokio notifies backends directly.
+//!
+//! The whole request is wrapped in `catch_unwind`: a dropped completion would
+//! leave the slot InProgress forever and hang the backend in its wait loop,
+//! so a panicking task fails the slot with EIO instead.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 use core::{
-    io_control::{IoControl, IoOpKind, IoWorkRequest},
+    io_control::{IoControl, IoOpKind, IoSlot, IoWorkRequest},
     relfork::{RelFork, ops},
 };
 use pgsys::latch::SetLatch;
@@ -41,6 +46,41 @@ async fn process_io_request(request: IoWorkRequest) {
     let pool = control.backend_pool(request.backend_id as i32);
     let slot = pool.slot(request.slot_index as usize);
 
+    let (status, nblocks) = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(&slot))) {
+        Ok(result) => result,
+        Err(_) => (libc::EIO, 0u32),
+    };
+
+    // Check generation before writing results — if the slot was recycled by a new
+    // backend (attach() bumped generation), discard this stale completion silently.
+    let current_gen = slot.generation.load(Ordering::Relaxed);
+    if current_gen != request.generation {
+        // Slot was recycled. Do NOT write results, mark_completed, or SetLatch.
+        // The new backend will have reset this slot to Free state.
+        return;
+    }
+
+    // Write result fields (must happen before mark_completed)
+    slot.result_status.store(status, Ordering::Relaxed);
+    slot.result_nblocks.store(nblocks, Ordering::Relaxed);
+
+    // CAS (InProgress → Completed): if the slot was recycled after the
+    // generation check, this fails and the stale result is discarded.
+    if !slot.try_mark_completed() {
+        return;
+    }
+
+    // Wake the backend directly — no main-thread harvest step
+    let latch = slot.owner_latch.load(Ordering::Acquire) as *mut pgsys::latch::Latch;
+    if !latch.is_null() {
+        unsafe {
+            SetLatch(latch);
+        }
+    }
+}
+
+/// Perform I/O based on operation type.
+fn do_io(slot: &IoSlot) -> (i32, u32) {
     let rf = RelFork {
         spc_oid: slot.spc_oid,
         db_oid: slot.db_oid,
@@ -48,8 +88,7 @@ async fn process_io_request(request: IoWorkRequest) {
         fork_number: slot.fork_number,
     };
 
-    // Perform I/O based on operation type
-    let (status, nblocks) = match slot.op {
+    match slot.op {
         IoOpKind::Read => {
             let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *mut u8;
             match ops::read_blocks(&rf, slot.block_number, slot.nblocks, buffer_ptr) {
@@ -69,29 +108,5 @@ async fn process_io_request(request: IoWorkRequest) {
             Err(_) => (libc::EIO, 0u32),
         },
         _ => (libc::ENOTSUP, 0u32),
-    };
-
-    // Check generation before writing results — if the slot was recycled by a new
-    // backend (attach() bumped generation), discard this stale completion silently.
-    let current_gen = slot.generation.load(Ordering::Relaxed);
-    if current_gen != request.generation {
-        // Slot was recycled. Do NOT write results, mark_completed, or SetLatch.
-        // The new backend will have reset this slot to Free state.
-        return;
-    }
-
-    // Write result fields (must happen before mark_completed)
-    slot.result_status.store(status, Ordering::Relaxed);
-    slot.result_nblocks.store(nblocks, Ordering::Relaxed);
-
-    // Mark completed (Release fence ensures results visible before state change)
-    slot.mark_completed();
-
-    // Wake the backend directly — no main-thread harvest step
-    let latch = slot.owner_latch.load(Ordering::Acquire) as *mut pgsys::latch::Latch;
-    if !latch.is_null() {
-        unsafe {
-            SetLatch(latch);
-        }
     }
 }

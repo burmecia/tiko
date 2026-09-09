@@ -5,6 +5,7 @@
 //!
 //! This module extracts that common logic into `submit_and_wait`.
 
+use libc::ENOENT;
 use std::sync::atomic::Ordering;
 
 use core::io_control::*;
@@ -14,9 +15,6 @@ use pgsys::{
     logging::*,
     smgr::*,
 };
-
-/// POSIX ENOENT (No such file or directory) — constant to avoid libc dependency.
-const ENOENT: i32 = 2;
 
 /// Result of a completed async I/O request.
 #[allow(dead_code)]
@@ -118,7 +116,12 @@ pub(crate) unsafe fn submit_and_wait_raw(
             if let Some(idx) = pool.try_claim() {
                 break idx;
             }
-            WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, -1, wait_event);
+            WaitLatch(
+                MyLatch,
+                WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                1000,
+                wait_event,
+            );
         };
         let slot = pool.slot(slot_idx);
 

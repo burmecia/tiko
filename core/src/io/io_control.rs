@@ -239,11 +239,20 @@ impl IoSlot {
     }
 
     /// Mark completed (InProgress → Completed).
-    /// Called by Tokio worker after writing result fields.
-    /// Caller must then call SetLatch(owner_latch) to wake the backend.
-    pub fn mark_completed(&self) {
+    ///
+    /// CAS, not a store: a stale Tokio completion after the slot was recycled
+    /// (backend died, `attach()` reset it, new backend filled it) must not
+    /// clobber the new request's state. Returns false if the slot is no longer
+    /// InProgress — the caller must discard the result and skip `SetLatch`.
+    pub fn try_mark_completed(&self) -> bool {
         self.state
-            .store(SlotState::Completed as u8, Ordering::Release);
+            .compare_exchange(
+                SlotState::InProgress as u8,
+                SlotState::Completed as u8,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     /// Release slot (Completed → Free).
@@ -280,16 +289,20 @@ impl IoSlot {
     }
 
     /// Fail slot with an error and wake the backend via SetLatch.
-    pub fn fail_with_error(&self, error_code: i32) {
+    /// Returns false if the slot was no longer InProgress (recycled — result discarded).
+    pub fn fail_with_error(&self, error_code: i32) -> bool {
         self.result_status.store(error_code, Ordering::Release);
-        self.mark_completed();
-        // Wake the backend directly
-        let latch = self.owner_latch.load(Ordering::Acquire) as *mut Latch;
-        if !latch.is_null() {
-            unsafe {
-                SetLatch(latch);
+        let completed = self.try_mark_completed();
+        if completed {
+            // Wake the backend directly
+            let latch = self.owner_latch.load(Ordering::Acquire) as *mut Latch;
+            if !latch.is_null() {
+                unsafe {
+                    SetLatch(latch);
+                }
             }
         }
+        completed
     }
 }
 
