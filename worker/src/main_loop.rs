@@ -109,7 +109,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     // Store our PID and latch so backends can check liveness and wake us
     io_control
         .worker_pid
-        .store(unsafe { MyProcPid } as u32, Ordering::Relaxed);
+        .store(unsafe { MyProcPid } as u32, Ordering::Release);
     io_control
         .worker_latch
         .store(unsafe { MyLatch } as u64, Ordering::Release);
