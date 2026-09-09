@@ -10,9 +10,11 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::dispatcher::Dispatcher;
-use crate::log_relay;
-use core::io_control::IoControl;
+use crate::{
+    dispatcher::Dispatcher, io_handler, log_relay, tasks::compactor::CompactionRequestMsg,
+    thread_pool,
+};
+use core::{io_control::IoControl, utils::rw_lock};
 use pgsys::{
     common::{MyProcPid, SIGHUP, SIGTERM},
     cshim::check_for_interrupts,
@@ -20,10 +22,6 @@ use pgsys::{
     logging::*,
     wait_events::new_wait_event,
 };
-
-use crate::io_handler;
-use crate::tasks::compactor::CompactionRequestMsg;
-use crate::thread_pool;
 
 /// Global flags for managing worker lifecycle and configuration
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -53,6 +51,12 @@ fn setup_signal_handlers() {
     pg_log_debug1("tiko: signal handlers installed");
 }
 
+/// Bounded work channel size from the main thread to Tokio
+const WORK_QUEUE_SIZE: usize = 512;
+
+/// Compaction request channel buffer (main loop → compactor task)
+const COMPACTION_REQ_QUEUE_SIZE: usize = 4;
+
 /// Wait event identifier for Tiko worker main loop
 static mut WAIT_EVENT_TIKO_WORKER_MAIN: u32 = 0;
 
@@ -79,15 +83,12 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
 
     // Initialize Tokio runtime for async I/O
     if let Err(e) = thread_pool::init_tokio_runtime() {
-        pg_log_error(format!(
-            "tiko: failed to initialize Tokio runtime: {:?}",
-            e
-        ));
+        pg_log_error(format!("tiko: failed to initialize Tokio runtime: {:?}", e));
         return;
     }
 
     // Initialize dispatcher — work channel from main thread to Tokio
-    let (dispatcher, rx) = Dispatcher::new(512);
+    let (dispatcher, rx) = Dispatcher::new(WORK_QUEUE_SIZE);
 
     // Spawn io_worker_loop on Tokio — receives requests and spawns per-request tasks
     thread_pool::spawn_task(io_handler::io_worker_loop(rx));
@@ -95,7 +96,8 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     // Spawn the compactor background task now that the runtime and ProjectCtx are initialised.
     // The main loop relays basebackup compaction requests from the shmem slot
     // (`TimelineState::compaction_request`) into this channel.
-    let (compaction_req_tx, compaction_req_rx) = tokio::sync::mpsc::channel(4);
+    let (compaction_req_tx, compaction_req_rx) =
+        tokio::sync::mpsc::channel(COMPACTION_REQ_QUEUE_SIZE);
     thread_pool::spawn_compactor_task(compaction_req_rx);
 
     // Spawn WAL streaming task.
@@ -137,7 +139,7 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
         // A Tokio thread that found a wedged shmem lock poisons the worker
         // (it cannot elog itself). PANIC here on the PG thread so the
         // postmaster crash-restarts and reinitialises shared memory.
-        if let Some(msg) = core::utils::rw_lock::take_poison() {
+        if let Some(msg) = rw_lock::take_poison() {
             pg_log(PANIC, msg);
         }
 

@@ -335,10 +335,11 @@ async fn handle_xlogdata(
 
         // Segment switch: seal the old segment before starting a new one.
         if let Some(state) = cur_seg.as_ref()
-            && state.seg_no != seg_no {
-                let old = cur_seg.take().unwrap();
-                seal_segment(old, sim, timeline_id, confirmed_lsn, conn).await?;
-            }
+            && state.seg_no != seg_no
+        {
+            let old = cur_seg.take().unwrap();
+            seal_segment(old, sim, timeline_id, confirmed_lsn, conn).await?;
+        }
         if cur_seg.is_none() {
             let mut s = SegState::new(seg_no);
             if seg_offset > 0 {

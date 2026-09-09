@@ -1,5 +1,5 @@
 use pgsys::{
-    common::{BlockNumber, ForkNumber, BLCKSZ},
+    common::{BLCKSZ, BlockNumber, ForkNumber},
     smgr::*,
 };
 

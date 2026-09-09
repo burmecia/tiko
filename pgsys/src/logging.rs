@@ -13,7 +13,7 @@
 //! PANIC aborts the process when the PG thread drains it.
 
 use std::collections::VecDeque;
-use std::ffi::{c_int, CString};
+use std::ffi::{CString, c_int};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 
