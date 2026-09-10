@@ -386,6 +386,12 @@ async fn handle_xlogdata(
 
 /// Seal a completed WAL segment.
 ///
+/// A non-partial segment must have observed exactly `XLOG_SEG_SIZE` bytes
+/// before it is sealed; a short buffer means the stream jumped (gap/overlap),
+/// so sealing it would fabricate replayable WAL with a zero-filled tail. In
+/// that case this returns an error and the reconnect loop re-streams from the
+/// last confirmed segment boundary.
+///
 /// 1. Join all in-flight chunk PUTs and upload the tail (any error propagates
 ///    to the reconnect loop).
 /// 2. For a fully-observed segment: zero-pad to `XLOG_SEG_SIZE`, PUT the sealed
@@ -405,6 +411,17 @@ async fn seal_segment(
     let seg_no = state.seg_no;
     let name = wal_seg_name(timeline_id, seg_no);
 
+    // A fully-observed segment is exactly full; anything shorter is a stream
+    // discontinuity. Refuse before publishing anything, so the gap is retried
+    // from `confirmed_lsn` instead of being masked by a zero-padded seal.
+    if segment_truncated(state.partial, state.buf.len(), XLOG_SEG_SIZE) {
+        return Err(format!(
+            "segment {name} incomplete at {} bytes (expected {XLOG_SEG_SIZE}); WAL stream discontinuity",
+            state.buf.len()
+        )
+        .into());
+    }
+
     // 1. Drain inflight chunk PUTs and flush the trailing partial chunk.
     join_chunks_and_flush_tail(&mut state, sim, timeline_id, &name).await?;
 
@@ -415,7 +432,8 @@ async fn seal_segment(
             "tiko: wal_receiver: segment {name} began mid-stream; kept as chunks-only (no sealed object)"
         ));
     } else {
-        // 2. Zero-pad to XLOG_SEG_SIZE and PUT the sealed segment.
+        // 2. PUT the sealed segment. `buf` is exactly XLOG_SEG_SIZE here (guarded
+        //    above), so the resize is a no-op kept for clarity.
         state.buf.resize(XLOG_SEG_SIZE, 0);
         let sealed = state.buf;
         let seg_key = sim.namespace().wal_segment(timeline_id, &name);
@@ -589,6 +607,17 @@ async fn send_standby_status(conn: &mut ReplConn, flush_lsn: u64) -> Result<(), 
 /// (a checkpoint — or compaction — committed) AND there is buffered tail to push.
 fn should_flush_tail(last_gen: u64, cur_gen: u64, has_tail: bool) -> bool {
     cur_gen != last_gen && has_tail
+}
+
+/// True when a non-partial segment ended short of its full size.
+///
+/// A non-partial segment starts at offset 0 and is only sealed once streaming
+/// crosses its end, so `received` must equal `seg_size`. Any other length means
+/// the WAL stream jumped (gap/overlap); sealing it would zero-fill the missing
+/// tail and falsely advertise complete, replayable WAL. Partial segments
+/// (mid-stream start) are never sealed, so they are exempt.
+fn segment_truncated(partial: bool, received: usize, seg_size: usize) -> bool {
+    !partial && received != seg_size
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
@@ -981,7 +1010,7 @@ fn parse_error_response(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::should_flush_tail;
+    use super::{segment_truncated, should_flush_tail};
 
     #[test]
     fn should_flush_tail_gate() {
@@ -989,5 +1018,16 @@ mod tests {
         assert!(!should_flush_tail(1, 2, false)); // advanced but nothing buffered
         assert!(!should_flush_tail(2, 2, true)); // no checkpoint since last flush
         assert!(!should_flush_tail(2, 2, false)); // unchanged + nothing buffered
+    }
+
+    #[test]
+    fn segment_truncated_gate() {
+        const SEG: usize = 16 * 1024 * 1024;
+        assert!(!segment_truncated(false, SEG, SEG)); // full segment seals
+        assert!(segment_truncated(false, SEG - 1, SEG)); // short: gap, refuse
+        assert!(segment_truncated(false, 0, SEG)); // nothing observed
+        assert!(segment_truncated(false, SEG + 1, SEG)); // overlong: refuse too
+        assert!(!segment_truncated(true, SEG - 1, SEG)); // partial never seals
+        assert!(!segment_truncated(true, 0, SEG));
     }
 }
