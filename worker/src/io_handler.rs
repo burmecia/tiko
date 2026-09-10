@@ -26,7 +26,9 @@
 //!
 //! The whole I/O is wrapped in `catch_unwind`: a dropped completion would
 //! leave the slot InProgress forever and hang the backend in its wait loop,
-//! so a panicking task fails the slot with EIO instead.
+//! so a panicking task fails the slot with EIO instead — and the panic
+//! payload is logged via the queued log relay (safe off the PG thread) so a
+//! code panic isn't indistinguishable from a storage error.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
@@ -76,7 +78,15 @@ async fn process_io_request(request: IoWorkRequest) {
     let (request, (status, nblocks)) = match tokio::task::spawn_blocking(move || {
         let result = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(&request))) {
             Ok(result) => result,
-            Err(_) => (libc::EIO, 0u32),
+            Err(payload) => {
+                pgsys::logging::pg_log_error(format!(
+                    "tiko: relfork I/O panicked for backend {} slot {}; failing with EIO ({})",
+                    backend_id,
+                    slot_index,
+                    panic_payload_message(payload.as_ref()),
+                ));
+                (libc::EIO, 0u32)
+            }
         };
         (request, result)
     })
@@ -117,6 +127,17 @@ async fn process_io_request(request: IoWorkRequest) {
         unsafe {
             SetLatch(latch);
         }
+    }
+}
+
+/// Extract a human-readable message from a panic payload for logging.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 
