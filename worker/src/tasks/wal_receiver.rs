@@ -230,6 +230,10 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
 
     // ── Message loop ──────────────────────────────────────────────────────────
     let mut confirmed_lsn: u64 = start_lsn;
+    // Next byte the walsender must deliver. Each XLogData must begin here
+    // (physical streaming is a contiguous byte stream), so a mismatch means a
+    // gap/overlap and we reconnect rather than archive incomplete coverage.
+    let mut expected_lsn: u64 = start_lsn;
     let mut cur_seg: Option<SegState> = None;
     // Last checkpoint/commit generation we flushed the tail at. Initialized to
     // the current value so we don't flush spuriously right after connecting.
@@ -252,6 +256,7 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
                             timeline_id,
                             &mut cur_seg,
                             &mut confirmed_lsn,
+                            &mut expected_lsn,
                             &mut conn,
                         )
                         .await?;
@@ -298,7 +303,8 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
 ///
 /// Wire format: `[w(1)][start_lsn(8)][end_lsn(8)][server_time(8)][wal_data...]`
 ///
-/// Detects segment switches, appends WAL bytes, fires chunk PUTs.
+/// Verifies the message begins where the previous one ended, then detects
+/// segment switches, appends WAL bytes, and fires chunk PUTs.
 #[allow(clippy::too_many_arguments)]
 async fn handle_xlogdata(
     msg: &[u8],
@@ -306,6 +312,7 @@ async fn handle_xlogdata(
     timeline_id: TimelineId,
     cur_seg: &mut Option<SegState>,
     confirmed_lsn: &mut u64,
+    expected_lsn: &mut u64,
     conn: &mut ReplConn,
 ) -> Result<(), BoxError> {
     if msg.len() < 25 {
@@ -315,6 +322,22 @@ async fn handle_xlogdata(
     let wal_data = &msg[25..];
     if wal_data.is_empty() {
         return Ok(());
+    }
+
+    // Physical streaming is a contiguous byte stream: each XLogData starts at
+    // the exact byte the previous one ended (walsender advances `sentPtr` by
+    // the bytes sent). Any mismatch is a gap or overlap, so fail and let the
+    // reconnect loop re-stream from `confirmed_lsn` instead of persisting WAL
+    // with a hole.
+    if start_lsn != *expected_lsn {
+        return Err(format!(
+            "WAL stream discontinuity: expected {:X}/{:X}, got {:X}/{:X}",
+            *expected_lsn >> 32,
+            *expected_lsn as u32,
+            start_lsn >> 32,
+            start_lsn as u32,
+        )
+        .into());
     }
 
     // Process `wal_data`, splitting at segment boundaries. The walsender CAN
@@ -379,6 +402,9 @@ async fn handle_xlogdata(
         cursor += piece_len as u64;
     }
 
+    // `cursor` now points one past the last byte consumed; the next XLogData
+    // must start here.
+    *expected_lsn = cursor;
     Ok(())
 }
 
