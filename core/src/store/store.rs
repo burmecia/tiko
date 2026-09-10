@@ -353,6 +353,21 @@ impl Store {
         TimelineSegment::from_bytes(&seg_bytes)
     }
 
+    /// Like [`Self::load_segment`], but returns `Ok(None)` when the segment
+    /// object no longer exists — e.g. a concurrent compactor deleted it after
+    /// a preceding `list_*`. Other errors propagate.
+    pub(super) fn try_load_segment(
+        &self,
+        segment_id: &SegmentId,
+    ) -> Result<Option<TimelineSegment>> {
+        let key = self.ns.timeline_segment(segment_id);
+        match self.storage.get(&key) {
+            Ok(bytes) => Ok(Some(TimelineSegment::from_bytes(&bytes)?)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Walk on-disk segments newest → oldest covering the half-open
     /// checkpoint range `[low_ckpt, high_ckpt_excl)`. On the first checkpoint
     /// whose summary contains `tag`, fetch the chunk into `dst` at the

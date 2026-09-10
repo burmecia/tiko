@@ -4,7 +4,7 @@ use super::Store;
 use crate::{
     error::{Error, Result},
     io_control::IoControl,
-    timeline::{Checkpoint, CheckpointSummary},
+    timeline::{Checkpoint, CheckpointSummary, SegmentId},
 };
 use pgsys::logging::{pg_log_debug1, pg_log_warning};
 
@@ -140,8 +140,17 @@ impl Store {
 
         let segments = self.list_segments_in_range(base_ckpt, upper)?;
         let mut to_apply: Vec<CheckpointSummary> = Vec::new();
+        let mut missing: Option<SegmentId> = None;
         for sid in &segments {
-            let seg = self.load_segment(sid)?;
+            let Some(seg) = self.try_load_segment(sid)? else {
+                // A concurrent compactor deleted this segment after we listed
+                // it. Its contents are only gone because a newer base manifest
+                // already covers them, so confirm `base_ckpt` moved and report
+                // a race (the caller retries/verifies coverage); otherwise fail
+                // loudly rather than publish a partial merge.
+                missing = Some(*sid);
+                break;
+            };
             for sc in &seg.checkpoints {
                 let in_range = if inclusive {
                     sc.ckpt <= upper
@@ -152,6 +161,19 @@ impl Store {
                     to_apply.push(sc.clone());
                 }
             }
+        }
+
+        if let Some(sid) = missing {
+            let base_now = {
+                let _guard = timeline.lock.read();
+                timeline.base_ckpt
+            };
+            if base_now != base_ckpt {
+                return Ok(CompactionResult::Raced);
+            }
+            return Err(Error::other(format!(
+                "timeline segment {sid} disappeared while base_ckpt stayed at {base_ckpt}"
+            )));
         }
 
         if to_apply.is_empty() {
