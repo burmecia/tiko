@@ -17,7 +17,14 @@
 //!
 //! This eliminates the harvest step — Tokio notifies backends directly.
 //!
-//! The whole request is wrapped in `catch_unwind`: a dropped completion would
+//! The I/O itself (`do_io`) runs on Tokio's blocking pool via
+//! `spawn_blocking`: it is fully synchronous (local cache/file I/O through
+//! the S3Sim backend + zstd + buffer memcpy), and running it on runtime
+//! worker threads would pin all 4 of them in kernel/NFS waits, starving the
+//! wal_receiver and compactor tasks sharing the runtime. The blocking pool
+//! also caps concurrent I/O at `max_blocking_threads` (8).
+//!
+//! The whole I/O is wrapped in `catch_unwind`: a dropped completion would
 //! leave the slot InProgress forever and hang the backend in its wait loop,
 //! so a panicking task fails the slot with EIO instead.
 
@@ -45,9 +52,10 @@ pub async fn io_worker_loop(mut rx: mpsc::Receiver<IoWorkRequest>) {
 /// Process a single I/O request.
 ///
 /// Performs the I/O from the dispatch-time snapshot (never re-reading slot
-/// fields), then completes via the pinned protocol and wakes the backend via
-/// SetLatch. If the slot was recycled at any point, the result is discarded
-/// silently — the new backend's own request will complete on its own.
+/// fields) on Tokio's blocking pool, then completes via the pinned protocol
+/// and wakes the backend via SetLatch. If the slot was recycled at any point,
+/// the result is discarded silently — the new backend's own request will
+/// complete on its own.
 async fn process_io_request(request: IoWorkRequest) {
     let control = IoControl::get();
     let pool = control.backend_pool(request.backend_id as i32);
@@ -59,9 +67,32 @@ async fn process_io_request(request: IoWorkRequest) {
         return;
     }
 
-    let (status, nblocks) = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(&request))) {
-        Ok(result) => result,
-        Err(_) => (libc::EIO, 0u32),
+    let backend_id = request.backend_id;
+    let slot_index = request.slot_index;
+
+    // Move the snapshot into the blocking task and get it back with the
+    // result — spawn_blocking needs 'static, and the completion path below
+    // only uses the slot, not the request fields.
+    let (request, (status, nblocks)) = match tokio::task::spawn_blocking(move || {
+        let result = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(&request))) {
+            Ok(result) => result,
+            Err(_) => (libc::EIO, 0u32),
+        };
+        (request, result)
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        // Unreachable in practice: the closure body cannot itself panic (the
+        // I/O is inside catch_unwind). If it ever happens, log it loudly —
+        // silently discarding would leave the slot InProgress forever.
+        Err(_) => {
+            pgsys::logging::pg_log_error(format!(
+                "tiko: blocking I/O task join failed for backend {} slot {}",
+                backend_id, slot_index
+            ));
+            return;
+        }
     };
 
     // Pin the slot for completion. Fails if attach() recycled it — generation

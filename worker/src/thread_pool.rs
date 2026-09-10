@@ -4,7 +4,12 @@
 //! This module initializes and manages the Tokio async runtime used by Tiko worker.
 //! Configuration:
 //! - 4 worker threads for async I/O operations
-//! - 8 blocking threads for CPU-bound work (if needed)
+//! - 64 blocking threads: the blocking pool hosts every synchronous relfork I/O
+//!   (spawn_blocking in io_handler), so its cap is the pipeline's I/O concurrency.
+//!   One Postgres per VM with ~MaxBackends(100) x 4 slots sets the theoretical
+//!   in-flight envelope; 64 matches the NFSv4.2 pipelining sweet spot — beyond
+//!   it, waits just move into the NFS client/server queue. Idle threads cost
+//!   only ~2 MB of mostly-untouched stack each.
 
 use std::sync::{Once, OnceLock};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -64,7 +69,8 @@ static RUNTIME_INIT: Once = Once::new();
 ///
 /// Sets up:
 /// - Worker thread pool (4 threads for async work)
-/// - Blocking thread pool (8 threads for blocking operations)
+/// - Blocking thread pool (64 threads — hosts every synchronous relfork I/O;
+///   see module docs for sizing)
 /// - Proper naming and lifecycle management
 pub(crate) fn init_tokio_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let mut init_error: Option<Box<dyn std::error::Error>> = None;
@@ -72,14 +78,14 @@ pub(crate) fn init_tokio_runtime() -> Result<(), Box<dyn std::error::Error>> {
     RUNTIME_INIT.call_once(|| {
         match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
-            .max_blocking_threads(8)
+            .max_blocking_threads(64)
             .thread_name("worker-tokio")
             .enable_all()
             .build()
         {
             Ok(runtime) => {
                 let _ = TOKIO_RUNTIME.set(runtime);
-                pg_log_info("tiko: Tokio runtime initialized (4 workers, 8 blocking)");
+                pg_log_info("tiko: Tokio runtime initialized (4 workers, 64 blocking)");
             }
             Err(e) => {
                 init_error = Some(Box::new(e));
@@ -133,7 +139,7 @@ impl Default for ThreadPoolConfig {
     fn default() -> Self {
         ThreadPoolConfig {
             worker_threads: 4,
-            blocking_threads: 8,
+            blocking_threads: 64,
         }
     }
 }
