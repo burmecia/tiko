@@ -21,7 +21,8 @@ use pgsys::timeline_id::TimelineId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::sleep;
 
 use crate::log_relay::{relay_debug1, relay_warning};
@@ -614,9 +615,20 @@ fn wal_seg_name(timeline_id: TimelineId, seg_no: u64) -> String {
 // Clear-text and MD5 password are also handled.  SCRAM-SHA-256 is not — for
 // SCRAM, configure pg_hba.conf with `trust` for `local replication`.
 
+// A backend message read by the reader task, or the terminal read error.
+type Incoming = Result<(u8, Vec<u8>), BoxError>;
+
 struct ReplConn {
-    reader: BufReader<OwnedReadHalf>,
+    incoming: mpsc::Receiver<Incoming>,
     writer: OwnedWriteHalf,
+    /// Owns the read half. Aborted on drop so reconnects never leak it.
+    reader: JoinHandle<()>,
+}
+
+impl Drop for ReplConn {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl ReplConn {
@@ -626,9 +638,16 @@ impl ReplConn {
             .await
             .map_err(|e| format!("cannot connect to PostgreSQL socket {socket_path}: {e}"))?;
         let (read, write) = stream.into_split();
+        // Read on a dedicated task so the streaming loop's keepalive `timeout`
+        // cancels a channel `recv`, not a `read_exact` mid-message (`read_exact`
+        // is not cancellation-safe — dropping it strands consumed bytes and
+        // desyncs the protocol).
+        let (tx, incoming) = mpsc::channel(16);
+        let reader = tokio::spawn(read_loop(BufReader::new(read), tx));
         let mut conn = ReplConn {
-            reader: BufReader::new(read),
+            incoming,
             writer: write,
+            reader,
         };
         conn.send_startup(user).await?;
         conn.handle_auth(user).await?;
@@ -821,22 +840,61 @@ impl ReplConn {
         Ok(())
     }
 
-    /// Read one backend message: `[type(1)][length(4)][body(length-4)]`.
+    /// Read one backend message, pulled from the reader task's channel.
+    ///
+    /// Cancel-safe: dropping this future leaves any in-flight message with the
+    /// reader task, so the keepalive `timeout` can never desync the stream.
     async fn read_message(&mut self) -> Result<(u8, Vec<u8>), BoxError> {
-        let mut header = [0u8; 5];
-        self.reader.read_exact(&mut header).await?;
-        let msg_type = header[0];
-        let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
-        if length < 4 {
-            return Err(format!(
-                "protocol error: message 0x{msg_type:02X} has length {length} < 4"
-            )
-            .into());
+        match self.incoming.recv().await {
+            Some(Ok(msg)) => Ok(msg),
+            Some(Err(e)) => Err(e),
+            None => Err("PostgreSQL connection closed".into()),
         }
-        let body_len = length - 4;
-        let mut body = vec![0u8; body_len];
-        self.reader.read_exact(&mut body).await?;
-        Ok((msg_type, body))
+    }
+}
+
+// ── Reader task ───────────────────────────────────────────────────────────────
+
+/// Read one backend message off the wire: `[type(1)][length(4)][body(length-4)]`.
+///
+/// Only [`read_loop`] calls this, so a cancelled consumer future can never
+/// strand a partially-read message.
+async fn read_message_raw(
+    reader: &mut BufReader<OwnedReadHalf>,
+) -> Result<(u8, Vec<u8>), BoxError> {
+    let mut header = [0u8; 5];
+    reader.read_exact(&mut header).await?;
+    let msg_type = header[0];
+    let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+    if length < 4 {
+        return Err(format!(
+            "protocol error: message 0x{msg_type:02X} has length {length} < 4"
+        )
+        .into());
+    }
+    let body_len = length - 4;
+    let mut body = vec![0u8; body_len];
+    reader.read_exact(&mut body).await?;
+    Ok((msg_type, body))
+}
+
+/// Own the read half and forward every backend message to the connection.
+///
+/// Runs until a read error (forwarded to the consumer), EOF, or the consumer
+/// drops the receiver. Only `ReplConn::drop` aborts it.
+async fn read_loop(mut reader: BufReader<OwnedReadHalf>, tx: mpsc::Sender<Incoming>) {
+    loop {
+        match read_message_raw(&mut reader).await {
+            Ok(msg) => {
+                if tx.send(Ok(msg)).await.is_err() {
+                    return; // consumer gone
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
     }
 }
 
