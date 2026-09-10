@@ -16,7 +16,7 @@ use crate::{
 };
 use core::{io_control::IoControl, utils::rw_lock};
 use pgsys::{
-    common::{MyProcPid, SIGHUP, SIGTERM},
+    common::{MyProcPid, SIGTERM},
     cshim::check_for_interrupts,
     latch::*,
     logging::*,
@@ -25,17 +25,10 @@ use pgsys::{
 
 /// Global flags for managing worker lifecycle and configuration
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-static CONFIG_RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Handle SIGTERM (shutdown request from postmaster)
 extern "C" fn handle_sigterm(_: c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-    wake_main_loop();
-}
-
-/// Handle SIGHUP (config reload request)
-extern "C" fn handle_sighup(_: c_int) {
-    CONFIG_RELOAD_PENDING.store(true, Ordering::Release);
     wake_main_loop();
 }
 
@@ -50,7 +43,6 @@ extern "C" fn wake_main_loop() {
 fn setup_signal_handlers() {
     unsafe {
         pqsignal(SIGTERM, Some(handle_sigterm));
-        pqsignal(SIGHUP, Some(handle_sighup));
     }
 
     unsafe {
@@ -149,7 +141,10 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
             pg_log_error("tiko: compactor task exited unexpectedly");
             compactor_handle = None;
         }
-        if wal_receiver_handle.as_ref().is_some_and(|h| h.is_finished()) {
+        if wal_receiver_handle
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+        {
             pg_log_error("tiko: wal_receiver task exited unexpectedly");
             wal_receiver_handle = None;
         }
