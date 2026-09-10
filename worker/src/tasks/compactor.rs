@@ -13,6 +13,11 @@
 //! the worker main loop), so the checkpointer never runs compaction itself
 //! while the worker is alive. No mutual exclusion is needed between the two.
 //!
+//! The merge itself is synchronous (S3Sim + manifest I/O, CPU) and runs on
+//! Tokio's blocking pool via `spawn_blocking`, so it never occupies one of the
+//! runtime's async worker threads (which serve the I/O pipeline and the WAL
+//! receiver).
+//!
 //! GC (retention enforcement / orphan chunk cleanup) is the control plane's
 //! responsibility and remains out of scope here.
 
@@ -59,33 +64,53 @@ pub async fn compactor_task(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                log_result("tick", store.run_compaction());
+                let result = run_blocking(move || store.run_compaction()).await;
+                log_result("tick", result);
             }
             Some(req) = req_rx.recv() => {
-                serve_compaction_request(store, req);
+                serve_compaction_request(store, req).await;
             }
         }
+    }
+}
+
+/// Run a synchronous compaction body on Tokio's blocking pool. The async worker
+/// threads only drive the pipeline; blocking them on S3Sim/manifest I/O would
+/// starve the I/O and WAL-receiver tasks. A `JoinError` (blocking task panicked)
+/// is surfaced as an ordinary `Err` so callers handle it uniformly.
+async fn run_blocking(
+    f: impl FnOnce() -> core::Result<CompactionResult> + Send + 'static,
+) -> core::Result<CompactionResult> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(core::Error::other(format!(
+            "compaction blocking task failed: {e}"
+        ))),
     }
 }
 
 /// Execute a basebackup compaction request and wake the requester. The
 /// completion is published before the latch is set; the requester also
 /// re-polls on a timeout, so a missed wake only costs one poll interval.
-fn serve_compaction_request(store: &'static Store, req: CompactionRequestMsg) {
+async fn serve_compaction_request(store: &'static Store, req: CompactionRequestMsg) {
+    let CompactionRequestMsg {
+        generation,
+        target,
+        requester_latch,
+    } = req;
+
     relay_debug1(format!(
-        "tiko: compactor: serving basebackup request gen={} target={}",
-        req.generation, req.target,
+        "tiko: compactor: serving basebackup request gen={generation} target={target}",
     ));
 
-    let status = match store.run_compaction_through(req.target) {
+    let status = match run_blocking(move || store.run_compaction_through(target)).await {
         Ok(result) => {
             log_result("basebackup", Ok(result));
             COMPACTION_STATUS_OK
         }
         Err(e) => {
             relay_debug1(format!(
-                "tiko: compactor: basebackup compaction through {} failed: {e}",
-                req.target,
+                "tiko: compactor: basebackup compaction through {target} failed: {e}",
             ));
             COMPACTION_STATUS_ERROR
         }
@@ -95,12 +120,12 @@ fn serve_compaction_request(store: &'static Store, req: CompactionRequestMsg) {
         io_control
             .timeline
             .compaction_request
-            .complete(req.generation, status);
+            .complete(generation, status);
     }
-    if req.requester_latch != 0 {
+    if requester_latch != 0 {
         // SAFETY: the requester published its own live latch; a SetLatch on
         // a recycled latch is a harmless spurious wakeup.
-        unsafe { SetLatch(req.requester_latch as *mut Latch) };
+        unsafe { SetLatch(requester_latch as *mut Latch) };
     }
 }
 
