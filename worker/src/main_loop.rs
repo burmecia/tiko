@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     dispatcher::Dispatcher, io_handler, log_relay, tasks::compactor::CompactionRequestMsg,
-    thread_pool,
+    thread_pool, watchdog::SlotWatchdog,
 };
 use core::{io_control::IoControl, utils::rw_lock};
 use pgsys::{
@@ -124,6 +124,11 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     // dedupe here to avoid queueing duplicates on every loop iteration.
     let mut last_compaction_gen = 0u64;
 
+    // Ledger of dispatched I/O requests, scanned periodically to fail slots
+    // stuck InProgress (e.g. blocking-pool threads wedged in NFS) — see
+    // watchdog.rs.
+    let mut slot_watchdog = SlotWatchdog::new();
+
     pg_log_info("tiko: initialized and entering main loop");
 
     // Main event loop
@@ -160,11 +165,22 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
             pg_log(PANIC, msg);
         }
 
-        // Pop from submit queue and dispatch to Tokio
-        match io_control.poll_submit_queue(|request| dispatcher.send_work(request)) {
+        // Pop from submit queue and dispatch to Tokio; record each dispatched
+        // request in the stuck-slot watchdog ledger.
+        match io_control.poll_submit_queue(|request| {
+            let backend_id = request.backend_id;
+            let slot_index = request.slot_index;
+            let generation = request.generation;
+            dispatcher.send_work(request).inspect(|_| {
+                slot_watchdog.record(backend_id, slot_index, generation);
+            })
+        }) {
             Ok(dispatched) => requests_processed += dispatched,
             Err(_) => break, // fatal: dispatcher disconnected
         }
+
+        // Periodic scan for slots stuck InProgress; rate-limited internally.
+        slot_watchdog.tick(io_control);
 
         // Relay a pending basebackup compaction request to the compactor task.
         if let Some(pending) = io_control.timeline.compaction_request.pending()
