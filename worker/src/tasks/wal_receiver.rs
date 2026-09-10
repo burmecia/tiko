@@ -302,7 +302,6 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
 async fn handle_xlogdata(
     msg: &[u8],
     sim: &'static Store,
-    //ns: &ProjectNamespace,
     timeline_id: TimelineId,
     cur_seg: &mut Option<SegState>,
     confirmed_lsn: &mut u64,
@@ -398,7 +397,6 @@ async fn handle_xlogdata(
 async fn seal_segment(
     mut state: SegState,
     sim: &'static Store,
-    //ns: &ProjectNamespace,
     timeline_id: TimelineId,
     confirmed_lsn: &mut u64,
     conn: &mut ReplConn,
