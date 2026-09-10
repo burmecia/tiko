@@ -6,8 +6,9 @@
 //!
 //! - **Per-backend slot pools**: Each backend owns a small pool of I/O slots (4 slots).
 //!   Claiming is a local bit-scan — zero contention, no CAS races.
-//! - **MPSC submit queue**: Backends push `(backend_id, slot_idx)` entries via `fetch_add`.
-//!   worker pops entries and dispatches to Tokio. Strict ordering, no advisory hints.
+//! - **MPSC submit queue**: Backends push `(backend_id, slot_idx)` entries through
+//!   a bounded per-cell-sequence ring (Vyukov); the worker pops and dispatches to
+//!   Tokio. Strict ordering, no advisory hints.
 //! - **SetLatch completion**: Tokio workers call `SetLatch` directly on the backend's latch
 //!   after marking a slot Completed. No harvest step, no main-thread scan.
 //!
@@ -42,8 +43,10 @@
 //!   pin winner may write result fields
 //! - `finish_completing()`: Release — ensures result fields visible before Completed
 //! - `current_state()`: Acquire — sees result data after Completed
-//! - `SubmitQueue.head.fetch_add`: Relaxed — ordering provided by entry store (Release)
-//! - `SubmitQueue.entries[].store`: Release — synchronizes with consumer's Acquire load
+//! - `SubmitQueue.head` CAS: Relaxed — confers cell ownership only
+//! - `SubmitQueue.seqs[]`: producer's Release store of `pos + 1` publishes its
+//!   entry store; consumer's Acquire load of it reads the entry. Consumer's
+//!   Release store of `pos + SUBMIT_QUEUE_SIZE` frees the cell for the next lap.
 //!
 //! # Shared Memory Layout
 //!
@@ -438,6 +441,10 @@ const _: () = assert!(
     std::mem::offset_of!(SubmitQueue, entries) == 128,
     "entries must be at offset 128"
 );
+const _: () = assert!(
+    std::mem::offset_of!(SubmitQueue, seqs) == 128 + SUBMIT_QUEUE_SIZE * size_of::<AtomicU32>(),
+    "seqs must immediately follow entries"
+);
 
 impl BackendSlotPool {
     fn init(&mut self) {
@@ -512,21 +519,33 @@ impl BackendSlotPool {
 
 // ── SubmitQueue ──
 
-/// MPSC ring buffer for I/O submission. Backends push, Tiko worker pops.
+/// Bounded MPSC ring buffer for I/O submission (Vyukov per-cell-sequence design).
 ///
-/// Entries are packed as `(backend_id: u16, slot_idx: u16)` into a u32.
-/// Zero is used as a sentinel (entry not yet written by producer).
+/// Backends push, Tiko worker pops. Each cell carries a sequence phase: the
+/// cell for ticket `pos` is writable when `seqs[idx] == pos`, published
+/// (readable) when `seqs[idx] == pos + 1`, and freed for the next lap when
+/// the consumer stores `pos + SUBMIT_QUEUE_SIZE`. A producer validates the
+/// cell *before* claiming its ticket via CAS on `head`, so a ticket beyond
+/// capacity is never issued and an entry can never be written over an
+/// unconsumed one (the race the earlier check-then-`fetch_add` version had).
+///
+/// Entries are packed as `[backend_id (30 bits) | slot_idx (2 bits)]`.
 #[repr(C, align(128))]
 pub struct SubmitQueue {
-    /// Producer head — backends do fetch_add(1) to claim next write position
+    /// Producer head — next ticket to hand out; CAS-claimed after cell validation
     head: AtomicU32,
     _pad_head: [u8; 60],
 
-    /// Consumer tail — only Tiko worker reads/writes
+    /// Consumer tail — next ticket to consume. Only the Tiko worker touches it.
     tail: AtomicU32,
     _pad_tail: [u8; 60],
 
+    /// Packed entry per cell. Valid only while published (`seqs[idx] == pos + 1`);
+    /// never cleared — the sequence counter gates all reads.
     entries: [AtomicU32; SUBMIT_QUEUE_SIZE],
+
+    /// Per-cell phase counter. Init: `seqs[i] = i`.
+    seqs: [AtomicU32; SUBMIT_QUEUE_SIZE],
 }
 
 /// Number of bits needed for slot_idx (log2(SLOTS_PER_BACKEND))
@@ -544,44 +563,92 @@ impl SubmitQueue {
     fn init(&self) {
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
-        for entry in &self.entries {
-            entry.store(0, Ordering::Relaxed);
+        for (i, seq) in self.seqs.iter().enumerate() {
+            seq.store(i as u32, Ordering::Relaxed);
         }
     }
 
     /// Pack a (backend_id, slot_idx) pair into a u32 submit entry.
     ///
-    /// Layout: `[backend_id (30 bits) | slot_idx (2 bits)] + 1`
-    /// The +1 avoids zero, which is our sentinel for "not yet written".
+    /// Layout: `[backend_id (30 bits) | slot_idx (2 bits)]`
     fn pack(backend_id: u32, slot_idx: u8) -> u32 {
         debug_assert!((slot_idx as u32) < SLOTS_PER_BACKEND as u32);
-        ((backend_id << SLOT_IDX_BITS) | slot_idx as u32).wrapping_add(1)
+        (backend_id << SLOT_IDX_BITS) | slot_idx as u32
     }
 
     /// Unpack a u32 entry back to (backend_id, slot_idx).
     fn unpack(val: u32) -> (u32, u8) {
-        let raw = val.wrapping_sub(1);
-        (raw >> SLOT_IDX_BITS, (raw & SLOT_IDX_MASK) as u8)
+        (val >> SLOT_IDX_BITS, (val & SLOT_IDX_MASK) as u8)
     }
 
     /// Push a submission entry. Called by backends after slot.publish().
     ///
-    /// Uses fetch_add for strict MPSC ordering. The entry store uses Release
-    /// to synchronize with the consumer's Acquire load.
+    /// Vyukov bounded-queue producer: the target cell's sequence is validated
+    /// *before* the ticket is claimed via CAS on `head`, so no ticket beyond
+    /// capacity ever exists and no entry can overwrite an unconsumed one.
+    /// The entry store is published by the Release store of `seqs[idx] = pos + 1`.
     ///
     /// Returns false if the queue is full (backpressure).
     pub fn push(&self, backend_id: u32, slot_idx: u8) -> bool {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) >= SUBMIT_QUEUE_SIZE as u32 {
-            return false; // Queue full
+        let mut pos = self.head.load(Ordering::Relaxed);
+        loop {
+            let idx = (pos as usize) % SUBMIT_QUEUE_SIZE;
+            let seq = self.seqs[idx].load(Ordering::Acquire);
+            let dif = seq.wrapping_sub(pos) as i32;
+            if dif == 0 {
+                // Cell confirmed writable for this ticket — claim it now
+                match self.head.compare_exchange_weak(
+                    pos,
+                    pos.wrapping_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        self.entries[idx]
+                            .store(Self::pack(backend_id, slot_idx), Ordering::Release);
+                        self.seqs[idx].store(pos.wrapping_add(1), Ordering::Release);
+                        return true;
+                    }
+                    Err(actual) => pos = actual,
+                }
+            } else if dif < 0 {
+                return false; // full: cell still holds an unconsumed entry
+            } else {
+                // Another producer raced ahead — re-evaluate at the new ticket
+                pos = self.head.load(Ordering::Relaxed);
+            }
         }
+    }
 
-        let pos = self.head.fetch_add(1, Ordering::Relaxed);
+    /// Read the entry published for ticket `tail`, if any.
+    ///
+    /// Single consumer. Returns `(pos, packed)` without freeing the cell — the
+    /// caller processes the entry and then calls `free_cell(pos)`, or leaves
+    /// the cell published (e.g. on backpressure) and retries the same entry
+    /// on the next poll. The producer's Release store of `seqs[idx] = pos + 1`
+    /// publishes its entry store.
+    fn pop(&self) -> Option<(u32, u32)> {
+        let pos = self.tail.load(Ordering::Relaxed);
         let idx = (pos as usize) % SUBMIT_QUEUE_SIZE;
-        let packed = Self::pack(backend_id, slot_idx);
-        self.entries[idx].store(packed, Ordering::Release);
-        true
+        if self.seqs[idx].load(Ordering::Acquire) != pos.wrapping_add(1) {
+            return None; // empty for this ticket, or producer hasn't published yet
+        }
+        Some((pos, self.entries[idx].load(Ordering::Relaxed)))
+    }
+
+    /// Free a consumed cell for its next lap and advance `tail`.
+    ///
+    /// Single consumer. The Release store of the sequence makes the cell
+    /// writable by the next lap's producer; `tail` advances under Relaxed
+    /// (only the consumer reads it for order, producers only use it for the
+    /// fullness check).
+    fn free_cell(&self, pos: u32) {
+        let idx = (pos as usize) % SUBMIT_QUEUE_SIZE;
+        self.tail.store(pos.wrapping_add(1), Ordering::Relaxed);
+        self.seqs[idx].store(
+            pos.wrapping_add(SUBMIT_QUEUE_SIZE as u32),
+            Ordering::Release,
+        );
     }
 }
 
@@ -834,19 +901,8 @@ impl IoControl {
         F: FnMut(IoWorkRequest) -> Result<()>,
     {
         let mut dispatched_count = 0u64;
-        let head = self.submit_queue.head.load(Ordering::Acquire);
-        let mut tail = self.submit_queue.tail.load(Ordering::Relaxed);
 
-        while tail != head {
-            let idx = (tail as usize) % SUBMIT_QUEUE_SIZE;
-            let entry = &self.submit_queue.entries[idx];
-            let packed = entry.load(Ordering::Acquire);
-
-            if packed == 0 {
-                // Producer claimed position but hasn't written entry yet — stop here
-                break;
-            }
-
+        while let Some((pos, packed)) = self.submit_queue.pop() {
             let (backend_id, slot_idx) = SubmitQueue::unpack(packed);
             let pool = self.backend_pool(backend_id as i32);
             let slot = pool.slot(slot_idx as usize);
@@ -860,9 +916,8 @@ impl IoControl {
                     slot_idx,
                     slot.current_state()
                 ));
-                // Clear entry and advance tail — skip this invalid entry
-                entry.store(0, Ordering::Relaxed);
-                tail = tail.wrapping_add(1);
+                // Free cell and advance tail — skip this invalid entry
+                self.submit_queue.free_cell(pos);
                 continue;
             };
 
@@ -889,8 +944,7 @@ impl IoControl {
                     backend_id, slot_idx, error_code
                 ));
                 slot.fail_with_error(generation, error_code);
-                entry.store(0, Ordering::Relaxed);
-                tail = tail.wrapping_add(1);
+                self.submit_queue.free_cell(pos);
                 continue;
             }
 
@@ -901,13 +955,12 @@ impl IoControl {
                         "tiko: dispatched backend={} slot={} op={:?} blk={} nblk={}",
                         backend_id, slot_idx, slot.op, slot.block_number, slot.nblocks
                     ));
-                    // Clear entry and advance tail on success
-                    entry.store(0, Ordering::Relaxed);
-                    tail = tail.wrapping_add(1);
+                    self.submit_queue.free_cell(pos);
                 }
                 Err(Error::TrySendError(TrySendError::Full(_))) => {
                     // Channel full — slot is InProgress but we can't dispatch yet.
-                    // Revert to Submitted, leave entry in place for next poll.
+                    // Revert to Submitted; the cell stays published (not freed) so
+                    // the next poll re-reads this entry.
                     slot.revert_to_submitted(generation);
                     pg_log_debug1(format!(
                         "tiko: dispatcher full, reverted backend={} slot={}",
@@ -922,17 +975,137 @@ impl IoControl {
                         backend_id, slot_idx
                     ));
                     slot.fail_with_error(generation, libc::EIO);
-                    entry.store(0, Ordering::Relaxed);
-                    tail = tail.wrapping_add(1);
-                    self.submit_queue.tail.store(tail, Ordering::Release);
+                    self.submit_queue.free_cell(pos);
                     return Err(err);
                 }
             }
         }
 
-        // Update tail
-        self.submit_queue.tail.store(tail, Ordering::Release);
-
         Ok(dispatched_count)
+    }
+}
+
+#[cfg(test)]
+mod submit_queue_tests {
+    use super::*;
+
+    fn q() -> Box<SubmitQueue> {
+        let q = Box::new(SubmitQueue {
+            head: AtomicU32::new(0),
+            _pad_head: [0; 60],
+            tail: AtomicU32::new(0),
+            _pad_tail: [0; 60],
+            entries: std::array::from_fn(|_| AtomicU32::new(0)),
+            seqs: std::array::from_fn(|i| AtomicU32::new(i as u32)),
+        });
+        q.init();
+        q
+    }
+
+    #[test]
+    fn fifo_full_and_wraparound() {
+        let q = q();
+
+        for i in 0..SUBMIT_QUEUE_SIZE as u32 {
+            assert!(q.push(i, (i & 3) as u8));
+        }
+        assert!(!q.push(0, 0), "queue must report full");
+
+        for i in 0..SUBMIT_QUEUE_SIZE as u32 {
+            let (pos, packed) = q.pop().unwrap();
+            assert_eq!(pos, i);
+            assert_eq!(SubmitQueue::unpack(packed), (i, (i & 3) as u8));
+            q.free_cell(pos);
+        }
+        assert!(q.pop().is_none());
+
+        for _ in 0..3 {
+            for i in 0..SUBMIT_QUEUE_SIZE as u32 {
+                assert!(q.push(i, (i & 3) as u8));
+            }
+            assert!(!q.push(0, 0));
+            for i in 0..SUBMIT_QUEUE_SIZE as u32 {
+                let (pos, packed) = q.pop().unwrap();
+                assert_eq!(SubmitQueue::unpack(packed), (i, (i & 3) as u8));
+                q.free_cell(pos);
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_push_pop_reuses_cells() {
+        let q = q();
+        let laps = 4u32;
+        for lap in 0..laps {
+            for i in 0..SUBMIT_QUEUE_SIZE as u32 {
+                let expected = lap * SUBMIT_QUEUE_SIZE as u32 + i;
+                assert!(q.push(i, (lap & 3) as u8));
+                let (pos, packed) = q.pop().unwrap();
+                assert_eq!(pos, expected, "FIFO ticket order across laps");
+                assert_eq!(SubmitQueue::unpack(packed), (i, (lap & 3) as u8));
+                q.free_cell(pos);
+            }
+        }
+        assert!(q.pop().is_none());
+        assert_eq!(
+            q.head.load(Ordering::Relaxed),
+            laps * SUBMIT_QUEUE_SIZE as u32
+        );
+        assert_eq!(
+            q.tail.load(Ordering::Relaxed),
+            laps * SUBMIT_QUEUE_SIZE as u32
+        );
+    }
+
+    #[test]
+    fn concurrent_producers_no_lost_entries() {
+        let q = q();
+        const PRODUCERS: u32 = 8;
+        const PER_PRODUCER: u32 = 2000;
+        const TOTAL: usize = (PRODUCERS * PER_PRODUCER) as usize;
+
+        let counts: Vec<AtomicU32> = (0..PRODUCERS).map(|_| AtomicU32::new(0)).collect();
+
+        std::thread::scope(|s| {
+            for b in 0..PRODUCERS {
+                let q = &q;
+                s.spawn(move || {
+                    for i in 0..PER_PRODUCER {
+                        while !q.push(b, (i & 3) as u8) {
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+            }
+
+            let consumer = {
+                let q = &q;
+                let counts = &counts;
+                s.spawn(move || {
+                    let mut drained = 0usize;
+                    while drained < TOTAL {
+                        if let Some((pos, packed)) = q.pop() {
+                            let (b, _) = SubmitQueue::unpack(packed);
+                            counts[b as usize].fetch_add(1, Ordering::Relaxed);
+                            q.free_cell(pos);
+                            drained += 1;
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                    }
+                })
+            };
+            consumer.join().unwrap();
+        });
+
+        for (b, c) in counts.iter().enumerate() {
+            assert_eq!(
+                c.load(Ordering::Relaxed),
+                PER_PRODUCER,
+                "backend {b} lost or duplicated entries"
+            );
+        }
+        assert_eq!(q.head.load(Ordering::Relaxed), TOTAL as u32);
+        assert_eq!(q.tail.load(Ordering::Relaxed), TOTAL as u32);
     }
 }
