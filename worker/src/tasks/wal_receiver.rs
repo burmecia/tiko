@@ -6,9 +6,10 @@
 //! objects as data arrives.  On segment switch the full buffer is zero-padded
 //! and PUT as a sealed segment object; chunks are then deleted (compaction).
 //!
-//! `tokio-postgres` 0.7 does not expose `CopyBoth` mode (needed for physical
-//! replication), so this module implements the minimal PostgreSQL wire
-//! protocol directly over `tokio::net::UnixStream`.
+//! `tokio-postgres` still does not expose `CopyBoth` mode (needed for physical
+//! replication) as of its latest release, 0.7.18 (2026-06); upstream PRs to add
+//! it remain unmerged.  This module therefore implements the minimal PostgreSQL
+//! wire protocol directly over `tokio::net::UnixStream`.
 //!
 //! See `wal_streaming.md` for the design rationale.
 
@@ -603,9 +604,10 @@ fn wal_seg_name(timeline_id: TimelineId, seg_no: u64) -> String {
 // Raw PostgreSQL wire protocol client (minimal, for physical replication only)
 // ══════════════════════════════════════════════════════════════════════════════
 //
-// tokio-postgres 0.7 does not expose CopyBoth mode, which is required for
-// physical replication (walsender uses bidirectional COPY).  This section
-// implements only what is needed:
+// tokio-postgres does not expose CopyBoth mode (required for physical
+// replication — walsender uses bidirectional COPY); no release up to 0.7.18
+// has it and the upstream PRs are unmerged.  This section implements only what
+// is needed:
 //   - Startup + trust authentication
 //   - Simple-query protocol (IDENTIFY_SYSTEM, CREATE_REPLICATION_SLOT)
 //   - CopyBoth mode (START_REPLICATION + send/recv CopyData)
