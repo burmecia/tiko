@@ -425,6 +425,20 @@ pub struct BackendSlotPool {
     pub attached: AtomicU8,
 }
 
+// Compile-time assertions for cache line separation
+const _: () = assert!(
+    std::mem::offset_of!(SubmitQueue, head) == 0,
+    "head must be at offset 0"
+);
+const _: () = assert!(
+    std::mem::offset_of!(SubmitQueue, tail) == 64,
+    "tail must be at offset 64 for cache line separation"
+);
+const _: () = assert!(
+    std::mem::offset_of!(SubmitQueue, entries) == 128,
+    "entries must be at offset 128"
+);
+
 impl BackendSlotPool {
     fn init(&mut self) {
         self.free_mask.store(0, Ordering::Relaxed);
@@ -570,20 +584,6 @@ impl SubmitQueue {
         true
     }
 }
-
-// Compile-time assertions for cache line separation
-const _: () = assert!(
-    std::mem::offset_of!(SubmitQueue, head) == 0,
-    "head must be at offset 0"
-);
-const _: () = assert!(
-    std::mem::offset_of!(SubmitQueue, tail) == 64,
-    "tail must be at offset 64 for cache line separation"
-);
-const _: () = assert!(
-    std::mem::offset_of!(SubmitQueue, entries) == 128,
-    "entries must be at offset 128"
-);
 
 // ── IoControl ──
 
