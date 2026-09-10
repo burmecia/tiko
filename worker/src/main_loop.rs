@@ -107,10 +107,10 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
     // (`TimelineState::compaction_request`) into this channel.
     let (compaction_req_tx, compaction_req_rx) =
         tokio::sync::mpsc::channel(COMPACTION_REQ_QUEUE_SIZE);
-    thread_pool::spawn_compactor_task(compaction_req_rx);
+    let mut compactor_handle = thread_pool::spawn_compactor_task(compaction_req_rx);
 
     // Spawn WAL streaming task.
-    thread_pool::spawn_wal_receiver_task();
+    let mut wal_receiver_handle = thread_pool::spawn_wal_receiver_task();
 
     // Get shared memory IO control structure
     let io_control = IoControl::get();
@@ -140,6 +140,19 @@ pub extern "C-unwind" fn worker_main(_arg: *mut c_void) {
 
         // Check for interrupts (SIGTERM, postmaster death, etc.)
         check_for_interrupts();
+
+        // The compactor and WAL receiver run for the process's lifetime, so a
+        // finished handle means the task panicked. Log once and drop the
+        // handle; the checkpointer's compaction escape hatch and the smgr
+        // sync fallback cover the lost functionality.
+        if compactor_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            pg_log_error("tiko: compactor task exited unexpectedly");
+            compactor_handle = None;
+        }
+        if wal_receiver_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            pg_log_error("tiko: wal_receiver task exited unexpectedly");
+            wal_receiver_handle = None;
+        }
 
         // Forward any log messages queued by Tokio threads.
         log_relay::drain(&log_rx);

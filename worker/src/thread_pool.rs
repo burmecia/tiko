@@ -6,56 +6,54 @@
 //! - 4 worker threads for async I/O operations
 //! - 8 blocking threads for CPU-bound work (if needed)
 
-use pgsys::logging::*;
 use std::sync::{Once, OnceLock};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::tasks::compactor::{CompactionRequestMsg, compactor_task};
-use crate::tasks::wal_receiver::{WalReceiverConfig, wal_receiver_task};
-use core::{
-    //project::{ProjectCtx, ProjectNamespace},
-    store::Store,
+use crate::tasks::{
+    compactor::{CompactionRequestMsg, compactor_task},
+    wal_receiver::{WalReceiverConfig, wal_receiver_task},
 };
+use core::store::Store;
+use pgsys::logging::*;
 
-/// Spawn the PITR background task on the Tokio runtime.
-///
-/// Does nothing if:
-/// - The runtime has not been initialised.
-/// - `Store` has not been initialised.
-///
 /// Call this from `worker_main` after both `init_tokio_runtime` and
 /// `init_project_ctx` have completed. `req_rx` carries basebackup compaction
-/// requests relayed by the main loop.
-pub(crate) fn spawn_compactor_task(req_rx: mpsc::Receiver<CompactionRequestMsg>) {
+/// requests relayed by the main loop. Returns the task's JoinHandle so the
+/// main loop can monitor it, or None if the task could not be spawned.
+pub(crate) fn spawn_compactor_task(
+    req_rx: mpsc::Receiver<CompactionRequestMsg>,
+) -> Option<JoinHandle<()>> {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_compactor_task called before runtime init; skipping");
-        return;
+        return None;
     };
 
     let Ok(store) = Store::try_get() else {
         pg_log_warning("tiko: Store not initialised; skipping compactor task");
-        return;
+        return None;
     };
 
-    runtime.spawn(compactor_task(store, req_rx));
+    Some(runtime.spawn(compactor_task(store, req_rx)))
 }
 
 /// Spawn the WAL receiver task on the Tokio runtime.
 ///
-/// Does nothing if the runtime, or `Store` are not yet initialised.
-pub(crate) fn spawn_wal_receiver_task() {
+/// Returns the task's JoinHandle so the main loop can monitor it, or None
+/// if the task could not be spawned.
+pub(crate) fn spawn_wal_receiver_task() -> Option<JoinHandle<()>> {
     let Some(runtime) = TOKIO_RUNTIME.get() else {
         pg_log_warning("tiko: spawn_wal_receiver_task called before runtime init; skipping");
-        return;
+        return None;
     };
 
     let Ok(store) = Store::try_get() else {
         pg_log_warning("tiko: Store not initialised; skipping WAL receiver task");
-        return;
+        return None;
     };
 
-    runtime.spawn(wal_receiver_task(store, WalReceiverConfig::default()));
+    let handle = runtime.spawn(wal_receiver_task(store, WalReceiverConfig::default()));
     pg_log_info("tiko: WAL receiver task spawned");
+    Some(handle)
 }
 
 /// The global Tokio runtime handle stored safely using OnceLock
