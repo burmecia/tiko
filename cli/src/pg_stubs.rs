@@ -29,3 +29,11 @@ pub static mut DataDir: *const c_char = c"".as_ptr();
 /// lines from standalone binaries are dropped here intentionally.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_pg_log(_elevel: c_int, _message: *const c_char) {}
+
+/// `bool RecoveryInProgress(void)` — read by `core`'s compaction guard, which
+/// only runs inside a running postmaster. A standalone binary is never
+/// recovering, so report false.
+#[unsafe(no_mangle)]
+pub extern "C" fn RecoveryInProgress() -> bool {
+    false
+}

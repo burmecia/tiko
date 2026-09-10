@@ -59,18 +59,6 @@ pub async fn compactor_task(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                // While the cluster is in archive/crash recovery the base manifest is
-                // the PITR anchor — the compactor must not touch state. (It would be a
-                // no-op anyway: head/redo stay seeded at the base checkpoint until the
-                // end-of-recovery checkpoint and the pre-recovery segments are deleted,
-                // so `run_compaction` would return `NoNewSegments`. Skip explicitly for
-                // clarity and defense-in-depth.) Resumes automatically once recovery
-                // finishes (promote).
-                if recovery_in_progress() {
-                    relay_debug1("tiko: compactor: cluster in recovery — skipping tick");
-                    continue;
-                }
-
                 log_result("tick", store.run_compaction());
             }
             Some(req) = req_rx.recv() => {
@@ -140,6 +128,11 @@ fn log_result(context: &str, result: core::Result<CompactionResult>) {
         Ok(CompactionResult::Skipped) => {
             relay_debug1(format!(
                 "tiko: compactor({context}): IoControl unavailable — skipping (initdb/single-user)"
+            ));
+        }
+        Ok(CompactionResult::RecoveryInProgress) => {
+            relay_debug1(format!(
+                "tiko: compactor({context}): cluster in recovery — skipping"
             ));
         }
         Err(e) => {

@@ -6,6 +6,7 @@ use crate::{
     io_control::IoControl,
     timeline::{Checkpoint, CheckpointSummary, SegmentId},
 };
+use pgsys::common::recovery_in_progress;
 use pgsys::logging::{pg_log_debug1, pg_log_warning};
 
 /// Outcome of one [`Store::run_compaction`] call. Returned to the compactor
@@ -14,6 +15,11 @@ use pgsys::logging::{pg_log_debug1, pg_log_warning};
 pub enum CompactionResult {
     /// No `IoControl` (initdb/single-user, or pre-postmaster startup).
     Skipped,
+    /// The cluster is in archive/crash recovery: the base manifest is the
+    /// PITR anchor and must not be advanced. Enforced centrally here so every
+    /// compaction path (tick, basebackup request, checkpointer fallback,
+    /// shutdown) honors it.
+    RecoveryInProgress,
     /// No segment checkpoints exist in the eligible range yet.
     NoNewSegments,
     /// Another compactor advanced `base_ckpt` while we were preparing the
@@ -136,6 +142,16 @@ impl Store {
         };
         if upper <= base_ckpt {
             return Ok(CompactionResult::NoNewSegments);
+        }
+
+        // While the cluster is in archive/crash recovery the base manifest is
+        // the PITR anchor — no compaction path may advance it. The periodic
+        // tick, basebackup requests (served by the worker), the checkpointer's
+        // local fallback, and shutdown compaction all funnel through here, so
+        // gating at this single point covers them. Resumes automatically once
+        // recovery finishes (promote).
+        if recovery_in_progress() {
+            return Ok(CompactionResult::RecoveryInProgress);
         }
 
         let segments = self.list_segments_in_range(base_ckpt, upper)?;
