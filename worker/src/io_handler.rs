@@ -6,9 +6,14 @@
 //! # Completion Path
 //!
 //! After I/O completes on a Tokio thread:
-//! 1. Write result fields to the slot (`result_status`, `result_nblocks`)
-//! 2. Mark slot completed (`try_mark_completed()` — CAS InProgress → Completed)
-//! 3. Call `SetLatch(owner_latch)` to wake the backend directly
+//! 1. Pin the slot (`try_start_completing()` — CAS (gen, InProgress) → (gen, Completing))
+//! 2. Write result fields to the slot (`result_status`, `result_nblocks`)
+//! 3. Finish completion (`finish_completing()` — CAS (gen, Completing) → (gen, Completed))
+//! 4. Call `SetLatch(owner_latch)` to wake the backend directly
+//!
+//! The generation is part of the CAS word, so a slot recycled by `attach()`
+//! (old backend died, new backend reusing the ProcNumber) can never be matched
+//! by a stale completer — even if the new request reached InProgress again.
 //!
 //! This eliminates the harvest step — Tokio notifies backends directly.
 //!
@@ -21,7 +26,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 use core::{
-    io_control::{IoControl, IoOpKind, IoSlot, IoWorkRequest},
+    io_control::{IoControl, IoOpKind, IoWorkRequest, SlotState},
     relfork::{RelFork, ops},
 };
 use pgsys::latch::SetLatch;
@@ -39,34 +44,39 @@ pub async fn io_worker_loop(mut rx: mpsc::Receiver<IoWorkRequest>) {
 
 /// Process a single I/O request.
 ///
-/// Looks up the slot in shared memory, performs the I/O operation,
-/// writes results to the slot, marks it completed, and wakes the backend via SetLatch.
+/// Performs the I/O from the dispatch-time snapshot (never re-reading slot
+/// fields), then completes via the pinned protocol and wakes the backend via
+/// SetLatch. If the slot was recycled at any point, the result is discarded
+/// silently — the new backend's own request will complete on its own.
 async fn process_io_request(request: IoWorkRequest) {
     let control = IoControl::get();
     let pool = control.backend_pool(request.backend_id as i32);
     let slot = pool.slot(request.slot_index as usize);
 
-    let (status, nblocks) = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(slot))) {
+    // Revalidate before touching buffers: if the slot was recycled while this
+    // task waited to be scheduled, the snapshot's buffer may have been reused.
+    if !slot.is_state(request.generation, SlotState::InProgress) {
+        return;
+    }
+
+    let (status, nblocks) = match std::panic::catch_unwind(AssertUnwindSafe(|| do_io(&request))) {
         Ok(result) => result,
         Err(_) => (libc::EIO, 0u32),
     };
 
-    // Check generation before writing results — if the slot was recycled by a new
-    // backend (attach() bumped generation), discard this stale completion silently.
-    let current_gen = slot.generation.load(Ordering::Relaxed);
-    if current_gen != request.generation {
-        // Slot was recycled. Do NOT write results, mark_completed, or SetLatch.
-        // The new backend will have reset this slot to Free state.
+    // Pin the slot for completion. Fails if attach() recycled it — generation
+    // mismatch is part of the CAS word, so a recycled slot can never match even
+    // if the new request reached InProgress again.
+    if !slot.try_start_completing(request.generation) {
         return;
     }
 
-    // Write result fields (must happen before mark_completed)
+    // Write result fields (only the pin winner may write these)
     slot.result_status.store(status, Ordering::Relaxed);
     slot.result_nblocks.store(nblocks, Ordering::Relaxed);
 
-    // CAS (InProgress → Completed): if the slot was recycled after the
-    // generation check, this fails and the stale result is discarded.
-    if !slot.try_mark_completed() {
+    if !slot.finish_completing(request.generation) {
+        // Recycled while pinned — discard; the new request completes on its own.
         return;
     }
 
@@ -79,34 +89,36 @@ async fn process_io_request(request: IoWorkRequest) {
     }
 }
 
-/// Perform I/O based on operation type.
-fn do_io(slot: &IoSlot) -> (i32, u32) {
+/// Perform I/O based on operation type, using only the dispatch-time snapshot.
+fn do_io(request: &IoWorkRequest) -> (i32, u32) {
     let rf = RelFork {
-        spc_oid: slot.spc_oid,
-        db_oid: slot.db_oid,
-        rel_number: slot.rel_number,
-        fork_number: slot.fork_number,
+        spc_oid: request.spc_oid,
+        db_oid: request.db_oid,
+        rel_number: request.rel_number,
+        fork_number: request.fork_number,
     };
 
-    match slot.op {
+    match request.op {
         IoOpKind::Read => {
-            let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *mut u8;
-            match ops::read_blocks(&rf, slot.block_number, slot.nblocks, buffer_ptr) {
+            let buffer_ptr = request.buffer_ptr as *mut u8;
+            match ops::read_blocks(&rf, request.block_number, request.nblocks, buffer_ptr) {
                 Ok(n) => (0i32, n),
                 Err(e) => (e.to_errno(), 0u32),
             }
         }
         IoOpKind::Write => {
-            let buffer_ptr = slot.buffer_ptr.load(Ordering::Acquire) as *const u8;
-            match ops::write_blocks(&rf, slot.block_number, slot.nblocks, buffer_ptr) {
+            let buffer_ptr = request.buffer_ptr as *const u8;
+            match ops::write_blocks(&rf, request.block_number, request.nblocks, buffer_ptr) {
                 Ok(n) => (0i32, n),
                 Err(e) => (e.to_errno(), 0u32),
             }
         }
-        IoOpKind::Prefetch => match ops::prefetch_blocks(&rf, slot.block_number, slot.nblocks) {
-            Ok(n) => (0i32, n),
-            Err(_) => (libc::EIO, 0u32),
-        },
+        IoOpKind::Prefetch => {
+            match ops::prefetch_blocks(&rf, request.block_number, request.nblocks) {
+                Ok(n) => (0i32, n),
+                Err(_) => (libc::EIO, 0u32),
+            }
+        }
         _ => (libc::ENOTSUP, 0u32),
     }
 }

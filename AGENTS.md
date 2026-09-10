@@ -172,10 +172,16 @@ pools (small fixed slots per backend, bitmask claiming — no CAS races on
 claim), an MPSC submit queue backends push into and the worker pops from, and
 direct `SetLatch` completion (no harvest step, no main-thread scan).
 
-Slot lifecycle: `Free → Filling → Submitted → InProgress → Completed → Free`
-(`SlotState` in `core/src/io/io_control.rs`) — backend claims and fills, backend
-publishes (release store), worker claims for processing (CAS), Tokio marks
-complete and sets the backend's latch, backend releases back to its pool.
+Slot lifecycle: `Free → Filling → Submitted → InProgress → Completing → Completed
+→ Free` (`SlotState` in `core/src/io/io_control.rs`) — backend claims and fills,
+backend publishes (release store), worker claims for processing (CAS), Tokio pins
+then marks complete and sets the backend's latch, backend releases back to its
+pool. State and a per-slot generation counter share one atomic word
+(`IoSlot.state_gen`, 29 bits gen + 3 bits state): `attach()` bumps gen and resets
+state in a single store, and every worker-side transition CASes the packed word,
+so generation check and state transition are atomic together and a stale
+completion can never match a recycled slot. Tokio tasks perform I/O from the
+dispatch-time snapshot in `IoWorkRequest`, never re-reading slot fields.
 
 The shmem `AtomicRWLock`s (cache/meta bucket + I/O locks, `TimelineState.lock`,
 `DraftBuffer.spill_lock`) and the `TimelineState.generation` seqlock carry a

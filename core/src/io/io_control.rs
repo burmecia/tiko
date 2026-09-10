@@ -13,21 +13,34 @@
 //!
 //! # Slot State Machine
 //!
-//! `Free → Filling → Submitted → InProgress → Completed → Free`
+//! `Free → Filling → Submitted → InProgress → Completing → Completed → Free`
 //!
 //! | Transition | Who | Mechanism |
 //! |---|---|---|
 //! | Free → Filling | Backend | Claim from own pool (bit clear) |
-//! | Filling → Submitted | Backend | `slot.publish()` (Release store) |
-//! | Submitted → InProgress | Tiko worker | `slot.try_start_processing()` (CAS) |
-//! | InProgress → Completed | Tokio | `slot.mark_completed()` + `SetLatch` |
+//! | Filling → Submitted | Backend | `slot.publish()` (gen-preserving Release store) |
+//! | Submitted → InProgress | Tiko worker | `slot.try_start_processing()` (CAS, returns gen) |
+//! | InProgress → Completing | Tokio | `slot.try_start_completing(gen)` (CAS on packed word) |
+//! | Completing → Completed | Tokio | `slot.finish_completing(gen)` (CAS on packed word) |
 //! | Completed → Free | Backend | `slot.release()` + `pool.release()` |
+//!
+//! # Stale-completion guard
+//!
+//! State and a per-slot generation counter live in one atomic word
+//! (`state_gen`: 29 bits generation, 3 bits state). `attach()` bumps the
+//! generation and resets the state with a single store; every Tokio-side
+//! transition CASes the whole word, so generation check and state transition
+//! are one atomic step and a stale completer can never match a recycled slot
+//! (even if the new request reached InProgress again — the classic ABA case).
 //!
 //! # Memory Ordering
 //!
 //! - `publish()`: Release — ensures request fields visible before Submitted
-//! - `try_start_processing()`: Acquire on success — sees request data
-//! - `mark_completed()`: Release — ensures result fields visible before Completed
+//! - `try_start_processing()`: Acquire on success — sees request data, and
+//!   captures the generation atomically with the transition
+//! - `try_start_completing()`: AcqRel on success — pins the slot; only the
+//!   pin winner may write result fields
+//! - `finish_completing()`: Release — ensures result fields visible before Completed
 //! - `current_state()`: Acquire — sees result data after Completed
 //! - `SubmitQueue.head.fetch_add`: Relaxed — ordering provided by entry store (Release)
 //! - `SubmitQueue.entries[].store`: Release — synchronizes with consumer's Acquire load
@@ -99,6 +112,7 @@ pub enum SlotState {
     Submitted = 2,
     InProgress = 3,
     Completed = 4,
+    Completing = 5,
 }
 
 impl From<u8> for SlotState {
@@ -109,9 +123,24 @@ impl From<u8> for SlotState {
             2 => SlotState::Submitted,
             3 => SlotState::InProgress,
             4 => SlotState::Completed,
+            5 => SlotState::Completing,
             _ => SlotState::Free,
         }
     }
+}
+
+/// `state_gen` packs a 29-bit generation counter and the 3-bit slot state into
+/// one atomic word so "check generation" + "transition state" is a single CAS.
+const SLOT_STATE_BITS: u32 = 3;
+const SLOT_STATE_MASK: u32 = (1 << SLOT_STATE_BITS) - 1;
+const SLOT_GENERATION_MASK: u32 = u32::MAX >> SLOT_STATE_BITS;
+
+fn pack_state_gen(generation: u32, state: SlotState) -> u32 {
+    ((generation & SLOT_GENERATION_MASK) << SLOT_STATE_BITS) | state as u32
+}
+
+fn unpack_generation(packed: u32) -> u32 {
+    (packed >> SLOT_STATE_BITS) & SLOT_GENERATION_MASK
 }
 
 // ── I/O operation types ──
@@ -141,14 +170,50 @@ pub enum IoOpKind {
 
 /// Work request sent from worker main thread to Tokio workers.
 ///
-/// Identifies a slot by its backend pool and slot index.
-/// `backend_id` is a ProcNumber (u32), `slot_index` is 0..SLOTS_PER_BACKEND-1,
-/// and `generation` guards against stale completions after backend slot recycle.
+/// A full snapshot of the slot, taken by the dispatcher as it transitions
+/// Submitted → InProgress: the Tokio task performs I/O from this snapshot only
+/// and never re-reads slot fields, so a recycled slot can't redirect in-flight
+/// I/O. `generation` is captured atomically with that transition and guards
+/// the completion path against stale completions after backend slot recycle.
 #[derive(Debug, Clone)]
 pub struct IoWorkRequest {
     pub backend_id: u32,
     pub slot_index: u8,
     pub generation: u32,
+    pub op: IoOpKind,
+    pub spc_oid: Oid,
+    pub db_oid: Oid,
+    pub rel_number: RelFileNumber,
+    pub fork_number: ForkNumber,
+    pub block_number: BlockNumber,
+    pub nblocks: BlockNumber,
+    pub buffer_ptr: u64,
+}
+
+impl IoWorkRequest {
+    /// Validate the request snapshot before dispatching to Tokio.
+    pub fn validate(&self) -> std::result::Result<(), i32> {
+        if self.op == IoOpKind::Invalid {
+            return Err(libc::EINVAL);
+        }
+
+        // Only Read and Write operations require a buffer
+        let needs_buffer = matches!(self.op, IoOpKind::Read | IoOpKind::Write);
+        if needs_buffer && self.buffer_ptr == 0 {
+            return Err(libc::EFAULT);
+        }
+
+        // Only operations that transfer blocks need nblocks validation
+        let needs_nblocks = matches!(
+            self.op,
+            IoOpKind::Read | IoOpKind::Write | IoOpKind::Prefetch
+        );
+        if needs_nblocks && (self.nblocks == 0 || self.nblocks > 1024) {
+            return Err(libc::EINVAL);
+        }
+
+        Ok(())
+    }
 }
 
 impl From<TrySendError<IoWorkRequest>> for Error {
@@ -162,12 +227,17 @@ impl From<TrySendError<IoWorkRequest>> for Error {
 /// A single I/O request slot in shared memory.
 ///
 /// Size: 64 bytes. No ConditionVariable — completion uses SetLatch via `owner_latch`.
-/// Generation counter prevents stale Tokio completions from corrupting recycled slots
-/// (e.g. when a backend dies with InProgress slots and a new backend reuses the ProcNumber).
+/// `state_gen` packs the slot state and a per-slot generation counter into one
+/// atomic word, preventing stale Tokio completions from corrupting recycled slots
+/// (e.g. when a backend dies with InProgress slots and a new backend reuses the
+/// ProcNumber): every worker-side transition CASes generation and state together.
 #[repr(C, align(64))]
 pub struct IoSlot {
     // ── Slot lifecycle ──
-    pub state: AtomicU8,
+    /// Packed `(generation << 3) | state`. `BackendSlotPool::attach()` bumps the
+    /// generation and resets the state with a single store; Tokio-side transitions
+    /// CAS the whole word, so a stale completion can never match a recycled slot.
+    pub state_gen: AtomicU32,
     pub op: IoOpKind,
 
     // ── Request identity ──
@@ -182,11 +252,6 @@ pub struct IoSlot {
     /// Backend's MyProcNumber (for debugging/validation)
     pub owner_proc: AtomicI32,
 
-    /// Monotonically increasing generation counter. Bumped by `BackendSlotPool::attach()`
-    /// when a new backend attaches. Tokio checks this at completion time — if the
-    /// generation has changed, the result is silently discarded (the original backend died).
-    pub generation: AtomicU32,
-
     /// Backend's MyLatch as u64. Tokio calls SetLatch(owner_latch) directly.
     pub owner_latch: AtomicU64,
 
@@ -195,19 +260,20 @@ pub struct IoSlot {
     pub buffer_ptr: AtomicU64,
 
     // ── Result ──
+    /// Written only by the completer holding the (generation, Completing) pin.
     pub result_status: AtomicI32,
     pub result_nblocks: AtomicU32,
-    // No _reserved needed: generation + alignment padding fill the 64 bytes exactly.
+    // No _reserved needed: padding after `op` fills the 64 bytes exactly.
 }
 
 const _: () = assert!(size_of::<IoSlot>() == 64, "IoSlot must be exactly 64 bytes");
 
 impl IoSlot {
     fn init(&mut self) {
-        self.state.store(SlotState::Free as u8, Ordering::Relaxed);
+        self.state_gen
+            .store(pack_state_gen(0, SlotState::Free), Ordering::Relaxed);
         self.op = IoOpKind::Invalid;
         self.owner_proc.store(-1, Ordering::Relaxed);
-        self.generation.store(0, Ordering::Relaxed);
         self.owner_latch.store(0, Ordering::Relaxed);
         self.buffer_ptr.store(0, Ordering::Relaxed);
         self.result_status.store(0, Ordering::Relaxed);
@@ -215,84 +281,122 @@ impl IoSlot {
     }
 
     pub fn current_state(&self) -> SlotState {
-        SlotState::from(self.state.load(Ordering::Acquire))
+        SlotState::from((self.state_gen.load(Ordering::Acquire) & SLOT_STATE_MASK) as u8)
     }
 
-    /// Publish the request (Filling → Submitted).
+    pub fn generation(&self) -> u32 {
+        unpack_generation(self.state_gen.load(Ordering::Acquire))
+    }
+
+    /// True iff the slot is currently in `state` at `generation`. Used by Tokio
+    /// tasks to revalidate before touching buffers: a task scheduled late (slot
+    /// already recycled) must not perform I/O from its stale snapshot.
+    pub fn is_state(&self, generation: u32, state: SlotState) -> bool {
+        self.state_gen.load(Ordering::Acquire) == pack_state_gen(generation, state)
+    }
+
+    /// Publish the request (Filling → Submitted), preserving the generation.
     /// Release fence ensures all request fields are visible before state change.
+    /// Called exclusively by the owning backend.
     pub fn publish(&self) {
-        self.state
-            .store(SlotState::Submitted as u8, Ordering::Release);
+        let generation = self.generation();
+        self.state_gen.store(
+            pack_state_gen(generation, SlotState::Submitted),
+            Ordering::Release,
+        );
     }
 
     /// Try to start processing (Submitted → InProgress).
-    /// Called by Tiko worker after popping from the submit queue.
-    pub fn try_start_processing(&self) -> bool {
-        self.state
-            .compare_exchange(
-                SlotState::Submitted as u8,
-                SlotState::InProgress as u8,
+    /// Called by Tiko worker after popping from the submit queue (sole caller).
+    /// Returns the generation captured atomically with the transition.
+    pub fn try_start_processing(&self) -> Option<u32> {
+        let mut cur = self.state_gen.load(Ordering::Acquire);
+        loop {
+            if SlotState::from((cur & SLOT_STATE_MASK) as u8) != SlotState::Submitted {
+                return None;
+            }
+            let generation = unpack_generation(cur);
+            match self.state_gen.compare_exchange_weak(
+                cur,
+                pack_state_gen(generation, SlotState::InProgress),
                 Ordering::Acquire,
-                Ordering::Relaxed,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(generation),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Pin the slot for completion (InProgress → Completing).
+    ///
+    /// CAS on the packed word: generation check and state transition are one
+    /// atomic step, so a stale completer (slot recycled by `attach()` and
+    /// redispatched for a new backend) can never match. Only the pin winner
+    /// may write the result fields.
+    pub fn try_start_completing(&self, generation: u32) -> bool {
+        self.state_gen
+            .compare_exchange(
+                pack_state_gen(generation, SlotState::InProgress),
+                pack_state_gen(generation, SlotState::Completing),
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
             .is_ok()
     }
 
-    /// Mark completed (InProgress → Completed).
-    ///
-    /// CAS, not a store: a stale Tokio completion after the slot was recycled
-    /// (backend died, `attach()` reset it, new backend filled it) must not
-    /// clobber the new request's state. Returns false if the slot is no longer
-    /// InProgress — the caller must discard the result and skip `SetLatch`.
-    pub fn try_mark_completed(&self) -> bool {
-        self.state
+    /// Finish completion (Completing → Completed). Release publishes the result
+    /// fields written while pinned. Returns false if the slot was recycled
+    /// while pinned — the caller must discard the result and skip `SetLatch`.
+    pub fn finish_completing(&self, generation: u32) -> bool {
+        self.state_gen
             .compare_exchange(
-                SlotState::InProgress as u8,
-                SlotState::Completed as u8,
+                pack_state_gen(generation, SlotState::Completing),
+                pack_state_gen(generation, SlotState::Completed),
                 Ordering::Release,
                 Ordering::Relaxed,
             )
             .is_ok()
     }
 
-    /// Release slot (Completed → Free).
-    /// Called by the backend after reading the result.
-    pub fn release(&self) {
-        self.state.store(SlotState::Free as u8, Ordering::Release);
+    /// Revert InProgress → Submitted (dispatch channel full; the queue entry
+    /// stays in place for the next poll). CAS, not a store: a slot recycled
+    /// meanwhile must not be resurrected at a stale generation.
+    pub fn revert_to_submitted(&self, generation: u32) -> bool {
+        self.state_gen
+            .compare_exchange(
+                pack_state_gen(generation, SlotState::InProgress),
+                pack_state_gen(generation, SlotState::Submitted),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
-    /// Validate slot data before dispatching to Tokio.
-    pub fn validate(&self) -> std::result::Result<(), i32> {
-        if self.op == IoOpKind::Invalid {
-            return Err(libc::EINVAL);
-        }
-
-        // Only Read and Write operations require a buffer
-        let needs_buffer = matches!(self.op, IoOpKind::Read | IoOpKind::Write);
-        if needs_buffer {
-            let buffer_ptr = self.buffer_ptr.load(Ordering::Acquire);
-            if buffer_ptr == 0 {
-                return Err(libc::EFAULT);
-            }
-        }
-
-        // Only operations that transfer blocks need nblocks validation
-        let needs_nblocks = matches!(
-            self.op,
-            IoOpKind::Read | IoOpKind::Write | IoOpKind::Prefetch
+    /// Release slot (Completed → Free), preserving the generation.
+    /// Called by the backend after reading the result.
+    pub fn release(&self) {
+        let generation = self.generation();
+        self.state_gen.store(
+            pack_state_gen(generation, SlotState::Free),
+            Ordering::Release,
         );
-        if needs_nblocks && (self.nblocks == 0 || self.nblocks > 1024) {
-            return Err(libc::EINVAL);
-        }
-
-        Ok(())
     }
 
     /// Fail slot with an error and wake the backend via SetLatch.
-    /// Returns false if the slot was no longer InProgress (recycled — result discarded).
-    pub fn fail_with_error(&self, error_code: i32) -> bool {
-        self.result_status.store(error_code, Ordering::Release);
-        let completed = self.try_mark_completed();
+    /// Returns false if the slot was no longer (generation, InProgress)
+    /// (recycled — result discarded).
+    pub fn fail_with_error(&self, generation: u32, error_code: i32) -> bool {
+        self.result_status.store(error_code, Ordering::Relaxed);
+        let completed = self
+            .state_gen
+            .compare_exchange(
+                pack_state_gen(generation, SlotState::InProgress),
+                pack_state_gen(generation, SlotState::Completed),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok();
         if completed {
             // Wake the backend directly
             let latch = self.owner_latch.load(Ordering::Acquire) as *mut Latch;
@@ -332,17 +436,18 @@ impl BackendSlotPool {
 
     /// Attach a backend to this pool. Called from s3_init() each time a backend starts.
     ///
-    /// Clears all slots to Free state and bumps their generation counter.
-    /// This handles ProcNumber recycling: if a previous backend crashed with
-    /// slots in InProgress state, Tokio will see the generation mismatch at
-    /// completion time and silently discard the stale result instead of
-    /// writing to recycled memory or calling SetLatch on a stale pointer.
+    /// Bumps each slot's generation and resets it to Free with a single store to
+    /// the packed word. This handles ProcNumber recycling: if a previous backend
+    /// crashed with slots in InProgress state, in-flight Tokio work for the old
+    /// backend can no longer match any CAS on this slot, so stale results are
+    /// silently discarded instead of corrupting the new backend's requests.
     pub fn attach(&self) {
         for slot in &self.slots {
-            slot.state.store(SlotState::Free as u8, Ordering::Relaxed);
-            // Bump generation so any in-flight Tokio work for the old backend
-            // will detect the mismatch and discard results.
-            slot.generation.fetch_add(1, Ordering::Relaxed);
+            let generation = slot.generation().wrapping_add(1) & SLOT_GENERATION_MASK;
+            slot.state_gen.store(
+                pack_state_gen(generation, SlotState::Free),
+                Ordering::Relaxed,
+            );
             slot.owner_proc.store(-1, Ordering::Relaxed);
             slot.owner_latch.store(0, Ordering::Relaxed);
             slot.buffer_ptr.store(0, Ordering::Relaxed);
@@ -746,8 +851,9 @@ impl IoControl {
             let pool = self.backend_pool(backend_id as i32);
             let slot = pool.slot(slot_idx as usize);
 
-            // Transition Submitted → InProgress
-            if !slot.try_start_processing() {
+            // Transition Submitted → InProgress, capturing the generation
+            // atomically with the state change.
+            let Some(generation) = slot.try_start_processing() else {
                 pg_log_warning(format!(
                     "tiko: slot {}/{} not in Submitted state (state={:?}), skipping",
                     backend_id,
@@ -758,27 +864,35 @@ impl IoControl {
                 entry.store(0, Ordering::Relaxed);
                 tail = tail.wrapping_add(1);
                 continue;
-            }
+            };
 
-            // Validate slot data
-            if let Err(error_code) = slot.validate() {
+            // Snapshot the request fields — the Tokio task performs I/O from
+            // this snapshot only, never re-reading a possibly recycled slot.
+            let request = IoWorkRequest {
+                backend_id,
+                slot_index: slot_idx,
+                generation,
+                op: slot.op,
+                spc_oid: slot.spc_oid,
+                db_oid: slot.db_oid,
+                rel_number: slot.rel_number,
+                fork_number: slot.fork_number,
+                block_number: slot.block_number,
+                nblocks: slot.nblocks,
+                buffer_ptr: slot.buffer_ptr.load(Ordering::Acquire),
+            };
+
+            // Validate request data
+            if let Err(error_code) = request.validate() {
                 pg_log_warning(format!(
                     "tiko: invalid slot data at backend={} slot={} (error={})",
                     backend_id, slot_idx, error_code
                 ));
-                slot.fail_with_error(error_code);
+                slot.fail_with_error(generation, error_code);
                 entry.store(0, Ordering::Relaxed);
                 tail = tail.wrapping_add(1);
                 continue;
             }
-
-            // Dispatch to Tokio — snapshot the generation so the completion path
-            // can detect if the slot was recycled by a new backend.
-            let request = IoWorkRequest {
-                backend_id,
-                slot_index: slot_idx,
-                generation: slot.generation.load(Ordering::Relaxed),
-            };
 
             match dispatch(request) {
                 Ok(()) => {
@@ -794,8 +908,7 @@ impl IoControl {
                 Err(Error::TrySendError(TrySendError::Full(_))) => {
                     // Channel full — slot is InProgress but we can't dispatch yet.
                     // Revert to Submitted, leave entry in place for next poll.
-                    slot.state
-                        .store(SlotState::Submitted as u8, Ordering::Release);
+                    slot.revert_to_submitted(generation);
                     pg_log_debug1(format!(
                         "tiko: dispatcher full, reverted backend={} slot={}",
                         backend_id, slot_idx
@@ -808,7 +921,7 @@ impl IoControl {
                         "tiko: dispatcher failed, failing backend={} slot={}",
                         backend_id, slot_idx
                     ));
-                    slot.fail_with_error(libc::EIO);
+                    slot.fail_with_error(generation, libc::EIO);
                     entry.store(0, Ordering::Relaxed);
                     tail = tail.wrapping_add(1);
                     self.submit_queue.tail.store(tail, Ordering::Release);
