@@ -20,10 +20,6 @@ path = "src/bin/tiko_branch.rs"
 name = "tiko_restore"
 path = "src/bin/tiko_restore.rs"
 
-# [[bin]]
-# name = "manifest_viewer"
-# path = "src/bin/manifest_viewer.rs"
-
 [[bin]]
 name = "tiko_tlseg_viewer"
 path = "src/bin/tiko_tlseg_viewer.rs"
