@@ -196,24 +196,107 @@ mod tests {
         assert_eq!(parse_wal_seg_no("0000000100000000000002BC"), Some(700));
     }
 
+    #[test]
+    fn parse_wal_segment_name_accepts_uppercase_hex() {
+        assert_eq!(
+            parse_wal_segment_name("0000000A000000010000000A"),
+            Some((TimelineId::new(10), XLOG_SEGS_PER_LOGID + 10))
+        );
+    }
+
+    #[test]
+    fn parse_wal_segment_name_max_fields() {
+        // The largest logical xlog id and segment offset must combine without
+        // overflowing u64.
+        assert_eq!(
+            parse_wal_segment_name("00000001FFFFFFFF00000000"),
+            Some((TimelineId::new(1), 0xFFFF_FFFFu64 * XLOG_SEGS_PER_LOGID))
+        );
+        assert_eq!(
+            parse_wal_segment_name("0000000100000000FFFFFFFF"),
+            Some((TimelineId::new(1), 0xFFFF_FFFF))
+        );
+    }
+
+    #[test]
+    fn parse_wal_segment_name_rejects_malformed_names() {
+        assert_eq!(parse_wal_segment_name(""), None);
+        assert_eq!(parse_wal_segment_name(&"0".repeat(23)), None);
+        assert_eq!(parse_wal_segment_name(&"0".repeat(25)), None);
+        assert_eq!(
+            parse_wal_segment_name(&format!("{}g", "0".repeat(23))),
+            None
+        );
+        assert_eq!(
+            parse_wal_segment_name("000000010000000000000001.partial"),
+            None
+        );
+        // 24 bytes but containing a multi-byte UTF-8 char: slicing must not
+        // panic (the all-ASCII-hex guard runs before any byte-range slice).
+        let multibyte = format!("{}{}", "0".repeat(22), "\u{e9}");
+        assert_eq!(multibyte.len(), 24);
+        assert_eq!(parse_wal_segment_name(&multibyte), None);
+        assert_eq!(parse_wal_seg_no(&multibyte), None);
+    }
+
+    #[test]
+    fn wal_long_header_zero_segment() {
+        let h = wal_long_header(TimelineId::new(0xFFFF_FFFF), 0, 0);
+        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 0xFFFF_FFFF);
+        // xlp_pageaddr = 0 at segment 0.
+        assert_eq!(u64::from_le_bytes(h[8..16].try_into().unwrap()), 0);
+        // Bytes 16..24 are xlp_rem_len plus alignment padding, both zero.
+        assert_eq!(h[16..24], [0u8; 8]);
+        assert_eq!(
+            u16::from_le_bytes(h[2..4].try_into().unwrap()),
+            XLP_LONG_HEADER
+        );
+    }
+
+    #[test]
+    fn wal_long_header_pageaddr_spans_logical_xlog_ids() {
+        // Segment numbers are global across logical xlog ids, so pageaddr must
+        // be the full 64-bit segment-start LSN (not truncated to 32 bits).
+        let seg_no = XLOG_SEGS_PER_LOGID * 2 + 3;
+        let h = wal_long_header(TimelineId::new(3), seg_no, 0);
+        assert_eq!(
+            u64::from_le_bytes(h[8..16].try_into().unwrap()),
+            seg_no * XLOG_SEG_SIZE as u64
+        );
+    }
+
     fn write_valid_crc(c: &mut [u8]) {
         let crc = crc32c(&c[..PG_CONTROL_OFF_CRC]);
         c[PG_CONTROL_OFF_CRC..PG_CONTROL_OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
     }
 
+    fn valid_control(system_identifier: u64) -> Vec<u8> {
+        let mut c = vec![0u8; 8192];
+        c[PG_CONTROL_OFF_VERSION..PG_CONTROL_OFF_VERSION + 4]
+            .copy_from_slice(&PG_CONTROL_VERSION.to_le_bytes());
+        c[0..8].copy_from_slice(&system_identifier.to_le_bytes());
+        write_valid_crc(&mut c);
+        c
+    }
+
     #[test]
-    fn crc32c_matches_reference_vector() {
-        // Standard CRC-32C check value, confirmed against pg_comp_crc32c.
+    fn crc32c_matches_reference_vectors() {
+        // Standard CRC-32C check values, confirmed against PostgreSQL's
+        // pg_comp_crc32c_sb8 (INIT/COMP/FIN_CRC32C).
+        assert_eq!(crc32c(b""), 0x0000_0000);
+        assert_eq!(crc32c(b"a"), 0xC1D0_4330);
+        assert_eq!(crc32c(b"abc"), 0x364B_3FB7);
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(
+            crc32c(b"The quick brown fox jumps over the lazy dog"),
+            0x2262_0404
+        );
+        assert_eq!(crc32c(&[0u8; 16]), 0x4270_9AEA);
     }
 
     #[test]
     fn read_system_identifier_reads_offset_zero() {
-        let mut c = vec![0u8; 8192];
-        c[PG_CONTROL_OFF_VERSION..PG_CONTROL_OFF_VERSION + 4]
-            .copy_from_slice(&PG_CONTROL_VERSION.to_le_bytes());
-        c[0..8].copy_from_slice(&0xDEAD_BEEF_0000_0001u64.to_le_bytes());
-        write_valid_crc(&mut c);
+        let mut c = valid_control(0xDEAD_BEEF_0000_0001);
         assert_eq!(read_system_identifier(&c).unwrap(), 0xDEAD_BEEF_0000_0001);
 
         // A covered byte changed under a stale CRC (a torn/corrupt read) is
@@ -227,5 +310,49 @@ mod tests {
             .copy_from_slice(&1700u32.to_le_bytes());
         assert!(read_system_identifier(&c).is_err());
         assert!(read_system_identifier(&[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn read_system_identifier_min_length_boundary() {
+        // Exactly through the CRC field is the minimum accepted length.
+        let mut c = vec![0u8; PG_CONTROL_OFF_CRC + 4];
+        c[PG_CONTROL_OFF_VERSION..PG_CONTROL_OFF_VERSION + 4]
+            .copy_from_slice(&PG_CONTROL_VERSION.to_le_bytes());
+        c[0..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        write_valid_crc(&mut c);
+        assert_eq!(read_system_identifier(&c).unwrap(), 0x1122_3344_5566_7788);
+
+        // One byte short of the CRC field is rejected.
+        assert!(read_system_identifier(&c[..PG_CONTROL_OFF_CRC + 3]).is_err());
+    }
+
+    #[test]
+    fn read_system_identifier_rejects_version_mismatch_with_valid_crc() {
+        let mut c = valid_control(7);
+        c[PG_CONTROL_OFF_VERSION..PG_CONTROL_OFF_VERSION + 4]
+            .copy_from_slice(&1700u32.to_le_bytes());
+        write_valid_crc(&mut c); // CRC is valid, but the version isn't ours
+        assert!(read_system_identifier(&c).is_err());
+    }
+
+    #[test]
+    fn read_system_identifier_rejects_corrupt_crc_field() {
+        let mut c = valid_control(0xABCD);
+        c[PG_CONTROL_OFF_CRC] ^= 0xFF; // corrupt the stored CRC itself
+        assert!(read_system_identifier(&c).is_err());
+    }
+
+    #[test]
+    fn read_system_identifier_crc_covers_last_header_byte() {
+        let mut c = valid_control(0xABCD);
+        c[PG_CONTROL_OFF_CRC - 1] ^= 0xFF; // last byte under the CRC
+        assert!(read_system_identifier(&c).is_err());
+    }
+
+    #[test]
+    fn read_system_identifier_ignores_bytes_past_crc() {
+        let mut c = valid_control(0x1234_5678_9ABC_DEF0);
+        c[PG_CONTROL_OFF_CRC + 4] ^= 0xFF; // zero padding after the CRC
+        assert_eq!(read_system_identifier(&c).unwrap(), 0x1234_5678_9ABC_DEF0);
     }
 }
