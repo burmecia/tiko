@@ -502,7 +502,14 @@ fn resolve_log_file(explicit: Option<&Path>, pgdata: &Path) -> PathBuf {
 /// tikoguest's `/pitr/restart` route).
 fn run_restart(args: &RestartArgs) -> Result<()> {
     let log_file = resolve_log_file(args.log_file.as_deref(), &args.pgdata);
-    cli::pgops::start_pg(&args.pg_ctl, &args.pgdata, Some(&log_file))?;
+    cli::pgops::start_pg(&cli::pgops::StartPgOpts {
+        pg_ctl: &args.pg_ctl,
+        pgdata: &args.pgdata,
+        log_file: Some(&log_file),
+        wait_secs: None,
+        server_opts: None,
+        envs: &[],
+    })?;
     eprintln!("tiko_pitr: database started");
     print_json(&RestartOutput {
         status: "started".to_string(),
@@ -557,7 +564,14 @@ fn recover_inner(
     // ends recovery by promoting and continuing as a primary. Logs are
     // redirected to `log_file` so the (debug-level) recovery output doesn't
     // spill to this process's stderr.
-    cli::pgops::start_pg(pg_ctl, pgdata, Some(log_file))?;
+    cli::pgops::start_pg(&cli::pgops::StartPgOpts {
+        pg_ctl,
+        pgdata,
+        log_file: Some(log_file),
+        wait_secs: Some(recovery_timeout),
+        server_opts: None,
+        envs: &[],
+    })?;
     if let Err(e) = cli::pgops::wait_for_promotion(psql, port, recovery_timeout) {
         let _ = cli::pgops::stop_pg(pg_ctl, pgdata);
         return Err(e);

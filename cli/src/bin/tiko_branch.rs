@@ -32,7 +32,7 @@
 //! `{"error":{"message":"..."}}` and the process exits non-zero.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
+use std::process::exit;
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -420,6 +420,7 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         branch.branch_port,
         branch.db_id,
         &branch_local,
+        Some(branch.recovery_timeout),
     )?;
 
     // 6. Wait for the branch to reach consistency and promote.
@@ -462,6 +463,7 @@ fn run_restart(args: &RestartArgs) -> Result<()> {
         args.branch_port,
         args.db_id,
         &branch_local,
+        None,
     )?;
     eprintln!(
         "tiko_branch: branch db_id={} is up on port {} (copy-on-write on parent storage)",
@@ -474,10 +476,11 @@ fn run_restart(args: &RestartArgs) -> Result<()> {
     })
 }
 
-/// Start the branch PostgreSQL via `pg_ctl start` with the branch's Tiko
-/// environment (`TIKO_DB_ID`/`TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH`) and the
-/// given listen port. Used by both `restore` (to
-/// drive recovery) and `restart` (to bring the branch back up).
+/// Start the branch PostgreSQL via [`cli::pgops::start_pg`] with the branch's
+/// Tiko environment (`TIKO_DB_ID`/`TIKO_STORAGE_ROOT`/`TIKO_LOCAL_PATH`) and the
+/// given listen port. Used by both `restore` (to drive recovery,
+/// `wait_secs = Some(recovery_timeout)`) and `restart` (already recovered, no
+/// wait deadline).
 ///
 /// Absolutizes the Tiko paths passed to the branch PG: postgres changes its CWD
 /// to PGDATA on startup, so a relative path would resolve under PGDATA (creating
@@ -489,6 +492,7 @@ fn start_branch_pg(
     branch_port: u16,
     db_id: u64,
     local_path: &Path,
+    wait_secs: Option<u64>,
 ) -> Result<()> {
     std::fs::create_dir_all(local_path)?;
     let log_path = pgdata.join("branch.log");
@@ -497,32 +501,25 @@ fn start_branch_pg(
     let branch_local_abs = cwd.join(local_path);
 
     let org_id = env::read_u64(env::ENV_ORG_ID)?;
-    let status = Command::new(pg_ctl)
-        .arg("start")
-        .arg("-D")
-        .arg(pgdata)
-        .arg("-l")
-        .arg(&log_path)
-        .arg("-w")
-        .arg("-o")
-        .arg(format!("-c port={}", branch_port))
-        .env("TIKO_ORG_ID", org_id.to_string())
-        .env("TIKO_DB_ID", db_id.to_string())
-        .env(
+    let server_opts = format!("-c port={branch_port}");
+    let envs = [
+        ("TIKO_ORG_ID", org_id.to_string()),
+        ("TIKO_DB_ID", db_id.to_string()),
+        (
             "TIKO_STORAGE_ROOT",
             storage_root_abs.to_string_lossy().to_string(),
-        )
-        .env(
+        ),
+        (
             "TIKO_LOCAL_PATH",
             branch_local_abs.to_string_lossy().to_string(),
-        )
-        .status()
-        .map_err(|e| Error::other(format!("failed to spawn pg_ctl: {e}")))?;
-    if !status.success() {
-        return Err(Error::other(format!(
-            "branch pg_ctl start failed (exit: {status}); see {}",
-            log_path.display()
-        )));
-    }
-    Ok(())
+        ),
+    ];
+    cli::pgops::start_pg(&cli::pgops::StartPgOpts {
+        pg_ctl,
+        pgdata,
+        log_file: Some(&log_path),
+        wait_secs,
+        server_opts: Some(&server_opts),
+        envs: &envs,
+    })
 }

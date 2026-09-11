@@ -157,9 +157,14 @@ pub fn run_psql(psql: &Path, port: u16, sql: &str) -> Result<String> {
 /// Assumes this process is the sole orchestrator of the target PGDATA (no
 /// concurrent `pg_ctl`): a non-zero exit with an absent `postmaster.pid` is
 /// treated as "already stopped".
+///
+/// `-s` keeps pg_ctl's informational output off stdout: the CLI emits a single
+/// JSON object there, and pg_ctl would otherwise interleave `waiting for server
+/// to shut down...`/`server stopped` (pg_ctl.c `print_msg`), breaking consumers.
 pub fn stop_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
     let status = Command::new(pg_ctl)
         .arg("stop")
+        .arg("-s")
         .arg("-D")
         .arg(pgdata)
         .args(["-m", "fast", "-w"])
@@ -176,7 +181,24 @@ pub fn stop_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
     ))
 }
 
-/// `pg_ctl -D <pgdata> [-l <log_file>] -w start` for normal startup.
+/// Options for [`start_pg`].
+pub struct StartPgOpts<'a> {
+    pub pg_ctl: &'a Path,
+    pub pgdata: &'a Path,
+    /// Postmaster log file (`pg_ctl -l`); `None` leaves the postmaster's
+    /// stderr attached to this process's stderr. See [`start_pg`].
+    pub log_file: Option<&'a Path>,
+    /// Seconds to wait for the postmaster to become ready (`pg_ctl -t`).
+    /// `None` uses pg_ctl's default (60 s). Recovery can take longer than that
+    /// to reach a consistent, connectable state, so pass the recovery timeout.
+    pub wait_secs: Option<u64>,
+    /// Extra postmaster options (`pg_ctl -o`), e.g. `-c port=5433`.
+    pub server_opts: Option<&'a str>,
+    /// Extra environment variables for the started postmaster (e.g. `TIKO_*`).
+    pub envs: &'a [(&'a str, String)],
+}
+
+/// `pg_ctl -s -D <pgdata> [-l <log_file>] [-t <secs>] [-o <opts>] -w start`.
 ///
 /// When `log_file` is `Some`, the postmaster's stdout/stderr are redirected to
 /// that file via pg_ctl's `-l` (which appends with `>> ... 2>&1`). When it is
@@ -186,20 +208,38 @@ pub fn stop_pg(pg_ctl: &Path, pgdata: &Path) -> Result<()> {
 /// `log_min_messages=debug1` output would spill to the caller's stderr, and in
 /// `tiko_pitr`'s case end up folded into tikoguest's HTTP error responses.
 /// Pass a log file unless you have a reason not to.
-pub fn start_pg(pg_ctl: &Path, pgdata: &Path, log_file: Option<&Path>) -> Result<()> {
-    let mut cmd = Command::new(pg_ctl);
-    cmd.arg("start").arg("-D").arg(pgdata);
-    if let Some(log) = log_file {
+///
+/// `-s` keeps pg_ctl's informational output off stdout: the CLI emits a single
+/// JSON object there, and pg_ctl would otherwise interleave `waiting for server
+/// to start...`/`server started` (pg_ctl.c `print_msg`), breaking consumers.
+/// `-t` is forwarded so a slow recovery isn't capped at pg_ctl's 60 s default.
+pub fn start_pg(opts: &StartPgOpts<'_>) -> Result<()> {
+    let mut cmd = Command::new(opts.pg_ctl);
+    cmd.arg("start").arg("-s").arg("-D").arg(opts.pgdata);
+    if let Some(log) = opts.log_file {
         cmd.arg("-l").arg(log);
+    }
+    if let Some(secs) = opts.wait_secs {
+        cmd.arg("-t").arg(secs.to_string());
+    }
+    if let Some(server_opts) = opts.server_opts {
+        cmd.arg("-o").arg(server_opts);
+    }
+    for (key, value) in opts.envs {
+        cmd.env(key, value);
     }
     cmd.arg("-w");
     let status = cmd
         .status()
         .map_err(|e| Error::other(format!("failed to spawn pg_ctl: {e}")))?;
     if !status.success() {
-        return Err(Error::other(format!(
-            "pg_ctl start failed (exit: {status})"
-        )));
+        return Err(Error::other(match opts.log_file {
+            Some(log) => format!(
+                "pg_ctl start failed (exit: {status}); see {}",
+                log.display()
+            ),
+            None => format!("pg_ctl start failed (exit: {status})"),
+        }));
     }
     Ok(())
 }
