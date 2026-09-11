@@ -92,15 +92,25 @@ fn first_token_after<'a>(label: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 /// Pack a directory into a compressed `tar.zst` blob in memory.
+///
+/// The tar stream is fed straight into the zstd encoder, so the uncompressed
+/// archive is never buffered in full (only the compressed result is).
+/// `follow_symlinks(false)` stores symlinks as links instead of expanding their
+/// targets (e.g. `pg_tblspc/*` tablespace links), and special files
+/// (sockets/FIFOs) become placeholder entries rather than being read.
 pub fn tar_dir_to_zst(src: &Path) -> Result<Vec<u8>> {
-    let tar_buf: Vec<u8> = Vec::new();
-    let mut builder = tar::Builder::new(tar_buf);
+    let encoder = zstd::Encoder::new(Vec::new(), 3)
+        .map_err(|e| Error::other(format!("zstd encoder init: {e}")))?;
+    let mut builder = tar::Builder::new(encoder);
+    builder.follow_symlinks(false);
     builder.append_dir_all(".", src)?;
     builder.finish()?;
-    let tar_buf = builder
+    let encoder = builder
         .into_inner()
         .map_err(|e| Error::other(format!("tar finalize: {e}")))?;
-    zstd::encode_all(tar_buf.as_slice(), 3).map_err(|e| Error::other(format!("zstd compress: {e}")))
+    encoder
+        .finish()
+        .map_err(|e| Error::other(format!("zstd compress: {e}")))
 }
 
 /// Decompress (zstd) and extract a base-backup tarball into `dest`.
