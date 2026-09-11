@@ -26,8 +26,11 @@ pub struct BasebackupOpts<'a> {
 
 /// Invoke `pg_basebackup` to produce a plain-format base backup in `dest`.
 ///
-/// `-c fast` triggers the `CHECKPOINT_CAUSE_BASEBACKUP` checkpoint that the
-/// Tiko checkpointer hooks to form a base manifest at the backup LSN.
+/// Starting a base backup always requests a `CHECKPOINT_CAUSE_BASEBACKUP`
+/// checkpoint (`do_pg_backup_start` in xlog.c), which the Tiko checkpointer hooks
+/// to form a base manifest at the backup LSN. The `-c` mode only affects how
+/// that checkpoint runs: `fast` adds `CHECKPOINT_IMMEDIATE`, `spread` (the
+/// pg_basebackup default) does not. Both trigger the hook.
 pub fn run_pg_basebackup(opts: &BasebackupOpts<'_>, dest: &Path) -> Result<()> {
     let mut cmd = Command::new(opts.pg_basebackup);
     cmd.arg("-D").arg(dest);
@@ -145,7 +148,7 @@ pub fn wait_for_promotion(psql: &Path, port: u16, timeout_secs: u64) -> Result<(
 }
 
 /// Run `psql -p <port> -d postgres -Atqc <sql>` and return stdout.
-pub fn run_psql(psql: &Path, port: u16, sql: &str) -> Result<String> {
+fn run_psql(psql: &Path, port: u16, sql: &str) -> Result<String> {
     let out = Command::new(psql)
         .args(["-p", &port.to_string()])
         .args(["-d", "postgres"])
