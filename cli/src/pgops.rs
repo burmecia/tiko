@@ -75,7 +75,8 @@ fn parse_label_lsn(label: &str, prefix: &str) -> Result<Lsn> {
 fn parse_label_tli(label: &str, prefix: &str) -> Result<TimelineId> {
     let token = first_token_after(label, prefix)
         .ok_or_else(|| Error::other(format!("backup_label missing '{prefix}' line")))?;
-    let t = u32::from_str_radix(token, 10)
+    let t = token
+        .parse::<u32>()
         .map_err(|_| Error::other(format!("invalid timeline in backup_label: '{token}'")))?;
     Ok(TimelineId::new(t))
 }
@@ -84,7 +85,7 @@ fn parse_label_tli(label: &str, prefix: &str) -> Result<TimelineId> {
 fn first_token_after<'a>(label: &'a str, prefix: &str) -> Option<&'a str> {
     for line in label.lines() {
         if let Some(rest) = line.trim_start().strip_prefix(prefix) {
-            return rest.trim().split_whitespace().next();
+            return rest.split_whitespace().next();
         }
     }
     None

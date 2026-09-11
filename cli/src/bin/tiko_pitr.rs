@@ -267,7 +267,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 fn run_list(store: &Store) -> Result<()> {
     // All base backups, newest-first (across every timeline).
     let mut backups = store.list_backups()?;
-    backups.sort_by(|a, b| b.ckpt.cmp(&a.ckpt));
+    backups.sort_by_key(|b| std::cmp::Reverse(b.ckpt));
     let backups_dto: Vec<BackupDto> = backups.iter().map(Into::into).collect();
 
     // The single recoverable window [earliest backup, WAL head]. Best-effort:
@@ -514,6 +514,7 @@ fn run_restart(args: &RestartArgs) -> Result<()> {
 /// wait for promotion, then stop it. Returns `Ok` only if PostgreSQL reached
 /// the target, promoted within the timeout, and stopped cleanly — leaving
 /// PGDATA recovered and quiesced for `tiko_pitr restart`.
+#[allow(clippy::too_many_arguments)]
 fn recover_inner(
     store: &Store,
     conf: &Path,
@@ -616,8 +617,8 @@ fn main() {
                 }
                 let store = Store::init()?;
                 let res = match &cli.command {
-                    Cmd::List => run_list(&store),
-                    Cmd::Backup(args) => run_backup(&store, args),
+                    Cmd::List => run_list(store),
+                    Cmd::Backup(args) => run_backup(store, args),
                     _ => unreachable!(),
                 };
                 drop(local_temp);
@@ -625,7 +626,7 @@ fn main() {
             }
             Cmd::Recover(args) => {
                 let store = Store::init()?;
-                run_recover(&store, args)?;
+                run_recover(store, args)?;
             }
         }
         Ok(())

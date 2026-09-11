@@ -257,7 +257,7 @@ fn main() {
                 // `--parent-db-id`). `TIKO_ORG_ID` identifies the shared org the
                 // parent and branch live in.
                 let store = Store::init()?;
-                let res = run_restore(&store, &args);
+                let res = run_restore(store, &args);
 
                 // Clean up the tool's temp cache (the branch PG has its own
                 // TIKO_LOCAL_PATH).

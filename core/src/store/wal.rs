@@ -1,6 +1,6 @@
 use super::Store;
 use crate::error::{Error, Result};
-use pgsys::{common::XLOG_SEG_SIZE, lsn::Lsn, timeline_id::TimelineId};
+use pgsys::{lsn::Lsn, timeline_id::TimelineId, version::XLOG_SEG_SIZE};
 use std::collections::BTreeMap;
 
 // Highest WAL segment number whose end LSN still fits a u64. The top value is
@@ -195,8 +195,8 @@ impl Store {
 #[cfg(test)]
 mod wal_coverage_tests {
     use super::{SegEntry, WalRun, parse_wal_key, wal_contiguous_run};
-    use pgsys::common::XLOG_SEG_SIZE;
     use pgsys::lsn::Lsn;
+    use pgsys::version::XLOG_SEG_SIZE;
 
     const SEG: u64 = XLOG_SEG_SIZE as u64;
 

@@ -28,7 +28,7 @@ use tokio::time::sleep;
 use crate::log_relay::{relay_debug1, relay_warning};
 use core::io_control::IoControl;
 use core::store::Store;
-use pgsys::common::XLOG_SEG_SIZE;
+use pgsys::version::XLOG_SEG_SIZE;
 use std::sync::atomic::Ordering;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -922,10 +922,9 @@ async fn read_message_raw(
     let msg_type = header[0];
     let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
     if length < 4 {
-        return Err(format!(
-            "protocol error: message 0x{msg_type:02X} has length {length} < 4"
-        )
-        .into());
+        return Err(
+            format!("protocol error: message 0x{msg_type:02X} has length {length} < 4").into(),
+        );
     }
     let body_len = length - 4;
     let mut body = vec![0u8; body_len];

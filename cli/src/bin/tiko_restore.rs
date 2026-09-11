@@ -18,8 +18,8 @@
 //! Exit codes follow the `restore_command` contract:
 //!   * `0`  — file restored to `%p`.
 //!   * `1`  — file not available in the archive (normal end-of-WAL / missing
-//!            history file) or a hard error. PostgreSQL ends/redirects
-//!            recovery accordingly.
+//!     history file) or a hard error. PostgreSQL ends/redirects recovery
+//!     accordingly.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,8 +29,8 @@ use clap::Parser;
 
 use cli::pgcontrol;
 use core::{error::Result, store::Store};
-use pgsys::common::XLOG_SEG_SIZE;
 use pgsys::timeline_id::TimelineId;
+use pgsys::version::{XLOG_PAGE_MAGIC, XLOG_SEG_SIZE};
 
 // `tiko_restore` runs as a standalone process (invoked by `restore_command`),
 // not loaded into the postmaster, so the PG symbols that `core` transitively
@@ -66,7 +66,7 @@ fn restore(store: &Store, args: &Args) -> Result<Outcome> {
     // files (`{tli:08X}.history`), `.backup`, and `.partial` files are never
     // uploaded by `wal_receiver`, so treat anything else as not-found and let
     // PostgreSQL fall back to its other recovery sources.
-    let Some(timeline_id) = parse_wal_segment_name(&args.wal_filename) else {
+    let Some((timeline_id, _seg_no)) = pgcontrol::parse_wal_segment_name(&args.wal_filename) else {
         return Ok(Outcome::NotFound);
     };
     let name = args.wal_filename.as_str();
@@ -126,18 +126,6 @@ fn restore(store: &Store, args: &Args) -> Result<Outcome> {
     Ok(Outcome::Restored)
 }
 
-/// Validate that `name` is a 24-character WAL segment file name and return its
-/// timeline id (the first 8 hex chars). Returns `None` for any other name.
-fn parse_wal_segment_name(name: &str) -> Option<TimelineId> {
-    if name.len() != 24 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    TimelineId::from_hex(&name[..8]).ok()
-}
-
-/// Little-endian bytes of `XLOG_PAGE_MAGIC` — what a real WAL page 0 begins with.
-const XLOG_PAGE_MAGIC_LE: [u8; 2] = 0xD118u16.to_le_bytes();
-
 /// On first access to a segment, PostgreSQL reads page 0's long header to
 /// validate the segment (`XLogReaderValidatePageHeader`) even when the target
 /// record is on a later page. A segment streamed mid-segment never archived its
@@ -146,7 +134,7 @@ const XLOG_PAGE_MAGIC_LE: [u8; 2] = 0xD118u16.to_le_bytes();
 /// place. Best-effort: on any missing input, warn (to the PG log) and leave the
 /// buffer unchanged — no worse than before.
 fn maybe_synthesize_long_header(buf: &mut [u8], tli: TimelineId, name: &str) {
-    if buf[0..2] == XLOG_PAGE_MAGIC_LE {
+    if buf[0..2] == XLOG_PAGE_MAGIC.to_le_bytes() {
         return; // offset 0 was archived — real long header already present
     }
     let Some(seg_no) = pgcontrol::parse_wal_seg_no(name) else {
