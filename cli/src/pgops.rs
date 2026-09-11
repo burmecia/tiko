@@ -128,15 +128,26 @@ pub fn extract_backup(tar_zst: &[u8], dest: &Path) -> Result<()> {
 /// Poll `SELECT pg_is_in_recovery()` once per second until it returns `f`
 /// (promotion complete) or `timeout_secs` elapses. Connects to the given
 /// `port` over the local socket.
-pub fn wait_for_promotion(psql: &Path, port: u16, timeout_secs: u64) -> Result<()> {
+///
+/// Fails fast if `pgdata/postmaster.pid` disappears (a cleanly-exited postmaster
+/// aborts recovery by removing it) instead of burning the whole timeout. Note
+/// the caller is assumed to own `port`: if some other primary is already
+/// listening there, `pg_ctl start` would have failed to bind, so a successful
+/// poll is taken to mean our recovering instance.
+pub fn wait_for_promotion(psql: &Path, pgdata: &Path, port: u16, timeout_secs: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         match run_psql(psql, port, "SELECT pg_is_in_recovery()") {
             Ok(out) if out.trim() == "f" => return Ok(()),
             // "t" = still in recovery; a query error = not accepting connections
             // yet (early startup) or a transient blip. Keep polling until the
-            // deadline; if the server died, `pg_ctl start` already returned Err.
+            // deadline.
             _ => {}
+        }
+        if !pgdata.join("postmaster.pid").exists() {
+            return Err(Error::other(
+                "PostgreSQL postmaster is no longer running during recovery",
+            ));
         }
         if Instant::now() >= deadline {
             return Err(Error::other(format!(
@@ -148,11 +159,15 @@ pub fn wait_for_promotion(psql: &Path, port: u16, timeout_secs: u64) -> Result<(
 }
 
 /// Run `psql -p <port> -d postgres -Atqc <sql>` and return stdout.
+///
+/// `PGCONNECT_TIMEOUT` bounds connection establishment so a hung or unreachable
+/// server can't block the poll loop indefinitely.
 fn run_psql(psql: &Path, port: u16, sql: &str) -> Result<String> {
     let out = Command::new(psql)
         .args(["-p", &port.to_string()])
         .args(["-d", "postgres"])
         .args(["-Atqc", sql])
+        .env("PGCONNECT_TIMEOUT", "5")
         .output()
         .map_err(|e| Error::other(format!("failed to spawn psql: {e}")))?;
     if !out.status.success() {

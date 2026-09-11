@@ -428,7 +428,12 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         .psql
         .clone()
         .unwrap_or_else(|| cli::pgops::sibling_binary(&branch.pg_ctl, "psql"));
-    cli::pgops::wait_for_promotion(&psql, branch.branch_port, branch.recovery_timeout)?;
+    cli::pgops::wait_for_promotion(
+        &psql,
+        &branch.pgdata,
+        branch.branch_port,
+        branch.recovery_timeout,
+    )?;
     eprintln!(
         "tiko_branch: branch db_id={} promoted; stopping (run `tiko_branch restart` to start it)",
         branch.db_id

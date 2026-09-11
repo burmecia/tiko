@@ -572,7 +572,7 @@ fn recover_inner(
         server_opts: None,
         envs: &[],
     })?;
-    if let Err(e) = cli::pgops::wait_for_promotion(psql, port, recovery_timeout) {
+    if let Err(e) = cli::pgops::wait_for_promotion(psql, pgdata, port, recovery_timeout) {
         let _ = cli::pgops::stop_pg(pg_ctl, pgdata);
         return Err(e);
     }
