@@ -27,6 +27,7 @@ path = "src/bin/tiko_tlseg_viewer.rs"
 [dependencies]
 core = { path = "../core" }
 pgsys = { path = "../pgsys" }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

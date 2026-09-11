@@ -153,7 +153,7 @@ struct RestartArgs {
     branch_port: u16,
     /// Per-branch local cache path (`TIKO_LOCAL_PATH`). Defaults to
     /// `<pgdata>/tiko`.
-    #[arg(long)]
+    #[arg(long, env = "TIKO_LOCAL_PATH")]
     local_path: Option<PathBuf>,
     /// Path to `pg_ctl`. Defaults to `pg_ctl` on PATH.
     #[arg(long, default_value = "pg_ctl")]
@@ -344,6 +344,13 @@ fn run_backup(args: &BackupArgs) -> Result<()> {
 /// via `backup_label`. Once the branch promotes it is **stopped** — leaving it
 /// quiesced for `tiko_branch restart`.
 fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
+    if branch.db_id == branch.parent_db_id {
+        return Err(Error::other(format!(
+            "branch db_id ({}) must differ from parent_db_id ({})",
+            branch.db_id, branch.parent_db_id
+        )));
+    }
+
     // A branch shares the parent's org; only db_id differs.
     let org_id = env::read_u64(env::ENV_ORG_ID)?;
     let branch_ns = DbNamespace::new(org_id, branch.db_id);
@@ -359,19 +366,70 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         branch.parent_db_id,
     );
 
-    // 1. Read the pack file and unpack it into the branch PGDATA. Start from a
-    //    clean tree so files from an interrupted prior restore can't linger
-    //    (unpack replaces archive members but leaves extra files alone). Then
-    //    drop any parent-local `tiko` cache pg_basebackup copied (it belongs to
-    //    the parent's db_id); the branch re-derives its own from the seeded ns.
+    // 1. Read the pack. Refuse to clobber a PGDATA a live postmaster is using
+    //    (e.g. the running parent passed by mistake), then move any existing
+    //    tree aside rather than deleting it, so a failed restore can be rolled
+    //    back. Building from scratch also drops files absent from the archive
+    //    (unpack alone leaves entries not in the archive in place).
     let tar_zst = std::fs::read(&branch.pack)
         .map_err(|e| Error::other(format!("read {}: {e}", branch.pack.display())))?;
-    if branch.pgdata.exists() {
-        std::fs::remove_dir_all(&branch.pgdata)
-            .map_err(|e| Error::other(format!("clear {}: {e}", branch.pgdata.display())))?;
+    ensure_pgdata_is_not_live(&branch.pgdata)?;
+    let prior = backup_path(&branch.pgdata);
+    let had_prior = branch.pgdata.exists();
+    if had_prior {
+        if prior.exists() {
+            std::fs::remove_dir_all(&prior)
+                .map_err(|e| Error::other(format!("clear {}: {e}", prior.display())))?;
+        }
+        std::fs::rename(&branch.pgdata, &prior)
+            .map_err(|e| Error::other(format!("move {} aside: {e}", branch.pgdata.display())))?;
     }
+
+    // Steps 2-7. Any failure after the prior PGDATA was moved rolls it back.
+    match restore_pgdata(store, branch, &branch_ns, &branch_local, &tar_zst) {
+        Ok(ckpt) => {
+            if had_prior {
+                let _ = std::fs::remove_dir_all(&prior);
+            }
+            print_json(&RestoreOutput {
+                status: "restored".to_string(),
+                db_id: branch.db_id,
+                parent_db_id: branch.parent_db_id,
+                timeline: ckpt.timeline_id.to_hex(),
+                checkpoint_lsn: ckpt.lsn.to_pg_string(),
+            })
+        }
+        Err(e) => {
+            // Best-effort: stop the half-started branch and put the prior
+            // PGDATA back.
+            let _ = cli::pgops::stop_pg(&branch.pg_ctl, &branch.pgdata);
+            let _ = std::fs::remove_dir_all(&branch.pgdata);
+            if had_prior && let Err(re) = std::fs::rename(&prior, &branch.pgdata) {
+                eprintln!(
+                    "tiko_branch: PGDATA rollback failed ({re}); prior tree left at {}",
+                    prior.display()
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Steps 2-7 of `restore`: build a fresh branch PGDATA from `tar_zst`, seed the
+/// branch namespace, drive recovery to the backup's consistency point, promote,
+/// and stop. Split from [`run_restore`] so a failure can roll the PGDATA back.
+fn restore_pgdata(
+    store: &Store,
+    branch: &RestoreArgs,
+    branch_ns: &DbNamespace,
+    branch_local: &Path,
+    tar_zst: &[u8],
+) -> Result<Checkpoint> {
+    // 1. Unpack into the branch PGDATA. Then drop any parent-local `tiko` cache
+    //    pg_basebackup copied (it belongs to the parent's db_id); the branch
+    //    re-derives its own from the seeded namespace.
     std::fs::create_dir_all(&branch.pgdata)?;
-    cli::pgops::extract_backup(&tar_zst, &branch.pgdata)?;
+    cli::pgops::extract_backup(tar_zst, &branch.pgdata)?;
     let branch_tiko = branch.pgdata.join("tiko");
     if branch_tiko.exists() {
         let _ = std::fs::remove_dir_all(&branch_tiko);
@@ -401,19 +459,23 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
     store.seed_branch_base_manifest(branch.parent_db_id, branch_ns.clone(), ckpt)?;
     eprintln!("tiko_branch: seeded branch namespace {branch_ns} from {ckpt}");
 
-    // 4. Clear any stale local base-manifest cache so the branch PostgreSQL
-    //    re-derives it from the freshly-seeded shared-storage namespace.
-    //    `Store::init()` prefers the on-disk `base_manifest.tikm` fast path; a
-    //    leftover from a previous run (or the tool's temp store) would shadow
-    //    the seeded manifest and pollute the branch's view.
-    let manifest_path = branch_local.join(BASE_MANIFEST_FILE_NAME);
-    if manifest_path.exists() {
-        std::fs::remove_file(&manifest_path)
-            .map_err(|e| Error::other(format!("remove {}: {e}", manifest_path.display())))?;
-        eprintln!(
-            "tiko_branch: cleared stale local base manifest at {}",
-            manifest_path.display()
-        );
+    // 4. Clear stale local state: the `base_manifest.tikm` fast path (a
+    //    leftover would shadow the seeded manifest) and the `draft.spill`
+    //    write set (a leftover would be re-merged by the first commit). The
+    //    branch re-derives its view from the freshly-seeded namespace.
+    for name in [
+        BASE_MANIFEST_FILE_NAME,
+        core::timeline::draft::DRAFT_SPILL_FILE_NAME,
+    ] {
+        let path = branch_local.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| Error::other(format!("remove {}: {e}", path.display())))?;
+            eprintln!(
+                "tiko_branch: cleared stale local state at {}",
+                path.display()
+            );
+        }
     }
 
     // 5. Start the branch PostgreSQL to drive archive recovery to the backup's
@@ -425,7 +487,7 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         &branch.pgdata,
         branch.branch_port,
         branch.db_id,
-        &branch_local,
+        branch_local,
         Some(branch.recovery_timeout),
     )?;
 
@@ -450,13 +512,46 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
     //    (and keeps `restore` from leaving a running primary the caller may not
     //    be ready to serve).
     cli::pgops::stop_pg(&branch.pg_ctl, &branch.pgdata)?;
-    print_json(&RestoreOutput {
-        status: "restored".to_string(),
-        db_id: branch.db_id,
-        parent_db_id: branch.parent_db_id,
-        timeline: ckpt.timeline_id.to_hex(),
-        checkpoint_lsn: ckpt.lsn.to_pg_string(),
-    })
+    Ok(ckpt)
+}
+
+/// Sibling path used to stash an existing PGDATA during `restore`:
+/// `{pgdata}.tiko_branch_bak`.
+fn backup_path(pgdata: &Path) -> PathBuf {
+    let mut s = pgdata.as_os_str().to_os_string();
+    s.push(".tiko_branch_bak");
+    PathBuf::from(s)
+}
+
+/// Refuse to overwrite a PGDATA that a live postmaster is using. `restore` wipes
+/// the target tree, so clobbering the running parent (a plausible `--pgdata`
+/// mistake) would destroy it.
+fn ensure_pgdata_is_not_live(pgdata: &Path) -> Result<()> {
+    let Ok(contents) = std::fs::read_to_string(pgdata.join("postmaster.pid")) else {
+        return Ok(());
+    };
+    let Some(pid) = contents
+        .lines()
+        .next()
+        .and_then(|line| line.trim().parse::<i32>().ok())
+    else {
+        return Ok(());
+    };
+    if pid > 0 && pid_alive(pid) {
+        return Err(Error::other(format!(
+            "refusing to overwrite {}: postmaster.pid names live process {pid}",
+            pgdata.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Process liveness by PID; `EPERM` counts as alive.
+fn pid_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// `restart` subcommand: start the branch PostgreSQL left stopped by a
