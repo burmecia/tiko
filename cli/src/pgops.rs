@@ -287,3 +287,104 @@ pub fn sibling_binary(pg_ctl: &Path, name: &str) -> PathBuf {
         _ => PathBuf::from(name),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    const LABEL: &str = "START WAL LOCATION: 0/2000028 (file 000000010000000000000002)\n\
+                         CHECKPOINT LOCATION: 0/2000080\n\
+                         BACKUP METHOD: streamed\n\
+                         BACKUP FROM: primary\n\
+                         START TIME: 2026-01-01 00:00:00 UTC\n\
+                         LABEL: tiko\n\
+                         START TIMELINE: 3\n";
+
+    #[test]
+    fn parse_backup_label_extracts_all_fields() {
+        let (checkpoint, redo, timeline) = parse_backup_label(LABEL).unwrap();
+        assert_eq!(checkpoint, Lsn::from_pg_string("0/2000080").unwrap());
+        assert_eq!(redo, Lsn::from_pg_string("0/2000028").unwrap());
+        assert_eq!(timeline, TimelineId::new(3));
+    }
+
+    #[test]
+    fn parse_backup_label_rejects_missing_lines() {
+        assert!(parse_backup_label("LABEL: tiko\n").is_err());
+
+        let no_timeline = LABEL
+            .lines()
+            .filter(|l| !l.starts_with("START TIMELINE"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_backup_label(&no_timeline).is_err());
+    }
+
+    #[test]
+    fn first_token_after_stops_at_whitespace() {
+        assert_eq!(first_token_after(LABEL, "START TIMELINE:"), Some("3"));
+        assert_eq!(
+            first_token_after(LABEL, "CHECKPOINT LOCATION:"),
+            Some("0/2000080")
+        );
+        assert_eq!(first_token_after(LABEL, "MISSING:"), None);
+    }
+
+    #[test]
+    fn sibling_binary_uses_pg_ctl_directory() {
+        assert_eq!(
+            sibling_binary(Path::new("/opt/pg/bin/pg_ctl"), "psql"),
+            PathBuf::from("/opt/pg/bin/psql")
+        );
+        // A bare name has no parent dir, so it falls back to PATH lookup.
+        assert_eq!(
+            sibling_binary(Path::new("pg_ctl"), "psql"),
+            PathBuf::from("psql")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_round_trips_directory_and_preserves_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("pgdata");
+        fs::create_dir_all(src.join("global")).unwrap();
+        fs::write(src.join("PG_VERSION"), b"18\n").unwrap();
+        fs::write(src.join("global/pg_control"), b"ctl").unwrap();
+        std::os::unix::fs::symlink("PG_VERSION", src.join("version.link")).unwrap();
+
+        let packed = tar_dir_to_zst(&src).unwrap();
+        let dst = root.path().join("restored");
+        extract_backup(&packed, &dst).unwrap();
+
+        assert_eq!(fs::read(dst.join("PG_VERSION")).unwrap(), b"18\n");
+        assert_eq!(fs::read(dst.join("global/pg_control")).unwrap(), b"ctl");
+        assert!(
+            fs::symlink_metadata(dst.join("version.link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlinks must round-trip as links, not be expanded"
+        );
+    }
+
+    #[test]
+    fn extract_backup_leaves_entries_absent_from_the_archive() {
+        // Documents the non-clearing contract: callers that need a pristine
+        // tree (e.g. branch restore) clear dest themselves.
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("from_archive"), b"new").unwrap();
+        let packed = tar_dir_to_zst(&src).unwrap();
+
+        let dst = root.path().join("dst");
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("stale"), b"old").unwrap();
+        extract_backup(&packed, &dst).unwrap();
+
+        assert_eq!(fs::read(dst.join("from_archive")).unwrap(), b"new");
+        assert_eq!(fs::read(dst.join("stale")).unwrap(), b"old");
+    }
+}
