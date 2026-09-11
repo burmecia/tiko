@@ -189,8 +189,16 @@ impl Store {
         Ok((ckpt, bytes))
     }
 
-    /// Select the newest base backup with `created_at <= target_ts` on
-    /// `timeline` and return its `(checkpoint, tar_bytes)`.
+    /// Select the newest base backup with `created_at <= target_ts` that is on
+    /// `timeline` or an ancestor of it, and return its `(checkpoint,
+    /// tar_bytes)`.
+    ///
+    /// Ancestor-timeline backups (smaller `timeline_id`) are eligible: after a
+    /// promotion the newest timeline may have no backup of its own yet, and
+    /// PostgreSQL follows the timeline history from an ancestor base backup to
+    /// the recovery target. This mirrors [`Self::load_backup_at_or_before`],
+    /// which already admits ancestor backups via `Checkpoint`'s `(timeline_id,
+    /// lsn)` order.
     pub fn load_backup_before_time(
         &self,
         target_ts: i64,
@@ -199,7 +207,7 @@ impl Store {
         let ckpt = self
             .list_backups()?
             .into_iter()
-            .filter(|r| r.ckpt.timeline_id == timeline && r.created_at <= target_ts)
+            .filter(|r| r.ckpt.timeline_id <= timeline && r.created_at <= target_ts)
             .max_by_key(|r| (r.created_at, r.ckpt))
             .map(|r| r.ckpt)
             .ok_or_else(|| {
@@ -287,9 +295,9 @@ impl Store {
 
     /// Compute the PITR-recoverable window bounded by archived-WAL coverage:
     /// `earliest` = the oldest base *backup* whose recovery WAL (`[redo,
-    /// checkpoint]`) is inside the contiguous archived run; `latest_lsn` = the
-    /// end of that run. Errors with a clear message when nothing is recoverable
-    /// yet.
+    /// checkpoint]`) is archived on its own timeline (ancestors included);
+    /// `latest_lsn` = the end of the newest timeline's contiguous archived run.
+    /// Errors with a clear message when nothing is recoverable yet.
     pub fn recovery_window(&self) -> Result<RecoveryWindow> {
         // 1. Timeline = newest checkpoint's timeline.
         let rows = self.list_checkpoints()?;
@@ -302,18 +310,28 @@ impl Store {
         let run = self.archived_wal_run(timeline)?;
 
         // 3. Earliest usable base backup: ascending by checkpoint, first whose
-        //    recovery WAL is inside the archived run. PITR anchors on
-        //    pg_basebackup tarballs (`backup/`), not base manifests.
+        //    recovery WAL is archived on its OWN timeline. Ancestor-timeline
+        //    backups are eligible (PostgreSQL follows the timeline history from
+        //    the anchor to the target), so a backup taken before a promotion
+        //    stays usable. PITR anchors on pg_basebackup tarballs (`backup/`),
+        //    not base manifests.
         let mut backups = self.list_backups()?;
-        backups.retain(|b| b.ckpt.timeline_id == timeline);
+        backups.retain(|b| b.ckpt.timeline_id <= timeline);
         backups.sort_by_key(|b| b.ckpt);
 
-        let chosen = backups
-            .into_iter()
-            .find(|b| run.covers(b.redo_ckpt.lsn, b.ckpt.lsn))
-            .ok_or_else(|| {
-                Error::other("no base backup's WAL is archived; nothing is recoverable yet")
-            })?;
+        let mut chosen = None;
+        for b in backups {
+            let Ok(run_b) = self.archived_wal_run(b.ckpt.timeline_id) else {
+                continue;
+            };
+            if run_b.covers(b.redo_ckpt.lsn, b.ckpt.lsn) {
+                chosen = Some(b);
+                break;
+            }
+        }
+        let chosen = chosen.ok_or_else(|| {
+            Error::other("no base backup's WAL is archived; nothing is recoverable yet")
+        })?;
         let earliest_ckpt = chosen.ckpt;
         let earliest_ts = chosen.created_at;
 

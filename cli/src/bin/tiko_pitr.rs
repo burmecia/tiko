@@ -140,6 +140,10 @@ struct RestartArgs {
     /// PostgreSQL data directory. Defaults to `$PGDATA`.
     #[arg(long, env = "PGDATA")]
     pgdata: PathBuf,
+    /// Port the recovered PostgreSQL listens on. Must match the port used by
+    /// `recover`.
+    #[arg(long, env = "PGPORT", default_value_t = 5432)]
+    port: u16,
     /// Path to `pg_ctl`. Defaults to `pg_ctl` on `PATH`.
     #[arg(long, default_value = "pg_ctl")]
     pg_ctl: PathBuf,
@@ -343,12 +347,23 @@ fn run_backup(store: &Store, args: &BackupArgs) -> Result<()> {
 }
 
 fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
-    // 1. Recoverable window + target timeline.
-    let window = store.recovery_window()?;
+    // 1. Recoverable window + target timeline. The window describes the newest
+    //    timeline; when the caller pins an older `--timeline` we skip it — its
+    //    LSN/time bounds belong to a different timeline, so backup selection
+    //    and PostgreSQL validate reachability instead.
+    let window = match &args.timeline {
+        None => Some(store.recovery_window()?),
+        Some(_) => None,
+    };
     let timeline = match &args.timeline {
         Some(s) => TimelineId::from_hex(s)
             .map_err(|e| Error::other(format!("invalid --timeline '{s}': {e}")))?,
-        None => window.timeline,
+        None => {
+            window
+                .as_ref()
+                .expect("recovery window loaded when --timeline is absent")
+                .timeline
+        }
     };
 
     // 2. Resolve the target (time or lsn), validate it is within the window,
@@ -359,7 +374,9 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         &args.time
     {
         let target_ts = pitr::parse_pg_timestamp(time_str)?;
-        if target_ts < window.earliest_ts || target_ts > window.latest_ts {
+        if let Some(w) = &window
+            && (target_ts < w.earliest_ts || target_ts > w.latest_ts)
+        {
             return Err(Error::other(format!(
                 "target time '{time_str}' is outside the recoverable window; run `tiko_pitr list`"
             )));
@@ -377,9 +394,9 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
         )
     } else {
         let l = Lsn::parse_either(args.lsn.as_ref().unwrap()).map_err(Error::other)?;
-        // LSN bounds use the window's latest-timeline range; backup selection +
-        // PostgreSQL validate the precise reachability for an older --timeline.
-        if l < window.earliest_ckpt.lsn || l > window.latest_lsn {
+        if let Some(w) = &window
+            && (l < w.earliest_ckpt.lsn || l > w.latest_lsn)
+        {
             return Err(Error::other(format!(
                 "target LSN {} is outside the recoverable window; run `tiko_pitr list`",
                 l.to_pg_string()
@@ -478,6 +495,11 @@ fn run_recover(store: &Store, args: &RecoverArgs) -> Result<()> {
             }
             if manifest_backup.exists() {
                 let _ = std::fs::copy(&manifest_backup, &manifest_path);
+            } else {
+                // No manifest existed before recovery, so drop the one
+                // `recover_inner` may have installed; the restored PGDATA must
+                // not be paired with a mismatched live manifest.
+                let _ = std::fs::remove_file(&manifest_path);
             }
             let _ = std::fs::remove_dir_all(&backup);
             eprintln!("tiko_pitr: PGDATA + manifest restored; database left stopped");
@@ -502,12 +524,13 @@ fn resolve_log_file(explicit: Option<&Path>, pgdata: &Path) -> PathBuf {
 /// tikoguest's `/pitr/restart` route).
 fn run_restart(args: &RestartArgs) -> Result<()> {
     let log_file = resolve_log_file(args.log_file.as_deref(), &args.pgdata);
+    let server_opts = format!("-c port={}", args.port);
     cli::pgops::start_pg(&cli::pgops::StartPgOpts {
         pg_ctl: &args.pg_ctl,
         pgdata: &args.pgdata,
         log_file: Some(&log_file),
         wait_secs: None,
-        server_opts: None,
+        server_opts: Some(&server_opts),
         envs: &[],
     })?;
     eprintln!("tiko_pitr: database started");
@@ -556,6 +579,21 @@ fn recover_inner(
     // timeline's segments after promote).
     store.delete_all_segments()?;
 
+    // Clear the stale local write-set overflow. A leftover `draft.spill` from
+    // the pre-recovery instance would be re-merged into the first post-recovery
+    // commit (`DraftBuffer::drain` reads it), reintroducing old-timeline chunk
+    // refs that the segment deletion above is meant to drop. Mirrors
+    // `tiko_branch restore`.
+    let draft_spill = core::local_path().join(core::timeline::draft::DRAFT_SPILL_FILE_NAME);
+    if draft_spill.exists() {
+        std::fs::remove_file(&draft_spill)
+            .map_err(|e| Error::other(format!("remove {}: {e}", draft_spill.display())))?;
+        eprintln!(
+            "tiko_pitr: cleared stale local write set at {}",
+            draft_spill.display()
+        );
+    }
+
     pitr::write_pitr_recovery_conf(conf, timeline, target, tiko_restore, true)?;
     std::fs::write(pgdata.join(RECOVERY_SIGNAL_FILE), b"")?;
 
@@ -563,13 +601,16 @@ fn recover_inner(
     // recovery_target_action='promote', postgres does not exit on its own; it
     // ends recovery by promoting and continuing as a primary. Logs are
     // redirected to `log_file` so the (debug-level) recovery output doesn't
-    // spill to this process's stderr.
+    // spill to this process's stderr. `-c port` pins the listen port to the one
+    // `wait_for_promotion` polls, so a `postgresql.conf` port mismatch can't
+    // leave recovery waiting on the wrong port.
+    let server_opts = format!("-c port={port}");
     cli::pgops::start_pg(&cli::pgops::StartPgOpts {
         pg_ctl,
         pgdata,
         log_file: Some(log_file),
         wait_secs: Some(recovery_timeout),
-        server_opts: None,
+        server_opts: Some(&server_opts),
         envs: &[],
     })?;
     if let Err(e) = cli::pgops::wait_for_promotion(psql, pgdata, port, recovery_timeout) {
