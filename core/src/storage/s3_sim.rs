@@ -81,12 +81,7 @@ impl ObjectStorage for S3Sim {
     fn get(&self, key: &str) -> Result<Vec<u8>> {
         let path = self.root.join(key);
         let raw = fs::read(&path)?;
-        if raw.is_empty() || skip_compression(&path) {
-            Ok(raw)
-        } else {
-            let data = zstd::decode_all(raw.as_slice())?;
-            Ok(data)
-        }
+        decode_object(&path, raw)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -133,6 +128,36 @@ fn skip_compression(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("zst"))
 }
 
+/// zstd frame magic (little-endian), as emitted by `zstd::encode_all`.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Decode an object's stored bytes using the canonical encoding rule: `.json`
+/// and `.zst` objects (and empty files) are stored uncompressed, everything
+/// else is a zstd frame. Corrupt compressed data is an error.
+///
+/// Shared by `S3Sim::get` and the inspector CLIs so the storage format stays
+/// single-sourced.
+pub fn decode_object(path: &Path, raw: Vec<u8>) -> Result<Vec<u8>> {
+    if raw.is_empty() || skip_compression(path) {
+        Ok(raw)
+    } else {
+        Ok(zstd::decode_all(raw.as_slice())?)
+    }
+}
+
+/// Like [`decode_object`], but tolerates an uncompressed object whose extension
+/// is not in the skip list (e.g. an inspector reading a decompressed `.segment`
+/// or an object written by a backend that doesn't compress). A non-zstd frame
+/// is returned as-is; a zstd frame is always decompressed, so corruption still
+/// surfaces as an error.
+pub fn decode_object_autodetect(path: &Path, raw: Vec<u8>) -> Result<Vec<u8>> {
+    if raw.is_empty() || skip_compression(path) || !raw.starts_with(&ZSTD_MAGIC) {
+        Ok(raw)
+    } else {
+        Ok(zstd::decode_all(raw.as_slice())?)
+    }
+}
+
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -150,4 +175,31 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_object_round_trips_and_autodetects_uncompressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = dir.path().join("00000000.segment");
+        let raw = b"not compressed WAL metadata".to_vec();
+        let compressed = zstd::encode_all(raw.as_slice(), 1).unwrap();
+
+        // A zstd frame decodes under both rules.
+        assert_eq!(decode_object(&seg, compressed.clone()).unwrap(), raw);
+        assert_eq!(decode_object_autodetect(&seg, compressed).unwrap(), raw);
+
+        // Plain bytes on a non-skip extension: strict errors, autodetect passes.
+        assert!(decode_object(&seg, raw.clone()).is_err());
+        assert_eq!(decode_object_autodetect(&seg, raw.clone()).unwrap(), raw);
+
+        // Skip-compression extensions and empty inputs are raw either way.
+        let json = dir.path().join("meta.json");
+        assert_eq!(decode_object(&json, raw.clone()).unwrap(), raw);
+        assert_eq!(decode_object_autodetect(&json, raw.clone()).unwrap(), raw);
+        assert_eq!(decode_object(&seg, Vec::new()).unwrap(), Vec::<u8>::new());
+    }
 }

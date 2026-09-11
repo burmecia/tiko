@@ -29,11 +29,11 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use cli::pitr;
+use cli::util::fmt_unix_ts;
 use core::env;
 use core::error::{Error, Result};
 use core::store::{BackupRow, RecoveryWindow, Store};
@@ -250,14 +250,6 @@ struct RecoverOutput {
 struct RestartOutput {
     /// Always `"started"` (only emitted on success).
     status: String,
-}
-
-/// Render a Unix-seconds timestamp as RFC3339 UTC, falling back to the raw
-/// integer if the instant is out of `chrono`'s representable range.
-fn fmt_unix_ts(ts: i64) -> String {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .map(|t| t.to_rfc3339())
-        .unwrap_or_else(|| ts.to_string())
 }
 
 /// Pretty-print a DTO as JSON on stdout.
