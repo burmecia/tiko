@@ -117,6 +117,13 @@ pub fn tar_dir_to_zst(src: &Path) -> Result<Vec<u8>> {
 }
 
 /// Decompress (zstd) and extract a base-backup tarball into `dest`.
+///
+/// Unpacks over `dest`, creating it if needed. Pre-existing entries are replaced
+/// by archive members, but entries *absent* from the archive are left in place.
+/// Callers that need a pristine tree must clear `dest` first — and must not
+/// clear any directory intentionally preserved across the restore (e.g.
+/// `PGDATA/tiko`, which can hold the block store when `TIKO_STORAGE_ROOT` is
+/// unset).
 pub fn extract_backup(tar_zst: &[u8], dest: &Path) -> Result<()> {
     let tar_buf = zstd::decode_all(tar_zst)
         .map_err(|e| Error::other(format!("zstd decompress base backup: {e}")))?;

@@ -359,11 +359,17 @@ fn run_restore(store: &Store, branch: &RestoreArgs) -> Result<()> {
         branch.parent_db_id,
     );
 
-    // 1. Read the pack file and unpack it into the branch PGDATA. Then drop
-    //    any parent-local `tiko` cache pg_basebackup copied (it belongs to the
-    //    parent's db_id); the branch re-derives its own from the seeded ns.
+    // 1. Read the pack file and unpack it into the branch PGDATA. Start from a
+    //    clean tree so files from an interrupted prior restore can't linger
+    //    (unpack replaces archive members but leaves extra files alone). Then
+    //    drop any parent-local `tiko` cache pg_basebackup copied (it belongs to
+    //    the parent's db_id); the branch re-derives its own from the seeded ns.
     let tar_zst = std::fs::read(&branch.pack)
         .map_err(|e| Error::other(format!("read {}: {e}", branch.pack.display())))?;
+    if branch.pgdata.exists() {
+        std::fs::remove_dir_all(&branch.pgdata)
+            .map_err(|e| Error::other(format!("clear {}: {e}", branch.pgdata.display())))?;
+    }
     std::fs::create_dir_all(&branch.pgdata)?;
     cli::pgops::extract_backup(&tar_zst, &branch.pgdata)?;
     let branch_tiko = branch.pgdata.join("tiko");
