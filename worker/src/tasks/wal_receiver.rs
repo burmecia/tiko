@@ -28,7 +28,7 @@ use tokio::time::sleep;
 use crate::log_relay::{relay_debug1, relay_warning};
 use core::io_control::IoControl;
 use core::store::Store;
-use pgsys::version::XLOG_SEG_SIZE;
+use pgsys::version::{XLOG_PAGE_MAGIC, XLOG_SEG_SIZE};
 use std::sync::atomic::Ordering;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -155,6 +155,17 @@ async fn run_streaming(sim: &'static Store, config: &WalReceiverConfig) -> Resul
         .ok_or("IDENTIFY_SYSTEM: missing xlogpos")?;
     let xlogpos =
         parse_lsn(&xlogpos_str).map_err(|e| format!("IDENTIFY_SYSTEM: bad xlogpos: {e}"))?;
+
+    // ── Archive timeline history files ────────────────────────────────────────
+    // Tiko does not use archive_command, so mirror its timeline-history archival
+    // here: the live `pg_wal/*.history` files must reach storage for
+    // `restore_command` to fetch when recovering to a timeline other than 1.
+    // Best-effort — a failure must not stop WAL streaming — but loud.
+    if let Err(e) = persist_timeline_history(sim).await {
+        relay_warning(format!(
+            "tiko: wal_receiver: timeline history archive failed: {e}"
+        ));
+    }
 
     // ── Ensure slot exists and get restart_lsn ────────────────────────────────
     // Try READ_REPLICATION_SLOT first: succeeds silently if the slot already
@@ -367,15 +378,28 @@ async fn handle_xlogdata(
         if cur_seg.is_none() {
             let mut s = SegState::new(seg_no);
             if seg_offset > 0 {
-                // Mid-segment start — only on the very first connection, when
-                // the slot's restart_lsn is mid-segment. On reconnects and on
-                // normal segment transitions `cursor` is segment-aligned, so
-                // `seg_offset` is 0 (a clean, sealable segment). Zero-fill the
-                // prefix and mark partial: a sealed object's zero prefix would
-                // masquerade as a fully-valid, replayable 16 MiB segment.
-                s.buf.resize(seg_offset, 0);
-                s.chunks_uploaded = seg_offset;
-                s.partial = true;
+                // Mid-segment start: the slot's restart_lsn is mid-segment. This
+                // happens on the first connection and, critically, right after a
+                // promotion — the promotion point is mid-segment, so the new
+                // timeline's first segment straddles the switch and its
+                // `[0, seg_offset)` prefix is the PARENT timeline's WAL. The
+                // local `pg_wal` file is that same physical segment and already
+                // holds the prefix, so copy it when available: the archived
+                // child segment then replays correctly from offset 0 (and may be
+                // sealed once complete).
+                //
+                // When the prefix isn't locally available (e.g. a recycled or
+                // different `waldir`), zero-fill and mark partial: a sealed
+                // object's zero prefix would masquerade as valid replayable WAL.
+                let seg_name = wal_seg_name(timeline_id, seg_no);
+                match read_local_segment_prefix(seg_name, seg_offset).await {
+                    Some(prefix) => s.buf.extend_from_slice(&prefix),
+                    None => {
+                        s.buf.resize(seg_offset, 0);
+                        s.chunks_uploaded = seg_offset;
+                        s.partial = true;
+                    }
+                }
             }
             *cur_seg = Some(s);
         }
@@ -652,6 +676,71 @@ fn segment_truncated(partial: bool, received: usize, seg_size: usize) -> bool {
 /// Format: `{timeline:08X}{seg_no:016X}`  e.g. `000000010000000000000002`
 fn wal_seg_name(timeline_id: TimelineId, seg_no: u64) -> String {
     format!("{}{:016X}", timeline_id.to_hex(), seg_no)
+}
+
+/// Upload every `pg_wal/*.history` file to storage under its timeline's WAL
+/// prefix. PostgreSQL's `restore_command` fetches these when recovering to a
+/// timeline other than 1, and a `pg_basebackup -X none` tarball does not carry
+/// them, so `wal_receiver` is the only component that can archive them.
+///
+/// Re-uploaded on every (re)connect: a promotion creates a new (self-contained,
+/// full-ancestry) history file, and reconnects are rare.
+async fn persist_timeline_history(sim: &'static Store) -> Result<(), BoxError> {
+    let pg_wal = pgsys::common::data_dir_path().join("pg_wal");
+    let entries = match std::fs::read_dir(&pg_wal) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("read {}: {e}", pg_wal.display()).into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let Some(tli) = core::parse_timeline_history_name(&name) else {
+            continue;
+        };
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("read {}: {e}", entry.path().display()).into()),
+        };
+        let key = sim.namespace().wal_history(tli);
+        let name_log = name.clone();
+        tokio::task::spawn_blocking(move || sim.storage_put(&key, &bytes))
+            .await
+            .map_err(|e| format!("timeline history PUT panicked: {e}"))??;
+        relay_debug1(format!(
+            "tiko: wal_receiver: archived timeline history {name_log}"
+        ));
+    }
+    Ok(())
+}
+
+/// Read the first `len` bytes of the local `pg_wal/{name}` segment file.
+///
+/// Returns `None` when the file can't be read, is shorter than `len`, or its
+/// page-0 magic is absent (the prefix is unwritten/preallocated zeros rather
+/// than real WAL). Used to recover the parent-timeline prefix of a segment that
+/// began mid-stream after a promotion.
+async fn read_local_segment_prefix(name: String, len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    tokio::task::spawn_blocking(move || {
+        let path = pgsys::common::data_dir_path().join("pg_wal").join(&name);
+        let mut file = std::fs::File::open(&path).ok()?;
+        let mut buf = vec![0u8; len];
+        std::io::Read::read_exact(&mut file, &mut buf).ok()?;
+        if buf.len() < 2 || buf[0..2] != XLOG_PAGE_MAGIC.to_le_bytes() {
+            return None;
+        }
+        Some(buf)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

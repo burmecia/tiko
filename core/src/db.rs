@@ -190,6 +190,28 @@ impl DbNamespace {
             byte_offset
         )
     }
+
+    /// Storage key for a timeline history file:
+    /// `{ns}/wal/{tl:08X}/{tl:08X}.history`. Stored alongside the timeline's WAL
+    /// because PostgreSQL fetches it through `restore_command` when recovering
+    /// to a timeline other than 1.
+    pub fn wal_history(&self, timeline_id: TimelineId) -> String {
+        format!(
+            "{}{}.history",
+            self.wal_segments_prefix(timeline_id),
+            timeline_id.to_hex()
+        )
+    }
+}
+
+/// Parse a timeline history filename (`{tli:08X}.history`) into its timeline id.
+/// Returns `None` for anything that is not exactly 8 hex digits plus `.history`.
+pub fn parse_timeline_history_name(name: &str) -> Option<TimelineId> {
+    let stem = name.strip_suffix(".history")?;
+    if stem.len() != 8 || !stem.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    TimelineId::from_hex(stem).ok()
 }
 
 impl fmt::Display for DbNamespace {
@@ -279,6 +301,25 @@ mod tests {
         // Round-trip with the builder.
         let key = ns.base_manifest(&ckpt(1, 0x3000028));
         assert_eq!(ns.parse_base_manifest(&key), Some(ckpt(1, 0x3000028)));
+    }
+
+    #[test]
+    fn parses_timeline_history_name_and_builds_key() {
+        assert_eq!(
+            parse_timeline_history_name("0000000A.history"),
+            Some(TimelineId::new(10))
+        );
+        assert_eq!(
+            parse_timeline_history_name("00000002.history"),
+            Some(TimelineId::new(2))
+        );
+        assert_eq!(parse_timeline_history_name("00000002.partial"), None);
+        assert_eq!(parse_timeline_history_name("0000002.history"), None);
+        assert_eq!(parse_timeline_history_name("00000002.historyx"), None);
+        assert_eq!(
+            ns().wal_history(TimelineId::new(10)),
+            "12/5/wal/0000000A/0000000A.history"
+        );
     }
 
     #[test]

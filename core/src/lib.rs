@@ -12,7 +12,7 @@ pub mod timeline;
 pub mod utils;
 
 pub use chunk::{BLOCKS_PER_CHUNK, CHUNK_TAG_SIZE, ChunkTag};
-pub use db::DbNamespace;
+pub use db::{DbNamespace, parse_timeline_history_name};
 pub use env::{local_path, storage_root_path};
 pub use error::{Error, Result};
 pub use io::io_control;

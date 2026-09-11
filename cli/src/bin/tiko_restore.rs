@@ -4,8 +4,13 @@
 //! `restore_command = 'tiko_restore %f %p'`, where `%f` is the WAL segment
 //! file name and `%p` is the destination path (relative to the data dir).
 //!
-//! Reads the WAL produced by `wal_receiver`. Two object shapes can exist for a
-//! given segment (see `worker/src/tasks/wal_receiver.rs`):
+//! Reads the WAL produced by `wal_receiver`, plus the cluster's timeline
+//! history files (`{tli:08X}.history`, also archived by `wal_receiver`), which
+//! PostgreSQL requests when the recovery target timeline is newer than the base
+//! backup's.
+//!
+//! Two object shapes can exist for a given segment (see
+//! `worker/src/tasks/wal_receiver.rs`):
 //!
 //!   1. A **sealed** object — a complete, zero-padded `XLOG_SEG_SIZE` segment.
 //!      This is the authoritative copy and is preferred when present.
@@ -22,6 +27,7 @@
 //!     accordingly.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -62,22 +68,48 @@ enum Outcome {
 
 /// Restore one requested WAL file.
 fn restore(store: &Store, args: &Args) -> Result<Outcome> {
-    // We only archive regular 24-hex WAL segment files. Timeline history
-    // files (`{tli:08X}.history`), `.backup`, and `.partial` files are never
-    // uploaded by `wal_receiver`, so treat anything else as not-found and let
-    // PostgreSQL fall back to its other recovery sources.
-    let Some((timeline_id, _seg_no)) = pgcontrol::parse_wal_segment_name(&args.wal_filename) else {
-        return Ok(Outcome::NotFound);
-    };
     let name = args.wal_filename.as_str();
     let loc = store.namespace();
 
-    // 1. Prefer the sealed (complete) segment object.
+    // 1. Timeline history files (`{tli:08X}.history`) are archived by
+    //    `wal_receiver` under the timeline's WAL prefix. PostgreSQL fetches
+    //    them through `restore_command` when the recovery target timeline is
+    //    newer than the base backup's (e.g. after a promotion).
+    if let Some(tli) = core::parse_timeline_history_name(name) {
+        let key = loc.wal_history(tli);
+        return match store.storage_get(&key) {
+            Ok(bytes) => {
+                write_atomic(&args.dest_path, &bytes)?;
+                Ok(Outcome::Restored)
+            }
+            Err(e) if e.is_not_found() => Ok(Outcome::NotFound),
+            Err(e) => Err(e),
+        };
+    }
+
+    // We only archive regular 24-hex WAL segment files. `.backup` and
+    // `.partial` files are never uploaded, so treat anything else as
+    // not-found and let PostgreSQL fall back to its other recovery sources.
+    let Some((timeline_id, _seg_no)) = pgcontrol::parse_wal_segment_name(name) else {
+        return Ok(Outcome::NotFound);
+    };
+
+    // 2. Prefer the sealed (complete) segment object.
     let seg_key = loc.wal_segment(timeline_id, name);
     match store.storage_get(&seg_key) {
-        Ok(bytes) => {
+        Ok(bytes) if bytes.len() == XLOG_SEG_SIZE => {
             write_atomic(&args.dest_path, &bytes)?;
             return Ok(Outcome::Restored);
+        }
+        Ok(bytes) => {
+            // A wrong-length sealed object (truncated/empty) would be handed to
+            // PostgreSQL as a valid segment. Fall back to the chunks, which
+            // compaction deletes only after the sealed PUT has completed.
+            eprintln!(
+                "tiko_restore: sealed segment {seg_key} is {} bytes (expected {XLOG_SEG_SIZE}); \
+                 falling back to chunks",
+                bytes.len()
+            );
         }
         Err(e) if e.is_not_found() => {} // fall through to chunk assembly
         Err(e) => {
@@ -90,7 +122,7 @@ fn restore(store: &Store, args: &Args) -> Result<Outcome> {
         }
     }
 
-    // 2. Fall back to assembling the segment from its 256 KiB chunks.
+    // 3. Fall back to assembling the segment from its 256 KiB chunks.
     let prefix = loc.wal_chunk_prefix(timeline_id, name);
     let chunk_keys = store.storage_list_prefix(&prefix)?;
     if chunk_keys.is_empty() {
@@ -140,22 +172,11 @@ fn maybe_synthesize_long_header(buf: &mut [u8], tli: TimelineId, name: &str) {
     let Some(seg_no) = pgcontrol::parse_wal_seg_no(name) else {
         return; // not a parseable segment name; nothing to synthesize
     };
-    // restore_command runs with cwd = the data directory, so global/pg_control
-    // is the live control file holding this cluster's system_identifier.
-    let sysid = match fs::read("global/pg_control") {
-        Ok(ctl) => match pgcontrol::read_system_identifier(&ctl) {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!(
-                    "tiko_restore: bad global/pg_control ({e}); \
-                     leaving segment {name} page 0 unsynthesized"
-                );
-                return;
-            }
-        },
+    let sysid = match read_control_system_identifier() {
+        Ok(id) => id,
         Err(e) => {
             eprintln!(
-                "tiko_restore: cannot read global/pg_control ({e}); \
+                "tiko_restore: cannot read system_identifier from global/pg_control ({e}); \
                  leaving segment {name} page 0 unsynthesized"
             );
             return;
@@ -165,6 +186,27 @@ fn maybe_synthesize_long_header(buf: &mut [u8], tli: TimelineId, name: &str) {
     buf[0..hdr.len()].copy_from_slice(&hdr);
 }
 
+/// Read `system_identifier` from `global/pg_control`, retrying a few times.
+///
+/// restore_command runs with cwd = the data directory, so `global/pg_control`
+/// is the live control file. The recovering postmaster rewrites it in place, so
+/// a single read can catch a torn buffer (rejected by the CRC guard); a bounded
+/// retry avoids silently skipping long-header synthesis on that transient.
+fn read_control_system_identifier() -> Result<u64> {
+    let mut last: Option<core::error::Error> = None;
+    for _ in 0..4 {
+        match fs::read("global/pg_control") {
+            Ok(ctl) => match pgcontrol::read_system_identifier(&ctl) {
+                Ok(id) => return Ok(id),
+                Err(e) => last = Some(e),
+            },
+            Err(e) => last = Some(e.into()),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(last.unwrap_or_else(|| core::error::Error::other("pg_control read failed")))
+}
+
 /// Parse the byte offset encoded in a chunk key's final path component
 /// (`{...}.chunks/{offset:016X}`).
 fn chunk_offset(key: &str) -> Option<usize> {
@@ -172,13 +214,37 @@ fn chunk_offset(key: &str) -> Option<usize> {
     usize::from_str_radix(last, 16).ok()
 }
 
-/// Write `data` to `dest` atomically: write to a sibling temp file, then
-/// rename. A crash mid-write must never leave PostgreSQL a partial segment.
+/// Write `data` to `dest` atomically: write to a sibling temp file, fsync it,
+/// then rename. A crash mid-write must never leave PostgreSQL a partial
+/// segment, and the rename must be durable before this returns (matching the
+/// archive/restore contract). WAL files are mode `0600`.
 fn write_atomic(dest: &Path, data: &[u8]) -> Result<()> {
     let tmp = temp_sibling(dest);
-    fs::write(&tmp, data)?;
+    let staged = (|| -> Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     match fs::rename(&tmp, dest) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(parent) = dest.parent()
+                && !parent.as_os_str().is_empty()
+                && let Ok(dir) = fs::File::open(parent)
+            {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e.into())
